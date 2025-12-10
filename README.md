@@ -17,7 +17,7 @@ pip install -r requirements.txt
 python winexe32emu.py hello_messagebox.exe
 
 # With maximum instruction count
-python winexe32emu.py hello_messagebox.exe 10000
+python winexe32emu.py hello_messagebox.exe -n 10000
 
 # Set memory amount (MiB)
 python winexe32emu.py hello_console.exe -m 256
