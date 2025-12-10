@@ -1,0 +1,5 @@
+pefile
+colorama
+unicorn
+capstone
+pygame  # optional (only needed for the pseudo-GUI)
