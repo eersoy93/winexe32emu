@@ -1,6 +1,6 @@
 # winexe32emu.py
 
-32-bit Windows EXE emulator in Python.
+32-bit Windows EXE emulator in Python. Written with GitHub Copilot.
 
 ![winexe32emu 0.0.1 Fake Desktop Image](doc/winexe32emu_0_0_1.png)
 
