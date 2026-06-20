@@ -35,7 +35,7 @@ for src in examples/*.c; do
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
                 -nostartfiles -lkernel32 -luser32 -mwindows -e_WinMain@16
             ;;
-        hello_empty_window|empty_window)
+        hello_empty_window|empty_window|hello_button)
             # Full Win32 window application - with standard CRT
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
                 -lkernel32 -luser32 -lgdi32 -mwindows

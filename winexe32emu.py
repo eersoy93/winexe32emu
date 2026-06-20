@@ -297,6 +297,19 @@ class WinAPIHandler:
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     WM_CHAR = 0x0102
+    WM_COMMAND = 0x0111
+    WM_MOUSEMOVE = 0x0200
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    WM_RBUTTONDOWN = 0x0204
+    WM_RBUTTONUP = 0x0205
+
+    # Mouse key state flags (wParam for mouse messages)
+    MK_LBUTTON = 0x0001
+    MK_RBUTTON = 0x0002
+
+    # Button notification codes (high word of WM_COMMAND wParam)
+    BN_CLICKED = 0
     
     def __init__(self, emulator, gui=None):
         self.emu = emulator
@@ -310,6 +323,7 @@ class WinAPIHandler:
         
         # Message queue system
         self.message_queue = []
+        self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
         self.painted_windows = set()  # Windows that received WM_PAINT
         self.quit_requested = False
         
@@ -379,7 +393,21 @@ class WinAPIHandler:
             return data.decode('utf-16-le', errors='replace')
         except:
             return "<read error>"
-    
+
+    def post_window_message(self, hwnd, message, wParam, lParam):
+        """Thread-safe: enqueue a window message (called from the GUI thread).
+
+        The emulation thread consumes these in GetMessageA. Only plain Python
+        data is touched here; Unicorn memory is written later on the emu thread.
+        """
+        with self.message_lock:
+            self.message_queue.append({
+                'hwnd': hwnd & 0xFFFFFFFF,
+                'message': message & 0xFFFFFFFF,
+                'wParam': wParam & 0xFFFFFFFF,
+                'lParam': lParam & 0xFFFFFFFF,
+            })
+
     # KERNEL32.DLL functions
     def GetModuleHandleA(self, args):
         """GetModuleHandleA emulation"""
@@ -1410,18 +1438,47 @@ class WinAPIHandler:
         if self.gui and self.gui.running:
             # Create control for top-level controls
             if class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX"]:
-                hwnd = self.gui.create_control(hWndParent, class_name, window_name, 
-                                               x, y, nWidth, nHeight, dwStyle)
+                # For child controls hMenu carries the control ID (used by WM_COMMAND)
+                hwnd = self.gui.create_control(hWndParent, class_name, window_name,
+                                               x, y, nWidth, nHeight, dwStyle,
+                                               control_id=hMenu)
             else:
                 hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle)
-            
+
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
                 self.gui.windows[hwnd].class_name = class_name
+
+            # Real Windows sends WM_CREATE to the WndProc synchronously, before
+            # CreateWindowEx returns. Apps often create their child controls here.
+            # Controls have no app WndProc, so this only fires for app windows.
+            wndproc = self._find_wndproc_for_hwnd(hwnd)
+            if wndproc:
+                cs_addr = self._build_createstruct(
+                    lpParam, hInstance, hMenu, hWndParent,
+                    nHeight, nWidth, y, x, dwStyle, lpWindowName, lpClassName, dwExStyle)
+                self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
         else:
             hwnd = self.get_next_handle()
-        
+
         return hwnd
+
+    def _build_createstruct(self, lpCreateParams, hInstance, hMenu, hwndParent,
+                            cy, cx, y, x, style, lpszName, lpszClass, dwExStyle):
+        """Allocate and fill a CREATESTRUCTA, return its address (for WM_CREATE)."""
+        addr = self.emu.heap_alloc(48)
+        data = struct.pack("<IIIIiiiiIIII",
+                           lpCreateParams & 0xFFFFFFFF,
+                           hInstance & 0xFFFFFFFF,
+                           hMenu & 0xFFFFFFFF,
+                           hwndParent & 0xFFFFFFFF,
+                           cy, cx, y, x,
+                           style & 0xFFFFFFFF,
+                           lpszName & 0xFFFFFFFF,
+                           lpszClass & 0xFFFFFFFF,
+                           dwExStyle & 0xFFFFFFFF)
+        self.emu.uc.mem_write(addr, data)
+        return addr
     
     def ShowWindow(self, args):
         """ShowWindow emulation"""
@@ -1612,7 +1669,15 @@ class WinAPIHandler:
         lParam = args[3]
         log.debug(f"PostMessageA(0x{hWnd:x}, 0x{Msg:x}, 0x{wParam:x}, 0x{lParam:x})")
         return 1
-    
+
+    def PostQuitMessage(self, args):
+        """PostQuitMessage emulation - request message loop exit"""
+        nExitCode = args[0]
+        log.debug(f"PostQuitMessage({nExitCode})")
+        # The blocking GetMessageA relies on this to break the loop
+        self.quit_requested = True
+        return 0
+
     def GetMessageA(self, args):
         """GetMessageA emulation - For message loop"""
         lpMsg = args[0]
@@ -1629,40 +1694,56 @@ class WinAPIHandler:
                 self.emu.uc.mem_write(lpMsg, msg_data)
             return 0
         
-        # Send WM_PAINT for windows not yet painted
-        for hwnd, window in list(self.gui.windows.items()) if self.gui else []:
-            if hwnd not in self.painted_windows and window.visible:
-                self.painted_windows.add(hwnd)
+        # Block until a message is available, the app quits, or the GUI closes.
+        # This runs on the emulation thread; the GUI thread feeds message_queue.
+        while True:
+            if self.quit_requested:
                 if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", hwnd, self.WM_PAINT, 0, 0, 0, 0, 0)
+                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
                     self.emu.uc.mem_write(lpMsg, msg_data)
-                log.debug(f"GetMessageA() -> WM_PAINT for hwnd=0x{hwnd:x}")
-                return 1
-        
-        # Return message if queue has one
-        if self.message_queue:
-            msg = self.message_queue.pop(0)
-            if lpMsg:
-                msg_data = struct.pack("<IIIIIii", msg['hwnd'], msg['message'], 
-                                       msg['wParam'], msg['lParam'], 0, 0, 0)
-                self.emu.uc.mem_write(lpMsg, msg_data)
-            if msg['message'] == self.WM_QUIT:
                 return 0
-            return 1
-        
-        # WM_QUIT if GUI exists and window was closed
-        if self.gui and not self.gui.running:
-            if lpMsg:
-                msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-                self.emu.uc.mem_write(lpMsg, msg_data)
-            return 0
-        
-        # Default: let program terminate (emulation is limited)
-        self.quit_requested = True
-        if lpMsg:
-            msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-            self.emu.uc.mem_write(lpMsg, msg_data)
-        return 0
+
+            # Send WM_PAINT for visible windows not yet painted
+            for hwnd, window in list(self.gui.windows.items()) if self.gui else []:
+                if hwnd not in self.painted_windows and window.visible:
+                    self.painted_windows.add(hwnd)
+                    if lpMsg:
+                        msg_data = struct.pack("<IIIIIii", hwnd, self.WM_PAINT, 0, 0, 0, 0, 0)
+                        self.emu.uc.mem_write(lpMsg, msg_data)
+                    log.debug(f"GetMessageA() -> WM_PAINT for hwnd=0x{hwnd:x}")
+                    return 1
+
+            # Return a queued message (input forwarded from the GUI thread)
+            msg = None
+            with self.message_lock:
+                if self.message_queue:
+                    msg = self.message_queue.pop(0)
+            if msg is not None:
+                if lpMsg:
+                    msg_data = struct.pack("<IIIIIii", msg['hwnd'], msg['message'],
+                                           msg['wParam'], msg['lParam'], 0, 0, 0)
+                    self.emu.uc.mem_write(lpMsg, msg_data)
+                if msg['message'] == self.WM_QUIT:
+                    return 0
+                return 1
+
+            # GUI window closed -> end the message loop
+            if self.gui and not self.gui.running:
+                if lpMsg:
+                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
+                    self.emu.uc.mem_write(lpMsg, msg_data)
+                return 0
+
+            # No GUI at all -> nothing can ever arrive, terminate
+            if not self.gui:
+                self.quit_requested = True
+                if lpMsg:
+                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
+                    self.emu.uc.mem_write(lpMsg, msg_data)
+                return 0
+
+            # Idle: wait for the GUI thread to post input (does not burn instructions)
+            time.sleep(0.01)
     
     def TranslateMessage(self, args):
         """TranslateMessage emulation"""
@@ -2712,6 +2793,7 @@ class FakeControl:
         self.visible = True
         self.enabled = True
         self.parent_hwnd = 0
+        self.control_id = 0  # Control ID (hMenu in CreateWindowEx) for WM_COMMAND
         self.checked = False  # For Checkbox/Radio
         
     def contains_point(self, px, py, parent_x=0, parent_y=0):
@@ -2743,12 +2825,17 @@ class PseudoWindowsGUI:
     MIN_WINDOW_WIDTH = 120
     MIN_WINDOW_HEIGHT = 80
 
+    # Window chrome geometry (client area origin = x+BORDER, y+BORDER+TITLE_BAR_H)
+    BORDER = 3
+    TITLE_BAR_H = 25
+
     def __init__(self, width=1024, height=768):
         self.width = width
         self.height = height
         self.screen = None
         self.running = False
         self.clock = None
+        self.winapi = None  # WinAPIHandler back-reference (set by CPUEmulator.initialize)
         
         # Window management
         self.windows = {}  # hwnd -> FakeWindow
@@ -2849,10 +2936,14 @@ class PseudoWindowsGUI:
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self._handle_mouse_click(event.pos, event.button)
                 elif event.type == pygame.MOUSEBUTTONUP:
-                    # Release drag / resize
+                    # Release drag / resize; forward release to app if neither
+                    was_interacting = (self.dragging_window is not None or
+                                       self.resizing_window is not None)
                     self.dragging_window = None
                     self.resizing_window = None
                     self.resize_edge = None
+                    if not was_interacting:
+                        self._forward_mouse_up(event.pos, event.button)
                 elif event.type == pygame.MOUSEMOTION:
                     # Window resizing (takes priority over dragging)
                     if self.resizing_window and self.resizing_window in self.windows:
@@ -3323,6 +3414,49 @@ class PseudoWindowsGUI:
             except Exception:
                 pass
 
+    def _is_app_window(self, hwnd):
+        """True if hwnd is an emulated application window with a WndProc."""
+        if not self.winapi or hwnd == self.console_hwnd:
+            return False
+        return bool(self.winapi._find_wndproc_for_hwnd(hwnd))
+
+    def _client_point(self, win, x, y):
+        """Convert screen coordinates to a window's client coordinates."""
+        return (x - (win.x + self.BORDER),
+                y - (win.y + self.BORDER + self.TITLE_BAR_H))
+
+    @staticmethod
+    def _make_lparam(cx, cy):
+        """Pack client x/y into an lParam (LOWORD=x, HIWORD=y)."""
+        return ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+
+    def _post_button_command(self, win, control):
+        """Notify a window's WndProc that one of its buttons was clicked."""
+        parent_hwnd = control.parent_hwnd or win.hwnd
+        wParam = ((self.winapi.BN_CLICKED & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
+        self.winapi.post_window_message(parent_hwnd, self.winapi.WM_COMMAND,
+                                        wParam, control.hwnd)
+
+    def _forward_mouse_up(self, pos, button):
+        """Forward a mouse-button release to the app window under the cursor."""
+        if not self.winapi:
+            return
+        x, y = pos
+        for hwnd in reversed(self.z_order):
+            win = self.windows.get(hwnd)
+            if win and win.visible and not win.minimized and win.contains_point(x, y):
+                if win.is_dialog or not self._is_app_window(hwnd):
+                    return
+                if y < win.y + self.BORDER + self.TITLE_BAR_H:
+                    return  # title bar / chrome, not client area
+                cx, cy = self._client_point(win, x, y)
+                lparam = self._make_lparam(cx, cy)
+                if button == 1:
+                    self.winapi.post_window_message(hwnd, self.winapi.WM_LBUTTONUP, 0, lparam)
+                elif button == 3:
+                    self.winapi.post_window_message(hwnd, self.winapi.WM_RBUTTONUP, 0, lparam)
+                return
+
     def _handle_mouse_click(self, pos, button):
         """Handle mouse click"""
         x, y = pos
@@ -3435,19 +3569,68 @@ class PseudoWindowsGUI:
                     content_x = win.x + 3
                     content_y = win.y + 28
                     for control in win.controls:
-                        if control.class_name == "BUTTON":
+                        if control.class_name == "BUTTON" and control.visible and control.enabled:
                             btn_x = content_x + control.x
                             btn_y = content_y + control.y
-                            if (btn_x <= x <= btn_x + control.width and 
+                            if (btn_x <= x <= btn_x + control.width and
                                 btn_y <= y <= btn_y + control.height):
                                 # If dialog window (MessageBox) - OK/Cancel button closes it
                                 if win.is_dialog:
                                     self._close_window(hwnd)
                                     return
-                                # Normal window - WM_COMMAND message (TODO)
-                    
+                                # Normal window - notify WndProc with WM_COMMAND
+                                if button == 1 and self.winapi:
+                                    self._post_button_command(win, control)
+                                return
+
+                    # No control hit -> forward raw mouse click to the WndProc
+                    if (not win.is_dialog and y >= content_y and
+                            self._is_app_window(hwnd)):
+                        cx, cy = self._client_point(win, x, y)
+                        lparam = self._make_lparam(cx, cy)
+                        if button == 1:
+                            self.winapi.post_window_message(
+                                hwnd, self.winapi.WM_LBUTTONDOWN,
+                                self.winapi.MK_LBUTTON, lparam)
+                        elif button == 3:
+                            self.winapi.post_window_message(
+                                hwnd, self.winapi.WM_RBUTTONDOWN,
+                                self.winapi.MK_RBUTTON, lparam)
+
                     break
     
+    def _pygame_key_to_vk(self, event):
+        """Map a Pygame key to a Windows virtual-key code, or None."""
+        key = event.key
+        if pygame.K_a <= key <= pygame.K_z:
+            return key - 32            # 'a' (0x61) -> VK 'A' (0x41)
+        if pygame.K_0 <= key <= pygame.K_9:
+            return key                 # '0' (0x30) -> VK 0x30
+        if pygame.K_F1 <= key <= pygame.K_F12:
+            return 0x70 + (key - pygame.K_F1)
+        special = {
+            pygame.K_ESCAPE: 0x1B, pygame.K_RETURN: 0x0D, pygame.K_KP_ENTER: 0x0D,
+            pygame.K_SPACE: 0x20, pygame.K_TAB: 0x09, pygame.K_BACKSPACE: 0x08,
+            pygame.K_DELETE: 0x2E, pygame.K_LEFT: 0x25, pygame.K_UP: 0x26,
+            pygame.K_RIGHT: 0x27, pygame.K_DOWN: 0x28, pygame.K_HOME: 0x24,
+            pygame.K_END: 0x23, pygame.K_PAGEUP: 0x21, pygame.K_PAGEDOWN: 0x22,
+        }
+        return special.get(key)
+
+    def _forward_key_to_window(self, event):
+        """Forward a keystroke to the active application window's WndProc."""
+        if not self.winapi:
+            return
+        hwnd = self.active_window
+        if not hwnd or not self._is_app_window(hwnd):
+            return
+        vk = self._pygame_key_to_vk(event)
+        if vk is not None:
+            self.winapi.post_window_message(hwnd, self.winapi.WM_KEYDOWN, vk, 1)
+        # Synthesize WM_CHAR for printable input (TranslateMessage behavior)
+        if event.unicode and len(event.unicode) == 1 and event.unicode.isprintable():
+            self.winapi.post_window_message(hwnd, self.winapi.WM_CHAR, ord(event.unicode), 1)
+
     def _handle_key_press(self, event):
         """Handle keyboard key press"""
         # If console input mode is active
@@ -3471,7 +3654,11 @@ class PseudoWindowsGUI:
                 # Printable character
                 if event.unicode and event.unicode.isprintable():
                     self.console_input += event.unicode
-    
+            return
+
+        # Otherwise forward the keystroke to the active application window
+        self._forward_key_to_window(event)
+
     def _check_messagebox(self):
         """Check MessageBox requests"""
         try:
@@ -3527,12 +3714,13 @@ class PseudoWindowsGUI:
         log.debug(f"GUI: Window created - HWND=0x{hwnd:08x}, '{title}'")
         return hwnd
     
-    def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0):
+    def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0, control_id=0):
         """Create new control"""
         hwnd = self.get_next_hwnd()
         control = FakeControl(hwnd, class_name, text, x, y, width, height, style)
         control.parent_hwnd = parent_hwnd
-        
+        control.control_id = control_id
+
         self.controls[hwnd] = control
         
         if parent_hwnd in self.windows:
@@ -3833,6 +4021,10 @@ class CPUEmulator:
         
         # Create API handler (with GUI reference)
         self.api_handler = WinAPIHandler(self, self.gui)
+
+        # Give the GUI thread a back-reference so it can post window messages
+        if self.gui:
+            self.gui.winapi = self.api_handler
         
         # Setup memory
         self._setup_memory()
@@ -4396,8 +4588,9 @@ def main():
         epilog=f"EXE files are searched in c_drive/ folder by default.\nExample: python winexe32emu.py hello_messagebox.exe"
     )
     parser.add_argument("exe", help="PE file to run (inside c_drive/ or full path)")
-    parser.add_argument("-n", "--max-instructions", type=int, default=100000,
-                        help="Maximum instructions to execute (default: 100000)")
+    parser.add_argument("-n", "--max-instructions", type=int, default=None,
+                        help="Maximum instructions to execute "
+                             "(default: 5000000 with GUI, 100000 without)")
     parser.add_argument("-m", "--memory", type=int, default=128,
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
@@ -4419,8 +4612,12 @@ def main():
             log.info(f"Also searched in c_drive/ folder: {c_drive_exe}")
             sys.exit(1)
     
-    max_instr = args.max_instructions
     use_gui = not args.no_gui
+    # Interactive GUI apps run a long message loop; default to a higher cap
+    if args.max_instructions is not None:
+        max_instr = args.max_instructions
+    else:
+        max_instr = 5_000_000 if use_gui else 100000
     heap_size_mib = args.memory
     
     # Update heap size
