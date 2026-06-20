@@ -2814,7 +2814,7 @@ class PseudoWindowsGUI:
         pygame.init()
         pygame.display.set_caption("Windows 32-bit Emulator - Fake Desktop")
         
-        self.screen = pygame.display.set_mode((self.width, self.height))
+        self.screen = pygame.display.set_mode((self.width, self.height), pygame.SCALED)
         self.clock = pygame.time.Clock()
         
         # Load fonts
