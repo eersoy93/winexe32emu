@@ -2737,7 +2737,12 @@ class PseudoWindowsGUI:
     COLOR_TEXT = (0, 0, 0)
     COLOR_EDIT_BG = (255, 255, 255)
     COLOR_TASKBAR = (192, 192, 192)
-    
+
+    # Resize settings
+    RESIZE_BORDER = 6      # Edge grab margin (pixels)
+    MIN_WINDOW_WIDTH = 120
+    MIN_WINDOW_HEIGHT = 80
+
     def __init__(self, width=1024, height=768):
         self.width = width
         self.height = height
@@ -2789,7 +2794,14 @@ class PseudoWindowsGUI:
         self.dragging_window = None  # Dragged window hwnd
         self.drag_offset_x = 0
         self.drag_offset_y = 0
-        
+
+        # Window resizing
+        self.resizing_window = None  # Resized window hwnd
+        self.resize_edge = None      # Active edge: 'left','right','top','bottom' + corners
+        self.resize_start_mouse = (0, 0)  # Mouse pos when resize began
+        self.resize_start_rect = (0, 0, 0, 0)  # Window (x, y, w, h) when resize began
+        self.current_cursor = None   # Currently set system cursor (avoid redundant sets)
+
     def start(self):
         """Start GUI thread"""
         if not PYGAME_AVAILABLE:
@@ -2837,17 +2849,25 @@ class PseudoWindowsGUI:
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self._handle_mouse_click(event.pos, event.button)
                 elif event.type == pygame.MOUSEBUTTONUP:
-                    # Release drag
+                    # Release drag / resize
                     self.dragging_window = None
+                    self.resizing_window = None
+                    self.resize_edge = None
                 elif event.type == pygame.MOUSEMOTION:
+                    # Window resizing (takes priority over dragging)
+                    if self.resizing_window and self.resizing_window in self.windows:
+                        self._resize_window_to(self.windows[self.resizing_window], event.pos)
                     # Window dragging
-                    if self.dragging_window and self.dragging_window in self.windows:
+                    elif self.dragging_window and self.dragging_window in self.windows:
                         win = self.windows[self.dragging_window]
                         win.x = event.pos[0] - self.drag_offset_x
                         win.y = event.pos[1] - self.drag_offset_y
                         # Keep within screen boundaries
                         win.x = max(0, min(win.x, self.width - 50))
                         win.y = max(0, min(win.y, self.height - 60))
+                    else:
+                        # Update mouse cursor based on hovered edge
+                        self._update_resize_cursor(event.pos)
                 elif event.type == pygame.KEYDOWN:
                     self._handle_key_press(event)
             
@@ -3199,6 +3219,110 @@ class PseudoWindowsGUI:
                            (rect.x + 4, rect.y + rect.height - 5), 
                            (rect.x + rect.width - 5, rect.y + rect.height - 5), 2)
     
+    def _get_resize_edge(self, win, x, y):
+        """Return which edge/corner the point is on, or None.
+
+        Returns one of: 'left','right','top','bottom','topleft','topright',
+        'bottomleft','bottomright'. Resizing is disabled for maximized,
+        minimized and dialog (MessageBox) windows.
+        """
+        if win.maximized or win.minimized or win.is_dialog:
+            return None
+
+        m = self.RESIZE_BORDER
+
+        # Point must be near the window rectangle (inner border band)
+        if not (win.x - m <= x <= win.x + win.width + m and
+                win.y - m <= y <= win.y + win.height + m):
+            return None
+
+        left = abs(x - win.x) <= m
+        right = abs(x - (win.x + win.width)) <= m
+        top = abs(y - win.y) <= m
+        bottom = abs(y - (win.y + win.height)) <= m
+
+        edge = ""
+        if top:
+            edge += "top"
+        elif bottom:
+            edge += "bottom"
+        if left:
+            edge += "left"
+        elif right:
+            edge += "right"
+
+        return edge or None
+
+    def _resize_window_to(self, win, pos):
+        """Resize a window while the user drags an edge/corner."""
+        mx, my = pos
+        edge = self.resize_edge
+        sx, sy = self.resize_start_mouse
+        ox, oy, ow, oh = self.resize_start_rect
+
+        dx = mx - sx
+        dy = my - sy
+
+        new_x, new_y, new_w, new_h = ox, oy, ow, oh
+
+        if "left" in edge:
+            new_x = ox + dx
+            new_w = ow - dx
+        elif "right" in edge:
+            new_w = ow + dx
+
+        if "top" in edge:
+            new_y = oy + dy
+            new_h = oh - dy
+        elif "bottom" in edge:
+            new_h = oh + dy
+
+        # Enforce minimum size, keeping the opposite edge anchored
+        if new_w < self.MIN_WINDOW_WIDTH:
+            if "left" in edge:
+                new_x -= (self.MIN_WINDOW_WIDTH - new_w)
+            new_w = self.MIN_WINDOW_WIDTH
+        if new_h < self.MIN_WINDOW_HEIGHT:
+            if "top" in edge:
+                new_y -= (self.MIN_WINDOW_HEIGHT - new_h)
+            new_h = self.MIN_WINDOW_HEIGHT
+
+        # Keep the title bar reachable on screen
+        new_y = max(0, new_y)
+
+        win.x, win.y, win.width, win.height = new_x, new_y, new_w, new_h
+
+    def _update_resize_cursor(self, pos):
+        """Set the mouse cursor to a resize arrow when hovering an edge."""
+        x, y = pos
+        edge = None
+
+        # Find the topmost window under the cursor
+        for hwnd in reversed(self.z_order):
+            win = self.windows.get(hwnd)
+            if win and win.visible and not win.minimized and win.contains_point(x, y):
+                edge = self._get_resize_edge(win, x, y)
+                break
+
+        cursor_map = {
+            "left": pygame.SYSTEM_CURSOR_SIZEWE,
+            "right": pygame.SYSTEM_CURSOR_SIZEWE,
+            "top": pygame.SYSTEM_CURSOR_SIZENS,
+            "bottom": pygame.SYSTEM_CURSOR_SIZENS,
+            "topleft": pygame.SYSTEM_CURSOR_SIZENWSE,
+            "bottomright": pygame.SYSTEM_CURSOR_SIZENWSE,
+            "topright": pygame.SYSTEM_CURSOR_SIZENESW,
+            "bottomleft": pygame.SYSTEM_CURSOR_SIZENESW,
+        }
+        cursor = cursor_map.get(edge, pygame.SYSTEM_CURSOR_ARROW)
+
+        if cursor != self.current_cursor:
+            try:
+                pygame.mouse.set_cursor(cursor)
+                self.current_cursor = cursor
+            except Exception:
+                pass
+
     def _handle_mouse_click(self, pos, button):
         """Handle mouse click"""
         x, y = pos
@@ -3290,6 +3414,16 @@ class PseudoWindowsGUI:
                                     break
                             return
                     
+                    # Edge/corner resizing (left button only)
+                    if button == 1:
+                        edge = self._get_resize_edge(win, x, y)
+                        if edge:
+                            self.resizing_window = hwnd
+                            self.resize_edge = edge
+                            self.resize_start_mouse = (x, y)
+                            self.resize_start_rect = (win.x, win.y, win.width, win.height)
+                            return
+
                     # Title bar click (start dragging) - if not maximized
                     if win.y + 3 <= y <= win.y + 25 and not win.maximized:
                         self.dragging_window = hwnd
