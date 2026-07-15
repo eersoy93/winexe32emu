@@ -42,6 +42,24 @@ python winexe32emu.py /path/to/file.exe
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32)
 - Console and GUI application support
+- GDI drawing (CreatePen, CreateSolidBrush, Rectangle, Ellipse, LineTo, SetPixel, ...)
+- Timers (SetTimer/KillTimer, WM_TIMER, TimerProc callbacks)
+- Interactive EDIT controls (keyboard focus, caret, GetDlgItemTextA)
+- Window menus (CreateMenu, AppendMenuA, SetMenu, WM_COMMAND)
+
+## Examples
+
+| Example | Demonstrates |
+|---|---|
+| `hello_messagebox.c` | MessageBoxA |
+| `hello_console.c` | Console output |
+| `console_input.c` | Console input |
+| `hello_empty_window.c` | Window + WM_PAINT text |
+| `hello_button.c` | BUTTON control + WM_COMMAND |
+| `gdi_drawing.c` | Pens, brushes, shapes, pixels |
+| `timer_counter.c` | SetTimer + InvalidateRect repaint loop |
+| `edit_form.c` | Typing into an EDIT box, reading it back |
+| `menu_demo.c` | Menu bar with dropdowns and separators |
 
 ## Copyright and License
 
