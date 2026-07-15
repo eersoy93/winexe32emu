@@ -14,16 +14,16 @@ pip install -r requirements.txt
 
 ```bash
 # Put EXE files in the c_drive/ folder
-python winexe32emu.py hello_messagebox.exe
+python winexe32emu.py window_demo.exe
 
 # With maximum instruction count
-python winexe32emu.py hello_messagebox.exe -n 10000
+python winexe32emu.py window_demo.exe -n 10000
 
 # Set memory amount (MiB)
-python winexe32emu.py hello_console.exe -m 256
+python winexe32emu.py console_demo.exe -m 256
 
 # Run without GUI
-python winexe32emu.py hello_console.exe --no-gui
+python winexe32emu.py console_demo.exe --no-gui
 
 # Also works with full path
 python winexe32emu.py /path/to/file.exe
@@ -51,15 +51,8 @@ python winexe32emu.py /path/to/file.exe
 
 | Example | Demonstrates |
 |---|---|
-| `hello_messagebox.c` | MessageBoxA |
-| `hello_console.c` | Console output |
-| `console_input.c` | Console input |
-| `hello_empty_window.c` | Window + WM_PAINT text |
-| `hello_button.c` | BUTTON control + WM_COMMAND |
-| `gdi_drawing.c` | Pens, brushes, shapes, pixels |
-| `timer_counter.c` | SetTimer + InvalidateRect repaint loop |
-| `edit_form.c` | Typing into an EDIT box, reading it back |
-| `menu_demo.c` | Menu bar with dropdowns and separators |
+| `console_demo.c` | Console output and input (WriteConsoleA, ReadConsoleA, WriteFile, lstr* functions) |
+| `window_demo.c` | Menu bar with dropdowns, EDIT/BUTTON/STATIC controls, WM_COMMAND, SetTimer + InvalidateRect repaint loop, GDI drawing (pens, brushes, shapes, pixels), MessageBoxA |
 
 ## Copyright and License
 

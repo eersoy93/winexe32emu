@@ -5481,7 +5481,7 @@ def main():
     """Main function"""
     print(f"{Fore.CYAN}{Style.BRIGHT}")
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║          Windows 32-bit EXE Emulator v0.0.1              ║")
+    print("║          Windows 32-bit EXE Emulator v0.0.5              ║")
     print("║       PE Loader + CPU + Pygame GUI Emulation             ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
