@@ -19,6 +19,9 @@ python winexe32emu.py window_demo.exe
 # With maximum instruction count
 python winexe32emu.py window_demo.exe -n 10000
 
+# Unlimited instructions (recommended for games)
+python winexe32emu.py ball_demo.exe -n 0
+
 # Set memory amount (MiB)
 python winexe32emu.py console_demo.exe -m 256
 
@@ -42,9 +45,13 @@ python winexe32emu.py /path/to/file.exe
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32)
 - Console and GUI application support
-- GDI drawing (CreatePen, CreateSolidBrush, Rectangle, Ellipse, LineTo, SetPixel, ...)
+- GDI drawing (CreatePen, CreateSolidBrush, Rectangle, Ellipse, LineTo, SetPixel, Polygon, Polyline, RoundRect, Arc, Pie, ...)
+- Fonts (CreateFontA/CreateFontIndirectA: size, bold, italic, underline)
+- Game loops (PeekMessageA, GetAsyncKeyState, real Sleep pacing)
+- Double buffering (CreateCompatibleDC, CreateCompatibleBitmap, BitBlt)
 - Timers (SetTimer/KillTimer, WM_TIMER, TimerProc callbacks)
 - Interactive EDIT controls (keyboard focus, caret, GetDlgItemTextA)
+- Interactive LISTBOX/COMBOBOX/checkbox controls (LB_*, CB_*, BM_* messages, LBN_SELCHANGE/CBN_SELCHANGE notifications)
 - Window menus (CreateMenu, AppendMenuA, SetMenu, WM_COMMAND)
 
 ## Examples
@@ -53,6 +60,9 @@ python winexe32emu.py /path/to/file.exe
 |---|---|
 | `console_demo.c` | Console output and input (WriteConsoleA, ReadConsoleA, WriteFile, lstr* functions) |
 | `window_demo.c` | Menu bar with dropdowns, EDIT/BUTTON/STATIC controls, WM_COMMAND, SetTimer + InvalidateRect repaint loop, GDI drawing (pens, brushes, shapes, pixels), MessageBoxA |
+| `ball_demo.c` | Real-time game loop: PeekMessageA, GetAsyncKeyState paddle input, double-buffered rendering (CreateCompatibleDC/BitBlt), Sleep-paced frames. Run with `-n 0` |
+| `gdi_demo.c` | Rich GDI drawing: CreateFontA (bold/italic/underline), Polygon star, Pie chart, RoundRect, Arc, Polyline |
+| `controls_demo.c` | Interactive controls: LISTBOX (LB_ADDSTRING, LBN_SELCHANGE), COMBOBOX dropdown (CB_ADDSTRING, CBN_SELCHANGE), auto checkbox (IsDlgButtonChecked), EDIT + buttons via WM_COMMAND |
 
 ## Copyright and License
 

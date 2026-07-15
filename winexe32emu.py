@@ -312,6 +312,41 @@ class WinAPIHandler:
 
     # Button notification codes (high word of WM_COMMAND wParam)
     BN_CLICKED = 0
+
+    # Control notification codes (high word of WM_COMMAND wParam)
+    LBN_SELCHANGE = 1
+    CBN_SELCHANGE = 1
+
+    # Button control messages
+    BM_GETCHECK = 0x00F0
+    BM_SETCHECK = 0x00F1
+
+    # Listbox control messages
+    LB_ADDSTRING = 0x0180
+    LB_INSERTSTRING = 0x0181
+    LB_DELETESTRING = 0x0182
+    LB_RESETCONTENT = 0x0184
+    LB_SETCURSEL = 0x0186
+    LB_GETCURSEL = 0x0188
+    LB_GETTEXT = 0x0189
+    LB_GETTEXTLEN = 0x018A
+    LB_GETCOUNT = 0x018B
+    LB_ERR = 0xFFFFFFFF  # -1 as unsigned
+
+    # Combobox control messages
+    CB_ADDSTRING = 0x0143
+    CB_DELETESTRING = 0x0144
+    CB_GETCOUNT = 0x0146
+    CB_GETCURSEL = 0x0147
+    CB_GETLBTEXT = 0x0148
+    CB_GETLBTEXTLEN = 0x0149
+    CB_RESETCONTENT = 0x014B
+    CB_SETCURSEL = 0x014E
+    CB_ERR = 0xFFFFFFFF
+
+    # PeekMessage removal flags
+    PM_NOREMOVE = 0x0000
+    PM_REMOVE = 0x0001
     
     def __init__(self, emulator, gui=None):
         self.emu = emulator
@@ -1167,10 +1202,16 @@ class WinAPIHandler:
         return 1
     
     def Sleep(self, args):
-        """Sleep emulation"""
+        """Sleep emulation - real wait so game loops pace correctly"""
         dwMilliseconds = args[0]
         log.debug(f"Sleep({dwMilliseconds}ms)")
-        # We don't actually wait
+        # Sleep in short chunks so a stop request is not delayed
+        end = time.time() + min(dwMilliseconds, 10000) / 1000.0
+        while not self.emu.stop_emulation:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
         return 0
     
     def GetFileAttributesA(self, args):
@@ -1459,8 +1500,13 @@ class WinAPIHandler:
         if self.gui and self.gui.running:
             # Create control for top-level controls
             if class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX"]:
+                # BUTTON with a checkbox style (BS_CHECKBOX/BS_AUTOCHECKBOX)
+                # is drawn and clicked as a checkbox
+                control_class = class_name
+                if class_name.upper() == "BUTTON" and (dwStyle & 0xF) in (0x2, 0x3):
+                    control_class = "CHECKBOX"
                 # For child controls hMenu carries the control ID (used by WM_COMMAND)
-                hwnd = self.gui.create_control(hWndParent, class_name, window_name,
+                hwnd = self.gui.create_control(hWndParent, control_class, window_name,
                                                x, y, nWidth, nHeight, dwStyle,
                                                control_id=hMenu)
             else:
@@ -1691,6 +1737,26 @@ class WinAPIHandler:
         hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
         return self.SetWindowTextA([hwnd, lpString])
 
+    def CheckDlgButton(self, args):
+        """CheckDlgButton emulation - set a checkbox's state by control id"""
+        hDlg = args[0]
+        nIDButton = args[1]
+        uCheck = args[2]
+        hwnd = self.GetDlgItem([hDlg, nIDButton])
+        if self.gui and hwnd in self.gui.controls:
+            self.gui.controls[hwnd].checked = bool(uCheck)
+            return 1
+        return 0
+
+    def IsDlgButtonChecked(self, args):
+        """IsDlgButtonChecked emulation"""
+        hDlg = args[0]
+        nIDButton = args[1]
+        hwnd = self.GetDlgItem([hDlg, nIDButton])
+        if self.gui and hwnd in self.gui.controls:
+            return 1 if self.gui.controls[hwnd].checked else 0
+        return 0
+
     def SetFocus(self, args):
         """SetFocus emulation - give keyboard focus to a control"""
         hWnd = args[0]
@@ -1707,6 +1773,17 @@ class WinAPIHandler:
     def GetFocus(self, args):
         """GetFocus emulation"""
         return (self.gui.focused_control or 0) if self.gui else 0
+
+    def GetAsyncKeyState(self, args):
+        """GetAsyncKeyState emulation - poll key state (game loops)"""
+        vKey = args[0]
+        if self.gui and self.gui.key_states.get(vKey):
+            return 0x8000  # Key is currently down (bit 15)
+        return 0
+
+    def GetKeyState(self, args):
+        """GetKeyState emulation (same as GetAsyncKeyState in the emulator)"""
+        return self.GetAsyncKeyState(args)
 
     def SendMessageA(self, args):
         """SendMessageA emulation"""
@@ -1734,19 +1811,100 @@ class WinAPIHandler:
             text = self.gui.get_window_text(hWnd) if self.gui else ""
             return len(text)
 
+        # Control messages (LISTBOX, COMBOBOX, checkbox BUTTON)
+        if self.gui and hWnd in self.gui.controls:
+            return self._control_message(self.gui.controls[hWnd], Msg, wParam, lParam)
+
         # Other messages: deliver synchronously to the window's WndProc
         wndproc = self._find_wndproc_for_hwnd(hWnd)
         if wndproc:
             return self.emu.call_wndproc(wndproc, hWnd, Msg, wParam, lParam)
         return 0
+
+    def _control_message(self, control, Msg, wParam, lParam):
+        """Handle a message sent to a child control (emulation thread).
+
+        Item lists are swapped in as new list objects so the GUI thread can
+        keep painting the snapshot it already holds.
+        """
+        items = control.items
+
+        # ----- Checkbox / button messages -----
+        if Msg == self.BM_GETCHECK:
+            return 1 if control.checked else 0
+        if Msg == self.BM_SETCHECK:
+            control.checked = bool(wParam)
+            return 0
+
+        # ----- Listbox messages -----
+        if Msg == self.LB_ADDSTRING:
+            control.items = items + [self.read_string(lParam)]
+            return len(control.items) - 1
+        if Msg == self.LB_INSERTSTRING:
+            index = len(items) if wParam >= len(items) else wParam
+            control.items = items[:index] + [self.read_string(lParam)] + items[index:]
+            return index
+        if Msg == self.LB_DELETESTRING:
+            if wParam >= len(items):
+                return self.LB_ERR
+            control.items = items[:wParam] + items[wParam + 1:]
+            if control.sel_index >= len(control.items):
+                control.sel_index = -1
+            return len(control.items)
+        if Msg == self.LB_RESETCONTENT:
+            control.items = []
+            control.sel_index = -1
+            return 0
+        if Msg == self.LB_GETCOUNT:
+            return len(items)
+        if Msg == self.LB_GETCURSEL:
+            return control.sel_index if control.sel_index >= 0 else self.LB_ERR
+        if Msg == self.LB_SETCURSEL:
+            if wParam == 0xFFFFFFFF:
+                control.sel_index = -1
+                return self.LB_ERR
+            if wParam < len(items):
+                control.sel_index = wParam
+                return wParam
+            return self.LB_ERR
+        if Msg == self.LB_GETTEXT:
+            if wParam >= len(items):
+                return self.LB_ERR
+            text = items[wParam]
+            if lParam:
+                self.emu.uc.mem_write(lParam, text.encode('utf-8') + b'\x00')
+            return len(text)
+        if Msg == self.LB_GETTEXTLEN:
+            return len(items[wParam]) if wParam < len(items) else self.LB_ERR
+
+        # ----- Combobox messages (same item list as listbox) -----
+        combo_to_list = {
+            self.CB_ADDSTRING: self.LB_ADDSTRING,
+            self.CB_DELETESTRING: self.LB_DELETESTRING,
+            self.CB_RESETCONTENT: self.LB_RESETCONTENT,
+            self.CB_GETCOUNT: self.LB_GETCOUNT,
+            self.CB_GETCURSEL: self.LB_GETCURSEL,
+            self.CB_SETCURSEL: self.LB_SETCURSEL,
+            self.CB_GETLBTEXT: self.LB_GETTEXT,
+            self.CB_GETLBTEXTLEN: self.LB_GETTEXTLEN,
+        }
+        if Msg in combo_to_list:
+            return self._control_message(control, combo_to_list[Msg], wParam, lParam)
+
+        log.debug(f"Unhandled control message 0x{Msg:04x} for {control.class_name}")
+        return 0
     
     def PostMessageA(self, args):
-        """PostMessageA emulation"""
+        """PostMessageA emulation - queue a message for the message loop"""
         hWnd = args[0]
         Msg = args[1]
         wParam = args[2]
         lParam = args[3]
         log.debug(f"PostMessageA(0x{hWnd:x}, 0x{Msg:x}, 0x{wParam:x}, 0x{lParam:x})")
+        if Msg == self.WM_QUIT:
+            self.quit_requested = True
+        else:
+            self.post_window_message(hWnd, Msg, wParam, lParam)
         return 1
 
     def PostQuitMessage(self, args):
@@ -1795,83 +1953,105 @@ class WinAPIHandler:
                 return (hwnd, timer_id, timer['callback'])
         return None
 
+    def _write_msg(self, lpMsg, hwnd, message, wParam, lParam):
+        """Fill a MSG structure in emulated memory"""
+        if lpMsg:
+            msg_data = struct.pack("<IIIIIii", hwnd, message, wParam, lParam, 0, 0, 0)
+            self.emu.uc.mem_write(lpMsg, msg_data)
+
+    def _next_message(self, remove=True):
+        """Single non-blocking scan for a pending message.
+
+        Returns (hwnd, message, wParam, lParam) or None. Priority mirrors
+        GetMessageA: synthesized WM_PAINT, then the input queue, then timers.
+        """
+        # Send WM_PAINT for visible windows not yet painted
+        for hwnd, window in list(self.gui.windows.items()) if self.gui else []:
+            if hwnd not in self.painted_windows and window.visible:
+                if remove:
+                    self.painted_windows.add(hwnd)
+                return (hwnd, self.WM_PAINT, 0, 0)
+
+        # Queued message (input forwarded from the GUI thread)
+        with self.message_lock:
+            if self.message_queue:
+                msg = self.message_queue.pop(0) if remove else self.message_queue[0]
+                return (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
+
+        # Fire due timers (lowest priority, like real WM_TIMER)
+        if remove:
+            due = self._pop_due_timer()
+            if due is not None:
+                timer_hwnd, timer_id, callback = due
+                return (timer_hwnd, self.WM_TIMER, timer_id, callback)
+
+        return None
+
     def GetMessageA(self, args):
         """GetMessageA emulation - For message loop"""
         lpMsg = args[0]
         hWnd = args[1]
         wMsgFilterMin = args[2]
         wMsgFilterMax = args[3]
-        
+
         log.debug(f"GetMessageA() - Message loop")
-        
-        # Exit if quit requested
-        if self.quit_requested:
-            if lpMsg:
-                msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-                self.emu.uc.mem_write(lpMsg, msg_data)
-            return 0
-        
+
         # Block until a message is available, the app quits, or the GUI closes.
         # This runs on the emulation thread; the GUI thread feeds message_queue.
         while True:
             if self.quit_requested:
-                if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-                    self.emu.uc.mem_write(lpMsg, msg_data)
+                self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
                 return 0
 
-            # Send WM_PAINT for visible windows not yet painted
-            for hwnd, window in list(self.gui.windows.items()) if self.gui else []:
-                if hwnd not in self.painted_windows and window.visible:
-                    self.painted_windows.add(hwnd)
-                    if lpMsg:
-                        msg_data = struct.pack("<IIIIIii", hwnd, self.WM_PAINT, 0, 0, 0, 0, 0)
-                        self.emu.uc.mem_write(lpMsg, msg_data)
-                    log.debug(f"GetMessageA() -> WM_PAINT for hwnd=0x{hwnd:x}")
-                    return 1
-
-            # Return a queued message (input forwarded from the GUI thread)
-            msg = None
-            with self.message_lock:
-                if self.message_queue:
-                    msg = self.message_queue.pop(0)
+            msg = self._next_message()
             if msg is not None:
-                if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", msg['hwnd'], msg['message'],
-                                           msg['wParam'], msg['lParam'], 0, 0, 0)
-                    self.emu.uc.mem_write(lpMsg, msg_data)
-                if msg['message'] == self.WM_QUIT:
+                hwnd, message, wParam, lParam = msg
+                self._write_msg(lpMsg, hwnd, message, wParam, lParam)
+                if message == self.WM_QUIT:
                     return 0
-                return 1
-
-            # Fire due timers (lowest priority, like real WM_TIMER)
-            due = self._pop_due_timer()
-            if due is not None:
-                timer_hwnd, timer_id, callback = due
-                if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", timer_hwnd, self.WM_TIMER,
-                                           timer_id, callback, 0, 0, 0)
-                    self.emu.uc.mem_write(lpMsg, msg_data)
-                log.debug(f"GetMessageA() -> WM_TIMER id={timer_id} for hwnd=0x{timer_hwnd:x}")
                 return 1
 
             # GUI window closed -> end the message loop
             if self.gui and not self.gui.running:
-                if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-                    self.emu.uc.mem_write(lpMsg, msg_data)
+                self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
                 return 0
 
             # No GUI at all -> nothing can ever arrive, terminate
             if not self.gui:
                 self.quit_requested = True
-                if lpMsg:
-                    msg_data = struct.pack("<IIIIIii", 0, self.WM_QUIT, 0, 0, 0, 0, 0)
-                    self.emu.uc.mem_write(lpMsg, msg_data)
+                self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
                 return 0
 
             # Idle: wait for the GUI thread to post input (does not burn instructions)
             time.sleep(0.01)
+
+    def PeekMessageA(self, args):
+        """PeekMessageA emulation - non-blocking message check (game loops)"""
+        lpMsg = args[0]
+        hWnd = args[1]
+        wMsgFilterMin = args[2]
+        wMsgFilterMax = args[3]
+        wRemoveMsg = args[4]
+
+        remove = bool(wRemoveMsg & self.PM_REMOVE)
+
+        # Quit pending or GUI gone: report WM_QUIT (PeekMessage returns TRUE)
+        if self.quit_requested or (self.gui and not self.gui.running) or not self.gui:
+            self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
+            return 1
+
+        msg = self._next_message(remove=remove)
+        if msg is None:
+            return 0
+
+        hwnd, message, wParam, lParam = msg
+        self._write_msg(lpMsg, hwnd, message, wParam, lParam)
+        log.debug(f"PeekMessageA() -> msg=0x{message:04x} hwnd=0x{hwnd:x}")
+        return 1
+
+    def PeekMessageW(self, args):
+        """PeekMessageW emulation (same as PeekMessageA in the emulator)"""
+        return self.PeekMessageA(args)
     
     def TranslateMessage(self, args):
         """TranslateMessage emulation"""
@@ -1958,17 +2138,21 @@ class WinAPIHandler:
         """Convert a Win32 COLORREF (0x00BBGGRR) to an (r, g, b) tuple"""
         return (colorref & 0xFF, (colorref >> 8) & 0xFF, (colorref >> 16) & 0xFF)
 
-    def _create_dc(self, hwnd):
-        """Create a DC handle bound to a window"""
+    def _create_dc(self, hwnd, memory=False):
+        """Create a DC handle bound to a window (or an off-screen memory DC)"""
         hdc = self.get_next_handle()
         self.dc_map[hdc] = hwnd
         self.dc_state[hdc] = {
             'pen': 0,          # 0 = default black pen, width 1
             'brush': 0,        # 0 = default white brush
+            'font': 0,         # 0 = default GUI font
             'pos': (0, 0),     # Current position (MoveToEx/LineTo)
             'text_color': (0, 0, 0),
             'bk_mode': 2,      # OPAQUE
             'bk_color': (255, 255, 255),
+            'memory': memory,  # Memory DCs keep their own display list
+            'shapes': [] if memory else None,
+            'bitmap': 0,       # Selected bitmap (memory DCs)
         }
         return hdc
 
@@ -2004,11 +2188,57 @@ class WinAPIHandler:
                 return brush['color']  # None for NULL_BRUSH
         return (255, 255, 255)  # Default: white brush
 
+    def _dc_font(self, hdc):
+        """Current font dict of a DC, or None for the default GUI font"""
+        state = self.dc_state.get(hdc)
+        if state and state.get('font'):
+            font = self.gdi_objects.get(state['font'])
+            if font and font['type'] == 'font':
+                return font
+        return None
+
+    def _memdc_size(self, hdc):
+        """Bitmap size of a memory DC -> (w, h) or None"""
+        state = self.dc_state.get(hdc)
+        if state:
+            bmp = self.gdi_objects.get(state.get('bitmap', 0))
+            if bmp and bmp['type'] == 'bitmap':
+                return (bmp['width'], bmp['height'])
+        return None
+
     def _add_shape(self, hdc, shape):
-        """Append a GDI shape to the display list of the DC's window"""
+        """Append a GDI shape to the display list of the DC's window.
+
+        Memory DCs collect shapes in their own list until BitBlt copies them.
+        An opaque rect covering the whole bitmap restarts the list, so a
+        game loop that fills the background every frame doesn't grow it.
+        """
+        state = self.dc_state.get(hdc)
+        if state and state.get('memory'):
+            if shape['type'] == 'rect' and shape.get('fill') is not None:
+                size = self._memdc_size(hdc)
+                if size:
+                    left, top, right, bottom = shape['rect']
+                    if left <= 0 and top <= 0 and right >= size[0] and bottom >= size[1]:
+                        state['shapes'] = []
+            state['shapes'].append(shape)
+            return
+
         hwnd = self._dc_hwnd(hdc)
         if self.gui and hwnd:
             self.gui.add_shape(hwnd, shape)
+
+    def _add_text(self, hdc, text, x, y):
+        """Append a text item to the DC's display list (window or memory DC)"""
+        state = self.dc_state.get(hdc, {})
+        shape = {
+            'type': 'text',
+            'pos': (x, y),
+            'text': text,
+            'color': state.get('text_color') or (0, 0, 0),
+            'font': self._dc_font(hdc),
+        }
+        self._add_shape(hdc, shape)
 
     def BeginPaint(self, args):
         """BeginPaint emulation"""
@@ -2146,11 +2376,8 @@ class WinAPIHandler:
 
         log.info(f"TextOutA(0x{hdc:x}, {x}, {y}, \"{text}\")")
 
-        # Draw text if GUI exists
         if self.gui:
-            state = self.dc_state.get(hdc, {})
-            self.gui.draw_text(text, x, y, self._dc_hwnd(hdc),
-                               color=state.get('text_color'))
+            self._add_text(hdc, text, x, y)
 
         return 1
     
@@ -2169,9 +2396,7 @@ class WinAPIHandler:
         log.info(f"TextOutW(0x{hdc:x}, {x}, {y}, \"{text}\")")
 
         if self.gui:
-            state = self.dc_state.get(hdc, {})
-            self.gui.draw_text(text, x, y, self._dc_hwnd(hdc),
-                               color=state.get('text_color'))
+            self._add_text(hdc, text, x, y)
 
         return 1
     
@@ -2214,11 +2439,9 @@ class WinAPIHandler:
             draw_y = y + (height - 16) // 2  # 16 pixel estimated height
         
         if self.gui:
-            target_hwnd = self._dc_hwnd(hdc)
-            if target_hwnd and target_hwnd != self.gui.console_hwnd:
-                state = self.dc_state.get(hdc, {})
-                self.gui.draw_text(text, draw_x, draw_y, target_hwnd,
-                                   color=state.get('text_color'))
+            state = self.dc_state.get(hdc, {})
+            if state.get('memory') or self._dc_hwnd(hdc) != self.gui.console_hwnd:
+                self._add_text(hdc, text, draw_x, draw_y)
 
         return height  # Text height
     
@@ -2246,9 +2469,7 @@ class WinAPIHandler:
         log.info(f"DrawTextW(0x{hdc:x}, \"{text}\")")
 
         if self.gui:
-            state = self.dc_state.get(hdc, {})
-            self.gui.draw_text(text, x, y, self._dc_hwnd(hdc),
-                               color=state.get('text_color'))
+            self._add_text(hdc, text, x, y)
 
         return 20  # Text height
     
@@ -2368,6 +2589,12 @@ class WinAPIHandler:
             elif obj['type'] == 'brush':
                 prev = state['brush']
                 state['brush'] = hobj
+            elif obj['type'] == 'font':
+                prev = state['font']
+                state['font'] = hobj
+            elif obj['type'] == 'bitmap':
+                prev = state.get('bitmap', 0)
+                state['bitmap'] = hobj
 
         log.debug(f"SelectObject(0x{hdc:x}, 0x{hobj:x}) -> 0x{prev:x}")
         return prev
@@ -2449,6 +2676,256 @@ class WinAPIHandler:
         color = self._colorref_to_rgb(colorref)
         self._add_shape(hdc, {'type': 'pixel', 'pos': (x, y), 'color': color})
         return colorref
+
+    @staticmethod
+    def _read_signed_args(args, start, count):
+        """Interpret stack dwords as signed 32-bit integers"""
+        return [v - 0x100000000 if v >= 0x80000000 else v
+                for v in args[start:start + count]]
+
+    def _read_points(self, address, count):
+        """Read an array of POINT structures -> [(x, y), ...]"""
+        points = []
+        try:
+            data = self.emu.uc.mem_read(address, count * 8)
+            for i in range(count):
+                x, y = struct.unpack_from("<ii", data, i * 8)
+                points.append((x, y))
+        except:
+            pass
+        return points
+
+    def Polygon(self, args):
+        """Polygon emulation - filled polygon with current pen and brush"""
+        hdc = args[0]
+        points = self._read_points(args[1], args[2])
+        log.debug(f"Polygon(0x{hdc:x}, {len(points)} points)")
+        if len(points) >= 3:
+            self._add_shape(hdc, {'type': 'polygon', 'points': points,
+                                  'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
+        return 1
+
+    def Polyline(self, args):
+        """Polyline emulation - connected line segments with current pen"""
+        hdc = args[0]
+        points = self._read_points(args[1], args[2])
+        log.debug(f"Polyline(0x{hdc:x}, {len(points)} points)")
+        pen = self._dc_pen(hdc)
+        if len(points) >= 2 and pen:
+            self._add_shape(hdc, {'type': 'polyline', 'points': points, 'pen': pen})
+        return 1
+
+    def RoundRect(self, args):
+        """RoundRect emulation - rectangle with rounded corners"""
+        hdc = args[0]
+        left, top, right, bottom, ew, eh = self._read_signed_args(args, 1, 6)
+        log.debug(f"RoundRect(0x{hdc:x}, {left}, {top}, {right}, {bottom})")
+        radius = max(0, min(ew, eh) // 2)
+        self._add_shape(hdc, {'type': 'roundrect', 'rect': (left, top, right, bottom),
+                              'radius': radius, 'fill': self._dc_brush(hdc),
+                              'pen': self._dc_pen(hdc)})
+        return 1
+
+    @staticmethod
+    def _arc_angles(left, top, right, bottom, x1, y1, x2, y2):
+        """GDI arc endpoints -> (start, end) angles in math orientation (radians)"""
+        import math
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        # Screen y grows downward; math orientation flips it
+        start = math.atan2(cy - y1, x1 - cx)
+        end = math.atan2(cy - y2, x2 - cx)
+        return start, end
+
+    def Arc(self, args):
+        """Arc emulation - elliptic arc drawn counterclockwise"""
+        hdc = args[0]
+        left, top, right, bottom, x1, y1, x2, y2 = self._read_signed_args(args, 1, 8)
+        log.debug(f"Arc(0x{hdc:x}, {left}, {top}, {right}, {bottom})")
+        pen = self._dc_pen(hdc)
+        if pen:
+            start, end = self._arc_angles(left, top, right, bottom, x1, y1, x2, y2)
+            self._add_shape(hdc, {'type': 'arc', 'rect': (left, top, right, bottom),
+                                  'start': start, 'end': end, 'pen': pen})
+        return 1
+
+    def Pie(self, args):
+        """Pie emulation - filled pie slice (approximated with a polygon)"""
+        import math
+        hdc = args[0]
+        left, top, right, bottom, x1, y1, x2, y2 = self._read_signed_args(args, 1, 8)
+        log.debug(f"Pie(0x{hdc:x}, {left}, {top}, {right}, {bottom})")
+
+        start, end = self._arc_angles(left, top, right, bottom, x1, y1, x2, y2)
+        if end <= start:
+            end += 2 * math.pi
+
+        # Sample the arc into polygon points (plus the center)
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        rx, ry = abs(right - left) / 2.0, abs(bottom - top) / 2.0
+        steps = max(8, int((end - start) * 16))
+        points = [(int(cx), int(cy))]
+        for i in range(steps + 1):
+            a = start + (end - start) * i / steps
+            points.append((int(cx + rx * math.cos(a)), int(cy - ry * math.sin(a))))
+
+        self._add_shape(hdc, {'type': 'polygon', 'points': points,
+                              'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
+        return 1
+
+    def CreateFontA(self, args):
+        """CreateFontA emulation"""
+        height = args[0] - 0x100000000 if args[0] >= 0x80000000 else args[0]
+        weight = args[4]
+        italic = args[5]
+        underline = args[6]
+        face = self.read_string(args[13]) if args[13] else ""
+
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {
+            'type': 'font',
+            'height': abs(height) or 13,
+            'bold': weight >= 600,
+            'italic': bool(italic),
+            'underline': bool(underline),
+            'face': face,
+        }
+        log.debug(f"CreateFontA(height={height}, weight={weight}, '{face}') -> 0x{handle:x}")
+        return handle
+
+    def CreateFontIndirectA(self, args):
+        """CreateFontIndirectA emulation - font from a LOGFONT structure"""
+        lplf = args[0]
+        try:
+            data = self.emu.uc.mem_read(lplf, 60)
+            height = struct.unpack_from("<i", data, 0)[0]
+            weight = struct.unpack_from("<i", data, 16)[0]
+            italic, underline = data[20], data[21]
+            face = data[28:60].split(b'\x00')[0].decode('utf-8', errors='replace')
+        except:
+            return 0
+
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {
+            'type': 'font',
+            'height': abs(height) or 13,
+            'bold': weight >= 600,
+            'italic': bool(italic),
+            'underline': bool(underline),
+            'face': face,
+        }
+        log.debug(f"CreateFontIndirectA(height={height}, '{face}') -> 0x{handle:x}")
+        return handle
+
+    def GetTextExtentPoint32A(self, args):
+        """GetTextExtentPoint32A emulation - measure a string"""
+        hdc = args[0]
+        text = self.read_string(args[1]) if args[1] else ""
+        c = args[2]
+        lpSize = args[3]
+        if c > 0 and len(text) > c:
+            text = text[:c]
+
+        # Rough estimate; the GUI font is close to 8x16 per character
+        width, height = len(text) * 8, 16
+        font = self._dc_font(hdc)
+        if font:
+            height = font['height']
+            width = int(len(text) * height * 0.55)
+
+        if lpSize:
+            self.emu.uc.mem_write(lpSize, struct.pack("<ii", width, height))
+        return 1
+
+    # ==================== MEMORY DC / DOUBLE BUFFERING ====================
+
+    def CreateCompatibleDC(self, args):
+        """CreateCompatibleDC emulation - off-screen memory DC"""
+        hdc = args[0]
+        mem_dc = self._create_dc(0, memory=True)
+        log.debug(f"CreateCompatibleDC(0x{hdc:x}) -> 0x{mem_dc:x}")
+        return mem_dc
+
+    def CreateCompatibleBitmap(self, args):
+        """CreateCompatibleBitmap emulation"""
+        hdc = args[0]
+        width = args[1]
+        height = args[2]
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height}
+        log.debug(f"CreateCompatibleBitmap(0x{hdc:x}, {width}, {height}) -> 0x{handle:x}")
+        return handle
+
+    def DeleteDC(self, args):
+        """DeleteDC emulation - free a memory DC"""
+        hdc = args[0]
+        log.debug(f"DeleteDC(0x{hdc:x})")
+        self._delete_dc(hdc)
+        return 1
+
+    @staticmethod
+    def _translate_shape(shape, dx, dy):
+        """Copy of a display list entry shifted by (dx, dy)"""
+        moved = dict(shape)
+        if 'rect' in moved:
+            l, t, r, b = moved['rect']
+            moved['rect'] = (l + dx, t + dy, r + dx, b + dy)
+        if 'pos' in moved:
+            x, y = moved['pos']
+            moved['pos'] = (x + dx, y + dy)
+        if 'from' in moved:
+            x, y = moved['from']
+            moved['from'] = (x + dx, y + dy)
+        if 'to' in moved:
+            x, y = moved['to']
+            moved['to'] = (x + dx, y + dy)
+        if 'points' in moved:
+            moved['points'] = [(x + dx, y + dy) for x, y in moved['points']]
+        return moved
+
+    def BitBlt(self, args):
+        """BitBlt emulation - copy a memory DC's display list to the target.
+
+        A blit that covers the whole client area replaces the window's
+        display list, so per-frame game rendering doesn't accumulate shapes.
+        """
+        hdcDest = args[0]
+        x, y, cx, cy = self._read_signed_args(args, 1, 4)
+        hdcSrc = args[5]
+        sx, sy = self._read_signed_args(args, 6, 2)
+        rop = args[8]
+
+        log.debug(f"BitBlt(0x{hdcDest:x}, {x}, {y}, {cx}, {cy}, src=0x{hdcSrc:x}, rop=0x{rop:08x})")
+
+        src_state = self.dc_state.get(hdcSrc)
+        if not src_state or not src_state.get('memory'):
+            return 1  # Only memory DC sources carry shapes
+
+        dx, dy = x - sx, y - sy
+        shapes = [self._translate_shape(s, dx, dy) for s in src_state['shapes']]
+
+        dest_state = self.dc_state.get(hdcDest)
+        if dest_state and dest_state.get('memory'):
+            dest_state['shapes'].extend(shapes)
+            return 1
+
+        hwnd = self._dc_hwnd(hdcDest)
+        if not self.gui or not hwnd or hwnd not in self.gui.windows:
+            return 1
+
+        window = self.gui.windows[hwnd]
+        client_w, client_h = self.gui.client_size(window)
+        if x <= 0 and y <= 0 and x + cx >= client_w and y + cy >= client_h:
+            # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
+            window.drawn_shapes = shapes
+        else:
+            window.drawn_shapes = window.drawn_shapes + shapes
+        return 1
+
+    def ValidateRect(self, args):
+        """ValidateRect emulation - mark the window as painted"""
+        hWnd = args[0]
+        self.painted_windows.add(hWnd)
+        return 1
 
     # ==================== MENU APIs ====================
 
@@ -3296,9 +3773,9 @@ class FakeWindow:
         self.bg_color = (240, 240, 240)  # Windows classic gray
         self.text = title
 
-        # Retained drawing lists (GDI display list, redrawn every frame)
-        self.drawn_texts = []   # TextOut/DrawText items
-        self.drawn_shapes = []  # Rectangle/Ellipse/LineTo/SetPixel items
+        # Retained drawing list (GDI display list, redrawn every frame):
+        # Rectangle/Ellipse/LineTo/SetPixel/Polygon/TextOut... items
+        self.drawn_shapes = []
 
         # Menu bar: list of {'text', 'id', 'items': [...]} or None
         self.menu = None
@@ -3378,6 +3855,8 @@ class FakeControl:
         self.parent_hwnd = 0
         self.control_id = 0  # Control ID (hMenu in CreateWindowEx) for WM_COMMAND
         self.checked = False  # For Checkbox/Radio
+        self.items = []       # For Listbox/Combobox (LB_ADDSTRING, CB_ADDSTRING)
+        self.sel_index = -1   # Selected item index (-1 = none)
         
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
@@ -3412,6 +3891,7 @@ class PseudoWindowsGUI:
     BORDER = 3
     TITLE_BAR_H = 25
     MENU_H = 20  # Menu bar height (only when the window has a menu)
+    LISTBOX_ITEM_H = 18  # Row height in LISTBOX and COMBOBOX dropdowns
 
     def __init__(self, width=1024, height=768):
         self.width = width
@@ -3433,11 +3913,18 @@ class PseudoWindowsGUI:
 
         # Open dropdown menu: (window_hwnd, top_level_item_index) or None
         self.open_menu = None
-        
+
+        # Open combobox dropdown: control hwnd or None
+        self.open_combo = None
+
+        # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
+        self.key_states = {}
+
         # Font
         self.font = None
         self.font_small = None
         self.font_bold = None
+        self._font_cache = {}  # (face, size, bold, italic) -> pygame Font
         
         # Event queue
         self.event_queue = queue.Queue()
@@ -3550,7 +4037,15 @@ class PseudoWindowsGUI:
                         # Update mouse cursor based on hovered edge
                         self._update_resize_cursor(event.pos)
                 elif event.type == pygame.KEYDOWN:
+                    vk = self._pygame_key_to_vk(event)
+                    if vk is not None:
+                        self.key_states[vk] = True
                     self._handle_key_press(event)
+                elif event.type == pygame.KEYUP:
+                    vk = self._pygame_key_to_vk(event)
+                    if vk is not None:
+                        self.key_states[vk] = False
+                        self._forward_key_up(vk)
             
             # MessageBox check
             self._check_messagebox()
@@ -3588,6 +4083,9 @@ class PseudoWindowsGUI:
 
         # Open dropdown menu is drawn over all windows
         self._draw_open_menu()
+
+        # Open combobox dropdown is drawn over all windows too
+        self._draw_open_combo()
     
     def _draw_taskbar(self):
         """Draw taskbar"""
@@ -3762,14 +4260,9 @@ class PseudoWindowsGUI:
         # Clip client-area drawing to the window (GDI shapes may overflow)
         self.screen.set_clip(content_rect)
 
-        # Render GDI shapes (Rectangle, Ellipse, LineTo, SetPixel, FillRect)
+        # Render GDI shapes and texts (Rectangle, Ellipse, TextOut, ...)
         for shape in window.drawn_shapes:
             self._draw_shape(shape, client_x, client_y)
-
-        # Render texts drawn with TextOutA/DrawTextA
-        for text_item in window.drawn_texts:
-            text_surface = self.font.render(text_item['text'], True, text_item.get('color') or self.COLOR_TEXT)
-            self.screen.blit(text_surface, (client_x + text_item['x'], client_y + text_item['y']))
 
         # Draw controls
         for control in window.controls:
@@ -3797,10 +4290,68 @@ class PseudoWindowsGUI:
                 color, width = shape['pen']
                 draw_func(self.screen, color, rect, width)
 
+        elif stype == 'roundrect':
+            left, top, right, bottom = shape['rect']
+            rect = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
+            radius = shape.get('radius', 0)
+            if shape.get('fill') is not None:
+                pygame.draw.rect(self.screen, shape['fill'], rect, border_radius=radius)
+            if shape.get('pen') is not None:
+                color, width = shape['pen']
+                pygame.draw.rect(self.screen, color, rect, width, border_radius=radius)
+
+        elif stype == 'polygon':
+            points = [(ox + x, oy + y) for x, y in shape['points']]
+            if len(points) >= 3:
+                if shape.get('fill') is not None:
+                    pygame.draw.polygon(self.screen, shape['fill'], points)
+                if shape.get('pen') is not None:
+                    color, width = shape['pen']
+                    pygame.draw.polygon(self.screen, color, points, width)
+
+        elif stype == 'polyline':
+            points = [(ox + x, oy + y) for x, y in shape['points']]
+            if len(points) >= 2 and shape.get('pen') is not None:
+                color, width = shape['pen']
+                pygame.draw.lines(self.screen, color, False, points, width)
+
+        elif stype == 'arc':
+            left, top, right, bottom = shape['rect']
+            rect = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
+            if shape.get('pen') is not None:
+                color, width = shape['pen']
+                pygame.draw.arc(self.screen, color, rect,
+                                shape['start'], shape['end'], width)
+
+        elif stype == 'text':
+            x, y = shape['pos']
+            font = self._get_render_font(shape.get('font'))
+            surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT)
+            self.screen.blit(surface, (ox + x, oy + y))
+            if shape.get('font') and shape['font'].get('underline'):
+                line_y = oy + y + surface.get_height() - 2
+                pygame.draw.line(self.screen, shape.get('color') or self.COLOR_TEXT,
+                                 (ox + x, line_y), (ox + x + surface.get_width(), line_y))
+
         elif stype == 'pixel':
             x, y = shape['pos']
             rect = pygame.Rect(ox + x, oy + y, 1, 1)
             pygame.draw.rect(self.screen, shape['color'], rect)
+
+    def _get_render_font(self, font_dict):
+        """Pygame font for a GDI font dict (cached); None -> default GUI font."""
+        if not font_dict:
+            return self.font
+        # GDI height is in pixels; pygame SysFont sizes are close to points
+        size = max(8, int(font_dict.get('height', 13) * 0.75))
+        face = (font_dict.get('face') or 'arial').lower()
+        bold = font_dict.get('bold', False)
+        italic = font_dict.get('italic', False)
+        key = (face, size, bold, italic)
+        if key not in self._font_cache:
+            self._font_cache[key] = pygame.font.SysFont(f"{face},arial", size,
+                                                        bold=bold, italic=italic)
+        return self._font_cache[key]
 
     def _draw_menu_bar(self, window):
         """Draw a window's menu bar and highlight the open item"""
@@ -3854,6 +4405,51 @@ class PseudoWindowsGUI:
             text = self.font.render(sub['text'], True, color)
             self.screen.blit(text, (rect.x + 16, rect.y + (rect.height - text.get_height()) // 2))
     
+    def _combo_dropdown_rects(self, control):
+        """Dropdown rect and item rects of an open combobox (screen coords)."""
+        win = self.windows.get(control.parent_hwnd)
+        if not win or not win.visible or win.minimized:
+            return None, []
+        ox, oy = self.client_origin(win)
+        box_h = min(control.height, 24)
+        item_h = self.LISTBOX_ITEM_H
+        count = max(1, len(control.items))
+        drop = pygame.Rect(ox + control.x, oy + control.y + box_h,
+                           control.width, count * item_h + 2)
+        rects = [pygame.Rect(drop.x + 1, drop.y + 1 + i * item_h,
+                             drop.width - 2, item_h)
+                 for i in range(len(control.items))]
+        return drop, rects
+
+    def _draw_open_combo(self):
+        """Draw the open combobox dropdown on top of everything"""
+        if not self.open_combo:
+            return
+        control = self.controls.get(self.open_combo)
+        if not control or not control.visible:
+            self.open_combo = None
+            return
+
+        drop, item_rects = self._combo_dropdown_rects(control)
+        if drop is None:
+            self.open_combo = None
+            return
+
+        shadow = pygame.Rect(drop.x + 3, drop.y + 3, drop.width, drop.height)
+        pygame.draw.rect(self.screen, (64, 64, 64), shadow)
+        pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, drop)
+        pygame.draw.rect(self.screen, (128, 128, 128), drop, 1)
+
+        mouse_pos = pygame.mouse.get_pos()
+        for i, (item, rect) in enumerate(zip(control.items, item_rects)):
+            hovered = rect.collidepoint(mouse_pos)
+            selected = (i == control.sel_index)
+            if hovered or selected:
+                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
+            color = self.COLOR_TITLE_TEXT if (hovered or selected) else self.COLOR_TEXT
+            text = self.font.render(item, True, color)
+            self.screen.blit(text, (rect.x + 3, rect.y + 1))
+
     def _draw_control(self, control, parent_x, parent_y):
         """Draw control"""
         if not control.visible:
@@ -3902,13 +4498,43 @@ class PseudoWindowsGUI:
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
             pygame.draw.rect(self.screen, (128, 128, 128), rect, 1)
-            
+
+            # Items with the selected one highlighted
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(rect)
+            item_h = self.LISTBOX_ITEM_H
+            for i, item in enumerate(control.items):
+                item_rect = pygame.Rect(abs_x + 1, abs_y + 1 + i * item_h,
+                                        control.width - 2, item_h)
+                if item_rect.top > rect.bottom:
+                    break
+                selected = (i == control.sel_index)
+                if selected:
+                    pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, item_rect)
+                color = self.COLOR_TITLE_TEXT if selected else self.COLOR_TEXT
+                text = self.font.render(item, True, color)
+                self.screen.blit(text, (item_rect.x + 3, item_rect.y + 1))
+            self.screen.set_clip(prev_clip)
+
         elif control.class_name == "COMBOBOX":
-            rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
+            box_h = min(control.height, 24)
+            rect = pygame.Rect(abs_x, abs_y, control.width, box_h)
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
             pygame.draw.rect(self.screen, (128, 128, 128), rect, 1)
+
+            # Selected item text
+            sel_text = ""
+            if 0 <= control.sel_index < len(control.items):
+                sel_text = control.items[control.sel_index]
+            if sel_text:
+                prev_clip = self.screen.get_clip()
+                self.screen.set_clip(rect)
+                text = self.font.render(sel_text, True, self.COLOR_TEXT)
+                self.screen.blit(text, (abs_x + 4, abs_y + (box_h - text.get_height()) // 2))
+                self.screen.set_clip(prev_clip)
+
             # Dropdown arrow
-            arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 1, 17, control.height - 2)
+            arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 1, 17, box_h - 2)
             self._draw_button_3d(arrow_rect, "▼", small=True)
             
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
@@ -4153,15 +4779,13 @@ class PseudoWindowsGUI:
             self.windows[hwnd].drawn_shapes.append(shape)
 
     def clear_drawings(self, hwnd):
-        """Reset a window's display lists (start of a paint cycle).
+        """Reset a window's display list (start of a paint cycle).
 
-        New empty lists are assigned instead of clearing in place, so the GUI
+        A new empty list is assigned instead of clearing in place, so the GUI
         thread can safely keep iterating a snapshot it already picked up.
         """
         if hwnd in self.windows:
-            win = self.windows[hwnd]
-            win.drawn_shapes = []
-            win.drawn_texts = []
+            self.windows[hwnd].drawn_shapes = []
 
     # ==================== MENU BAR ====================
 
@@ -4219,12 +4843,44 @@ class PseudoWindowsGUI:
         """Pack client x/y into an lParam (LOWORD=x, HIWORD=y)."""
         return ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
 
-    def _post_button_command(self, win, control):
-        """Notify a window's WndProc that one of its buttons was clicked."""
+    def _post_control_command(self, win, control, notify_code):
+        """Notify a window's WndProc about a control event via WM_COMMAND."""
         parent_hwnd = control.parent_hwnd or win.hwnd
-        wParam = ((self.winapi.BN_CLICKED & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
+        wParam = ((notify_code & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
         self.winapi.post_window_message(parent_hwnd, self.winapi.WM_COMMAND,
                                         wParam, control.hwnd)
+
+    def _post_button_command(self, win, control):
+        """Notify a window's WndProc that one of its buttons was clicked."""
+        self._post_control_command(win, control, self.winapi.BN_CLICKED)
+
+    def _handle_combo_click(self, pos, button):
+        """Handle clicks while a combobox dropdown is open.
+
+        Returns True if the click was consumed by the dropdown.
+        """
+        control = self.controls.get(self.open_combo)
+        if not control:
+            self.open_combo = None
+            return False
+
+        drop, item_rects = self._combo_dropdown_rects(control)
+        if drop is not None and drop.collidepoint(pos):
+            if button == 1:
+                for i, rect in enumerate(item_rects):
+                    if rect.collidepoint(pos):
+                        control.sel_index = i
+                        self.open_combo = None
+                        win = self.windows.get(control.parent_hwnd)
+                        if win and self.winapi:
+                            self._post_control_command(win, control,
+                                                       self.winapi.CBN_SELCHANGE)
+                        return True
+            return True  # Click inside dropdown chrome: swallow
+
+        # Click elsewhere: close the dropdown, then process the click normally
+        self.open_combo = None
+        return False
 
     def _forward_mouse_up(self, pos, button):
         """Forward a mouse-button release to the app window under the cursor."""
@@ -4302,6 +4958,10 @@ class PseudoWindowsGUI:
 
         # An open dropdown menu grabs clicks first
         if self.open_menu and self._handle_menu_click(pos, button):
+            return
+
+        # An open combobox dropdown grabs clicks next
+        if self.open_combo and self._handle_combo_click(pos, button):
             return
 
         # Click on taskbar windows
@@ -4425,8 +5085,13 @@ class PseudoWindowsGUI:
                             continue
                         ctrl_x = content_x + control.x
                         ctrl_y = content_y + control.y
+                        # A combobox only occupies its closed box; the
+                        # CreateWindow height includes the dropdown area
+                        ctrl_h = control.height
+                        if control.class_name == "COMBOBOX":
+                            ctrl_h = min(control.height, 24)
                         if not (ctrl_x <= x <= ctrl_x + control.width and
-                                ctrl_y <= y <= ctrl_y + control.height):
+                                ctrl_y <= y <= ctrl_y + ctrl_h):
                             continue
 
                         if control.class_name == "BUTTON":
@@ -4444,6 +5109,34 @@ class PseudoWindowsGUI:
                             # Give keyboard focus to the edit control
                             if button == 1:
                                 self.focused_control = control.hwnd
+                            return
+                        elif control.class_name == "CHECKBOX":
+                            if button == 1:
+                                self.focused_control = None
+                                # BS_AUTOCHECKBOX (0x3) toggles by itself
+                                if (control.style & 0xF) == 0x3:
+                                    control.checked = not control.checked
+                                if self.winapi:
+                                    self._post_button_command(win, control)
+                            return
+                        elif control.class_name == "LISTBOX":
+                            if button == 1:
+                                self.focused_control = None
+                                index = (y - ctrl_y - 1) // self.LISTBOX_ITEM_H
+                                if 0 <= index < len(control.items):
+                                    control.sel_index = index
+                                    if self.winapi:
+                                        self._post_control_command(
+                                            win, control, self.winapi.LBN_SELCHANGE)
+                            return
+                        elif control.class_name == "COMBOBOX":
+                            if button == 1:
+                                self.focused_control = None
+                                # Toggle the dropdown list
+                                if self.open_combo == control.hwnd:
+                                    self.open_combo = None
+                                else:
+                                    self.open_combo = control.hwnd
                             return
                         # Other control types: swallow the click
                         return
@@ -4483,8 +5176,19 @@ class PseudoWindowsGUI:
             pygame.K_DELETE: 0x2E, pygame.K_LEFT: 0x25, pygame.K_UP: 0x26,
             pygame.K_RIGHT: 0x27, pygame.K_DOWN: 0x28, pygame.K_HOME: 0x24,
             pygame.K_END: 0x23, pygame.K_PAGEUP: 0x21, pygame.K_PAGEDOWN: 0x22,
+            pygame.K_LSHIFT: 0x10, pygame.K_RSHIFT: 0x10,
+            pygame.K_LCTRL: 0x11, pygame.K_RCTRL: 0x11,
+            pygame.K_LALT: 0x12, pygame.K_RALT: 0x12,
         }
         return special.get(key)
+
+    def _forward_key_up(self, vk):
+        """Forward a key release (WM_KEYUP) to the active application window."""
+        if not self.winapi:
+            return
+        hwnd = self.active_window
+        if hwnd and self._is_app_window(hwnd):
+            self.winapi.post_window_message(hwnd, self.winapi.WM_KEYUP, vk, 1)
 
     def _forward_key_to_window(self, event):
         """Forward a keystroke to the active application window's WndProc."""
@@ -4841,26 +5545,6 @@ class PseudoWindowsGUI:
     def console_clear(self):
         """Clear console"""
         self.console_lines.clear()
-    
-    def draw_text(self, text, x, y, hwnd=None, color=None):
-        """Draw text inside window (for TextOutA/DrawTextA)"""
-        if color is None:
-            color = self.COLOR_TEXT
-
-        # Find active window
-        target_hwnd = hwnd or self.active_window
-        if target_hwnd and target_hwnd in self.windows:
-            window = self.windows[target_hwnd]
-
-            # Save text to FakeWindow (client-relative; rendered every frame)
-            window.drawn_texts.append({
-                'text': text,
-                'x': x,
-                'y': y,
-                'color': color
-            })
-
-            log.info(f"GUI: Text drawn - '{text}' at ({x}, {y}) in HWND=0x{target_hwnd:x}")
 
 
 class CPUEmulator:
@@ -5235,9 +5919,12 @@ class CPUEmulator:
         
         log.debug(f"Calling callback: 0x{callback_addr:08x} args={[hex(a) for a in args]}")
         
-        # Run callback
+        # Run callback. Unicorn's instruction budget is shared with the outer
+        # emu_start (nested runs clobber it), so pass 0 (unlimited) here and
+        # let the Python-side max_instructions check in _hook_code limit
+        # everything uniformly.
         try:
-            self.uc.emu_start(callback_addr, self.callback_return_addr, 0, 50000)
+            self.uc.emu_start(callback_addr, self.callback_return_addr, 0, 0)
         except UcError as e:
             log.error(f"Callback error: {e}")
         
@@ -5296,9 +5983,9 @@ class CPUEmulator:
     def _hook_code(self, uc, address, size, user_data):
         """Hook called for each instruction"""
         self.instruction_count += 1
-        
-        # Limit check
-        if self.instruction_count > self.max_instructions:
+
+        # Limit check (max_instructions <= 0 means unlimited)
+        if self.max_instructions > 0 and self.instruction_count > self.max_instructions:
             log.warning(f"Maximum instruction limit reached ({self.max_instructions})! Stopping emulation...")
             self.stop_emulation = True
             uc.emu_stop()
@@ -5406,18 +6093,19 @@ class CPUEmulator:
     
     def run(self, max_instructions=None):
         """Start emulation"""
-        if max_instructions:
+        if max_instructions is not None:
             self.max_instructions = max_instructions
-        
+
         log.header("Starting Emulation")
-        
+
         entry_point = self.pe_loader.image_base + self.pe_loader.entry_point
         log.info(f"Entry point: 0x{entry_point:08x}")
-        log.info(f"Maximum instructions: {self.max_instructions}")
-        
+        log.info(f"Maximum instructions: "
+                 f"{self.max_instructions if self.max_instructions > 0 else 'unlimited'}")
+
         try:
-            # Start emulation
-            self.uc.emu_start(entry_point, 0, 0, self.max_instructions)
+            # Start emulation (count 0 = unlimited in Unicorn)
+            self.uc.emu_start(entry_point, 0, 0, max(0, self.max_instructions))
 
         except UcError as e:
             eip = self.uc.reg_read(UC_X86_REG_EIP)
@@ -5495,7 +6183,8 @@ def main():
     parser.add_argument("exe", help="PE file to run (inside c_drive/ or full path)")
     parser.add_argument("-n", "--max-instructions", type=int, default=None,
                         help="Maximum instructions to execute "
-                             "(default: 5000000 with GUI, 100000 without)")
+                             "(default: 5000000 with GUI, 100000 without; "
+                             "0 = unlimited, recommended for games)")
     parser.add_argument("-m", "--memory", type=int, default=128,
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
