@@ -1606,11 +1606,13 @@ class WinAPIHandler:
         text = ""
         if self.gui:
             text = self.gui.get_window_text(hWnd)
-        
-        if lpString and text:
-            text_bytes = text.encode('utf-8')[:nMaxCount-1] + b'\x00'
+
+        # Always null-terminate the buffer (like real Windows), even when
+        # the text is empty - the caller's buffer is uninitialized memory
+        if lpString and nMaxCount > 0:
+            text_bytes = text.encode('utf-8')[:nMaxCount - 1] + b'\x00'
             self.emu.uc.mem_write(lpString, text_bytes)
-        
+
         log.debug(f"GetWindowTextA(0x{hWnd:x}) -> '{text}'")
         return len(text)
     
