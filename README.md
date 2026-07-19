@@ -53,6 +53,10 @@ python winexe32emu.py /path/to/file.exe
 - Interactive EDIT controls (keyboard focus, caret, GetDlgItemTextA)
 - Interactive LISTBOX/COMBOBOX/checkbox controls (LB_*, CB_*, BM_* messages, LBN_SELCHANGE/CBN_SELCHANGE notifications)
 - Window menus (CreateMenu, AppendMenuA, SetMenu, WM_COMMAND)
+- Mouse input (WM_MOUSEMOVE with button state, SetCapture/ReleaseCapture, GetCursorPos, ScreenToClient/ClientToScreen)
+- RECT utilities (SetRect, PtInRect, InflateRect, OffsetRect, IntersectRect, UnionRect, ...)
+- More GDI (FrameRect, PatBlt, Chord, CreateHatchBrush) and time APIs (GetLocalTime, GetSystemTime, MulDiv)
+- C runtime numerics (MSVC-compatible rand/srand, time, clock, atoi, abs)
 
 ## Examples
 
@@ -63,6 +67,7 @@ python winexe32emu.py /path/to/file.exe
 | `ball_demo.c` | Real-time game loop: PeekMessageA, GetAsyncKeyState paddle input, double-buffered rendering (CreateCompatibleDC/BitBlt), Sleep-paced frames. Run with `-n 0` |
 | `gdi_demo.c` | Rich GDI drawing: CreateFontA (bold/italic/underline), Polygon star, Pie chart, RoundRect, Arc, Polyline |
 | `controls_demo.c` | Interactive controls: LISTBOX (LB_ADDSTRING, LBN_SELCHANGE), COMBOBOX dropdown (CB_ADDSTRING, CBN_SELCHANGE), auto checkbox (IsDlgButtonChecked), EDIT + buttons via WM_COMMAND |
+| `paint_demo.c` | Mini paint program: WM_MOUSEMOVE drag drawing with SetCapture/ReleaseCapture, PtInRect palette hit-testing, FrameRect/PatBlt, GetLocalTime clock, rand/srand random color |
 
 ## Copyright and License
 
