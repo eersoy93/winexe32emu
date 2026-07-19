@@ -347,6 +347,29 @@ class WinAPIHandler:
     # PeekMessage removal flags
     PM_NOREMOVE = 0x0000
     PM_REMOVE = 0x0001
+
+    # Scrollbar messages and notification codes
+    WM_HSCROLL = 0x0114
+    WM_VSCROLL = 0x0115
+    SB_LINEUP = 0        # Also SB_LINELEFT
+    SB_LINEDOWN = 1      # Also SB_LINERIGHT
+    SB_PAGEUP = 2        # Also SB_PAGELEFT
+    SB_PAGEDOWN = 3      # Also SB_PAGERIGHT
+    SB_THUMBPOSITION = 4
+    SB_THUMBTRACK = 5
+    SB_ENDSCROLL = 8
+
+    # Scrollbar selectors (nBar) and control style
+    SB_HORZ = 0
+    SB_VERT = 1
+    SB_CTL = 2
+    SBS_VERT = 0x0001
+
+    # Scrollbar control messages (SBM_*)
+    SBM_SETPOS = 0x00E0
+    SBM_GETPOS = 0x00E1
+    SBM_SETRANGE = 0x00E2
+    SBM_GETRANGE = 0x00E3
     
     def __init__(self, emulator, gui=None):
         self.emu = emulator
@@ -1585,7 +1608,8 @@ class WinAPIHandler:
         # Create real window if GUI exists
         if self.gui and self.gui.running:
             # Create control for top-level controls
-            if class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX"]:
+            if class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
+                                      "SCROLLBAR"]:
                 # BUTTON with a checkbox style (BS_CHECKBOX/BS_AUTOCHECKBOX)
                 # is drawn and clicked as a checkbox
                 control_class = class_name
@@ -2112,6 +2136,124 @@ class WinAPIHandler:
         log.debug(f"MessageBeep(0x{args[0]:x})")
         return 1
 
+    # ---------- Scrollbar APIs (user32) ----------
+
+    def _scrollbar_control(self, hwnd, nBar):
+        """Resolve a scrollbar target to its FakeControl (SB_CTL only).
+
+        Standard window scrollbars (SB_HORZ/SB_VERT on a window handle) are
+        not emulated; only SCROLLBAR controls carry scroll state.
+        """
+        if self.gui and hwnd in self.gui.controls:
+            control = self.gui.controls[hwnd]
+            if control.class_name == "SCROLLBAR":
+                return control
+        if nBar != self.SB_CTL:
+            log.debug(f"Standard window scrollbar (nBar={nBar}) not emulated")
+        return None
+
+    @staticmethod
+    def scroll_pos_max(control):
+        """Highest legal scroll position (Windows: max - page + 1 if page set)"""
+        if control.scroll_page > 0:
+            return max(control.scroll_min,
+                       control.scroll_max - control.scroll_page + 1)
+        return control.scroll_max
+
+    def _clamp_scroll_pos(self, control, pos):
+        return max(control.scroll_min, min(pos, self.scroll_pos_max(control)))
+
+    def SetScrollPos(self, args):
+        """SetScrollPos emulation"""
+        hWnd, nBar = args[0], args[1]
+        nPos = args[2] - 0x100000000 if args[2] >= 0x80000000 else args[2]
+        control = self._scrollbar_control(hWnd, nBar)
+        if not control:
+            return 0
+        prev = control.scroll_pos
+        control.scroll_pos = self._clamp_scroll_pos(control, nPos)
+        log.debug(f"SetScrollPos(0x{hWnd:x}, {nPos}) -> prev {prev}")
+        return prev & 0xFFFFFFFF
+
+    def GetScrollPos(self, args):
+        """GetScrollPos emulation"""
+        control = self._scrollbar_control(args[0], args[1])
+        return (control.scroll_pos & 0xFFFFFFFF) if control else 0
+
+    def SetScrollRange(self, args):
+        """SetScrollRange emulation"""
+        hWnd, nBar = args[0], args[1]
+        nMin, nMax = self._read_signed_args(args, 2, 2)
+        control = self._scrollbar_control(hWnd, nBar)
+        if not control:
+            return 0
+        control.scroll_min = min(nMin, nMax)
+        control.scroll_max = max(nMin, nMax)
+        control.scroll_pos = self._clamp_scroll_pos(control, control.scroll_pos)
+        log.debug(f"SetScrollRange(0x{hWnd:x}, {nMin}..{nMax})")
+        return 1
+
+    def GetScrollRange(self, args):
+        """GetScrollRange emulation"""
+        control = self._scrollbar_control(args[0], args[1])
+        lpMin, lpMax = args[2], args[3]
+        if not control:
+            return 0
+        try:
+            if lpMin:
+                self.emu.uc.mem_write(lpMin, struct.pack("<i", control.scroll_min))
+            if lpMax:
+                self.emu.uc.mem_write(lpMax, struct.pack("<i", control.scroll_max))
+        except:
+            return 0
+        return 1
+
+    # SCROLLINFO fMask flags
+    SIF_RANGE = 0x0001
+    SIF_PAGE = 0x0002
+    SIF_POS = 0x0004
+    SIF_TRACKPOS = 0x0010
+
+    def SetScrollInfo(self, args):
+        """SetScrollInfo emulation"""
+        hWnd, nBar, lpsi = args[0], args[1], args[2]
+        control = self._scrollbar_control(hWnd, nBar)
+        if not control or not lpsi:
+            return 0
+        try:
+            # SCROLLINFO: cbSize, fMask, nMin, nMax, nPage, nPos, nTrackPos
+            data = self.emu.uc.mem_read(lpsi, 28)
+            _, fMask, nMin, nMax, nPage, nPos, _ = struct.unpack("<IIiiIii", data)
+        except:
+            return 0
+        if fMask & self.SIF_RANGE:
+            control.scroll_min = min(nMin, nMax)
+            control.scroll_max = max(nMin, nMax)
+        if fMask & self.SIF_PAGE:
+            control.scroll_page = nPage
+        if fMask & self.SIF_POS:
+            control.scroll_pos = nPos
+        control.scroll_pos = self._clamp_scroll_pos(control, control.scroll_pos)
+        log.debug(f"SetScrollInfo(0x{hWnd:x}, mask=0x{fMask:x}) -> pos {control.scroll_pos}")
+        return control.scroll_pos & 0xFFFFFFFF
+
+    def GetScrollInfo(self, args):
+        """GetScrollInfo emulation"""
+        hWnd, nBar, lpsi = args[0], args[1], args[2]
+        control = self._scrollbar_control(hWnd, nBar)
+        if not control or not lpsi:
+            return 0
+        try:
+            # Preserve the caller's cbSize and fMask, fill everything else
+            head = self.emu.uc.mem_read(lpsi, 8)
+            data = head + struct.pack("<iiIii", control.scroll_min,
+                                      control.scroll_max, control.scroll_page,
+                                      control.scroll_pos, control.scroll_pos)
+            self.emu.uc.mem_write(lpsi, bytes(data))
+        except:
+            return 0
+        return 1
+
     def SendMessageA(self, args):
         """SendMessageA emulation"""
         hWnd = args[0]
@@ -2217,6 +2359,31 @@ class WinAPIHandler:
         }
         if Msg in combo_to_list:
             return self._control_message(control, combo_to_list[Msg], wParam, lParam)
+
+        # ----- Scrollbar messages -----
+        if Msg == self.SBM_SETPOS:
+            pos = wParam - 0x100000000 if wParam >= 0x80000000 else wParam
+            prev = control.scroll_pos
+            control.scroll_pos = self._clamp_scroll_pos(control, pos)
+            return prev & 0xFFFFFFFF
+        if Msg == self.SBM_GETPOS:
+            return control.scroll_pos & 0xFFFFFFFF
+        if Msg == self.SBM_SETRANGE:
+            nmin = wParam - 0x100000000 if wParam >= 0x80000000 else wParam
+            nmax = lParam - 0x100000000 if lParam >= 0x80000000 else lParam
+            control.scroll_min = min(nmin, nmax)
+            control.scroll_max = max(nmin, nmax)
+            control.scroll_pos = self._clamp_scroll_pos(control, control.scroll_pos)
+            return 0
+        if Msg == self.SBM_GETRANGE:
+            try:
+                if wParam:
+                    self.emu.uc.mem_write(wParam, struct.pack("<i", control.scroll_min))
+                if lParam:
+                    self.emu.uc.mem_write(lParam, struct.pack("<i", control.scroll_max))
+            except:
+                pass
+            return 0
 
         log.debug(f"Unhandled control message 0x{Msg:04x} for {control.class_name}")
         return 0
@@ -2996,6 +3163,113 @@ class WinAPIHandler:
         return colorref
 
     @staticmethod
+    def _rgb_to_colorref(rgb):
+        """Convert an (r, g, b) tuple to a Win32 COLORREF (0x00BBGGRR)"""
+        r, g, b = rgb
+        return (b << 16) | (g << 8) | r
+
+    @staticmethod
+    def _point_near_segment(px, py, x1, y1, x2, y2, radius):
+        """Is (px, py) within radius of the segment (x1,y1)-(x2,y2)?"""
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0:
+            ex, ey = px - x1, py - y1
+        else:
+            t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+            ex, ey = px - (x1 + t * dx), py - (y1 + t * dy)
+        return ex * ex + ey * ey <= radius * radius
+
+    @staticmethod
+    def _point_in_polygon(px, py, points):
+        """Ray-casting point-in-polygon test"""
+        inside = False
+        n = len(points)
+        for i in range(n):
+            x1, y1 = points[i]
+            x2, y2 = points[(i + 1) % n]
+            if (y1 > py) != (y2 > py):
+                x_cross = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+                if px < x_cross:
+                    inside = not inside
+        return inside
+
+    def _shape_color_at(self, shapes, x, y):
+        """Color of the topmost display-list shape covering (x, y), or None"""
+        for shape in reversed(shapes):
+            stype = shape['type']
+            if stype == 'pixel':
+                if shape['pos'] == (x, y):
+                    return shape['color']
+            elif stype in ('rect', 'roundrect'):
+                left, top, right, bottom = shape['rect']
+                if left <= x < right and top <= y < bottom:
+                    pen = shape.get('pen')
+                    fill = shape.get('fill')
+                    on_border = (x < left + 1 or x >= right - 1 or
+                                 y < top + 1 or y >= bottom - 1)
+                    if pen and on_border:
+                        return pen[0] if isinstance(pen, tuple) else pen
+                    if fill is not None:
+                        return fill
+            elif stype == 'ellipse':
+                left, top, right, bottom = shape['rect']
+                rx, ry = (right - left) / 2.0, (bottom - top) / 2.0
+                if rx > 0 and ry > 0:
+                    nx = (x - (left + rx)) / rx
+                    ny = (y - (top + ry)) / ry
+                    if nx * nx + ny * ny <= 1.0 and shape.get('fill') is not None:
+                        return shape['fill']
+            elif stype == 'polygon':
+                if (shape.get('fill') is not None and len(shape['points']) >= 3 and
+                        self._point_in_polygon(x, y, shape['points'])):
+                    return shape['fill']
+            elif stype == 'line':
+                pen = shape.get('pen')
+                if pen:
+                    color, width = pen
+                    x1, y1 = shape['from']
+                    x2, y2 = shape['to']
+                    if self._point_near_segment(x, y, x1, y1, x2, y2,
+                                                max(1, width) / 2.0 + 0.5):
+                        return color
+            elif stype == 'polyline':
+                pen = shape.get('pen')
+                if pen:
+                    color, width = pen
+                    pts = shape['points']
+                    for i in range(len(pts) - 1):
+                        if self._point_near_segment(x, y, pts[i][0], pts[i][1],
+                                                    pts[i + 1][0], pts[i + 1][1],
+                                                    max(1, width) / 2.0 + 0.5):
+                            return color
+            # arc/text: no reliable hit test, skip
+        return None
+
+    def GetPixel(self, args):
+        """GetPixel emulation - resolved from the DC's display list"""
+        hdc = args[0]
+        x, y = self._read_signed_args(args, 1, 2)
+
+        state = self.dc_state.get(hdc)
+        if state and state.get('memory'):
+            shapes = state['shapes']
+            background = (255, 255, 255)
+        else:
+            hwnd = self._dc_hwnd(hdc)
+            if not self.gui or hwnd not in self.gui.windows:
+                return 0xFFFFFFFF  # CLR_INVALID
+            shapes = self.gui.windows[hwnd].drawn_shapes
+            background = PseudoWindowsGUI.COLOR_WINDOW_BG
+
+        color = self._shape_color_at(shapes, x, y)
+        if color is None:
+            color = background
+        colorref = self._rgb_to_colorref(color)
+        log.debug(f"GetPixel(0x{hdc:x}, {x}, {y}) -> 0x{colorref:06x}")
+        return colorref
+
+    @staticmethod
     def _read_signed_args(args, start, count):
         """Interpret stack dwords as signed 32-bit integers"""
         return [v - 0x100000000 if v >= 0x80000000 else v
@@ -3318,6 +3592,84 @@ class WinAPIHandler:
         window = self.gui.windows[hwnd]
         client_w, client_h = self.gui.client_size(window)
         if x <= 0 and y <= 0 and x + cx >= client_w and y + cy >= client_h:
+            # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
+            window.drawn_shapes = shapes
+        else:
+            window.drawn_shapes = window.drawn_shapes + shapes
+        return 1
+
+    @staticmethod
+    def _scale_shape(shape, sx_src, sy_src, xd, yd, scale_x, scale_y):
+        """Copy of a display list entry mapped through a StretchBlt transform"""
+        def tx(x):
+            return int(round(xd + (x - sx_src) * scale_x))
+
+        def ty(y):
+            return int(round(yd + (y - sy_src) * scale_y))
+
+        scaled = dict(shape)
+        if 'rect' in scaled:
+            l, t, r, b = scaled['rect']
+            x1, x2 = tx(l), tx(r)
+            y1, y2 = ty(t), ty(b)
+            # Normalize so mirrored blits keep left < right, top < bottom
+            scaled['rect'] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        if 'pos' in scaled:
+            x, y = scaled['pos']
+            scaled['pos'] = (tx(x), ty(y))
+        if 'from' in scaled:
+            x, y = scaled['from']
+            scaled['from'] = (tx(x), ty(y))
+        if 'to' in scaled:
+            x, y = scaled['to']
+            scaled['to'] = (tx(x), ty(y))
+        if 'points' in scaled:
+            scaled['points'] = [(tx(x), ty(y)) for x, y in scaled['points']]
+        if 'radius' in scaled:
+            scale_avg = (abs(scale_x) + abs(scale_y)) / 2.0
+            scaled['radius'] = max(0, int(round(scaled['radius'] * scale_avg)))
+        return scaled
+
+    def StretchBlt(self, args):
+        """StretchBlt emulation - copy a memory DC's display list scaled.
+
+        Like BitBlt, but the source rectangle is mapped onto the destination
+        rectangle; shape coordinates are transformed accordingly (pen widths
+        and font sizes are kept as-is).
+        """
+        hdcDest = args[0]
+        xd, yd, wd, hd = self._read_signed_args(args, 1, 4)
+        hdcSrc = args[5]
+        xs, ys, ws, hs = self._read_signed_args(args, 6, 4)
+        rop = args[10]
+
+        log.debug(f"StretchBlt(0x{hdcDest:x}, dst=({xd},{yd},{wd},{hd}), "
+                  f"src=0x{hdcSrc:x} ({xs},{ys},{ws},{hs}), rop=0x{rop:08x})")
+
+        if ws == 0 or hs == 0:
+            return 0
+
+        src_state = self.dc_state.get(hdcSrc)
+        if not src_state or not src_state.get('memory'):
+            return 1  # Only memory DC sources carry shapes
+
+        scale_x = wd / ws
+        scale_y = hd / hs
+        shapes = [self._scale_shape(s, xs, ys, xd, yd, scale_x, scale_y)
+                  for s in src_state['shapes']]
+
+        dest_state = self.dc_state.get(hdcDest)
+        if dest_state and dest_state.get('memory'):
+            dest_state['shapes'].extend(shapes)
+            return 1
+
+        hwnd = self._dc_hwnd(hdcDest)
+        if not self.gui or not hwnd or hwnd not in self.gui.windows:
+            return 1
+
+        window = self.gui.windows[hwnd]
+        client_w, client_h = self.gui.client_size(window)
+        if xd <= 0 and yd <= 0 and xd + wd >= client_w and yd + hd >= client_h:
             # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
             window.drawn_shapes = shapes
         else:
@@ -4340,6 +4692,11 @@ class FakeControl:
         self.checked = False  # For Checkbox/Radio
         self.items = []       # For Listbox/Combobox (LB_ADDSTRING, CB_ADDSTRING)
         self.sel_index = -1   # Selected item index (-1 = none)
+        # Scrollbar state (SCROLLBAR class)
+        self.scroll_min = 0
+        self.scroll_max = 100
+        self.scroll_pos = 0
+        self.scroll_page = 0  # 0 = no page size set (SetScrollInfo SIF_PAGE)
         
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
@@ -4445,6 +4802,9 @@ class PseudoWindowsGUI:
         self.drag_offset_x = 0
         self.drag_offset_y = 0
 
+        # Scrollbar thumb dragging: (control hwnd, grab offset in thumb) or None
+        self.dragging_scrollbar = None
+
         # Window resizing
         self.resizing_window = None  # Resized window hwnd
         self.resize_edge = None      # Active edge: 'left','right','top','bottom' + corners
@@ -4501,7 +4861,10 @@ class PseudoWindowsGUI:
                 elif event.type == pygame.MOUSEBUTTONUP:
                     # Release drag / resize; forward release to app if neither
                     was_interacting = (self.dragging_window is not None or
-                                       self.resizing_window is not None)
+                                       self.resizing_window is not None or
+                                       self.dragging_scrollbar is not None)
+                    if self.dragging_scrollbar is not None:
+                        self._end_scrollbar_drag()
                     self.dragging_window = None
                     self.resizing_window = None
                     self.resize_edge = None
@@ -4509,8 +4872,11 @@ class PseudoWindowsGUI:
                         self._forward_mouse_up(event.pos, event.button)
                 elif event.type == pygame.MOUSEMOTION:
                     self.mouse_pos = event.pos
+                    # Scrollbar thumb dragging grabs the mouse first
+                    if self.dragging_scrollbar is not None:
+                        self._drag_scrollbar_to(event.pos)
                     # Window resizing (takes priority over dragging)
-                    if self.resizing_window and self.resizing_window in self.windows:
+                    elif self.resizing_window and self.resizing_window in self.windows:
                         self._resize_window_to(self.windows[self.resizing_window], event.pos)
                     # Window dragging
                     elif self.dragging_window and self.dragging_window in self.windows:
@@ -5048,6 +5414,27 @@ class PseudoWindowsGUI:
             fill_width = int(control.width * 0.5)
             fill_rect = pygame.Rect(abs_x + 1, abs_y + 1, fill_width - 2, control.height - 2)
             pygame.draw.rect(self.screen, (0, 128, 0), fill_rect)
+
+        elif control.class_name == "SCROLLBAR":
+            m = self._scrollbar_metrics(control, abs_x, abs_y)
+
+            # Track (classic dotted-gray look approximated with a light gray)
+            pygame.draw.rect(self.screen, (224, 224, 224), m['track'])
+            pygame.draw.rect(self.screen, (128, 128, 128),
+                             pygame.Rect(abs_x, abs_y, control.width, control.height), 1)
+
+            # Arrow buttons
+            if m['vertical']:
+                self._draw_button_3d(m['up'], "▲", small=True)
+                self._draw_button_3d(m['down'], "▼", small=True)
+            else:
+                self._draw_button_3d(m['up'], "◄", small=True)
+                self._draw_button_3d(m['down'], "►", small=True)
+
+            # Thumb (pressed look while dragging)
+            dragging = (self.dragging_scrollbar is not None and
+                        self.dragging_scrollbar[0] == control.hwnd)
+            self._draw_button_3d(m['thumb'], "", pressed=dragging)
     
     def _draw_button_3d(self, rect, text, pressed=False, small=False):
         """Draw 3D-style button"""
@@ -5338,6 +5725,141 @@ class PseudoWindowsGUI:
         wParam = ((notify_code & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
         self.winapi.post_window_message(parent_hwnd, self.winapi.WM_COMMAND,
                                         wParam, control.hwnd)
+
+    # ==================== SCROLLBAR CONTROLS ====================
+
+    SCROLL_BTN = 16       # Arrow button length (pixels)
+    SCROLL_MIN_THUMB = 12  # Minimum thumb length
+
+    def _scrollbar_metrics(self, control, abs_x, abs_y):
+        """Geometry of a scrollbar control at its absolute screen position.
+
+        Returns a dict with 'vertical', arrow rects 'up'/'down', 'track' and
+        'thumb' rects, plus 'track_len' and 'thumb_len' along the scroll axis.
+        """
+        vertical = bool(control.style & 0x0001)  # SBS_VERT
+        length = control.height if vertical else control.width
+        btn = min(self.SCROLL_BTN, max(0, length // 2))
+        track_len = max(1, length - 2 * btn)
+
+        span = 1
+        pos_max = control.scroll_max
+        if self.winapi:
+            pos_max = self.winapi.scroll_pos_max(control)
+        span = max(1, pos_max - control.scroll_min)
+
+        # Thumb length: proportional when a page size is set
+        if control.scroll_page > 0:
+            content = max(1, control.scroll_max - control.scroll_min + 1)
+            thumb_len = int(track_len * control.scroll_page / content)
+        else:
+            thumb_len = self.SCROLL_MIN_THUMB
+        thumb_len = max(self.SCROLL_MIN_THUMB, min(thumb_len, track_len))
+
+        frac = (control.scroll_pos - control.scroll_min) / span
+        frac = max(0.0, min(1.0, frac))
+        thumb_off = int((track_len - thumb_len) * frac)
+
+        if vertical:
+            up = pygame.Rect(abs_x, abs_y, control.width, btn)
+            down = pygame.Rect(abs_x, abs_y + control.height - btn,
+                               control.width, btn)
+            track = pygame.Rect(abs_x, abs_y + btn, control.width, track_len)
+            thumb = pygame.Rect(abs_x, abs_y + btn + thumb_off,
+                                control.width, thumb_len)
+        else:
+            up = pygame.Rect(abs_x, abs_y, btn, control.height)
+            down = pygame.Rect(abs_x + control.width - btn, abs_y,
+                               btn, control.height)
+            track = pygame.Rect(abs_x + btn, abs_y, track_len, control.height)
+            thumb = pygame.Rect(abs_x + btn + thumb_off, abs_y,
+                                thumb_len, control.height)
+
+        return {'vertical': vertical, 'up': up, 'down': down, 'track': track,
+                'thumb': thumb, 'track_len': track_len, 'thumb_len': thumb_len,
+                'span': span, 'pos_max': pos_max}
+
+    def _scrollbar_abs_pos(self, control):
+        """Absolute screen position of a scrollbar control, or None"""
+        win = self.windows.get(control.parent_hwnd)
+        if not win or not win.visible or win.minimized:
+            return None
+        content_x, content_y = self.client_origin(win)
+        return (content_x + control.x, content_y + control.y)
+
+    def _post_scroll(self, control, code, pos):
+        """Post WM_VSCROLL/WM_HSCROLL for a scrollbar control to its parent."""
+        if not self.winapi or not control.parent_hwnd:
+            return
+        vertical = bool(control.style & 0x0001)
+        msg = self.winapi.WM_VSCROLL if vertical else self.winapi.WM_HSCROLL
+        wparam = (code & 0xFFFF) | ((pos & 0xFFFF) << 16)
+        self.winapi.post_window_message(control.parent_hwnd, msg,
+                                        wparam, control.hwnd)
+
+    def _scroll_by(self, control, delta, code):
+        """Move a scrollbar by delta positions and notify the parent."""
+        pos_max = self.winapi.scroll_pos_max(control) if self.winapi \
+            else control.scroll_max
+        new_pos = max(control.scroll_min, min(control.scroll_pos + delta, pos_max))
+        control.scroll_pos = new_pos
+        self._post_scroll(control, code, new_pos)
+
+    def _handle_scrollbar_click(self, control, x, y, abs_x, abs_y):
+        """Handle a left click inside a scrollbar control."""
+        winapi = self.winapi
+        if not winapi:
+            return
+        m = self._scrollbar_metrics(control, abs_x, abs_y)
+        page = control.scroll_page if control.scroll_page > 0 else 10
+
+        if m['up'].collidepoint(x, y):
+            self._scroll_by(control, -1, winapi.SB_LINEUP)
+        elif m['down'].collidepoint(x, y):
+            self._scroll_by(control, 1, winapi.SB_LINEDOWN)
+        elif m['thumb'].collidepoint(x, y):
+            grab = (y - m['thumb'].y) if m['vertical'] else (x - m['thumb'].x)
+            self.dragging_scrollbar = (control.hwnd, grab)
+        elif m['track'].collidepoint(x, y):
+            before = (y < m['thumb'].y) if m['vertical'] else (x < m['thumb'].x)
+            if before:
+                self._scroll_by(control, -page, winapi.SB_PAGEUP)
+            else:
+                self._scroll_by(control, page, winapi.SB_PAGEDOWN)
+
+    def _drag_scrollbar_to(self, pos):
+        """Track a scrollbar thumb drag (SB_THUMBTRACK)."""
+        hwnd, grab = self.dragging_scrollbar
+        control = self.controls.get(hwnd)
+        if not control or not self.winapi:
+            self.dragging_scrollbar = None
+            return
+        abs_pos = self._scrollbar_abs_pos(control)
+        if abs_pos is None:
+            self.dragging_scrollbar = None
+            return
+        m = self._scrollbar_metrics(control, abs_pos[0], abs_pos[1])
+        slide = m['track_len'] - m['thumb_len']
+        if slide <= 0:
+            return
+        coord = pos[1] if m['vertical'] else pos[0]
+        track_start = m['track'].y if m['vertical'] else m['track'].x
+        frac = (coord - grab - track_start) / slide
+        frac = max(0.0, min(1.0, frac))
+        new_pos = control.scroll_min + int(round(frac * m['span']))
+        if new_pos != control.scroll_pos:
+            control.scroll_pos = new_pos
+            self._post_scroll(control, self.winapi.SB_THUMBTRACK, new_pos)
+
+    def _end_scrollbar_drag(self):
+        """Finish a thumb drag: SB_THUMBPOSITION then SB_ENDSCROLL."""
+        hwnd, _ = self.dragging_scrollbar
+        self.dragging_scrollbar = None
+        control = self.controls.get(hwnd)
+        if control and self.winapi:
+            self._post_scroll(control, self.winapi.SB_THUMBPOSITION,
+                              control.scroll_pos)
+            self._post_scroll(control, self.winapi.SB_ENDSCROLL, 0)
 
     def _post_button_command(self, win, control):
         """Notify a window's WndProc that one of its buttons was clicked."""
@@ -5679,6 +6201,12 @@ class PseudoWindowsGUI:
                                     self.open_combo = None
                                 else:
                                     self.open_combo = control.hwnd
+                            return
+                        elif control.class_name == "SCROLLBAR":
+                            if button == 1:
+                                self.focused_control = None
+                                self._handle_scrollbar_click(control, x, y,
+                                                             ctrl_x, ctrl_y)
                             return
                         # Other control types: swallow the click
                         return
