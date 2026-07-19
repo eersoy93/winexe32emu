@@ -381,6 +381,13 @@ class WinAPIHandler:
         # Menus: hmenu -> list of items
         # item = {'flags': int, 'id': int, 'text': str, 'submenu': hmenu or 0}
         self.menus = {}
+
+        # Mouse capture (SetCapture/ReleaseCapture) - hwnd or 0
+        self.capture_hwnd = 0
+
+        # MSVCRT rand() state (MSVC-compatible LCG) and clock() epoch
+        self._rand_seed = 1
+        self._clock_epoch = time.time()
         
         # MSVCRT global variable memory addresses (lazy init)
         self._fmode_addr = 0
@@ -397,6 +404,8 @@ class WinAPIHandler:
         self._api_map = {
             '__p__fmode': self.api__p__fmode,
             '__p__commode': self.api__p__commode,
+            '__p__acmdln': self.api__p__acmdln,
+            '__p__wcmdln': self.api__p__wcmdln,
             '__set_app_type': self.api__set_app_type,
             '__getmainargs': self.api__getmainargs,
             '__wgetmainargs': self.api__wgetmainargs,
@@ -455,13 +464,21 @@ class WinAPIHandler:
         The emulation thread consumes these in GetMessageA. Only plain Python
         data is touched here; Unicorn memory is written later on the emu thread.
         """
+        msg = {
+            'hwnd': hwnd & 0xFFFFFFFF,
+            'message': message & 0xFFFFFFFF,
+            'wParam': wParam & 0xFFFFFFFF,
+            'lParam': lParam & 0xFFFFFFFF,
+        }
         with self.message_lock:
-            self.message_queue.append({
-                'hwnd': hwnd & 0xFFFFFFFF,
-                'message': message & 0xFFFFFFFF,
-                'wParam': wParam & 0xFFFFFFFF,
-                'lParam': lParam & 0xFFFFFFFF,
-            })
+            # Coalesce mouse moves like Windows does: replace a still-pending
+            # WM_MOUSEMOVE for the same window instead of flooding the queue
+            if (message == self.WM_MOUSEMOVE and self.message_queue and
+                    self.message_queue[-1]['message'] == self.WM_MOUSEMOVE and
+                    self.message_queue[-1]['hwnd'] == msg['hwnd']):
+                self.message_queue[-1] = msg
+                return
+            self.message_queue.append(msg)
 
     # KERNEL32.DLL functions
     def GetModuleHandleA(self, args):
@@ -521,6 +538,29 @@ class WinAPIHandler:
         log.debug("GetCommandLineW()")
         return self.emu.cmdline_wide_addr
     
+    def SetUnhandledExceptionFilter(self, args):
+        """SetUnhandledExceptionFilter emulation - no previous filter"""
+        log.debug(f"SetUnhandledExceptionFilter(0x{args[0]:08x})")
+        return 0
+
+    def LoadCursorA(self, args):
+        """LoadCursorA emulation - opaque cursor handle"""
+        log.debug(f"LoadCursorA(0x{args[0]:x}, 0x{args[1]:x})")
+        return self.get_next_handle()
+
+    def LoadCursorW(self, args):
+        """LoadCursorW emulation"""
+        return self.LoadCursorA(args)
+
+    def LoadIconA(self, args):
+        """LoadIconA emulation - opaque icon handle"""
+        log.debug(f"LoadIconA(0x{args[0]:x}, 0x{args[1]:x})")
+        return self.get_next_handle()
+
+    def LoadIconW(self, args):
+        """LoadIconW emulation"""
+        return self.LoadIconA(args)
+
     def AllocConsole(self, args):
         """AllocConsole emulation"""
         log.debug("AllocConsole() - Creating console window")
@@ -694,7 +734,53 @@ class WinAPIHandler:
         ticks = int(time.time() * 1000) & 0xFFFFFFFF
         log.debug(f"GetTickCount() -> {ticks}")
         return ticks
-    
+
+    def MulDiv(self, args):
+        """MulDiv emulation - (a * b) / c with rounding to nearest"""
+        n, num, den = self._read_signed_args(args, 0, 3)
+        if den == 0:
+            return 0xFFFFFFFF  # -1
+        prod = n * num
+        sign = 1 if (prod >= 0) == (den > 0) else -1
+        # Builtin abs: the CRT abs() emulation shadows it on the class only
+        pa, da = (prod if prod >= 0 else -prod), (den if den >= 0 else -den)
+        result = sign * ((pa + da // 2) // da)
+        log.debug(f"MulDiv({n}, {num}, {den}) -> {result}")
+        return result & 0xFFFFFFFF
+
+    def _write_systemtime(self, address, tm):
+        """Write a SYSTEMTIME structure (8 WORDs) to memory"""
+        ms = int((time.time() % 1) * 1000)
+        data = struct.pack("<8H", tm.tm_year, tm.tm_mon, (tm.tm_wday + 1) % 7,
+                           tm.tm_mday, tm.tm_hour, tm.tm_min,
+                           min(tm.tm_sec, 59), ms)
+        try:
+            self.emu.uc.mem_write(address, data)
+            return True
+        except:
+            return False
+
+    def GetLocalTime(self, args):
+        """GetLocalTime emulation"""
+        lpSystemTime = args[0]
+        log.debug("GetLocalTime()")
+        if lpSystemTime:
+            self._write_systemtime(lpSystemTime, time.localtime())
+        return 0
+
+    def GetSystemTime(self, args):
+        """GetSystemTime emulation (UTC)"""
+        lpSystemTime = args[0]
+        log.debug("GetSystemTime()")
+        if lpSystemTime:
+            self._write_systemtime(lpSystemTime, time.gmtime())
+        return 0
+
+    def Beep(self, args):
+        """Beep emulation (no audio device: logged only)"""
+        log.debug(f"Beep({args[0]} Hz, {args[1]} ms)")
+        return 1
+
     def QueryPerformanceCounter(self, args):
         """QueryPerformanceCounter emulation"""
         lpPerformanceCount = args[0]
@@ -1654,7 +1740,132 @@ class WinAPIHandler:
         
         log.debug(f"GetWindowRect(0x{hWnd:x}) -> ({left}, {top}, {right}, {bottom})")
         return 1
-    
+
+    # ---------- RECT utility APIs (user32) ----------
+
+    def _read_rect(self, address):
+        """Read a RECT from memory -> (left, top, right, bottom) or None"""
+        try:
+            return struct.unpack("<iiii", self.emu.uc.mem_read(address, 16))
+        except:
+            return None
+
+    def _write_rect(self, address, left, top, right, bottom):
+        """Write a RECT to memory"""
+        try:
+            self.emu.uc.mem_write(address, struct.pack("<iiii", left, top,
+                                                       right, bottom))
+            return True
+        except:
+            return False
+
+    def SetRect(self, args):
+        """SetRect emulation"""
+        lprc = args[0]
+        left, top, right, bottom = self._read_signed_args(args, 1, 4)
+        if not lprc:
+            return 0
+        return 1 if self._write_rect(lprc, left, top, right, bottom) else 0
+
+    def SetRectEmpty(self, args):
+        """SetRectEmpty emulation"""
+        lprc = args[0]
+        if not lprc:
+            return 0
+        return 1 if self._write_rect(lprc, 0, 0, 0, 0) else 0
+
+    def CopyRect(self, args):
+        """CopyRect emulation"""
+        lprcDst, lprcSrc = args[0], args[1]
+        rect = self._read_rect(lprcSrc) if lprcSrc else None
+        if not lprcDst or rect is None:
+            return 0
+        return 1 if self._write_rect(lprcDst, *rect) else 0
+
+    def OffsetRect(self, args):
+        """OffsetRect emulation"""
+        lprc = args[0]
+        dx, dy = self._read_signed_args(args, 1, 2)
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None:
+            return 0
+        left, top, right, bottom = rect
+        return 1 if self._write_rect(lprc, left + dx, top + dy,
+                                     right + dx, bottom + dy) else 0
+
+    def InflateRect(self, args):
+        """InflateRect emulation"""
+        lprc = args[0]
+        dx, dy = self._read_signed_args(args, 1, 2)
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None:
+            return 0
+        left, top, right, bottom = rect
+        return 1 if self._write_rect(lprc, left - dx, top - dy,
+                                     right + dx, bottom + dy) else 0
+
+    def PtInRect(self, args):
+        """PtInRect emulation (POINT is passed by value: two stack dwords)"""
+        lprc = args[0]
+        x, y = self._read_signed_args(args, 1, 2)
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None:
+            return 0
+        left, top, right, bottom = rect
+        return 1 if (left <= x < right and top <= y < bottom) else 0
+
+    def EqualRect(self, args):
+        """EqualRect emulation"""
+        r1 = self._read_rect(args[0]) if args[0] else None
+        r2 = self._read_rect(args[1]) if args[1] else None
+        if r1 is None or r2 is None:
+            return 0
+        return 1 if r1 == r2 else 0
+
+    def IsRectEmpty(self, args):
+        """IsRectEmpty emulation"""
+        rect = self._read_rect(args[0]) if args[0] else None
+        if rect is None:
+            return 1
+        left, top, right, bottom = rect
+        return 1 if (right <= left or bottom <= top) else 0
+
+    def IntersectRect(self, args):
+        """IntersectRect emulation"""
+        lprcDst = args[0]
+        r1 = self._read_rect(args[1]) if args[1] else None
+        r2 = self._read_rect(args[2]) if args[2] else None
+        if not lprcDst or r1 is None or r2 is None:
+            return 0
+        left, top = max(r1[0], r2[0]), max(r1[1], r2[1])
+        right, bottom = min(r1[2], r2[2]), min(r1[3], r2[3])
+        if right <= left or bottom <= top:
+            self._write_rect(lprcDst, 0, 0, 0, 0)
+            return 0
+        self._write_rect(lprcDst, left, top, right, bottom)
+        return 1
+
+    def UnionRect(self, args):
+        """UnionRect emulation"""
+        lprcDst = args[0]
+        r1 = self._read_rect(args[1]) if args[1] else None
+        r2 = self._read_rect(args[2]) if args[2] else None
+        if not lprcDst or r1 is None or r2 is None:
+            return 0
+        empty1 = r1[2] <= r1[0] or r1[3] <= r1[1]
+        empty2 = r2[2] <= r2[0] or r2[3] <= r2[1]
+        if empty1 and empty2:
+            self._write_rect(lprcDst, 0, 0, 0, 0)
+            return 0
+        if empty1:
+            self._write_rect(lprcDst, *r2)
+        elif empty2:
+            self._write_rect(lprcDst, *r1)
+        else:
+            self._write_rect(lprcDst, min(r1[0], r2[0]), min(r1[1], r2[1]),
+                             max(r1[2], r2[2]), max(r1[3], r2[3]))
+        return 1
+
     def MoveWindow(self, args):
         """MoveWindow emulation"""
         hWnd = args[0]
@@ -1786,6 +1997,120 @@ class WinAPIHandler:
     def GetKeyState(self, args):
         """GetKeyState emulation (same as GetAsyncKeyState in the emulator)"""
         return self.GetAsyncKeyState(args)
+
+    def GetCursorPos(self, args):
+        """GetCursorPos emulation - cursor position in fake-desktop coordinates"""
+        lpPoint = args[0]
+        x, y = self.gui.mouse_pos if self.gui else (0, 0)
+        if lpPoint:
+            try:
+                self.emu.uc.mem_write(lpPoint, struct.pack("<ii", x, y))
+            except:
+                return 0
+        log.debug(f"GetCursorPos() -> ({x}, {y})")
+        return 1
+
+    def SetCursorPos(self, args):
+        """SetCursorPos emulation (accepted but not applied to the real mouse)"""
+        x, y = self._read_signed_args(args, 0, 2)
+        log.debug(f"SetCursorPos({x}, {y})")
+        return 1
+
+    def ScreenToClient(self, args):
+        """ScreenToClient emulation"""
+        hWnd = args[0]
+        lpPoint = args[1]
+        if not lpPoint:
+            return 0
+        try:
+            x, y = struct.unpack("<ii", self.emu.uc.mem_read(lpPoint, 8))
+        except:
+            return 0
+        if self.gui and hWnd in self.gui.windows:
+            ox, oy = self.gui.client_origin(self.gui.windows[hWnd])
+            x, y = x - ox, y - oy
+        try:
+            self.emu.uc.mem_write(lpPoint, struct.pack("<ii", x, y))
+        except:
+            return 0
+        return 1
+
+    def ClientToScreen(self, args):
+        """ClientToScreen emulation"""
+        hWnd = args[0]
+        lpPoint = args[1]
+        if not lpPoint:
+            return 0
+        try:
+            x, y = struct.unpack("<ii", self.emu.uc.mem_read(lpPoint, 8))
+        except:
+            return 0
+        if self.gui and hWnd in self.gui.windows:
+            ox, oy = self.gui.client_origin(self.gui.windows[hWnd])
+            x, y = x + ox, y + oy
+        try:
+            self.emu.uc.mem_write(lpPoint, struct.pack("<ii", x, y))
+        except:
+            return 0
+        return 1
+
+    def SetCapture(self, args):
+        """SetCapture emulation - route mouse input to one window"""
+        hWnd = args[0]
+        prev = self.capture_hwnd
+        self.capture_hwnd = hWnd
+        log.debug(f"SetCapture(0x{hWnd:x})")
+        return prev
+
+    def ReleaseCapture(self, args):
+        """ReleaseCapture emulation"""
+        log.debug("ReleaseCapture()")
+        self.capture_hwnd = 0
+        return 1
+
+    def GetCapture(self, args):
+        """GetCapture emulation"""
+        return self.capture_hwnd
+
+    def GetParent(self, args):
+        """GetParent emulation"""
+        hWnd = args[0]
+        if self.gui and hWnd in self.gui.controls:
+            return self.gui.controls[hWnd].parent_hwnd or 0
+        return 0
+
+    def IsWindow(self, args):
+        """IsWindow emulation"""
+        hWnd = args[0]
+        if self.gui and (hWnd in self.gui.windows or hWnd in self.gui.controls):
+            return 1
+        return 0
+
+    def IsWindowVisible(self, args):
+        """IsWindowVisible emulation"""
+        hWnd = args[0]
+        if self.gui:
+            if hWnd in self.gui.windows:
+                win = self.gui.windows[hWnd]
+                return 1 if (win.visible and not win.minimized) else 0
+            if hWnd in self.gui.controls:
+                return 1 if self.gui.controls[hWnd].visible else 0
+        return 0
+
+    def IsWindowEnabled(self, args):
+        """IsWindowEnabled emulation"""
+        hWnd = args[0]
+        if self.gui:
+            if hWnd in self.gui.windows:
+                return 1 if self.gui.windows[hWnd].enabled else 0
+            if hWnd in self.gui.controls:
+                return 1 if self.gui.controls[hWnd].enabled else 0
+        return 0
+
+    def MessageBeep(self, args):
+        """MessageBeep emulation (no audio device: logged only)"""
+        log.debug(f"MessageBeep(0x{args[0]:x})")
+        return 1
 
     def SendMessageA(self, args):
         """SendMessageA emulation"""
@@ -2314,16 +2639,7 @@ class WinAPIHandler:
         log.debug(f"FillRect(0x{hdc:x}, rect=({left},{top},{right},{bottom}), brush=0x{hbr:x})")
 
         # Resolve the brush: GDI handle, or a system color index + 1 (e.g. COLOR_WINDOW+1)
-        color = None
-        brush = self.gdi_objects.get(hbr)
-        if brush and brush['type'] == 'brush':
-            color = brush['color']
-        elif hbr < 32:
-            syscolors = {
-                5 + 1: (255, 255, 255),   # COLOR_WINDOW+1
-                15 + 1: (240, 240, 240),  # COLOR_3DFACE/COLOR_BTNFACE+1
-            }
-            color = syscolors.get(hbr, (240, 240, 240))
+        color = self._brush_color(hbr)
 
         if color is not None:
             self._add_shape(hdc, {'type': 'rect', 'rect': (left, top, right, bottom),
@@ -2774,6 +3090,91 @@ class WinAPIHandler:
                               'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
         return 1
 
+    def Chord(self, args):
+        """Chord emulation - arc closed by its secant (approximated polygon)"""
+        import math
+        hdc = args[0]
+        left, top, right, bottom, x1, y1, x2, y2 = self._read_signed_args(args, 1, 8)
+        log.debug(f"Chord(0x{hdc:x}, {left}, {top}, {right}, {bottom})")
+
+        start, end = self._arc_angles(left, top, right, bottom, x1, y1, x2, y2)
+        if end <= start:
+            end += 2 * math.pi
+
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        rx, ry = abs(right - left) / 2.0, abs(bottom - top) / 2.0
+        steps = max(8, int((end - start) * 16))
+        points = []
+        for i in range(steps + 1):
+            a = start + (end - start) * i / steps
+            points.append((int(cx + rx * math.cos(a)), int(cy - ry * math.sin(a))))
+
+        self._add_shape(hdc, {'type': 'polygon', 'points': points,
+                              'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
+        return 1
+
+    def _brush_color(self, hbr):
+        """Resolve a brush handle (or COLOR_* + 1 index) to an RGB color"""
+        brush = self.gdi_objects.get(hbr)
+        if brush and brush['type'] == 'brush':
+            return brush['color']
+        if hbr < 32:
+            syscolors = {
+                5 + 1: (255, 255, 255),   # COLOR_WINDOW+1
+                15 + 1: (240, 240, 240),  # COLOR_3DFACE/COLOR_BTNFACE+1
+            }
+            return syscolors.get(hbr, (240, 240, 240))
+        return None
+
+    def FrameRect(self, args):
+        """FrameRect emulation - one-pixel border drawn with a brush"""
+        hdc = args[0]
+        lprc = args[1]
+        hbr = args[2]
+
+        rect = self._read_rect(lprc) if lprc else None
+        color = self._brush_color(hbr)
+        if rect is None or color is None:
+            return 0
+
+        left, top, right, bottom = rect
+        log.debug(f"FrameRect(0x{hdc:x}, ({left},{top},{right},{bottom}))")
+        self._add_shape(hdc, {'type': 'rect', 'rect': rect,
+                              'fill': None, 'pen': (color, 1)})
+        return 1
+
+    def PatBlt(self, args):
+        """PatBlt emulation - BLACKNESS/WHITENESS/PATCOPY fills"""
+        hdc = args[0]
+        x, y, w, h = self._read_signed_args(args, 1, 4)
+        rop = args[5]
+
+        if rop == 0x00000042:        # BLACKNESS
+            color = (0, 0, 0)
+        elif rop == 0x00FF0062:      # WHITENESS
+            color = (255, 255, 255)
+        else:                        # PATCOPY and others: current brush
+            color = self._dc_brush(hdc)
+
+        log.debug(f"PatBlt(0x{hdc:x}, {x}, {y}, {w}, {h}, rop=0x{rop:08x})")
+        if color is not None and w > 0 and h > 0:
+            self._add_shape(hdc, {'type': 'rect', 'rect': (x, y, x + w, y + h),
+                                  'fill': color, 'pen': None})
+        return 1
+
+    def CreateHatchBrush(self, args):
+        """CreateHatchBrush emulation (hatch pattern approximated as solid)"""
+        iHatch = args[0]
+        colorref = args[1]
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {
+            'type': 'brush',
+            'color': self._colorref_to_rgb(colorref),
+            'width': 0,
+        }
+        log.debug(f"CreateHatchBrush({iHatch}, 0x{colorref:06x}) -> 0x{handle:x}")
+        return handle
+
     def CreateFontA(self, args):
         """CreateFontA emulation"""
         height = args[0] - 0x100000000 if args[0] >= 0x80000000 else args[0]
@@ -3163,7 +3564,25 @@ class WinAPIHandler:
         addr = self._ensure_fmode_addr()
         log.debug(f"__p__fmode() -> 0x{addr:08x}")
         return addr
-    
+
+    def api__p__acmdln(self, args):
+        """__p__acmdln emulation - pointer to the ANSI command line pointer"""
+        if self._acmdln_addr == 0:
+            self._acmdln_addr = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(self._acmdln_addr,
+                                  struct.pack('<I', self.emu.cmdline_addr))
+        log.debug(f"__p__acmdln() -> 0x{self._acmdln_addr:08x}")
+        return self._acmdln_addr
+
+    def api__p__wcmdln(self, args):
+        """__p__wcmdln emulation - pointer to the wide command line pointer"""
+        if self._wcmdln_addr == 0:
+            self._wcmdln_addr = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(self._wcmdln_addr,
+                                  struct.pack('<I', self.emu.cmdline_wide_addr))
+        log.debug(f"__p__wcmdln() -> 0x{self._wcmdln_addr:08x}")
+        return self._wcmdln_addr
+
     def api__p__commode(self, args):
         """__p__commode emulation - Returns address of _commode variable"""
         addr = self._ensure_commode_addr()
@@ -3650,7 +4069,65 @@ class WinAPIHandler:
         if self.gui and self.gui.running:
             self.gui.console_write_stdout(s + "\n")
         return len(s) + 1
-    
+
+    # Numeric / time CRT functions
+    def rand(self, args):
+        """rand emulation (MSVC-compatible LCG, returns 0..0x7FFF)"""
+        self._rand_seed = (self._rand_seed * 214013 + 2531011) & 0xFFFFFFFF
+        return (self._rand_seed >> 16) & 0x7FFF
+
+    def srand(self, args):
+        """srand emulation"""
+        self._rand_seed = args[0] & 0xFFFFFFFF
+        log.debug(f"srand({args[0]})")
+        return 0
+
+    def time(self, args):
+        """time emulation - Unix timestamp (time_t as 32-bit)"""
+        lpTime = args[0]
+        t = int(time.time()) & 0xFFFFFFFF
+        if lpTime:
+            try:
+                self.emu.uc.mem_write(lpTime, struct.pack("<I", t))
+            except:
+                pass
+        log.debug(f"time() -> {t}")
+        return t
+
+    def clock(self, args):
+        """clock emulation - milliseconds since start (CLOCKS_PER_SEC=1000)"""
+        return int((time.time() - self._clock_epoch) * 1000) & 0xFFFFFFFF
+
+    def abs(self, args):
+        """abs emulation"""
+        v = args[0] - 0x100000000 if args[0] >= 0x80000000 else args[0]
+        return (v if v >= 0 else -v) & 0xFFFFFFFF
+
+    def labs(self, args):
+        """labs emulation (long == int on win32)"""
+        return self.abs(args)
+
+    def atoi(self, args):
+        """atoi emulation"""
+        s = self.read_string(args[0]).strip()
+        sign = 1
+        if s[:1] in ('+', '-'):
+            if s[0] == '-':
+                sign = -1
+            s = s[1:]
+        digits = ''
+        for ch in s:
+            if not ch.isdigit():
+                break
+            digits += ch
+        value = sign * int(digits) if digits else 0
+        log.debug(f"atoi -> {value}")
+        return value & 0xFFFFFFFF
+
+    def atol(self, args):
+        """atol emulation (long == int on win32)"""
+        return self.atoi(args)
+
     # File functions
     def fopen(self, args):
         """fopen emulation"""
@@ -3703,6 +4180,10 @@ class WinAPIHandler:
             return 0x12
         return 0xFFFFFFFF  # INVALID_HANDLE_VALUE
     
+    def _ismbblead(self, args):
+        """_ismbblead emulation - no multibyte lead bytes in the C locale"""
+        return 0
+
     def _isatty(self, args):
         """_isatty emulation"""
         fd = args[0]
@@ -3922,6 +4403,9 @@ class PseudoWindowsGUI:
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
         self.key_states = {}
 
+        # Last mouse position for GetCursorPos (GUI thread writes)
+        self.mouse_pos = (0, 0)
+
         # Font
         self.font = None
         self.font_small = None
@@ -4024,6 +4508,7 @@ class PseudoWindowsGUI:
                     if not was_interacting:
                         self._forward_mouse_up(event.pos, event.button)
                 elif event.type == pygame.MOUSEMOTION:
+                    self.mouse_pos = event.pos
                     # Window resizing (takes priority over dragging)
                     if self.resizing_window and self.resizing_window in self.windows:
                         self._resize_window_to(self.windows[self.resizing_window], event.pos)
@@ -4038,6 +4523,8 @@ class PseudoWindowsGUI:
                     else:
                         # Update mouse cursor based on hovered edge
                         self._update_resize_cursor(event.pos)
+                        # Forward WM_MOUSEMOVE to the app window
+                        self._forward_mouse_move(event.pos, event.buttons)
                 elif event.type == pygame.KEYDOWN:
                     vk = self._pygame_key_to_vk(event)
                     if vk is not None:
@@ -4884,11 +5371,64 @@ class PseudoWindowsGUI:
         self.open_combo = None
         return False
 
+    def _capture_target(self):
+        """Window that currently captures the mouse (SetCapture), or None."""
+        if not self.winapi:
+            return None
+        cap = self.winapi.capture_hwnd
+        if cap and cap in self.windows and self._is_app_window(cap):
+            return self.windows[cap]
+        return None
+
+    def _forward_mouse_move(self, pos, buttons):
+        """Forward WM_MOUSEMOVE to the captured or hovered app window."""
+        if not self.winapi:
+            return
+        x, y = pos
+        wparam = 0
+        if buttons[0]:
+            wparam |= self.winapi.MK_LBUTTON
+        if buttons[2]:
+            wparam |= self.winapi.MK_RBUTTON
+
+        # Mouse capture: every move goes to the capturing window
+        win = self._capture_target()
+        if win is None:
+            # Otherwise: topmost visible app window under the cursor
+            for hwnd in reversed(self.z_order):
+                w = self.windows.get(hwnd)
+                if w and w.visible and not w.minimized and w.contains_point(x, y):
+                    if w.is_dialog or not self._is_app_window(hwnd):
+                        return
+                    if y < self.client_origin(w)[1]:
+                        return  # title bar / menu bar / chrome
+                    win = w
+                    break
+        if win is None:
+            return
+        cx, cy = self._client_point(win, x, y)
+        self.winapi.post_window_message(win.hwnd, self.winapi.WM_MOUSEMOVE,
+                                        wparam, self._make_lparam(cx, cy))
+
     def _forward_mouse_up(self, pos, button):
         """Forward a mouse-button release to the app window under the cursor."""
         if not self.winapi:
             return
         x, y = pos
+
+        # Mouse capture: the release always goes to the capturing window
+        win = self._capture_target()
+        if win is not None:
+            cx, cy = self._client_point(win, x, y)
+            lparam = self._make_lparam(cx, cy)
+            if button == 1:
+                self.winapi.post_window_message(win.hwnd, self.winapi.WM_LBUTTONUP,
+                                                0, lparam)
+            elif button == 3:
+                self.winapi.post_window_message(win.hwnd, self.winapi.WM_RBUTTONUP,
+                                                0, lparam)
+            return
+
         for hwnd in reversed(self.z_order):
             win = self.windows.get(hwnd)
             if win and win.visible and not win.minimized and win.contains_point(x, y):
