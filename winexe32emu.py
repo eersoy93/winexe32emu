@@ -5390,7 +5390,7 @@ class PseudoWindowsGUI:
 
             # Dropdown arrow
             arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 1, 17, box_h - 2)
-            self._draw_button_3d(arrow_rect, "▼", small=True)
+            self._draw_button_3d(arrow_rect, "", small=True, arrow='down')
             
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
             # Checkbox box
@@ -5425,19 +5425,24 @@ class PseudoWindowsGUI:
 
             # Arrow buttons
             if m['vertical']:
-                self._draw_button_3d(m['up'], "▲", small=True)
-                self._draw_button_3d(m['down'], "▼", small=True)
+                self._draw_button_3d(m['up'], "", small=True, arrow='up')
+                self._draw_button_3d(m['down'], "", small=True, arrow='down')
             else:
-                self._draw_button_3d(m['up'], "◄", small=True)
-                self._draw_button_3d(m['down'], "►", small=True)
+                self._draw_button_3d(m['up'], "", small=True, arrow='left')
+                self._draw_button_3d(m['down'], "", small=True, arrow='right')
 
             # Thumb (pressed look while dragging)
             dragging = (self.dragging_scrollbar is not None and
                         self.dragging_scrollbar[0] == control.hwnd)
             self._draw_button_3d(m['thumb'], "", pressed=dragging)
     
-    def _draw_button_3d(self, rect, text, pressed=False, small=False):
-        """Draw 3D-style button"""
+    def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None):
+        """Draw 3D-style button.
+
+        When ``arrow`` is one of 'up'/'down'/'left'/'right', a filled triangle
+        is drawn instead of ``text``. Triangles render crisply at any size and
+        don't depend on the system font carrying Unicode arrow glyphs.
+        """
         pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
         
         if not pressed:
@@ -5459,12 +5464,38 @@ class PseudoWindowsGUI:
             pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
                            (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
         
+        if arrow:
+            self._draw_arrow(rect, arrow, pressed=pressed)
+            return
+
         # Text
         font = self.font_small if small else self.font
         text_surface = font.render(text, True, self.COLOR_TEXT)
         text_rect = text_surface.get_rect(center=rect.center)
         self.screen.blit(text_surface, text_rect)
-    
+
+    def _draw_arrow(self, rect, direction, pressed=False):
+        """Draw a small filled triangle centered in ``rect``.
+
+        ``direction`` is 'up', 'down', 'left' or 'right'. Used for scrollbar
+        arrow buttons and the combo-box dropdown, replacing font glyphs that
+        render poorly (or not at all) at small sizes on some systems.
+        """
+        cx, cy = rect.center
+        if pressed:
+            cx += 1
+            cy += 1
+        dw, dh = 3, 2  # triangle half-base / depth -> 7px base, 4px tall
+        if direction == 'down':
+            points = [(cx - dw, cy - dh), (cx + dw, cy - dh), (cx, cy + dh)]
+        elif direction == 'up':
+            points = [(cx - dw, cy + dh), (cx + dw, cy + dh), (cx, cy - dh)]
+        elif direction == 'right':
+            points = [(cx - dh, cy - dw), (cx - dh, cy + dw), (cx + dh, cy)]
+        else:  # 'left'
+            points = [(cx + dh, cy - dw), (cx + dh, cy + dw), (cx - dh, cy)]
+        pygame.draw.polygon(self.screen, self.COLOR_TEXT, points)
+
     def _draw_window_button(self, rect, symbol, btn_type):
         """Draw window control button (minimize, maximize, close)"""
         # Background
