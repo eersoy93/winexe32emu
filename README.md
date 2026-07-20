@@ -43,34 +43,8 @@ python winexe32emu.py /path/to/file.exe
 - PE file loading and analysis
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with Pygame
-- Basic Win32 API support (user32, kernel32, gdi32)
+- Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
 - Console and GUI application support
-- GDI drawing (CreatePen, CreateSolidBrush, Rectangle, Ellipse, LineTo, SetPixel, Polygon, Polyline, RoundRect, Arc, Pie, ...)
-- Fonts (CreateFontA/CreateFontIndirectA: size, bold, italic, underline)
-- Game loops (PeekMessageA, GetAsyncKeyState, real Sleep pacing)
-- Double buffering (CreateCompatibleDC, CreateCompatibleBitmap, BitBlt)
-- Timers (SetTimer/KillTimer, WM_TIMER, TimerProc callbacks)
-- Interactive EDIT controls (keyboard focus, caret, GetDlgItemTextA)
-- Interactive LISTBOX/COMBOBOX/checkbox controls (LB_*, CB_*, BM_* messages, LBN_SELCHANGE/CBN_SELCHANGE notifications)
-- Window menus (CreateMenu, AppendMenuA, SetMenu, WM_COMMAND)
-- Mouse input (WM_MOUSEMOVE with button state, SetCapture/ReleaseCapture, GetCursorPos, ScreenToClient/ClientToScreen)
-- Interactive SCROLLBAR controls (SetScrollPos/Range/Info, WM_HSCROLL/WM_VSCROLL with SB_LINE/SB_PAGE/SB_THUMBTRACK, draggable thumb)
-- StretchBlt scaled blits and GetPixel readback from the display list
-- RECT utilities (SetRect, PtInRect, InflateRect, OffsetRect, IntersectRect, UnionRect, ...)
-- More GDI (FrameRect, PatBlt, Chord, CreateHatchBrush) and time APIs (GetLocalTime, GetSystemTime, MulDiv)
-- C runtime numerics (MSVC-compatible rand/srand, time, clock, atoi, abs)
-
-## Examples
-
-| Example | Demonstrates |
-|---|---|
-| `console_demo.c` | Console output and input (WriteConsoleA, ReadConsoleA, WriteFile, lstr* functions) |
-| `window_demo.c` | Menu bar with dropdowns, EDIT/BUTTON/STATIC controls, WM_COMMAND, SetTimer + InvalidateRect repaint loop, GDI drawing (pens, brushes, shapes, pixels), MessageBoxA |
-| `ball_demo.c` | Real-time game loop: PeekMessageA, GetAsyncKeyState paddle input, double-buffered rendering (CreateCompatibleDC/BitBlt), Sleep-paced frames. Run with `-n 0` |
-| `gdi_demo.c` | Rich GDI drawing: CreateFontA (bold/italic/underline), Polygon star, Pie chart, RoundRect, Arc, Polyline |
-| `controls_demo.c` | Interactive controls: LISTBOX (LB_ADDSTRING, LBN_SELCHANGE), COMBOBOX dropdown (CB_ADDSTRING, CBN_SELCHANGE), auto checkbox (IsDlgButtonChecked), EDIT + buttons via WM_COMMAND |
-| `paint_demo.c` | Mini paint program: WM_MOUSEMOVE drag drawing with SetCapture/ReleaseCapture, PtInRect palette hit-testing, FrameRect/PatBlt, GetLocalTime clock, rand/srand random color |
-| `scroll_demo.c` | SCROLLBAR controls: WM_HSCROLL/WM_VSCROLL handling (SB_LINE/SB_PAGE/SB_THUMBTRACK), SetScrollPos/GetScrollPos, StretchBlt zoom/pan of a memory-DC scene, GetPixel color probe |
 
 ## Copyright and License
 
