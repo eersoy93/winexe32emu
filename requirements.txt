@@ -2,4 +2,4 @@ pefile
 colorama
 unicorn
 capstone
-pygame  # optional (only needed for the pseudo-GUI)
+pygame-ce  # optional (only needed for the pseudo-GUI)
