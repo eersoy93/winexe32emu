@@ -46,6 +46,10 @@ python winexe32emu.py /path/to/file.exe
 - Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
 - Console and GUI application support
 
+## Disclaimer
+
+This project is not endorsed by, affiliated with, or sponsored by Microsoft Corporation in any way. Windows, Win32, and related trademarks are the property of Microsoft Corporation. This is an independent, educational emulation project.
+
 ## Copyright and License
 
 Copyright 2025-2026 Erdem Ersoy (eersoy93)
