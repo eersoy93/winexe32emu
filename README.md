@@ -32,6 +32,10 @@ Use `-h` parameter for command-line help.
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
 
+## Versioning
+
+- First version is 0.0.1, every version bumps to 0.0.5, 0.0.10, 0.0.15 etc.
+
 ## Disclaimer
 
 This project is not endorsed by, affiliated with, or sponsored by Microsoft Corporation in any way. Windows, Win32, and related trademarks are the property of Microsoft Corporation. This is an independent, educational emulation project.
