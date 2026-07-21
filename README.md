@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Put EXE files in the c_drive/ folder. After that, run:
+Put EXE files or compile examples in the c_drive/ folder. After that, run:
 
 ```bash
 python3 winexe32emu.py gdi_demo.exe
