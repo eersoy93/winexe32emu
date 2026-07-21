@@ -378,6 +378,10 @@ class WinAPIHandler:
         self.handles = {}
         self.next_handle = 0x1000
         self.console_output = []
+        # msvcrt FILE* streams: fake FILE pointer -> {'fp': python file, 'path': str}
+        self.file_streams = {}
+        self.next_file_ptr = 0x0F000000  # dedicated range for fake FILE* pointers
+        self._last_error = 0  # GetLastError/SetLastError storage
         self.registered_classes = {}  # Registered window classes
         self.atoms = {}  # RegisterClass atoms
         self.next_atom = 0xC000
@@ -484,6 +488,72 @@ class WinAPIHandler:
             return data.decode('utf-16-le', errors='replace')
         except:
             return "<read error>"
+
+    # ==================== SANDBOXED FILE SYSTEM ====================
+
+    def resolve_c_drive_path(self, filename):
+        """Map a Windows-style filename into the c_drive/ sandbox.
+
+        The emulated program may only ever touch files inside c_drive/.
+        Any path that would escape that directory (via "..", an absolute
+        path, or a drive letter pointing elsewhere) is rejected and this
+        returns None. On success it returns the absolute host path, which is
+        guaranteed to live under C_DRIVE_PATH.
+        """
+        if not filename:
+            return None
+
+        # Make sure the sandbox root exists so real I/O can happen.
+        try:
+            os.makedirs(C_DRIVE_PATH, exist_ok=True)
+        except OSError as e:
+            log.error(f"Cannot create c_drive/ sandbox: {e}")
+            return None
+
+        # Normalise Windows path syntax to a relative POSIX-ish path.
+        name = filename.replace('\\', '/')
+
+        # Strip a drive-letter prefix ("C:/...", "c:foo"). Everything is
+        # treated as living on the emulated C: drive regardless of letter.
+        if len(name) >= 2 and name[1] == ':':
+            name = name[2:]
+
+        # Drop UNC / leading-slash roots so they are taken relative to the
+        # sandbox instead of the host filesystem root.
+        name = name.lstrip('/')
+
+        if not name:
+            return None
+
+        # Resolve against the sandbox root and confirm containment. Using
+        # realpath collapses any "..", symlinks, etc. before the check so a
+        # crafted name cannot climb out of c_drive/.
+        root = os.path.realpath(C_DRIVE_PATH)
+        candidate = os.path.realpath(os.path.join(root, name))
+
+        if candidate != root and not candidate.startswith(root + os.sep):
+            log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
+            return None
+
+        return candidate
+
+    def _c_mode_to_python(self, mode):
+        """Translate a C fopen()/CreateFile mode string to a Python one.
+
+        Always binary so no host newline translation corrupts data; the
+        emulated program sees the exact bytes it wrote.
+        """
+        mode = (mode or "").lower()
+        base = 'r'
+        if 'a' in mode:
+            base = 'a'
+        elif 'w' in mode:
+            base = 'w'
+        elif 'r' in mode:
+            base = 'r'
+        if '+' in mode:
+            base += '+'
+        return base + 'b'
 
     def post_window_message(self, hwnd, message, wParam, lParam):
         """Thread-safe: enqueue a window message (called from the GUI thread).
@@ -632,26 +702,40 @@ class WinAPIHandler:
         
         try:
             data = self.emu.uc.mem_read(lpBuffer, nNumberOfBytesToWrite)
-            text = data.decode('utf-8', errors='replace')
-            
+            bytes_written = nNumberOfBytesToWrite
+
             if hFile in [0x11]:  # stdout
+                text = data.decode('utf-8', errors='replace')
                 print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
                 # Write to GUI console
                 if self.gui and self.gui.running:
                     self.gui.console_write_stdout(text)
             elif hFile in [0x12]:  # stderr
+                text = data.decode('utf-8', errors='replace')
                 print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
                 # Write to GUI console
                 if self.gui and self.gui.running:
                     self.gui.console_write_stderr(text)
-            
+            else:
+                # Real file handle (opened via CreateFile, inside c_drive/)
+                info = self.handles.get(hFile)
+                if info and info.get('fp'):
+                    written = info['fp'].write(bytes(data))
+                    bytes_written = written if written is not None else nNumberOfBytesToWrite
+                else:
+                    # Unknown handle: report failure so callers notice.
+                    if lpNumberOfBytesWritten != 0:
+                        self.emu.uc.mem_write(lpNumberOfBytesWritten, struct.pack('<I', 0))
+                    log.warning(f"WriteFile to unknown handle 0x{hFile:x}")
+                    return 0
+
             # Write bytes written count to memory
             if lpNumberOfBytesWritten != 0:
-                self.emu.uc.mem_write(lpNumberOfBytesWritten, 
-                                      struct.pack('<I', nNumberOfBytesToWrite))
-            
+                self.emu.uc.mem_write(lpNumberOfBytesWritten,
+                                      struct.pack('<I', bytes_written & 0xFFFFFFFF))
+
             log.debug(f"WriteFile(0x{hFile:x}, {nNumberOfBytesToWrite} bytes)")
             return 1  # Success
         except Exception as e:
@@ -685,13 +769,14 @@ class WinAPIHandler:
     
     def GetLastError(self, args):
         """GetLastError emulation"""
-        log.debug("GetLastError() -> 0")
-        return 0
-    
+        log.debug(f"GetLastError() -> {self._last_error}")
+        return self._last_error & 0xFFFFFFFF
+
     def SetLastError(self, args):
         """SetLastError emulation"""
         dwErrCode = args[0]
         log.debug(f"SetLastError({dwErrCode})")
+        self._last_error = dwErrCode
         return 0
     
     def VirtualAlloc(self, args):
@@ -1309,8 +1394,15 @@ class WinAPIHandler:
         """CloseHandle emulation"""
         hObject = args[0]
         log.debug(f"CloseHandle(0x{hObject:x})")
-        
+
         if hObject in self.handles:
+            info = self.handles[hObject]
+            fp = info.get('fp')
+            if fp:
+                try:
+                    fp.close()
+                except OSError as e:
+                    log.error(f"CloseHandle close error: {e}")
             del self.handles[hObject]
         return 1
     
@@ -1328,57 +1420,180 @@ class WinAPIHandler:
         return 0
     
     def GetFileAttributesA(self, args):
-        """GetFileAttributesA emulation"""
+        """GetFileAttributesA emulation (sandboxed to c_drive/)"""
         lpFileName = args[0]
         filename = self.read_string(lpFileName)
         log.debug(f"GetFileAttributesA(\"{filename}\")")
-        
-        # File not found
-        return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
-    
+
+        path = self.resolve_c_drive_path(filename)
+        if path is None or not os.path.exists(path):
+            return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
+        if os.path.isdir(path):
+            return 0x10  # FILE_ATTRIBUTE_DIRECTORY
+        return 0x80  # FILE_ATTRIBUTE_NORMAL
+
     def CreateFileA(self, args):
-        """CreateFileA emulation"""
-        lpFileName = args[0]
+        """CreateFileA emulation - opens a real file inside the c_drive/ sandbox"""
+        filename = self.read_string(args[0])
         dwDesiredAccess = args[1]
-        dwShareMode = args[2]
-        lpSecurityAttributes = args[3]
         dwCreationDisposition = args[4]
-        dwFlagsAndAttributes = args[5]
-        hTemplateFile = args[6]
-        
-        filename = self.read_string(lpFileName)
-        log.debug(f"CreateFileA(\"{filename}\", 0x{dwDesiredAccess:x})")
-        
-        # Return fake handle
+        log.debug(f"CreateFileA(\"{filename}\", access=0x{dwDesiredAccess:x}, "
+                  f"disp={dwCreationDisposition})")
+        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition)
+
+    def CreateFileW(self, args):
+        """CreateFileW emulation - wide-char CreateFile"""
+        filename = self.read_wide_string(args[0])
+        dwDesiredAccess = args[1]
+        dwCreationDisposition = args[4]
+        log.debug(f"CreateFileW(\"{filename}\", access=0x{dwDesiredAccess:x}, "
+                  f"disp={dwCreationDisposition})")
+        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition)
+
+    def _create_file_common(self, filename, dwDesiredAccess, dwCreationDisposition):
+        """Shared CreateFile opener used by the A/W variants.
+
+        Honours the sandbox: names that escape c_drive/ get
+        INVALID_HANDLE_VALUE and ERROR_ACCESS_DENIED.
+        """
+        INVALID_HANDLE_VALUE = 0xFFFFFFFF
+        path = self.resolve_c_drive_path(filename)
+        if path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return INVALID_HANDLE_VALUE
+
+        GENERIC_WRITE = 0x40000000
+        want_write = bool(dwDesiredAccess & GENERIC_WRITE)
+        exists = os.path.exists(path)
+
+        # CreationDisposition: CREATE_NEW=1, CREATE_ALWAYS=2, OPEN_EXISTING=3,
+        # OPEN_ALWAYS=4, TRUNCATE_EXISTING=5
+        try:
+            if dwCreationDisposition == 1:      # CREATE_NEW
+                if exists:
+                    self._last_error = 80  # ERROR_FILE_EXISTS
+                    return INVALID_HANDLE_VALUE
+                fp = open(path, 'w+b')
+            elif dwCreationDisposition == 2:    # CREATE_ALWAYS
+                fp = open(path, 'w+b')
+            elif dwCreationDisposition == 3:    # OPEN_EXISTING
+                if not exists:
+                    self._last_error = 2  # ERROR_FILE_NOT_FOUND
+                    return INVALID_HANDLE_VALUE
+                fp = open(path, 'r+b' if want_write else 'rb')
+            elif dwCreationDisposition == 4:    # OPEN_ALWAYS
+                fp = open(path, 'r+b') if exists else open(path, 'w+b')
+            elif dwCreationDisposition == 5:    # TRUNCATE_EXISTING
+                if not exists:
+                    self._last_error = 2
+                    return INVALID_HANDLE_VALUE
+                fp = open(path, 'w+b')
+            else:
+                fp = open(path, 'r+b' if want_write else 'rb')
+        except OSError as e:
+            log.error(f"CreateFile(\"{filename}\") failed: {e}")
+            self._last_error = 2
+            return INVALID_HANDLE_VALUE
+
         handle = self.get_next_handle()
-        self.handles[handle] = {'type': 'file', 'name': filename}
+        self.handles[handle] = {'type': 'file', 'name': filename,
+                                'fp': fp, 'path': path}
+        self._last_error = 0
         return handle
-    
+
     def GetFileSize(self, args):
         """GetFileSize emulation"""
         hFile = args[0]
         lpFileSizeHigh = args[1]
-        
+
         log.debug(f"GetFileSize(0x{hFile:x})")
-        
+
+        size = 0
+        info = self.handles.get(hFile)
+        if info and info.get('fp'):
+            try:
+                fp = info['fp']
+                cur = fp.tell()
+                fp.seek(0, os.SEEK_END)
+                size = fp.tell()
+                fp.seek(cur, os.SEEK_SET)
+            except OSError:
+                size = 0
+
         if lpFileSizeHigh != 0:
-            self.emu.uc.mem_write(lpFileSizeHigh, struct.pack('<I', 0))
-        
-        return 0  # File size 0
-    
+            self.emu.uc.mem_write(lpFileSizeHigh,
+                                  struct.pack('<I', (size >> 32) & 0xFFFFFFFF))
+
+        return size & 0xFFFFFFFF
+
+    def SetFilePointer(self, args):
+        """SetFilePointer emulation"""
+        hFile = args[0]
+        lDistanceToMove = args[1]
+        # args[2] lpDistanceToMoveHigh (ignored, 32-bit offsets only)
+        dwMoveMethod = args[3]  # FILE_BEGIN=0, FILE_CURRENT=1, FILE_END=2
+
+        # Interpret distance as signed 32-bit.
+        if lDistanceToMove & 0x80000000:
+            lDistanceToMove -= 0x100000000
+
+        log.debug(f"SetFilePointer(0x{hFile:x}, {lDistanceToMove}, method={dwMoveMethod})")
+
+        info = self.handles.get(hFile)
+        if not info or not info.get('fp'):
+            return 0xFFFFFFFF  # INVALID_SET_FILE_POINTER
+
+        whence = {0: os.SEEK_SET, 1: os.SEEK_CUR, 2: os.SEEK_END}.get(dwMoveMethod, os.SEEK_SET)
+        try:
+            info['fp'].seek(lDistanceToMove, whence)
+            return info['fp'].tell() & 0xFFFFFFFF
+        except OSError:
+            return 0xFFFFFFFF
+
+    def DeleteFileA(self, args):
+        """DeleteFileA emulation (sandboxed)"""
+        filename = self.read_string(args[0])
+        log.debug(f"DeleteFileA(\"{filename}\")")
+        path = self.resolve_c_drive_path(filename)
+        if path is None or not os.path.isfile(path):
+            self._last_error = 2
+            return 0  # FALSE
+        try:
+            os.remove(path)
+            return 1
+        except OSError as e:
+            log.error(f"DeleteFileA(\"{filename}\") failed: {e}")
+            self._last_error = 5
+            return 0
+
     def ReadFile(self, args):
-        """ReadFile emulation"""
+        """ReadFile emulation - reads from a real sandboxed file"""
         hFile = args[0]
         lpBuffer = args[1]
         nNumberOfBytesToRead = args[2]
         lpNumberOfBytesRead = args[3]
-        
+
         log.debug(f"ReadFile(0x{hFile:x}, {nNumberOfBytesToRead} bytes)")
-        
-        # 0 bytes read
+
+        data = b''
+        info = self.handles.get(hFile)
+        if info and info.get('fp'):
+            try:
+                data = info['fp'].read(nNumberOfBytesToRead)
+            except OSError as e:
+                log.error(f"ReadFile error: {e}")
+                return 0
+
+        if data:
+            try:
+                self.emu.uc.mem_write(lpBuffer, data)
+            except Exception as e:
+                log.error(f"ReadFile mem_write error: {e}")
+                return 0
+
         if lpNumberOfBytesRead != 0:
-            self.emu.uc.mem_write(lpNumberOfBytesRead, struct.pack('<I', 0))
-        
+            self.emu.uc.mem_write(lpNumberOfBytesRead, struct.pack('<I', len(data)))
+
         return 1
     
     def ReadConsoleA(self, args):
@@ -5251,26 +5466,250 @@ class WinAPIHandler:
         return assigned & 0xFFFFFFFF
 
     # File functions
+    def _alloc_file_ptr(self, fp, path):
+        """Register a Python file object and hand back a fake FILE* pointer."""
+        ptr = self.next_file_ptr
+        self.next_file_ptr += 0x20
+        self.file_streams[ptr] = {'fp': fp, 'path': path}
+        return ptr
+
     def fopen(self, args):
-        """fopen emulation"""
+        """fopen emulation - opens a real file inside the c_drive/ sandbox"""
         filename = self.read_string(args[0])
         mode = self.read_string(args[1])
         log.debug(f"fopen(\"{filename}\", \"{mode}\")")
-        return 0  # Failed
-    
+
+        path = self.resolve_c_drive_path(filename)
+        if path is None:
+            self._last_error = 13  # EACCES
+            return 0  # NULL
+
+        try:
+            fp = open(path, self._c_mode_to_python(mode))
+        except OSError as e:
+            log.debug(f"fopen(\"{filename}\") failed: {e}")
+            self._last_error = 2  # ENOENT
+            return 0
+
+        return self._alloc_file_ptr(fp, path)
+
+    def _p_stream(self, ptr):
+        """Look up the Python file object for a FILE* pointer (or None)."""
+        info = self.file_streams.get(ptr)
+        return info['fp'] if info else None
+
     def fclose(self, args):
         """fclose emulation"""
-        log.debug("fclose()")
-        return 0
-    
+        stream = args[0]
+        log.debug(f"fclose(0x{stream:x})")
+        info = self.file_streams.pop(stream, None)
+        if info:
+            try:
+                info['fp'].close()
+            except OSError:
+                return 0xFFFFFFFF  # EOF
+            return 0
+        return 0xFFFFFFFF  # EOF
+
     def fread(self, args):
-        """fread emulation"""
-        log.debug("fread()")
-        return 0
-    
+        """fread emulation - fread(ptr, size, nmemb, FILE*)"""
+        ptr = args[0]
+        size = args[1]
+        nmemb = args[2]
+        stream = args[3]
+        log.debug(f"fread(0x{ptr:x}, {size}, {nmemb}, 0x{stream:x})")
+
+        fp = self._p_stream(stream)
+        if fp is None or size == 0:
+            return 0
+        try:
+            data = fp.read(size * nmemb)
+        except OSError as e:
+            log.error(f"fread error: {e}")
+            return 0
+        if data:
+            try:
+                self.emu.uc.mem_write(ptr, data)
+            except Exception as e:
+                log.error(f"fread mem_write error: {e}")
+                return 0
+        return len(data) // size  # count of complete elements read
+
     def fwrite(self, args):
-        """fwrite emulation"""
-        log.debug("fwrite()")
+        """fwrite emulation - fwrite(ptr, size, nmemb, FILE*)"""
+        ptr = args[0]
+        size = args[1]
+        nmemb = args[2]
+        stream = args[3]
+        log.debug(f"fwrite(0x{ptr:x}, {size}, {nmemb}, 0x{stream:x})")
+
+        total = size * nmemb
+        if total == 0:
+            return 0
+
+        # stdout / stderr FILE* come from __iob_func (heap range), not our
+        # sandbox map - route those to the console like WriteFile does.
+        fp = self._p_stream(stream)
+        try:
+            data = bytes(self.emu.uc.mem_read(ptr, total))
+        except Exception as e:
+            log.error(f"fwrite mem_read error: {e}")
+            return 0
+
+        if fp is None:
+            text = data.decode('utf-8', errors='replace')
+            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+            self.console_output.append(text)
+            if self.gui and self.gui.running:
+                self.gui.console_write_stdout(text)
+            return nmemb
+
+        try:
+            written = fp.write(data)
+        except OSError as e:
+            log.error(f"fwrite error: {e}")
+            return 0
+        if size == 0:
+            return 0
+        return (written if written is not None else total) // size
+
+    def fseek(self, args):
+        """fseek emulation - fseek(FILE*, offset, whence)"""
+        stream = args[0]
+        offset = args[1]
+        whence = args[2]
+        if offset & 0x80000000:
+            offset -= 0x100000000
+        log.debug(f"fseek(0x{stream:x}, {offset}, {whence})")
+        fp = self._p_stream(stream)
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            fp.seek(offset, {0: os.SEEK_SET, 1: os.SEEK_CUR, 2: os.SEEK_END}.get(whence, os.SEEK_SET))
+            return 0
+        except OSError:
+            return 0xFFFFFFFF
+
+    def ftell(self, args):
+        """ftell emulation"""
+        stream = args[0]
+        fp = self._p_stream(stream)
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            return fp.tell() & 0xFFFFFFFF
+        except OSError:
+            return 0xFFFFFFFF
+
+    def rewind(self, args):
+        """rewind emulation"""
+        fp = self._p_stream(args[0])
+        if fp is not None:
+            try:
+                fp.seek(0, os.SEEK_SET)
+            except OSError:
+                pass
+        return 0
+
+    def feof(self, args):
+        """feof emulation - nonzero once a read has hit end-of-file"""
+        stream = args[0]
+        info = self.file_streams.get(stream)
+        if not info:
+            return 0
+        fp = info['fp']
+        try:
+            cur = fp.tell()
+            probe = fp.read(1)
+            if probe == b'':
+                return 1
+            fp.seek(cur, os.SEEK_SET)
+            return 0
+        except OSError:
+            return 0
+
+    def fgetc(self, args):
+        """fgetc emulation - returns the byte read, or EOF (-1)"""
+        fp = self._p_stream(args[0])
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            b = fp.read(1)
+        except OSError:
+            return 0xFFFFFFFF
+        if not b:
+            return 0xFFFFFFFF  # EOF
+        return b[0]
+
+    def fputc(self, args):
+        """fputc emulation - fputc(c, FILE*)"""
+        c = args[0] & 0xFF
+        stream = args[1]
+        fp = self._p_stream(stream)
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            fp.write(bytes([c]))
+        except OSError:
+            return 0xFFFFFFFF
+        return c
+
+    def fgets(self, args):
+        """fgets emulation - fgets(buf, n, FILE*)"""
+        buf = args[0]
+        n = args[1]
+        stream = args[2]
+        fp = self._p_stream(stream)
+        if fp is None or n <= 0:
+            return 0
+        out = bytearray()
+        try:
+            while len(out) < n - 1:
+                ch = fp.read(1)
+                if not ch:
+                    break
+                out += ch
+                if ch == b'\n':
+                    break
+        except OSError:
+            return 0
+        if not out:
+            return 0  # NULL at EOF with nothing read
+        out += b'\x00'
+        try:
+            self.emu.uc.mem_write(buf, bytes(out))
+        except Exception as e:
+            log.error(f"fgets mem_write error: {e}")
+            return 0
+        return buf
+
+    def fputs(self, args):
+        """fputs emulation - fputs(str, FILE*)"""
+        s = args[0]
+        stream = args[1]
+        text = self.read_string(s, max_len=4096)
+        fp = self._p_stream(stream)
+        if fp is None:
+            # Treat unknown stream as stdout.
+            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+            self.console_output.append(text)
+            if self.gui and self.gui.running:
+                self.gui.console_write_stdout(text)
+            return 0
+        try:
+            fp.write(text.encode('utf-8', errors='replace'))
+        except OSError:
+            return 0xFFFFFFFF  # EOF
+        return 0
+
+    def fflush(self, args):
+        """fflush emulation"""
+        fp = self._p_stream(args[0])
+        if fp is not None:
+            try:
+                fp.flush()
+            except OSError:
+                return 0xFFFFFFFF
         return 0
     
     def api__iob_func(self, args):

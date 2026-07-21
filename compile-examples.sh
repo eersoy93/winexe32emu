@@ -25,6 +25,11 @@ for src in examples/*.c; do
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
                 -lkernel32 -mwindows
             ;;
+        file_demo)
+            # Console application - sandboxed file I/O (kernel32 + msvcrt)
+            i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
+                -lkernel32 -mconsole
+            ;;
         *)
             # Default: GUI application
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \

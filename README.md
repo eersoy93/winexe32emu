@@ -31,6 +31,9 @@ python winexe32emu.py console_demo.exe -m 256
 # Run without GUI
 python winexe32emu.py console_demo.exe --no-gui
 
+# Sandboxed file read/write demo (all I/O stays inside c_drive/)
+python winexe32emu.py file_demo.exe -n 0 --no-gui
+
 # Also works with full path
 python winexe32emu.py /path/to/file.exe
 ```
@@ -53,6 +56,12 @@ python winexe32emu.py /path/to/file.exe
   character classification (`isdigit`, `toupper`, ...), `qsort` / `bsearch`,
   and a basic `sscanf`
 - Console and GUI application support
+- Sandboxed file read/write: Win32 (`CreateFile`, `ReadFile`, `WriteFile`,
+  `SetFilePointer`, `GetFileSize`, `GetFileAttributes`, `DeleteFile`) and
+  C runtime (`fopen`, `fread`, `fwrite`, `fgets`, `fputs`, `fseek`, `ftell`,
+  `feof`, ...). All paths are confined to `c_drive/` — the emulated program
+  cannot read or write anything outside it (`..`, absolute paths and drive
+  letters are all resolved into the sandbox or rejected)
 
 ## Disclaimer
 
