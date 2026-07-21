@@ -14,29 +14,10 @@ pip install -r requirements.txt
 
 ```bash
 # Put EXE files in the c_drive/ folder
-python winexe32emu.py window_demo.exe
-
-# Calculator / form demo (EDIT controls, GetDlgItemInt, qsort, strtol)
-python winexe32emu.py calc_demo.exe -n 0
-
-# With maximum instruction count
-python winexe32emu.py window_demo.exe -n 10000
-
-# Unlimited instructions (recommended for games)
-python winexe32emu.py ball_demo.exe -n 0
-
-# Set memory amount (MiB)
-python winexe32emu.py console_demo.exe -m 256
-
-# Run without GUI
-python winexe32emu.py console_demo.exe --no-gui
-
-# Sandboxed file read/write demo (all I/O stays inside c_drive/)
-python winexe32emu.py file_demo.exe -n 0 --no-gui
-
-# Also works with full path
-python winexe32emu.py /path/to/file.exe
+python3 winexe32emu.py window_demo.exe
 ```
+
+Use `-h` parameter for command-line help.
 
 ## Folder Structure
 
