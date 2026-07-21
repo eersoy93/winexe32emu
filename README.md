@@ -16,6 +16,9 @@ pip install -r requirements.txt
 # Put EXE files in the c_drive/ folder
 python winexe32emu.py window_demo.exe
 
+# Calculator / form demo (EDIT controls, GetDlgItemInt, qsort, strtol)
+python winexe32emu.py calc_demo.exe -n 0
+
 # With maximum instruction count
 python winexe32emu.py window_demo.exe -n 10000
 
@@ -44,6 +47,11 @@ python winexe32emu.py /path/to/file.exe
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
+- Interactive controls: buttons, edit boxes, list/combo boxes, scrollbars, menus
+- Form helpers: `GetDlgItemInt` / `SetDlgItemInt`, `GetWindowLong` / `SetWindowLong`
+- C runtime helpers: string (`strchr`, `strstr`, `strtol`, `strncmp`, ...),
+  character classification (`isdigit`, `toupper`, ...), `qsort` / `bsearch`,
+  and a basic `sscanf`
 - Console and GUI application support
 
 ## Disclaimer
