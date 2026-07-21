@@ -1,4 +1,4 @@
-# winexe32emu.py
+# winexe32emu
 
 32-bit Windows EXE emulator in Python. Written with GitHub Copilot and Claude AI.
 
