@@ -28,6 +28,7 @@ import pefile
 import threading
 import queue
 import time
+from functools import cmp_to_key
 from colorama import init, Fore, Style
 
 # Default EXE directory (c_drive/)
@@ -404,6 +405,9 @@ class WinAPIHandler:
         # Menus: hmenu -> list of items
         # item = {'flags': int, 'id': int, 'text': str, 'submenu': hmenu or 0}
         self.menus = {}
+
+        # GetWindowLong/SetWindowLong storage: hwnd -> {index: value}
+        self.window_longs = {}
 
         # Mouse capture (SetCapture/ReleaseCapture) - hwnd or 0
         self.capture_hwnd = 0
@@ -1973,6 +1977,152 @@ class WinAPIHandler:
         lpString = args[2]
         hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
         return self.SetWindowTextA([hwnd, lpString])
+
+    def GetDlgItemInt(self, args):
+        """GetDlgItemInt emulation - read a control's text and parse an integer.
+
+        Signature: UINT GetDlgItemInt(hDlg, nIDDlgItem, lpTranslated, bSigned)
+        """
+        hDlg = args[0]
+        nIDDlgItem = args[1]
+        lpTranslated = args[2]
+        bSigned = args[3]
+
+        text = ""
+        hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
+        if self.gui:
+            text = self.gui.get_window_text(hwnd)
+        text = text.strip()
+
+        # Parse the leading integer, exactly like the Win32 implementation
+        sign = 1
+        idx = 0
+        if bSigned and idx < len(text) and text[idx] in '+-':
+            if text[idx] == '-':
+                sign = -1
+            idx += 1
+        elif not bSigned and idx < len(text) and text[idx] == '+':
+            idx += 1
+        digits = ''
+        while idx < len(text) and text[idx].isdigit():
+            digits += text[idx]
+            idx += 1
+
+        success = 1 if digits else 0
+        value = (sign * int(digits)) if digits else 0
+
+        if bSigned:
+            # Clamp to INT range
+            if value > 0x7FFFFFFF or value < -0x80000000:
+                success = 0
+                value = 0
+        else:
+            if value > 0xFFFFFFFF:
+                success = 0
+                value = 0
+
+        if lpTranslated:
+            try:
+                self.emu.uc.mem_write(lpTranslated, struct.pack('<I', success))
+            except Exception:
+                pass
+
+        log.debug(f"GetDlgItemInt(0x{hDlg:x}, {nIDDlgItem}) -> {value} (ok={success})")
+        return value & 0xFFFFFFFF
+
+    def SetDlgItemInt(self, args):
+        """SetDlgItemInt emulation - set a control's text from an integer.
+
+        Signature: BOOL SetDlgItemInt(hDlg, nIDDlgItem, uValue, bSigned)
+        """
+        hDlg = args[0]
+        nIDDlgItem = args[1]
+        uValue = args[2]
+        bSigned = args[3]
+
+        if bSigned and uValue >= 0x80000000:
+            value = uValue - 0x100000000
+        else:
+            value = uValue
+        text = str(value)
+
+        hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
+        log.debug(f"SetDlgItemInt(0x{hDlg:x}, {nIDDlgItem}, {text})")
+        if self.gui:
+            self.gui.set_window_text(hwnd, text)
+        return 1
+
+    def GetDlgCtrlID(self, args):
+        """GetDlgCtrlID emulation - return a control's ID"""
+        hwndCtl = args[0]
+        if self.gui and hwndCtl in self.gui.controls:
+            return self.gui.controls[hwndCtl].control_id
+        return 0
+
+    def _window_long(self, hWnd, nIndex, new_value=None, set_value=False):
+        """Shared GetWindowLong/SetWindowLong backend.
+
+        Handles the common negative GWL_* indices against real window state
+        and keeps every other index (including positive extra-bytes offsets)
+        in a per-handle dictionary.
+        """
+        GWL_WNDPROC = -4
+        GWL_STYLE = -16
+        GWL_EXSTYLE = -20
+        GWL_USERDATA = -21   # GWLP_USERDATA on 32-bit
+
+        win = self.gui.windows.get(hWnd) if self.gui else None
+        store = self.window_longs.setdefault(hWnd, {})
+
+        if nIndex == GWL_WNDPROC:
+            old = win.wndproc if win else store.get(nIndex, 0)
+            if set_value:
+                if win:
+                    win.wndproc = new_value
+                store[nIndex] = new_value
+            return old & 0xFFFFFFFF
+        if nIndex == GWL_STYLE:
+            old = win.style if win else store.get(nIndex, 0)
+            if set_value:
+                if win:
+                    win.style = new_value
+                store[nIndex] = new_value
+            return old & 0xFFFFFFFF
+        if nIndex in (GWL_EXSTYLE, GWL_USERDATA):
+            old = store.get(nIndex, 0)
+            if set_value:
+                store[nIndex] = new_value
+            return old & 0xFFFFFFFF
+
+        # Generic slot (extra window bytes, etc.)
+        old = store.get(nIndex, 0)
+        if set_value:
+            store[nIndex] = new_value
+        return old & 0xFFFFFFFF
+
+    def GetWindowLongA(self, args):
+        """GetWindowLongA emulation"""
+        hWnd = args[0]
+        nIndex = args[1] if args[1] < 0x80000000 else args[1] - 0x100000000
+        value = self._window_long(hWnd, nIndex)
+        log.debug(f"GetWindowLongA(0x{hWnd:x}, {nIndex}) -> 0x{value:08x}")
+        return value
+
+    def SetWindowLongA(self, args):
+        """SetWindowLongA emulation - returns the previous value"""
+        hWnd = args[0]
+        nIndex = args[1] if args[1] < 0x80000000 else args[1] - 0x100000000
+        dwNewLong = args[2]
+        old = self._window_long(hWnd, nIndex, dwNewLong, set_value=True)
+        log.debug(f"SetWindowLongA(0x{hWnd:x}, {nIndex}, 0x{dwNewLong:08x}) -> 0x{old:08x}")
+        return old
+
+    # Wide variants share the same backend
+    def GetWindowLongW(self, args):
+        return self.GetWindowLongA(args)
+
+    def SetWindowLongW(self, args):
+        return self.SetWindowLongA(args)
 
     def CheckDlgButton(self, args):
         """CheckDlgButton emulation - set a checkbox's state by control id"""
@@ -4479,6 +4629,626 @@ class WinAPIHandler:
     def atol(self, args):
         """atol emulation (long == int on win32)"""
         return self.atoi(args)
+
+    # ---- Character classification / conversion (msvcrt) ----
+    # These take an int (the character promoted to int) and return an int.
+
+    def isalpha(self, args):
+        """isalpha emulation"""
+        c = args[0] & 0xFF
+        return 1 if chr(c).isalpha() else 0
+
+    def isdigit(self, args):
+        """isdigit emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x30 <= c <= 0x39 else 0
+
+    def isalnum(self, args):
+        """isalnum emulation"""
+        c = args[0] & 0xFF
+        return 1 if chr(c).isalnum() else 0
+
+    def isspace(self, args):
+        """isspace emulation"""
+        c = args[0] & 0xFF
+        return 1 if c in (0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D) else 0
+
+    def isupper(self, args):
+        """isupper emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x41 <= c <= 0x5A else 0
+
+    def islower(self, args):
+        """islower emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x61 <= c <= 0x7A else 0
+
+    def isxdigit(self, args):
+        """isxdigit emulation"""
+        c = args[0] & 0xFF
+        return 1 if chr(c) in "0123456789abcdefABCDEF" else 0
+
+    def ispunct(self, args):
+        """ispunct emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x21 <= c <= 0x7E and not chr(c).isalnum() else 0
+
+    def iscntrl(self, args):
+        """iscntrl emulation"""
+        c = args[0] & 0xFF
+        return 1 if c < 0x20 or c == 0x7F else 0
+
+    def isprint(self, args):
+        """isprint emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x20 <= c <= 0x7E else 0
+
+    def isgraph(self, args):
+        """isgraph emulation"""
+        c = args[0] & 0xFF
+        return 1 if 0x21 <= c <= 0x7E else 0
+
+    def toupper(self, args):
+        """toupper emulation"""
+        c = args[0] & 0xFF
+        return (c - 0x20) if 0x61 <= c <= 0x7A else c
+
+    def tolower(self, args):
+        """tolower emulation"""
+        c = args[0] & 0xFF
+        return (c + 0x20) if 0x41 <= c <= 0x5A else c
+
+    # msvcrt exposes some ctype helpers with a leading underscore too
+    def _toupper(self, args):
+        return self.toupper(args)
+
+    def _tolower(self, args):
+        return self.tolower(args)
+
+    # ---- Additional string functions (msvcrt) ----
+
+    def strchr(self, args):
+        """strchr emulation - pointer to first occurrence of a char (or NULL)"""
+        s_addr = args[0]
+        c = args[1] & 0xFF
+        try:
+            data = self.emu.uc.mem_read(s_addr, 4096)
+        except Exception:
+            return 0
+        end = data.find(b'\x00')
+        limit = len(data) if end == -1 else end + 1  # include terminator (c may be 0)
+        for i in range(limit):
+            if data[i] == c:
+                return s_addr + i
+        return 0
+
+    def strrchr(self, args):
+        """strrchr emulation - pointer to last occurrence of a char (or NULL)"""
+        s_addr = args[0]
+        c = args[1] & 0xFF
+        try:
+            data = self.emu.uc.mem_read(s_addr, 4096)
+        except Exception:
+            return 0
+        end = data.find(b'\x00')
+        limit = len(data) if end == -1 else end + 1
+        found = -1
+        for i in range(limit):
+            if data[i] == c:
+                found = i
+        return (s_addr + found) if found != -1 else 0
+
+    def strstr(self, args):
+        """strstr emulation - pointer to first occurrence of a substring"""
+        hay_addr = args[0]
+        needle = self.read_string(args[1])
+        haystack = self.read_string(hay_addr)
+        if needle == "":
+            return hay_addr
+        idx = haystack.find(needle)
+        if idx == -1:
+            return 0
+        # byte offset (haystack is decoded, but ASCII demos map 1:1)
+        return hay_addr + len(haystack[:idx].encode('utf-8'))
+
+    def strncmp(self, args):
+        """strncmp emulation"""
+        n = args[2]
+        try:
+            d1 = bytes(self.emu.uc.mem_read(args[0], n))
+            d2 = bytes(self.emu.uc.mem_read(args[1], n))
+        except Exception:
+            return 0
+        # Compare up to n bytes, stopping at a shared null terminator
+        for i in range(n):
+            a, b = d1[i], d2[i]
+            if a != b:
+                return -1 if a < b else 1
+            if a == 0:
+                break
+        return 0
+
+    def _strnicmp(self, args):
+        """_strnicmp / strnicmp emulation (case-insensitive, n bytes)"""
+        n = args[2]
+        s1 = self.read_string(args[0], n).lower()
+        s2 = self.read_string(args[1], n).lower()
+        s1, s2 = s1[:n], s2[:n]
+        if s1 < s2:
+            return -1
+        elif s1 > s2:
+            return 1
+        return 0
+
+    def strnicmp(self, args):
+        return self._strnicmp(args)
+
+    def strncat(self, args):
+        """strncat emulation - append at most n chars"""
+        dest = args[0]
+        src = args[1]
+        n = args[2]
+        dest_str = self.read_string(dest)
+        src_str = self.read_string(src)[:n]
+        try:
+            self.emu.uc.mem_write(dest, (dest_str + src_str).encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return dest
+
+    def strspn(self, args):
+        """strspn emulation - length of prefix consisting of accept chars"""
+        s = self.read_string(args[0])
+        accept = set(self.read_string(args[1]))
+        count = 0
+        for ch in s:
+            if ch not in accept:
+                break
+            count += 1
+        return count
+
+    def strcspn(self, args):
+        """strcspn emulation - length of prefix with no reject chars"""
+        s = self.read_string(args[0])
+        reject = set(self.read_string(args[1]))
+        count = 0
+        for ch in s:
+            if ch in reject:
+                break
+            count += 1
+        return count
+
+    def strpbrk(self, args):
+        """strpbrk emulation - pointer to first char that is in accept"""
+        s_addr = args[0]
+        s = self.read_string(s_addr)
+        accept = set(self.read_string(args[1]))
+        for i, ch in enumerate(s):
+            if ch in accept:
+                return s_addr + i
+        return 0
+
+    def _strrev(self, args):
+        """_strrev emulation - reverse a string in place"""
+        s_addr = args[0]
+        s = self.read_string(s_addr)
+        try:
+            self.emu.uc.mem_write(s_addr, s[::-1].encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return s_addr
+
+    def _strlwr(self, args):
+        """_strlwr emulation - lowercase in place"""
+        s_addr = args[0]
+        s = self.read_string(s_addr)
+        try:
+            self.emu.uc.mem_write(s_addr, s.lower().encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return s_addr
+
+    def _strupr(self, args):
+        """_strupr emulation - uppercase in place"""
+        s_addr = args[0]
+        s = self.read_string(s_addr)
+        try:
+            self.emu.uc.mem_write(s_addr, s.upper().encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return s_addr
+
+    def _strdup(self, args):
+        """_strdup emulation - allocate a copy of the string"""
+        s = self.read_string(args[0])
+        data = s.encode('utf-8') + b'\x00'
+        addr = self.emu.heap_alloc(len(data))
+        try:
+            self.emu.uc.mem_write(addr, data)
+        except Exception:
+            pass
+        return addr
+
+    def strdup(self, args):
+        return self._strdup(args)
+
+    def memchr(self, args):
+        """memchr emulation - pointer to first occurrence of a byte"""
+        s_addr = args[0]
+        c = args[1] & 0xFF
+        n = args[2]
+        try:
+            data = self.emu.uc.mem_read(s_addr, n)
+        except Exception:
+            return 0
+        idx = data.find(bytes([c]))
+        return (s_addr + idx) if idx != -1 else 0
+
+    def _parse_c_integer(self, text, base):
+        """Shared strtol/strtoul helper. Returns (value, chars_consumed)."""
+        i = 0
+        n = len(text)
+        while i < n and text[i] in ' \t\n\r\v\f':
+            i += 1
+        start = i
+        sign = 1
+        if i < n and text[i] in '+-':
+            if text[i] == '-':
+                sign = -1
+            i += 1
+        # Determine/skip base prefix
+        if base == 0:
+            if i < n and text[i] == '0':
+                if i + 1 < n and text[i + 1] in 'xX':
+                    base = 16
+                    i += 2
+                else:
+                    base = 8
+                    i += 1
+            else:
+                base = 10
+        elif base == 16 and i + 1 < n and text[i] == '0' and text[i + 1] in 'xX':
+            i += 2
+        digits_start = i
+        digits = ''
+        while i < n:
+            ch = text[i].lower()
+            if ch.isdigit():
+                d = ord(ch) - ord('0')
+            elif 'a' <= ch <= 'z':
+                d = ord(ch) - ord('a') + 10
+            else:
+                break
+            if d >= base:
+                break
+            digits += ch
+            i += 1
+        if digits == '':
+            # No conversion performed
+            return 0, 0
+        value = sign * int(digits, base)
+        return value, i
+
+    def strtol(self, args):
+        """strtol emulation (nptr, endptr, base)"""
+        nptr = args[0]
+        endptr = args[1]
+        base = args[2]
+        text = self.read_string(nptr)
+        value, consumed = self._parse_c_integer(text, base)
+        if endptr:
+            try:
+                self.emu.uc.mem_write(endptr, struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF))
+            except Exception:
+                pass
+        # Clamp to signed long range
+        if value > 0x7FFFFFFF:
+            value = 0x7FFFFFFF
+        elif value < -0x80000000:
+            value = -0x80000000
+        return value & 0xFFFFFFFF
+
+    def strtoul(self, args):
+        """strtoul emulation (nptr, endptr, base)"""
+        nptr = args[0]
+        endptr = args[1]
+        base = args[2]
+        text = self.read_string(nptr)
+        value, consumed = self._parse_c_integer(text, base)
+        if endptr:
+            try:
+                self.emu.uc.mem_write(endptr, struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF))
+            except Exception:
+                pass
+        return value & 0xFFFFFFFF
+
+    def _itoa(self, args):
+        """_itoa emulation (value, buffer, radix)"""
+        value = args[0]
+        buf = args[1]
+        radix = args[2] if args[2] else 10
+        if radix == 10 and value >= 0x80000000:
+            value -= 0x100000000  # signed for base 10
+        if value == 0:
+            text = '0'
+        else:
+            neg = value < 0
+            v = abs(value)
+            digs = '0123456789abcdefghijklmnopqrstuvwxyz'
+            out = ''
+            while v:
+                out = digs[v % radix] + out
+                v //= radix
+            text = ('-' + out) if neg else out
+        try:
+            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return buf
+
+    def itoa(self, args):
+        return self._itoa(args)
+
+    def _ltoa(self, args):
+        return self._itoa(args)
+
+    def _ultoa(self, args):
+        """_ultoa emulation (unsigned value, buffer, radix)"""
+        value = args[0] & 0xFFFFFFFF
+        buf = args[1]
+        radix = args[2] if args[2] else 10
+        if value == 0:
+            text = '0'
+        else:
+            digs = '0123456789abcdefghijklmnopqrstuvwxyz'
+            out = ''
+            v = value
+            while v:
+                out = digs[v % radix] + out
+                v //= radix
+            text = out
+        try:
+            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
+        except Exception:
+            pass
+        return buf
+
+    def qsort(self, args):
+        """qsort emulation (base, num, size, compar).
+
+        Sorts an array in place by repeatedly invoking the C comparison
+        callback. Each comparison copies the two candidate elements into
+        scratch buffers and calls compar(&a, &b) via the callback machinery.
+        """
+        base = args[0]
+        num = args[1]
+        size = args[2]
+        compar = args[3]
+        if num <= 1 or size == 0 or base == 0 or compar == 0:
+            return 0
+        log.debug(f"qsort(0x{base:08x}, {num}, {size}, 0x{compar:08x})")
+        try:
+            elements = [bytes(self.emu.uc.mem_read(base + i * size, size))
+                        for i in range(num)]
+        except Exception:
+            return 0
+
+        # Two scratch buffers for the comparator arguments
+        buf_a = self.emu.heap_alloc(size)
+        buf_b = self.emu.heap_alloc(size)
+
+        def cmp(a, b):
+            try:
+                self.emu.uc.mem_write(buf_a, a)
+                self.emu.uc.mem_write(buf_b, b)
+            except Exception:
+                return 0
+            r = self.emu.call_callback(compar, [buf_a, buf_b])
+            # Return value is a signed int
+            if r >= 0x80000000:
+                r -= 0x100000000
+            return r
+
+        try:
+            elements.sort(key=cmp_to_key(cmp))
+            self.emu.uc.mem_write(base, b''.join(elements))
+        except Exception as e:
+            log.warning(f"qsort failed: {e}")
+        return 0
+
+    def bsearch(self, args):
+        """bsearch emulation (key, base, num, size, compar)"""
+        key = args[0]
+        base = args[1]
+        num = args[2]
+        size = args[3]
+        compar = args[4]
+        if num == 0 or size == 0 or base == 0 or compar == 0:
+            return 0
+        try:
+            key_data = bytes(self.emu.uc.mem_read(key, size))
+        except Exception:
+            return 0
+        buf = self.emu.heap_alloc(size)
+        lo, hi = 0, num - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            elem_addr = base + mid * size
+            try:
+                self.emu.uc.mem_write(buf, key_data)
+            except Exception:
+                return 0
+            r = self.emu.call_callback(compar, [buf, elem_addr])
+            if r >= 0x80000000:
+                r -= 0x100000000
+            if r == 0:
+                return elem_addr
+            elif r < 0:
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        return 0
+
+    def sscanf(self, args):
+        """sscanf emulation (basic: %d %i %u %o %x %c %s %f %lf, with widths).
+
+        Reads from the source string and stores results through the pointer
+        arguments that follow the format string. Returns the number of
+        successfully assigned fields (matching the C contract).
+        """
+        src = self.read_string(args[0])
+        fmt = self.read_string(args[1])
+        varargs = args[2:]
+        si = 0          # index into source
+        arg_index = 0   # index into varargs
+        assigned = 0
+        fi = 0
+        n = len(fmt)
+
+        def skip_ws():
+            nonlocal si
+            while si < len(src) and src[si] in ' \t\n\r\v\f':
+                si += 1
+
+        while fi < n:
+            fc = fmt[fi]
+            if fc in ' \t\n\r\v\f':
+                skip_ws()
+                fi += 1
+                continue
+            if fc != '%':
+                # Literal must match
+                if si < len(src) and src[si] == fc:
+                    si += 1
+                    fi += 1
+                    continue
+                break
+            # Parse a conversion: %[*][width][l]type
+            fi += 1
+            suppress = False
+            if fi < n and fmt[fi] == '*':
+                suppress = True
+                fi += 1
+            width = ''
+            while fi < n and fmt[fi].isdigit():
+                width += fmt[fi]
+                fi += 1
+            while fi < n and fmt[fi] in 'lhL':
+                fi += 1
+            if fi >= n:
+                break
+            conv = fmt[fi]
+            fi += 1
+            maxw = int(width) if width else None
+
+            if conv == '%':
+                if si < len(src) and src[si] == '%':
+                    si += 1
+                continue
+
+            if conv in 'diuxXo':
+                skip_ws()
+                start = si
+                token = ''
+                if si < len(src) and src[si] in '+-':
+                    token += src[si]
+                    si += 1
+                base = {'d': 10, 'i': 10, 'u': 10, 'x': 16, 'X': 16, 'o': 8}[conv]
+                if conv in 'xX' and src[si:si + 2].lower() == '0x':
+                    token += src[si:si + 2]
+                    si += 2
+                digitset = {10: '0123456789', 16: '0123456789abcdefABCDEF',
+                            8: '01234567'}[base]
+                while si < len(src) and src[si] in digitset:
+                    if maxw and (si - start) >= maxw:
+                        break
+                    token += src[si]
+                    si += 1
+                try:
+                    val = int(token, base)
+                except ValueError:
+                    break
+                if not suppress:
+                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
+                    arg_index += 1
+                    if ptr:
+                        try:
+                            # Store as a 32-bit int (signed or unsigned both fit
+                            # the same 4 bytes once masked)
+                            self.emu.uc.mem_write(ptr, struct.pack('<I', val & 0xFFFFFFFF))
+                        except Exception:
+                            pass
+                    assigned += 1
+            elif conv in 'fFeEgG':
+                skip_ws()
+                start = si
+                token = ''
+                if si < len(src) and src[si] in '+-':
+                    token += src[si]
+                    si += 1
+                while si < len(src) and (src[si].isdigit() or src[si] in '.eE+-'):
+                    if maxw and (si - start) >= maxw:
+                        break
+                    token += src[si]
+                    si += 1
+                try:
+                    fval = float(token)
+                except ValueError:
+                    break
+                if not suppress:
+                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
+                    arg_index += 1
+                    if ptr:
+                        # Default float conversion target is 'float' (4 bytes),
+                        # but with an 'l' length modifier it is a double. We
+                        # cannot easily know here, so store as float (4 bytes).
+                        try:
+                            self.emu.uc.mem_write(ptr, struct.pack('<f', fval))
+                        except Exception:
+                            pass
+                    assigned += 1
+            elif conv == 'c':
+                count = maxw if maxw else 1
+                if si + count > len(src):
+                    count = len(src) - si
+                if count <= 0:
+                    break
+                chunk = src[si:si + count]
+                si += count
+                if not suppress:
+                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
+                    arg_index += 1
+                    if ptr:
+                        try:
+                            self.emu.uc.mem_write(ptr, chunk.encode('utf-8'))
+                        except Exception:
+                            pass
+                    assigned += 1
+            elif conv == 's':
+                skip_ws()
+                start = si
+                token = ''
+                while si < len(src) and src[si] not in ' \t\n\r\v\f':
+                    if maxw and (si - start) >= maxw:
+                        break
+                    token += src[si]
+                    si += 1
+                if token == '':
+                    break
+                if not suppress:
+                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
+                    arg_index += 1
+                    if ptr:
+                        try:
+                            self.emu.uc.mem_write(ptr, token.encode('utf-8') + b'\x00')
+                        except Exception:
+                            pass
+                    assigned += 1
+            else:
+                break
+
+        log.debug(f"sscanf(...) -> {assigned}")
+        return assigned & 0xFFFFFFFF
 
     # File functions
     def fopen(self, args):
@@ -7270,7 +8040,7 @@ def main():
     """Main function"""
     print(f"{Fore.CYAN}{Style.BRIGHT}")
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║          Windows 32-bit EXE Emulator v0.0.10             ║")
+    print("║          Windows 32-bit EXE Emulator v0.0.11             ║")
     print("║       PE Loader + CPU + Pygame GUI Emulation             ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
