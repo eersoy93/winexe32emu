@@ -31,6 +31,9 @@ import time
 from functools import cmp_to_key
 from colorama import init, Fore, Style
 
+# Version info
+WINEXE32EMU_VERSION = "0.0.15"
+
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
@@ -8479,7 +8482,7 @@ def main():
     """Main function"""
     print(f"{Fore.CYAN}{Style.BRIGHT}")
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║          Windows 32-bit EXE Emulator v0.0.11             ║")
+    print(f"║          Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}             ║")
     print("║       PE Loader + CPU + Pygame GUI Emulation             ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
