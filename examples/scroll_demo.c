@@ -73,6 +73,14 @@ static void DrawScene(HDC hdc)
     Ellipse(hdc, SCENE_W - 60, 10, SCENE_W - 15, 55);
     DeleteObject(brush);
 
+    // Clouds
+    brush = CreateSolidBrush(RGB(255, 255, 255));
+    SelectObject(hdc, brush);
+    Ellipse(hdc, 20, 20, 60, 40);
+    Ellipse(hdc, 40, 14, 82, 38);
+    Ellipse(hdc, 62, 22, 98, 42);
+    DeleteObject(brush);
+
     // House body
     brush = CreateSolidBrush(RGB(220, 120, 60));
     SelectObject(hdc, brush);
@@ -93,6 +101,20 @@ static void DrawScene(HDC hdc)
     SelectObject(hdc, brush);
     Rectangle(hdc, 70, 95, 90, 130);
     DeleteObject(brush);
+
+    // Window with a cross frame
+    brush = CreateSolidBrush(RGB(180, 220, 255));
+    SelectObject(hdc, brush);
+    Rectangle(hdc, 96, 82, 114, 102);
+    DeleteObject(brush);
+    pen = CreatePen(PS_SOLID, 1, RGB(80, 60, 30));
+    old_pen = (HPEN)SelectObject(hdc, pen);
+    MoveToEx(hdc, 105, 82, NULL);
+    LineTo(hdc, 105, 102);
+    MoveToEx(hdc, 96, 92, NULL);
+    LineTo(hdc, 114, 92);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen);
 
     // Fence line
     pen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
@@ -143,11 +165,24 @@ static void OnPaint(HWND hwnd)
     probe_y = dst_y + dst_h / 2;
     probe = GetPixel(hdc, probe_x, probe_y);
 
-    wsprintfA(status, "zoom %d%% | pan %d px | pixel(%d,%d) = RGB(%d,%d,%d)",
+    // Status bar strip along the bottom
+    {
+        RECT client;
+        RECT bar;
+        HBRUSH strip;
+        GetClientRect(hwnd, &client);
+        SetRect(&bar, 0, 356, client.right, client.bottom);
+        strip = CreateSolidBrush(RGB(238, 240, 244));
+        FillRect(hdc, &bar, strip);
+        DeleteObject(strip);
+    }
+
+    wsprintfA(status, "zoom %d%%  |  pan %d px  |  pixel(%d,%d) = RGB(%d,%d,%d)",
               zoom, g_pan_pos, probe_x, probe_y,
               (int)GetRValue(probe), (int)GetGValue(probe), (int)GetBValue(probe));
-    SetTextColor(hdc, RGB(0, 0, 0));
-    TextOutA(hdc, 8, 360, status, lstrlenA(status));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(40, 40, 40));
+    TextOutA(hdc, 8, 362, status, lstrlenA(status));
 
     EndPaint(hwnd, &ps);
 }

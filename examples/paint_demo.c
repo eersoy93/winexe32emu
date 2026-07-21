@@ -112,47 +112,79 @@ static void OnPaint(HWND hwnd)
 {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
+    RECT client;
     RECT canvas;
     RECT rc;
     HBRUSH black_brush;
-    HBRUSH white_brush;
+    HBRUSH fill;
+    HPEN framePen;
+    HPEN oldPen;
+    HBRUSH oldBrush;
     SYSTEMTIME now;
     char status[128];
     int i;
 
+    GetClientRect(hwnd, &client);
     black_brush = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    white_brush = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    SetBkMode(hdc, TRANSPARENT);
 
-    // Palette squares (the last one is the random-color slot)
+    // Toolbar strip behind the palette, with a coloured accent line
+    SetRect(&rc, 0, 0, client.right, PALETTE_TOP + PALETTE_SIZE + PALETTE_TOP - 2);
+    fill = CreateSolidBrush(RGB(238, 240, 244));
+    FillRect(hdc, &rc, fill);
+    DeleteObject(fill);
+    SetRect(&rc, 0, rc.bottom, client.right, rc.bottom + 2);
+    fill = CreateSolidBrush(RGB(0, 120, 160));
+    FillRect(hdc, &rc, fill);
+    DeleteObject(fill);
+
+    // Palette swatches as rounded squares (last one is the random-color slot)
+    framePen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
     for (i = 0; i < PALETTE_COUNT; i++)
     {
-        HBRUSH brush;
         PaletteRect(i, &rc);
+        oldPen = (HPEN)SelectObject(hdc, framePen);
 
         if (i < PALETTE_COUNT - 1)
         {
-            brush = CreateSolidBrush(g_palette[i]);
-            FillRect(hdc, &rc, brush);
-            DeleteObject(brush);
+            fill = CreateSolidBrush(g_palette[i]);
+            oldBrush = (HBRUSH)SelectObject(hdc, fill);
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+            SelectObject(hdc, oldBrush);
+            DeleteObject(fill);
         }
         else
         {
-            FillRect(hdc, &rc, white_brush);
+            oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(WHITE_BRUSH));
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+            SelectObject(hdc, oldBrush);
             SetTextColor(hdc, RGB(0, 0, 0));
             TextOutA(hdc, rc.left + 11, rc.top + 7, "?", 1);
         }
-        FrameRect(hdc, &rc, black_brush);
+        SelectObject(hdc, oldPen);
 
-        // Highlight the selected slot with an extra outer frame
+        // Highlight the selected slot with a thick accent frame
         if (i == g_selected)
         {
+            HPEN selPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 200));
             InflateRect(&rc, 3, 3);
-            FrameRect(hdc, &rc, black_brush);
+            oldPen = (HPEN)SelectObject(hdc, selPen);
+            oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+            SelectObject(hdc, oldPen);
+            SelectObject(hdc, oldBrush);
+            DeleteObject(selPen);
         }
     }
+    DeleteObject(framePen);
 
-    // White canvas with a black frame
+    // Canvas: a soft drop shadow, a white surface and a thin frame
     CanvasRect(hwnd, &canvas);
+    rc = canvas;
+    OffsetRect(&rc, 3, 3);
+    fill = CreateSolidBrush(RGB(205, 208, 214));
+    FillRect(hdc, &rc, fill);
+    DeleteObject(fill);
     PatBlt(hdc, canvas.left, canvas.top,
            canvas.right - canvas.left, canvas.bottom - canvas.top, WHITENESS);
     FrameRect(hdc, &canvas, black_brush);
@@ -168,12 +200,17 @@ static void OnPaint(HWND hwnd)
         DeleteObject(pen);
     }
 
-    // Status line: clock, stroke count and usage hint
+    // Status bar: clock, stroke count and usage hint
+    SetRect(&rc, 0, canvas.bottom + 2, client.right, client.bottom);
+    fill = CreateSolidBrush(RGB(238, 240, 244));
+    FillRect(hdc, &rc, fill);
+    DeleteObject(fill);
+
     GetLocalTime(&now);
-    wsprintfA(status, "%02d:%02d:%02d | %d strokes | right-click clears",
+    wsprintfA(status, "%02d:%02d:%02d  |  %d strokes  |  right-click clears",
               now.wHour, now.wMinute, now.wSecond, g_segments);
-    SetTextColor(hdc, RGB(0, 0, 0));
-    TextOutA(hdc, CANVAS_MARGIN, canvas.bottom + 4, status, lstrlenA(status));
+    SetTextColor(hdc, RGB(40, 40, 40));
+    TextOutA(hdc, CANVAS_MARGIN, canvas.bottom + 5, status, lstrlenA(status));
 
     EndPaint(hwnd, &ps);
 }

@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 ```bash
 # Put EXE files in the c_drive/ folder
-python3 winexe32emu.py window_demo.exe
+python3 winexe32emu.py gdi_demo.exe
 ```
 
 Use `-h` parameter for command-line help.
@@ -34,7 +34,7 @@ Use `-h` parameter for command-line help.
 
 ## Versioning
 
-- First version is 0.0.1, every version bumps to 0.0.5, 0.0.10, 0.0.15 etc.
+- First version is 0.0.1, every version is bumped to 0.0.5, 0.0.10, 0.0.15 etc.
 
 ## Disclaimer
 
