@@ -40,7 +40,7 @@ python winexe32emu.py /path/to/file.exe
 
 ## Folder Structure
 
-- `c_drive/` - Put your EXE files here (default search path)
+- `c_drive/` - Put your EXE files here (emulation path)
 - `examples/` - Example C source codes
 - `compile-examples.sh` - Script to compile examples
 
@@ -50,18 +50,6 @@ python winexe32emu.py /path/to/file.exe
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
-- Interactive controls: buttons, edit boxes, list/combo boxes, scrollbars, menus
-- Form helpers: `GetDlgItemInt` / `SetDlgItemInt`, `GetWindowLong` / `SetWindowLong`
-- C runtime helpers: string (`strchr`, `strstr`, `strtol`, `strncmp`, ...),
-  character classification (`isdigit`, `toupper`, ...), `qsort` / `bsearch`,
-  and a basic `sscanf`
-- Console and GUI application support
-- Sandboxed file read/write: Win32 (`CreateFile`, `ReadFile`, `WriteFile`,
-  `SetFilePointer`, `GetFileSize`, `GetFileAttributes`, `DeleteFile`) and
-  C runtime (`fopen`, `fread`, `fwrite`, `fgets`, `fputs`, `fseek`, `ftell`,
-  `feof`, ...). All paths are confined to `c_drive/` — the emulated program
-  cannot read or write anything outside it (`..`, absolute paths and drive
-  letters are all resolved into the sandbox or rejected)
 
 ## Disclaimer
 
