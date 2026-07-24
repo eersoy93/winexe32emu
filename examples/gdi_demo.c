@@ -233,13 +233,13 @@ static void OnPaint(HWND hwnd)
 
         SelectObject(hdc, boldFont);
         SetTextColor(hdc, RGB(0, 0, 128));
-        TextOutA(hdc, 30, py + 10, "Bold headline", 13);
+        TextOutA(hdc, 30, py + 10, "Bold Headline", 13);
         SelectObject(hdc, italicFont);
         SetTextColor(hdc, RGB(80, 80, 80));
-        TextOutA(hdc, 30, py + 38, "Italic subheading", 17);
+        TextOutA(hdc, 30, py + 38, "Italic Subheading", 17);
         SelectObject(hdc, underFont);
         SetTextColor(hdc, RGB(150, 0, 0));
-        TextOutA(hdc, 250, py + 40, "Underlined note", 15);
+        TextOutA(hdc, 250, py + 40, "Underlined Note", 15);
         SelectObject(hdc, oldFont);
         DeleteObject(boldFont);
         DeleteObject(italicFont);
