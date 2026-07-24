@@ -81,8 +81,8 @@ static const Header g_headers[] =
 {
     {  16,   8, 208, "Greeting"      },
     {  16, 116, 208, "Calculator"    },
-    {  16, 224, 208, "Sort numbers"  },
-    { 240,   8, 208, "List manager"  },
+    {  16, 224, 208, "Sort Numbers"  },
+    { 240,   8, 208, "List Manager"  },
     { 240, 238, 208, "Options"       },
 };
 #define HEADER_COUNT (int)(sizeof(g_headers) / sizeof(g_headers[0]))
