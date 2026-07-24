@@ -34,10 +34,10 @@ Press ESC to quit.
 */
 
 #include <windows.h>
-#include <stdlib.h>   /* strtol, qsort */
-#include <ctype.h>    /* isdigit */
+#include <stdlib.h>
+#include <ctype.h>
 
-static const char* CLASS_NAME = "GuiDemoClass";
+static const char* CLASS_NAME = "GUIDemoClass";
 
 /* ---- Control identifiers (grouped by section) ---- */
 #define IDC_NAME_EDIT   101
@@ -74,7 +74,7 @@ static const char* CLASS_NAME = "GuiDemoClass";
 /* ---- Timer identifier ---- */
 #define IDT_CLOCK 1
 
-/* One coloured section header drawn in WM_PAINT */
+/* One colored section header drawn in WM_PAINT */
 typedef struct { int x, y, w; const char* title; } Header;
 
 static const Header g_headers[] =
@@ -129,7 +129,7 @@ static void SayHello(HWND hwnd)
     }
 
     MessageBoxA(hwnd, message, "Greeting", MB_OK | MB_ICONINFORMATION);
-    SetStatus(hwnd, "Said hello.");
+    SetStatus(hwnd, "Said hello!");
 }
 
 /* Calculator section: read both boxes as integers, compute, write back. */
@@ -207,7 +207,7 @@ static void DoSort(HWND hwnd)
         value = strtol(p, &end, 10);
         if (end == p)
         {
-            p++;              /* No digits consumed - avoid an infinite loop */
+            p++;  /* No digits consumed, avoid an infinite loop */
             continue;
         }
         numbers[count++] = (int)value;
@@ -420,7 +420,7 @@ static void CreateMenuBar(HWND hwnd)
     DrawMenuBar(hwnd);
 }
 
-/* Paint the coloured section headers and the status-bar strip. */
+/* Paint the colored section headers and the status-bar strip. */
 static void OnPaint(HWND hwnd)
 {
     PAINTSTRUCT ps;
@@ -526,15 +526,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 case IDM_FILE_EXIT:   DestroyWindow(hwnd);   break;
                 case IDM_HELP_ABOUT:
                     MessageBoxA(hwnd,
-                        "GUI Demo - winexe32emu example.\n"
-                        "Menus, controls, a calculator and a sorter in one window.",
+                        "winexe32emu - GUI Demo",
                         "About", MB_OK | MB_ICONINFORMATION);
                     break;
 
                 case IDC_UPPER_CHECK:
                     SetStatus(hwnd, IsDlgButtonChecked(hwnd, IDC_UPPER_CHECK)
                                     ? "Uppercase mode is ON"
-                                    : "Uppercase mode is off");
+                                    : "Uppercase mode is OFF");
                     break;
 
                 case IDC_ITEM_LIST:
@@ -560,7 +559,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                         if (sel != CB_ERR)
                         {
                             SendMessageA(combo, CB_GETLBTEXT, sel, (LPARAM)item);
-                            wsprintfA(status, "Colour: %s", item);
+                            wsprintfA(status, "Color: %s", item);
                             SetStatus(hwnd, status);
                         }
                     }
