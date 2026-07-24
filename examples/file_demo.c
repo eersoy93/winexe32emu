@@ -46,11 +46,11 @@ int main(void)
         const char *msg = "Hello from the sandbox!\n";
         WriteFile(hFile, msg, (DWORD)lstrlenA(msg), &written, NULL);
         CloseHandle(hFile);
-        WriteString(hOut, "Win32: wrote hello.txt\n");
+        WriteString(hOut, "(Win32) 'hello.txt' has been written!\n");
     }
     else
     {
-        WriteString(hOut, "Win32: could not create hello.txt\n");
+        WriteString(hOut, "(Win32) 'hello.txt' couldn't be created!'\n");
     }
 
     hFile = CreateFileA("hello.txt", GENERIC_READ, 0, NULL,
@@ -61,7 +61,7 @@ int main(void)
         if (ReadFile(hFile, buffer, sizeof(buffer) - 1, &read, NULL))
         {
             buffer[read] = '\0';
-            WriteString(hOut, "Win32: read back -> ");
+            WriteString(hOut, "(Win32) 'hello.txt' has been read!\n");
             WriteString(hOut, buffer);
         }
         CloseHandle(hFile);
@@ -72,9 +72,9 @@ int main(void)
     if (fp)
     {
         fputs("line written with fputs\n", fp);
-        fwrite("more bytes\n", 1, 11, fp);
+        fwrite("more bytes written\n", 1, 11, fp);
         fclose(fp);
-        WriteString(hOut, "CRT:   wrote notes.txt\n");
+        WriteString(hOut, "(CRT) 'notes.txt' has been written!\n");
     }
 
     fp = fopen("notes.txt", "r");
@@ -82,7 +82,7 @@ int main(void)
     {
         if (fgets(buffer, sizeof(buffer), fp))
         {
-            WriteString(hOut, "CRT:   read back -> ");
+            WriteString(hOut, "(CRT) 'notes.txt' has been read!\n");
             WriteString(hOut, buffer);
         }
         fclose(fp);
@@ -92,10 +92,10 @@ int main(void)
     hFile = CreateFileA("..\\escape.txt", GENERIC_WRITE, 0, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
-        WriteString(hOut, "Sandbox: escape via \"..\\escape.txt\" was blocked (good)\n");
+        WriteString(hOut, "Sandbox escape via '..\\escape.txt' was blocked! Good!\n");
     else
     {
-        WriteString(hOut, "Sandbox: escape SUCCEEDED (bad!)\n");
+        WriteString(hOut, "Sandbox escape via '..\\escape.txt' succeeded! Bad!\n");
         CloseHandle(hFile);
     }
 
