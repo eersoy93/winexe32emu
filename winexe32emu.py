@@ -32,16 +32,18 @@ from functools import cmp_to_key
 from colorama import init, Fore, Style
 
 # Version info
-WINEXE32EMU_VERSION = "0.0.15"
+WINEXE32EMU_VERSION = "0.0.16"
 
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
+
 from unicorn import *
 from unicorn.x86_const import *
 from capstone import *
 
 # Pygame import (optional for GUI)
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 try:
     import pygame
     PYGAME_AVAILABLE = True
@@ -79,8 +81,8 @@ class DebugLogger:
     @staticmethod
     def header(msg):
         print(f"\n{Fore.WHITE}{Style.BRIGHT}{'='*60}")
-        print(f" {msg}")
-        print(f"{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}{Style.BRIGHT}{msg}")
+        print(f"{Fore.WHITE}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}\n")
 
 
 log = DebugLogger()
@@ -8480,20 +8482,20 @@ class CPUEmulator:
 
 def main():
     """Main function"""
-    print(f"{Fore.CYAN}{Style.BRIGHT}")
-    print("╔══════════════════════════════════════════════════════════╗")
-    print(f"║          Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}             ║")
-    print("║       PE Loader + CPU + Pygame GUI Emulation             ║")
-    print("╚══════════════════════════════════════════════════════════╝")
+    print(f"{Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════════╗")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║          Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}             ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}╚══════════════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
-    
+
     import argparse
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"EXE files are searched in c_drive/ folder by default.\nExample: python winexe32emu.py hello_messagebox.exe"
+        epilog=f"EXE files are searched in c_drive/ folder by default.\nExample: python3 winexe32emu.py hello_messagebox.exe"
     )
-    parser.add_argument("exe", help="PE file to run (inside c_drive/ or full path)")
+    parser.add_argument("exe", help="PE file to run (inside c_drive/)")
     parser.add_argument("-n", "--max-instructions", type=int, default=None,
                         help="Maximum instructions to execute "
                              "(default: 5000000 with GUI, 100000 without; "
@@ -8502,44 +8504,41 @@ def main():
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
                         help="Run without GUI")
-    
+
     args = parser.parse_args()
-    
+
     # Determine EXE path
     exe_path = args.exe
-    
-    # If file not found directly, search in c_drive/
-    if not os.path.isfile(exe_path):
-        c_drive_exe = os.path.join(C_DRIVE_PATH, exe_path)
-        if os.path.isfile(c_drive_exe):
-            exe_path = c_drive_exe
-            log.info(f"Loading EXE from c_drive/ folder: {exe_path}")
-        else:
-            log.error(f"File not found: {args.exe}")
-            log.info(f"Also searched in c_drive/ folder: {c_drive_exe}")
-            sys.exit(1)
+    c_drive_exe_path = os.path.join(C_DRIVE_PATH, exe_path)
+
+    if os.path.isfile(c_drive_exe_path):
+        exe_path = c_drive_exe_path
+        log.info(f"Loading EXE from emulation C drive: {exe_path}")
+    else:
+        log.error(f"File not found in emulation C drive: {args.exe}")
+        sys.exit(1)
     
     use_gui = not args.no_gui
-    # Interactive GUI apps run a long message loop; default to a higher cap
+
     if args.max_instructions is not None:
         max_instr = args.max_instructions
     else:
         max_instr = 5_000_000 if use_gui else 100000
     heap_size_mib = args.memory
-    
+
     # Update heap size
     CPUEmulator.HEAP_SIZE = heap_size_mib * 1024 * 1024
     log.info(f"Heap size: {heap_size_mib} MiB ({CPUEmulator.HEAP_SIZE} bytes)")
-    
+
     # Load PE file
     loader = PELoader(exe_path)
-    
+
     if not loader.load():
         log.error("Failed to load PE file!")
         sys.exit(1)
-    
+
     loader.print_summary()
-    
+
     # Start GUI (optional)
     gui = None
     if use_gui and PYGAME_AVAILABLE:
@@ -8552,16 +8551,16 @@ def main():
             gui = None
     elif use_gui and not PYGAME_AVAILABLE:
         log.warning("Pygame not installed, continuing without GUI...")
-    
+
     # Start CPU emulator (with GUI reference)
     emulator = CPUEmulator(loader, gui)
-    
+
     if not emulator.initialize():
         log.error("Failed to initialize CPU emulator!")
         if gui:
             gui.stop()
         sys.exit(1)
-    
+
     # Disassemble entry point
     entry_point = loader.image_base + loader.entry_point
     emulator.disassemble(entry_point, 20)
