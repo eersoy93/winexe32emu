@@ -296,7 +296,7 @@ class PELoader:
 
 class WinAPIHandler:
     """Windows API emulation"""
-    
+
     # Windows message constants
     WM_CREATE = 0x0001
     WM_DESTROY = 0x0002
@@ -379,7 +379,7 @@ class WinAPIHandler:
     SBM_GETPOS = 0x00E1
     SBM_SETRANGE = 0x00E2
     SBM_GETRANGE = 0x00E3
-    
+
     def __init__(self, emulator, gui=None):
         self.emu = emulator
         self.gui = gui  # PseudoWindowsGUI reference
