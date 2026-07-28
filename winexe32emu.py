@@ -393,7 +393,7 @@ class WinAPIHandler:
         self.registered_classes = {}  # Registered window classes
         self.atoms = {}  # RegisterClass atoms
         self.next_atom = 0xC000
-        
+
         # Message queue system
         self.message_queue = []
         self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
@@ -427,7 +427,7 @@ class WinAPIHandler:
         # MSVCRT rand() state (MSVC-compatible LCG) and clock() epoch
         self._rand_seed = 1
         self._clock_epoch = time.time()
-        
+
         # MSVCRT global variable memory addresses (lazy init)
         self._fmode_addr = 0
         self._commode_addr = 0
@@ -438,7 +438,7 @@ class WinAPIHandler:
         self._argc = 0
         self._argv_addr = 0
         self._wargv_addr = 0
-        
+
         # API name mapping (for functions starting with double underscore)
         self._api_map = {
             '__p__fmode': self.api__p__fmode,
@@ -458,7 +458,7 @@ class WinAPIHandler:
             '__iob_func': self.api__iob_func,
             '__acrt_iob_func': self.api__acrt_iob_func,
         }
-    
+
     def get_api_handler(self, func_name):
         """Find API handler"""
         # First search in mapping
