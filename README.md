@@ -18,7 +18,9 @@ Put EXE files or compile examples in the c_drive/ folder. After that, run:
 python3 winexe32emu.py gdi_demo.exe
 ```
 
-Use `-h` parameter for command-line help.
+Use `-h` parameter for command-line help. For programs using a legacy ANSI code page (e.g. Turkish text), add `--codepage cp1254` (default: `utf-8`).
+
+The emulator exits with the program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
 

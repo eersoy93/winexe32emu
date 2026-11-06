@@ -24,6 +24,7 @@ import sys
 import os
 import re
 import struct
+import codecs
 import pefile
 import threading
 import queue
@@ -37,6 +38,11 @@ WINEXE32EMU_VERSION = "0.0.16"
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
+
+# Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
+# default because MinGW emits string literals as UTF-8; set via --codepage
+# (e.g. cp1254, cp1252) to behave like a localized Windows.
+ANSI_CODEPAGE = "utf-8"
 
 from unicorn import *
 from unicorn.x86_const import *
@@ -124,7 +130,8 @@ class PELoader:
         log.success("32-bit PE file verified!")
 
         # Get basic info
-        self._parse_headers()
+        if not self._parse_headers():
+            return False
         self._parse_sections()
         self._parse_imports()
         self._parse_exports()
@@ -156,7 +163,7 @@ class PELoader:
         subsystem_name = subsystem_names.get(subsystem, f"Unknown")
         log.info(f"Subsystem: {subsystem_name} ({subsystem})")
         if subsystem_name == "Unknown":
-            log.error("Unknown subsystem: {subsystem}")
+            log.error(f"Unknown subsystem: {subsystem}")
             return False
 
         # Characteristics
@@ -170,6 +177,8 @@ class PELoader:
             log.debug("  - 32BIT_MACHINE")
         if characteristics & 0x2000:
             log.debug("  - DLL")
+
+        return True
 
     def _parse_sections(self):
         """Parse section information"""
@@ -294,8 +303,183 @@ class PELoader:
         log.info(f"Entry point: 0x{self.image_base + self.entry_point:08x}")
 
 
+class ConsoleStream:
+    """File-like object backing the CRT stdin/stdout/stderr FILE* streams.
+
+    Output is buffered per line so byte-at-a-time writers (fputc, used by
+    MinGW's printf) produce readable log lines; multi-byte UTF-8 sequences
+    split across writes are decoded correctly once the line is complete.
+    """
+
+    def __init__(self, handler, kind):
+        self.handler = handler
+        self.kind = kind  # 'stdin' | 'stdout' | 'stderr'
+        self._out = bytearray()
+        self._in = bytearray()
+
+    def write(self, data):
+        if self.kind == 'stdin':
+            raise OSError("stdin is not writable")
+        self._out += data
+        if b'\n' in data:
+            self.flush()
+        return len(data)
+
+    def flush(self):
+        if not self._out:
+            return
+        text = self._out.decode(ANSI_CODEPAGE, errors='replace')
+        self._out.clear()
+        if self.kind == 'stderr':
+            print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
+        else:
+            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+        self.handler.console_output.append(text)
+        gui = self.handler.gui
+        if gui and gui.running:
+            if self.kind == 'stderr':
+                gui.console_write_stderr(text)
+            else:
+                gui.console_write_stdout(text)
+
+    def _fill(self):
+        """Read one more line of input. Returns False at EOF."""
+        if self.kind != 'stdin':
+            raise OSError("stream is not readable")
+        # Make any pending prompt visible before blocking for input
+        self.handler.flush_std_streams()
+        gui = self.handler.gui
+        if gui:
+            line = gui.request_console_input()
+            if line is None:
+                return False
+            self._in += (line + "\n").encode(ANSI_CODEPAGE, errors='replace')
+            return True
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return False
+        self._in += line
+        return True
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            while self._fill():
+                pass
+            size = len(self._in)
+        while len(self._in) < size:
+            # Line-oriented like a real console: return what is available
+            # once at least one byte has been read.
+            if self._in or not self._fill():
+                break
+        data = bytes(self._in[:size])
+        del self._in[:size]
+        return data
+
+    def unread(self, data):
+        """Push bytes back to the front of the input buffer (ungetc)."""
+        if self.kind != 'stdin':
+            raise OSError("stream is not readable")
+        self._in[:0] = data
+
+    def seek(self, offset, whence=0):
+        raise OSError("console streams are not seekable")
+
+    def tell(self):
+        raise OSError("console streams are not seekable")
+
+    def close(self):
+        # Never close the host's real stdio
+        self.flush()
+
+
 class WinAPIHandler:
     """Windows API emulation"""
+
+    # Imports from these DLLs use cdecl (caller cleans the stack)
+    CDECL_DLL_PREFIXES = ('msvcr', 'msvcp', 'crtdll', 'ucrtbase', 'api-ms-win-crt-')
+
+    # Variadic functions exported by stdcall DLLs are cdecl
+    CDECL_FUNCTIONS = {'wsprintfA', 'wsprintfW'}
+
+    # Argument counts (DWORDs) for emulated stdcall APIs. The callee must pop
+    # these from the stack before returning, exactly like the real DLLs do.
+    STDCALL_ARG_COUNTS = {
+        # kernel32
+        'GetModuleHandleA': 1, 'GetModuleHandleW': 1, 'GetProcAddress': 2,
+        'ExitProcess': 1, 'GetCommandLineA': 0, 'GetCommandLineW': 0,
+        'SetUnhandledExceptionFilter': 1, 'AllocConsole': 0, 'FreeConsole': 0,
+        'GetStdHandle': 1, 'WriteFile': 5, 'WriteConsoleA': 5,
+        'GetLastError': 0, 'SetLastError': 1, 'VirtualAlloc': 4,
+        'VirtualFree': 3, 'HeapCreate': 3, 'HeapAlloc': 3, 'HeapFree': 3,
+        'GetProcessHeap': 0, 'GetCurrentProcess': 0, 'GetCurrentProcessId': 0,
+        'GetCurrentThreadId': 0, 'GetTickCount': 0, 'MulDiv': 3,
+        'GetLocalTime': 1, 'GetSystemTime': 1, 'Beep': 2,
+        'QueryPerformanceCounter': 1, 'GetSystemTimeAsFileTime': 1,
+        'IsDebuggerPresent': 0, 'GetVersion': 0, 'GetVersionExA': 1,
+        'GetVersionExW': 1, 'SetErrorMode': 1, 'GetModuleFileNameA': 3,
+        'GetModuleFileNameW': 3, 'LoadLibraryA': 1, 'LoadLibraryW': 1,
+        'LoadLibraryExA': 3, 'LoadLibraryExW': 3, 'FreeLibrary': 1,
+        'GetSystemDirectoryA': 2, 'GetSystemDirectoryW': 2,
+        'GetWindowsDirectoryA': 2, 'GetWindowsDirectoryW': 2,
+        'GetTempPathA': 2, 'lstrlenA': 1, 'lstrlenW': 1,
+        'GetStartupInfoA': 1, 'GetStartupInfoW': 1, 'lstrcpyA': 2,
+        'lstrcpynA': 3, 'lstrcatA': 2, 'lstrcmpA': 2, 'lstrcmpiA': 2,
+        'GlobalAlloc': 2, 'GlobalFree': 1, 'GlobalLock': 1, 'GlobalUnlock': 1,
+        'LocalAlloc': 2, 'LocalFree': 1, 'CloseHandle': 1, 'Sleep': 1,
+        'GetFileAttributesA': 1, 'CreateFileA': 7, 'CreateFileW': 7,
+        'GetFileSize': 2, 'SetFilePointer': 4, 'DeleteFileA': 1,
+        'ReadFile': 5, 'ReadConsoleA': 5, 'GetEnvironmentVariableA': 3,
+        'ExpandEnvironmentStringsA': 3, 'InitializeCriticalSection': 1,
+        'InitializeCriticalSectionAndSpinCount': 2, 'EnterCriticalSection': 1,
+        'TryEnterCriticalSection': 1, 'LeaveCriticalSection': 1,
+        'DeleteCriticalSection': 1,
+        # user32
+        'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
+        'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
+        'RegisterClassA': 1, 'RegisterClassExA': 1, 'CreateWindowExA': 12,
+        'ShowWindow': 2, 'UpdateWindow': 1, 'DestroyWindow': 1,
+        'SetWindowTextA': 2, 'GetWindowTextA': 3, 'GetClientRect': 2,
+        'GetWindowRect': 2, 'SetRect': 5, 'SetRectEmpty': 1, 'CopyRect': 2,
+        'OffsetRect': 3, 'InflateRect': 3, 'PtInRect': 3, 'EqualRect': 2,
+        'IsRectEmpty': 1, 'IntersectRect': 3, 'UnionRect': 3,
+        'MoveWindow': 6, 'SetWindowPos': 7, 'EnableWindow': 2,
+        'GetDlgItem': 2, 'GetDlgItemTextA': 4, 'SetDlgItemTextA': 3,
+        'GetDlgItemInt': 4, 'SetDlgItemInt': 4, 'GetDlgCtrlID': 1,
+        'GetWindowLongA': 2, 'SetWindowLongA': 3, 'GetWindowLongW': 2,
+        'SetWindowLongW': 3, 'CheckDlgButton': 3, 'IsDlgButtonChecked': 2,
+        'SetFocus': 1, 'GetFocus': 0, 'GetAsyncKeyState': 1, 'GetKeyState': 1,
+        'GetCursorPos': 1, 'SetCursorPos': 2, 'ScreenToClient': 2,
+        'ClientToScreen': 2, 'SetCapture': 1, 'ReleaseCapture': 0,
+        'GetCapture': 0, 'GetParent': 1, 'IsWindow': 1, 'IsWindowVisible': 1,
+        'IsWindowEnabled': 1, 'MessageBeep': 1, 'SetScrollPos': 4,
+        'GetScrollPos': 2, 'SetScrollRange': 5, 'GetScrollRange': 4,
+        'SetScrollInfo': 4, 'GetScrollInfo': 3, 'SendMessageA': 4,
+        'PostMessageA': 4, 'PostQuitMessage': 1, 'SetTimer': 4, 'KillTimer': 2,
+        'GetMessageA': 4, 'PeekMessageA': 5, 'PeekMessageW': 5,
+        'TranslateMessage': 1, 'DispatchMessageA': 1, 'DefWindowProcA': 4,
+        'BeginPaint': 2, 'EndPaint': 2, 'InvalidateRect': 3, 'ValidateRect': 2,
+        'FillRect': 3, 'FrameRect': 3, 'GetDC': 1, 'ReleaseDC': 2,
+        'DrawTextA': 5, 'DrawTextW': 5, 'CreateMenu': 0, 'CreatePopupMenu': 0,
+        'AppendMenuA': 4, 'SetMenu': 2, 'DrawMenuBar': 1, 'DestroyMenu': 1,
+        # gdi32
+        'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
+        'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
+        'CreateHatchBrush': 2, 'GetStockObject': 1, 'SelectObject': 2,
+        'DeleteObject': 1, 'MoveToEx': 4, 'LineTo': 3, 'Rectangle': 5,
+        'Ellipse': 5, 'SetPixel': 4, 'GetPixel': 3, 'Polygon': 3,
+        'Polyline': 3, 'RoundRect': 7, 'Arc': 9, 'Pie': 9, 'Chord': 9,
+        'PatBlt': 6, 'CreateFontA': 14, 'CreateFontIndirectA': 1,
+        'GetTextExtentPoint32A': 4, 'CreateCompatibleDC': 1,
+        'CreateCompatibleBitmap': 3, 'DeleteDC': 1, 'BitBlt': 9,
+        'StretchBlt': 11,
+        # advapi32
+        'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
+        'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
+        'RegSetValueExW': 6, 'RegCreateKeyExA': 9, 'RegCreateKeyExW': 9,
+        # ole32
+        'OleInitialize': 1, 'OleUninitialize': 0, 'CoInitialize': 1,
+        'CoUninitialize': 0,
+    }
 
     # Windows message constants
     WM_CREATE = 0x0001
@@ -437,7 +621,21 @@ class WinAPIHandler:
         self._wenviron_addr = 0
         self._argc = 0
         self._argv_addr = 0
+        self.exit_handlers = []
+        self.exit_code = None
+        self._exit_handlers_ran = False
         self._wargv_addr = 0
+        self._environ_ptr_addr = 0
+        self._wenviron_ptr_addr = 0
+        self._initenv_addr = 0
+        self._winitenv_addr = 0
+
+        # CRT stdio: _iob[3] FILE structs backed by ConsoleStream objects
+        self._iob_addr = 0
+        self.std_streams = []
+        self._errno_addr = 0
+        self._lconv_addr = 0
+        self._c_locale_addr = 0
 
         # API name mapping (for functions starting with double underscore)
         self._api_map = {
@@ -466,6 +664,108 @@ class WinAPIHandler:
             return self._api_map[func_name]
         # Then search as normal attribute
         return getattr(self, func_name, None)
+
+    def stack_cleanup_bytes(self, dll_name, func_name):
+        """Bytes of arguments the callee pops on return (stdcall).
+
+        Returns 0 for cdecl functions and None when the function is stdcall
+        but its argument count is unknown.
+        """
+        dll = dll_name.lower()
+        if dll.startswith(self.CDECL_DLL_PREFIXES) or func_name in self.CDECL_FUNCTIONS:
+            return 0
+        argc = self.STDCALL_ARG_COUNTS.get(func_name)
+        return None if argc is None else argc * 4
+
+    # MSVCRT FILE layout: _ptr, _cnt, _base, _flag, _file, _charbuf, _bufsiz, _tmpfname
+    _FILE_SIZE = 0x20
+    _IOREAD = 0x0001
+    _IOWRT = 0x0002
+
+    def _ensure_iob(self):
+        """Allocate the CRT _iob[3] array and bind stdin/stdout/stderr to it."""
+        if self._iob_addr:
+            return self._iob_addr
+        self._iob_addr = self.emu.heap_alloc(self._FILE_SIZE * 3)
+        for fd, kind in enumerate(('stdin', 'stdout', 'stderr')):
+            ptr = self._iob_addr + fd * self._FILE_SIZE
+            flag = self._IOREAD if fd == 0 else self._IOWRT
+            file_struct = struct.pack('<IIIIIIII', 0, 0, 0, flag, fd, 0, 0, 0)
+            self.emu.uc.mem_write(ptr, file_struct)
+            stream = ConsoleStream(self, kind)
+            self.std_streams.append(stream)
+            self.file_streams[ptr] = {'fp': stream, 'path': kind}
+        return self._iob_addr
+
+    def flush_std_streams(self):
+        """Flush buffered console output (called at exit and before input)."""
+        for stream in self.std_streams:
+            if stream.kind != 'stdin':
+                stream.flush()
+
+    def _ensure_env_ptr(self, attr, wide=False):
+        """Allocate a pointer variable that points to an empty environment block."""
+        if getattr(self, attr) == 0:
+            env_block_attr = '_wenviron_addr' if wide else '_environ_addr'
+            if getattr(self, env_block_attr) == 0:
+                block = self.emu.heap_alloc(8)
+                self.emu.uc.mem_write(block, struct.pack('<I', 0))
+                setattr(self, env_block_attr, block)
+            var = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(var, struct.pack('<I', getattr(self, env_block_attr)))
+            setattr(self, attr, var)
+        return getattr(self, attr)
+
+    def windows_exe_path(self):
+        """Path of the main EXE as the program sees it (C:\\...)."""
+        rel = os.path.relpath(os.path.abspath(self.emu.pe_loader.filepath),
+                              os.path.abspath(C_DRIVE_PATH))
+        if rel.startswith('..'):
+            rel = os.path.basename(self.emu.pe_loader.filepath)
+        return "C:\\" + rel.replace('/', '\\')
+
+    def windows_command_line(self):
+        path = self.windows_exe_path()
+        return f'"{path}"' if ' ' in path else path
+
+    def _set_exit_code(self, code):
+        if self.exit_code is None:
+            self.exit_code = code & 0xFFFFFFFF
+
+    def run_exit_handlers(self):
+        """Run atexit/_onexit handlers in LIFO order (once)."""
+        if self._exit_handlers_ran:
+            return
+        self._exit_handlers_ran = True
+        while self.exit_handlers and not self.emu.stop_emulation:
+            func = self.exit_handlers.pop()
+            log.debug(f"Running exit handler 0x{func:08x}")
+            self.emu.call_callback(func, [])
+
+    def resolve_data_import(self, dll_name, name):
+        """Address of an exported CRT *variable*, or None if not a data import.
+
+        Data imports must point at real memory: the program dereferences the
+        IAT entry directly instead of calling through it.
+        """
+        if not dll_name.lower().startswith(self.CDECL_DLL_PREFIXES):
+            return None
+        resolvers = {
+            '_iob': self._ensure_iob,
+            '_fmode': self._ensure_fmode_addr,
+            '_commode': self._ensure_commode_addr,
+            '_acmdln': lambda: self.api__p__acmdln([]),
+            '_wcmdln': lambda: self.api__p__wcmdln([]),
+            '__argc': lambda: self.api__p___argc([]),
+            '__argv': lambda: self.api__p___argv([]),
+            '__wargv': lambda: self.api__p___wargv([]),
+            '_environ': lambda: self._ensure_env_ptr('_environ_ptr_addr'),
+            '__initenv': lambda: self._ensure_env_ptr('_initenv_addr'),
+            '_wenviron': lambda: self._ensure_env_ptr('_wenviron_ptr_addr', wide=True),
+            '__winitenv': lambda: self._ensure_env_ptr('_winitenv_addr', wide=True),
+        }
+        resolver = resolvers.get(name)
+        return resolver() if resolver else None
         
     def get_next_handle(self):
         """Create new handle"""
@@ -473,29 +773,50 @@ class WinAPIHandler:
         self.next_handle += 4
         return handle
     
-    def read_string(self, address, max_len=256):
-        """Read null-terminated string from memory"""
-        try:
-            data = self.emu.uc.mem_read(address, max_len)
-            null_pos = data.find(b'\x00')
-            if null_pos != -1:
-                data = data[:null_pos]
-            return data.decode('utf-8', errors='replace')
-        except:
-            return "<read error>"
-    
-    def read_wide_string(self, address, max_len=256):
-        """Read wide string (UTF-16) from memory"""
-        try:
-            data = self.emu.uc.mem_read(address, max_len * 2)
-            # Find null terminator
-            for i in range(0, len(data), 2):
-                if data[i:i+2] == b'\x00\x00':
-                    data = data[:i]
+    def _read_until_null(self, address, max_bytes, unit):
+        """Read up to max_bytes from emulated memory, stopping at a NUL unit.
+
+        Reads page by page so a short string that ends just before an
+        unmapped page is still returned. Returns None if nothing is readable.
+        """
+        data = bytearray()
+        addr = address
+        while len(data) < max_bytes:
+            chunk = min(max_bytes - len(data), 0x1000 - (addr & 0xFFF))
+            try:
+                block = self.emu.uc.mem_read(addr, chunk)
+            except UcError:
+                if not data:
+                    return None
+                break
+            start = len(data)
+            data += block
+            addr += chunk
+            # Re-scan from an aligned position so a terminator split across
+            # chunks (wide strings) is found too
+            pos = start - (start % unit)
+            while True:
+                pos = data.find(b'\x00' * unit, pos)
+                if pos == -1:
                     break
-            return data.decode('utf-16-le', errors='replace')
-        except:
+                if pos % unit == 0:
+                    return bytes(data[:pos])
+                pos += 1
+        return bytes(data[:max_bytes - (max_bytes % unit)])
+
+    def read_string(self, address, max_len=0x10000):
+        """Read null-terminated ANSI string from memory"""
+        data = self._read_until_null(address, max_len, 1)
+        if data is None:
             return "<read error>"
+        return data.decode(ANSI_CODEPAGE, errors='replace')
+    
+    def read_wide_string(self, address, max_len=0x8000):
+        """Read wide string (UTF-16) from memory"""
+        data = self._read_until_null(address, max_len * 2, 2)
+        if data is None:
+            return "<read error>"
+        return data.decode('utf-16-le', errors='replace')
 
     # ==================== SANDBOXED FILE SYSTEM ====================
 
@@ -628,6 +949,7 @@ class WinAPIHandler:
         """ExitProcess emulation"""
         exit_code = args[0]
         log.success(f"ExitProcess({exit_code}) called - Terminating program...")
+        self._set_exit_code(exit_code)
         self.process_exited = True
         self.emu.stop_emulation = True
         return 0
@@ -713,14 +1035,14 @@ class WinAPIHandler:
             bytes_written = nNumberOfBytesToWrite
 
             if hFile in [0x11]:  # stdout
-                text = data.decode('utf-8', errors='replace')
+                text = data.decode(ANSI_CODEPAGE, errors='replace')
                 print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
                 # Write to GUI console
                 if self.gui and self.gui.running:
                     self.gui.console_write_stdout(text)
             elif hFile in [0x12]:  # stderr
-                text = data.decode('utf-8', errors='replace')
+                text = data.decode(ANSI_CODEPAGE, errors='replace')
                 print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
                 # Write to GUI console
@@ -759,7 +1081,7 @@ class WinAPIHandler:
         
         try:
             data = self.emu.uc.mem_read(lpBuffer, nNumberOfCharsToWrite)
-            text = data.decode('utf-8', errors='replace')
+            text = data.decode(ANSI_CODEPAGE, errors='replace')
             print(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}", end='')
             self.console_output.append(text)
             
@@ -1057,16 +1379,20 @@ class WinAPIHandler:
         lpFilename = args[1]
         nSize = args[2]
         
-        # Return file path for main module
-        filepath = self.emu.pe_loader.filepath
-        if len(filepath) >= nSize:
-            filepath = filepath[:nSize-1]
-        
-        filepath_bytes = filepath.encode('utf-8') + b'\x00'
-        self.emu.uc.mem_write(lpFilename, filepath_bytes)
-        
+        filepath = self.windows_exe_path()
+        data = filepath.encode(ANSI_CODEPAGE, errors='replace')
+        if nSize == 0:
+            return 0
+        if len(data) >= nSize:
+            # Truncated: Windows XP+ semantics (no room for full name)
+            data = data[:nSize - 1]
+            self.emu.uc.mem_write(lpFilename, data + b'\x00')
+            self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+            return nSize
+        self.emu.uc.mem_write(lpFilename, data + b'\x00')
+
         log.debug(f"GetModuleFileNameA(0x{hModule:x}) -> \"{filepath}\"")
-        return len(filepath)
+        return len(data)
     
     def GetModuleFileNameW(self, args):
         """GetModuleFileNameW emulation"""
@@ -1074,13 +1400,15 @@ class WinAPIHandler:
         lpFilename = args[1]
         nSize = args[2]
         
-        filepath = self.emu.pe_loader.filepath
+        filepath = self.windows_exe_path()
+        if nSize == 0:
+            return 0
         if len(filepath) >= nSize:
-            filepath = filepath[:nSize-1]
-        
-        filepath_bytes = filepath.encode('utf-16-le') + b'\x00\x00'
-        self.emu.uc.mem_write(lpFilename, filepath_bytes)
-        
+            self.emu.uc.mem_write(lpFilename, filepath[:nSize - 1].encode('utf-16-le') + b'\x00\x00')
+            self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+            return nSize
+        self.emu.uc.mem_write(lpFilename, filepath.encode('utf-16-le') + b'\x00\x00')
+
         log.debug(f"GetModuleFileNameW(0x{hModule:x}) -> \"{filepath}\"")
         return len(filepath)
     
@@ -1147,7 +1475,7 @@ class WinAPIHandler:
         
         sys_dir = "C:\\Windows\\System32"
         if len(sys_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, sys_dir.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(lpBuffer, sys_dir.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"GetSystemDirectoryA() -> \"{sys_dir}\"")
         return len(sys_dir)
@@ -1159,7 +1487,7 @@ class WinAPIHandler:
         
         win_dir = "C:\\Windows"
         if len(win_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, win_dir.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(lpBuffer, win_dir.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"GetWindowsDirectoryA() -> \"{win_dir}\"")
         return len(win_dir)
@@ -1171,7 +1499,7 @@ class WinAPIHandler:
         
         temp_path = "C:\\Windows\\Temp\\"
         if len(temp_path) < nBufferLength:
-            self.emu.uc.mem_write(lpBuffer, temp_path.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(lpBuffer, temp_path.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"GetTempPathA() -> \"{temp_path}\"")
         return len(temp_path)
@@ -1234,18 +1562,6 @@ class WinAPIHandler:
         """GetStartupInfoW emulation"""
         return self.GetStartupInfoA(args)
     
-    def GetSystemDirectoryA(self, args):
-        """GetSystemDirectoryA emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        sys_dir = "C:\\Windows\\System32"
-        if len(sys_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, sys_dir.encode('utf-8') + b'\x00')
-        
-        log.debug(f"GetSystemDirectoryA() -> \"{sys_dir}\"")
-        return len(sys_dir)
-    
     def GetSystemDirectoryW(self, args):
         """GetSystemDirectoryW emulation"""
         lpBuffer = args[0]
@@ -1257,18 +1573,6 @@ class WinAPIHandler:
         
         log.debug(f"GetSystemDirectoryW() -> \"{sys_dir}\"")
         return len(sys_dir)
-    
-    def GetWindowsDirectoryA(self, args):
-        """GetWindowsDirectoryA emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        win_dir = "C:\\Windows"
-        if len(win_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, win_dir.encode('utf-8') + b'\x00')
-        
-        log.debug(f"GetWindowsDirectoryA() -> \"{win_dir}\"")
-        return len(win_dir)
     
     def GetWindowsDirectoryW(self, args):
         """GetWindowsDirectoryW emulation"""
@@ -1288,7 +1592,7 @@ class WinAPIHandler:
         lpString2 = args[1]
         
         src = self.read_string(lpString2)
-        self.emu.uc.mem_write(lpString1, src.encode('utf-8') + b'\x00')
+        self.emu.uc.mem_write(lpString1, src.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"lstrcpyA(0x{lpString1:08x}, \"{src[:32]}...\")")
         return lpString1
@@ -1303,7 +1607,7 @@ class WinAPIHandler:
         if len(src) >= iMaxLength:
             src = src[:iMaxLength-1]
         
-        self.emu.uc.mem_write(lpString1, src.encode('utf-8') + b'\x00')
+        self.emu.uc.mem_write(lpString1, src.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"lstrcpynA(0x{lpString1:08x}, \"{src[:32]}...\", {iMaxLength})")
         return lpString1
@@ -1317,7 +1621,7 @@ class WinAPIHandler:
         src = self.read_string(lpString2)
         result = dst + src
         
-        self.emu.uc.mem_write(lpString1, result.encode('utf-8') + b'\x00')
+        self.emu.uc.mem_write(lpString1, result.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         log.debug(f"lstrcatA() -> \"{result[:32]}...\"")
         return lpString1
@@ -1366,7 +1670,7 @@ class WinAPIHandler:
         addr = self.emu.heap_alloc(dwBytes)
         
         # Zero memory if GMEM_ZEROINIT (0x0040) flag is set
-        if uFlags & 0x0040:
+        if addr and uFlags & 0x0040:
             self.emu.uc.mem_write(addr, b'\x00' * dwBytes)
         
         log.debug(f"GlobalAlloc(0x{uFlags:x}, {dwBytes}) -> 0x{addr:08x}")
@@ -1427,6 +1731,37 @@ class WinAPIHandler:
             time.sleep(min(0.05, remaining))
         return 0
     
+    # Critical sections: the emulated process is single-threaded, so these
+    # never contend and need no real locking.
+    def InitializeCriticalSection(self, args):
+        """InitializeCriticalSection emulation"""
+        try:
+            self.emu.uc.mem_write(args[0], b'\x00' * 24)  # sizeof(CRITICAL_SECTION)
+        except UcError:
+            pass
+        return 0
+
+    def InitializeCriticalSectionAndSpinCount(self, args):
+        """InitializeCriticalSectionAndSpinCount emulation"""
+        self.InitializeCriticalSection(args)
+        return 1
+
+    def EnterCriticalSection(self, args):
+        """EnterCriticalSection emulation"""
+        return 0
+
+    def TryEnterCriticalSection(self, args):
+        """TryEnterCriticalSection emulation - always acquires"""
+        return 1
+
+    def LeaveCriticalSection(self, args):
+        """LeaveCriticalSection emulation"""
+        return 0
+
+    def DeleteCriticalSection(self, args):
+        """DeleteCriticalSection emulation"""
+        return 0
+
     def GetFileAttributesA(self, args):
         """GetFileAttributesA emulation (sandboxed to c_drive/)"""
         lpFileName = args[0]
@@ -1614,35 +1949,29 @@ class WinAPIHandler:
         
         log.debug(f"ReadConsoleA(0x{hConsoleInput:x}, max {nNumberOfCharsToRead} chars)")
         
-        # Get user input from GUI (thread-safe)
         if self.gui:
-            # Call GUI's request_console_input method (blocking)
             user_input = self.gui.request_console_input()
             if user_input is None:
                 user_input = ""
-            
-            # Add line ending
-            user_input += "\r\n"
-            
-            # Limit to maximum character count
-            if len(user_input) > nNumberOfCharsToRead:
-                user_input = user_input[:nNumberOfCharsToRead]
-            
-            # Write to buffer
-            self.emu.uc.mem_write(lpBuffer, user_input.encode('cp1254', errors='replace'))
-            
-            # Write number of characters read
-            if lpNumberOfCharsRead != 0:
-                self.emu.uc.mem_write(lpNumberOfCharsRead, struct.pack('<I', len(user_input)))
-            
-            log.debug(f"ReadConsoleA: '{user_input.strip()}' read ({len(user_input)} chars)")
-            return 1
-        
-        # Return empty string if no GUI
+            data = (user_input + "\r\n").encode(ANSI_CODEPAGE, errors='replace')
+        else:
+            try:
+                line = sys.stdin.buffer.readline()
+            except (OSError, ValueError):
+                line = b""
+            if line.endswith(b"\n") and not line.endswith(b"\r\n"):
+                line = line[:-1] + b"\r\n"
+            data = line
+
+        # ANSI console reads count bytes, not Unicode characters
+        data = data[:nNumberOfCharsToRead]
+        if data:
+            self.emu.uc.mem_write(lpBuffer, data)
         if lpNumberOfCharsRead != 0:
-            self.emu.uc.mem_write(lpNumberOfCharsRead, struct.pack('<I', 0))
+            self.emu.uc.mem_write(lpNumberOfCharsRead, struct.pack('<I', len(data)))
+        log.debug(f"ReadConsoleA: {data!r} ({len(data)} bytes)")
         return 1
-    
+
     def GetEnvironmentVariableA(self, args):
         """GetEnvironmentVariableA emulation"""
         lpName = args[0]
@@ -1664,7 +1993,7 @@ class WinAPIHandler:
         
         value = env_vars.get(name.upper(), '')
         if value and lpBuffer != 0 and len(value) < nSize:
-            self.emu.uc.mem_write(lpBuffer, value.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(lpBuffer, value.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
             return len(value)
         
         return 0  # Not found
@@ -1686,7 +2015,7 @@ class WinAPIHandler:
         result = result.replace('%TMP%', 'C:\\Windows\\Temp')
         
         if lpDst != 0 and len(result) < nSize:
-            self.emu.uc.mem_write(lpDst, result.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(lpDst, result.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         
         return len(result) + 1
     
@@ -1947,11 +2276,14 @@ class WinAPIHandler:
         # Always null-terminate the buffer (like real Windows), even when
         # the text is empty - the caller's buffer is uninitialized memory
         if lpString and nMaxCount > 0:
-            text_bytes = text.encode('utf-8')[:nMaxCount - 1] + b'\x00'
-            self.emu.uc.mem_write(lpString, text_bytes)
+            text_bytes = text.encode(ANSI_CODEPAGE, errors='replace')[:nMaxCount - 1]
+            self.emu.uc.mem_write(lpString, text_bytes + b'\x00')
+            copied = len(text_bytes)
+        else:
+            copied = 0
 
         log.debug(f"GetWindowTextA(0x{hWnd:x}) -> '{text}'")
-        return len(text)
+        return copied
     
     def GetClientRect(self, args):
         """GetClientRect emulation"""
@@ -2714,7 +3046,7 @@ class WinAPIHandler:
                 return self.LB_ERR
             text = items[wParam]
             if lParam:
-                self.emu.uc.mem_write(lParam, text.encode('utf-8') + b'\x00')
+                self.emu.uc.mem_write(lParam, text.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
             return len(text)
         if Msg == self.LB_GETTEXTLEN:
             return len(items[wParam]) if wParam < len(items) else self.LB_ERR
@@ -3850,7 +4182,7 @@ class WinAPIHandler:
             height = struct.unpack_from("<i", data, 0)[0]
             weight = struct.unpack_from("<i", data, 16)[0]
             italic, underline = data[20], data[21]
-            face = data[28:60].split(b'\x00')[0].decode('utf-8', errors='replace')
+            face = data[28:60].split(b'\x00')[0].decode(ANSI_CODEPAGE, errors='replace')
         except:
             return 0
 
@@ -4334,22 +4666,29 @@ class WinAPIHandler:
         pfend = args[1]
         log.debug(f"_initterm(0x{pfbegin:08x}, 0x{pfend:08x})")
         
-        # Call each function pointer
+        self._run_initializers(pfbegin, pfend, stop_on_error=False)
+        return 0
+
+    def _run_initializers(self, pfbegin, pfend, stop_on_error):
         current = pfbegin
-        while current < pfend:
+        while current < pfend and not self.emu.stop_emulation:
             try:
                 func_ptr = struct.unpack('<I', self.emu.uc.mem_read(current, 4))[0]
-                if func_ptr != 0:
-                    log.debug(f"  _initterm: skipping function 0x{func_ptr:08x}")
-                    # We don't actually call it, could cause complexity
-                current += 4
-            except:
+            except UcError:
                 break
+            current += 4
+            if func_ptr in (0, 0xFFFFFFFF):
+                continue
+            log.debug(f"  _initterm: calling 0x{func_ptr:08x}")
+            result = self.emu.call_callback(func_ptr, [])
+            if stop_on_error and result != 0:
+                return result
         return 0
-    
+
     def _initterm_e(self, args):
-        """_initterm_e emulation - _initterm with error checking"""
-        return self._initterm(args)
+        """_initterm_e emulation - stops at the first initializer returning non-zero"""
+        log.debug(f"_initterm_e(0x{args[0]:08x}, 0x{args[1]:08x})")
+        return self._run_initializers(args[0], args[1], stop_on_error=True)
     
     def api__getmainargs(self, args):
         """__getmainargs emulation - Returns argc, argv, environ"""
@@ -4370,8 +4709,8 @@ class WinAPIHandler:
             argv0_addr = self.emu.heap_alloc(256)  # argv[0] string
             
             # argv[0] = program name
-            prog_name = self.emu.pe_loader.filepath + "\x00"
-            self.emu.uc.mem_write(argv0_addr, prog_name.encode('utf-8'))
+            prog_name = self.windows_exe_path().encode(ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(argv0_addr, prog_name[:255] + b'\x00')
             
             # argv[0] pointer, argv[1] = NULL
             self.emu.uc.mem_write(self._argv_addr, struct.pack('<II', argv0_addr, 0))
@@ -4405,7 +4744,7 @@ class WinAPIHandler:
             wargv0_addr = self.emu.heap_alloc(512)  # wargv[0] string
             
             # wargv[0] = program name (wide)
-            prog_name = self.emu.pe_loader.filepath
+            prog_name = self.windows_exe_path()[:255]
             self.emu.uc.mem_write(wargv0_addr, prog_name.encode('utf-16-le') + b'\x00\x00')
             
             # wargv[0] pointer, wargv[1] = NULL
@@ -4436,8 +4775,8 @@ class WinAPIHandler:
         if self._argv_addr == 0:
             self._argv_addr = self.emu.heap_alloc(16)
             argv0_addr = self.emu.heap_alloc(256)
-            prog_name = self.emu.pe_loader.filepath + "\x00"
-            self.emu.uc.mem_write(argv0_addr, prog_name.encode('utf-8'))
+            prog_name = self.windows_exe_path().encode(ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(argv0_addr, prog_name[:255] + b'\x00')
             self.emu.uc.mem_write(self._argv_addr, struct.pack('<II', argv0_addr, 0))
         
         # Return address of argv pointer
@@ -4451,7 +4790,7 @@ class WinAPIHandler:
         if self._wargv_addr == 0:
             self._wargv_addr = self.emu.heap_alloc(16)
             wargv0_addr = self.emu.heap_alloc(512)
-            prog_name = self.emu.pe_loader.filepath
+            prog_name = self.windows_exe_path()[:255]
             self.emu.uc.mem_write(wargv0_addr, prog_name.encode('utf-16-le') + b'\x00\x00')
             self.emu.uc.mem_write(self._wargv_addr, struct.pack('<II', wargv0_addr, 0))
         
@@ -4464,25 +4803,34 @@ class WinAPIHandler:
         """_amsg_exit emulation - runtime error message and exit"""
         errnum = args[0]
         log.error(f"_amsg_exit({errnum}) - Runtime error!")
+        self._set_exit_code(255)
+        self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0
     
     def _cexit(self, args):
-        """_cexit emulation"""
+        """_cexit emulation - run exit handlers without terminating"""
         log.debug("_cexit()")
+        self.run_exit_handlers()
+        self.flush_std_streams()
         return 0
     
     def _exit(self, args):
-        """_exit emulation"""
+        """_exit emulation - terminate without running exit handlers"""
         code = args[0]
         log.debug(f"_exit({code})")
+        self._set_exit_code(code)
+        self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0
     
     def exit(self, args):
-        """exit emulation"""
+        """exit emulation - run atexit handlers, flush, terminate"""
         code = args[0]
         log.debug(f"exit({code})")
+        self.run_exit_handlers()
+        self._set_exit_code(code)
+        self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0
     
@@ -4510,12 +4858,16 @@ class WinAPIHandler:
         """_onexit emulation - atexit registration"""
         func = args[0]
         log.debug(f"_onexit(0x{func:08x})")
+        if func:
+            self.exit_handlers.append(func)
         return func  # Success
     
     def atexit(self, args):
         """atexit emulation"""
         func = args[0]
         log.debug(f"atexit(0x{func:08x})")
+        if func:
+            self.exit_handlers.append(func)
         return 0  # Success
     
     def _lock(self, args):
@@ -4553,6 +4905,8 @@ class WinAPIHandler:
         """__dllonexit emulation"""
         func = args[0]
         log.debug(f"__dllonexit(0x{func:08x})")
+        if func:
+            self.exit_handlers.append(func)
         return func
     
     def _invoke_watson(self, args):
@@ -4576,9 +4930,9 @@ class WinAPIHandler:
     def strlen(self, args):
         """strlen emulation"""
         s = args[0]
-        string = self.read_string(s)
-        log.debug(f"strlen(\"{string[:32]}...\") -> {len(string)}")
-        return len(string)
+        data = self._read_until_null(s, 0x7FFFFFFF, 1) or b''
+        log.debug(f"strlen(0x{s:08x}) -> {len(data)}")
+        return len(data)
     
     def wcslen(self, args):
         """wcslen emulation"""
@@ -4606,10 +4960,11 @@ class WinAPIHandler:
         count = args[2]
         log.debug(f"memcpy(0x{dest:08x}, 0x{src:08x}, {count})")
         try:
-            data = self.emu.uc.mem_read(src, count)
+            # bytes(): unicorn's mem_write rejects the bytearray mem_read returns
+            data = bytes(self.emu.uc.mem_read(src, count))
             self.emu.uc.mem_write(dest, data)
-        except:
-            pass
+        except UcError as e:
+            log.warning(f"memcpy(0x{dest:08x}, 0x{src:08x}, {count}) failed: {e}")
         return dest
     
     def memmove(self, args):
@@ -4638,7 +4993,7 @@ class WinAPIHandler:
         src = args[1]
         string = self.read_string(src)
         try:
-            self.emu.uc.mem_write(dest, string.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(dest, string.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except:
             pass
         return dest
@@ -4650,7 +5005,7 @@ class WinAPIHandler:
         count = args[2]
         string = self.read_string(src, count)
         try:
-            data = string.encode('utf-8')[:count]
+            data = string.encode(ANSI_CODEPAGE, errors='replace')[:count]
             if len(data) < count:
                 data += b'\x00' * (count - len(data))
             self.emu.uc.mem_write(dest, data)
@@ -4685,19 +5040,36 @@ class WinAPIHandler:
         dest_str = self.read_string(dest)
         src_str = self.read_string(src)
         try:
-            self.emu.uc.mem_write(dest, (dest_str + src_str).encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(dest, (dest_str + src_str).encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except:
             pass
         return dest
     
+    _FORMAT_SPEC_RE = re.compile(
+        r'%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d*))?'
+        r'(hh|h|ll|l|L|I64|I32|I|j|z|t|w)?([diouxXcCsSpnfFeEgGaA%])')
+
     def _format_string(self, fmt, varargs):
         """printf/wsprintf style formatting with 32-bit stack arguments.
 
-        Supports %d %i %u %x %X %c %s %% with optional '-', '0', width and
-        precision. varargs is the argument list starting at the first value.
+        Supports flags (-+ #0), '*' width/precision, length modifiers
+        (hh h l ll L I I32 I64 j z t w) and d i o u x X c C s S p n f F e E
+        g G a A. 64-bit integers and doubles consume two stack slots.
+        varargs is the argument list starting at the first value.
         """
         result = []
         arg_index = 0
+
+        def next_arg():
+            nonlocal arg_index
+            value = varargs[arg_index] if arg_index < len(varargs) else 0
+            arg_index += 1
+            return value
+
+        def next_qword():
+            low = next_arg()
+            return low | (next_arg() << 32)
+
         i = 0
         while i < len(fmt):
             ch = fmt[i]
@@ -4706,49 +5078,93 @@ class WinAPIHandler:
                 i += 1
                 continue
 
-            # Parse %[flags][width][.precision][l]type
-            spec = re.match(r'%([-0]*)(\d*)(?:\.(\d+))?l?([diuxXcs%])', fmt[i:])
+            spec = self._FORMAT_SPEC_RE.match(fmt, i)
             if not spec:
                 result.append(ch)
                 i += 1
                 continue
+            i = spec.end()
 
-            flags, width, precision, conv = spec.groups()
-            i += spec.end()
-
+            flags, width, precision, length, conv = spec.groups()
             if conv == '%':
                 result.append('%')
                 continue
 
-            arg = varargs[arg_index] if arg_index < len(varargs) else 0
-            arg_index += 1
+            if width == '*':
+                w = next_arg()
+                w = w - 0x100000000 if w >= 0x80000000 else w
+                if w < 0:
+                    flags += '-'
+                    w = -w
+                width = str(w)
+            if precision == '*':
+                p = next_arg()
+                precision = None if p >= 0x80000000 else str(p)
+            elif precision == '':
+                precision = '0'
 
-            if conv in 'di':
-                # Interpret as signed 32-bit
-                value = arg - 0x100000000 if arg >= 0x80000000 else arg
-                text = str(value)
-            elif conv == 'u':
-                text = str(arg)
-            elif conv in 'xX':
-                text = format(arg, conv)
-            elif conv == 'c':
-                text = chr(arg & 0xFF)
-            else:  # 's'
-                text = self.read_string(arg) if arg else ""
-                if precision:
-                    text = text[:int(precision)]
+            wide64 = length in ('ll', 'I64', 'j')
 
-            if width:
-                pad = int(width)
-                if '-' in flags:
-                    text = text.ljust(pad)
-                elif '0' in flags and conv != 's':
-                    sign = ''
-                    if text.startswith('-'):
-                        sign, text = '-', text[1:]
-                    text = sign + text.rjust(pad - len(sign), '0')
+            if conv in 'diouxX':
+                value = next_qword() if wide64 else next_arg()
+                bits = 64 if wide64 else 32
+                if length == 'hh':
+                    bits = 8
+                elif length == 'h':
+                    bits = 16
+                value &= (1 << bits) - 1
+                if conv in 'di':
+                    if value >= 1 << (bits - 1):
+                        value -= 1 << bits
+                    py_conv = 'd'
                 else:
-                    text = text.rjust(pad)
+                    py_conv = conv
+                py_flags = flags.replace('#', '') if conv in 'diu' else flags
+                if conv == 'u':
+                    py_conv = 'd'
+                text = ('%' + py_flags + (width or '') +
+                        ('.' + precision if precision is not None else '') +
+                        py_conv) % value
+                if conv == 'o' and '#' in flags:
+                    text = text.replace('0o', '0', 1)
+            elif conv in 'fFeEgGaA':
+                value = struct.unpack('<d', struct.pack('<Q', next_qword()))[0]
+                if conv in 'aA':
+                    text = value.hex()
+                    if conv == 'A':
+                        text = text.upper()
+                    text = ('%' + flags.replace('0', '').replace('#', '') +
+                            (width or '') + 's') % text
+                else:
+                    text = ('%' + flags + (width or '') +
+                            ('.' + precision if precision is not None else '') +
+                            conv) % value
+            elif conv == 'p':
+                text = ('%' + flags.replace('#', '').replace('0', '') +
+                        (width or '') + 's') % format(next_arg(), '08X')
+            elif conv == 'n':
+                next_arg()  # pointer to the count; not written
+                continue
+            elif conv in 'cC':
+                value = next_arg()
+                if conv == 'C' or length in ('l', 'w'):
+                    text = chr(value & 0xFFFF)
+                else:
+                    text = bytes([value & 0xFF]).decode(ANSI_CODEPAGE, errors='replace')
+                text = ('%' + flags.replace('0', '') + (width or '') + 's') % text
+            else:  # 's' / 'S'
+                ptr = next_arg()
+                wide = conv == 'S' or length in ('l', 'w')
+                if not ptr:
+                    text = "(null)"
+                elif wide:
+                    text = self.read_wide_string(ptr)
+                else:
+                    text = self.read_string(ptr)
+                text = ('%' + flags.replace('0', '').replace('#', '') +
+                        (width or '') +
+                        ('.' + precision if precision is not None else '') +
+                        's') % text
 
             result.append(text)
 
@@ -4759,40 +5175,42 @@ class WinAPIHandler:
         buf = args[0]
         fmt = self.read_string(args[1])
         text = self._format_string(fmt, args[2:])
+        data = text.encode(ANSI_CODEPAGE, errors='replace')[:1023]
         log.debug(f"wsprintfA(0x{buf:08x}, \"{fmt}\") -> \"{text}\"")
         try:
-            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
-        except:
+            self.emu.uc.mem_write(buf, data + b'\x00')
+        except UcError:
             pass
-        return len(text)
+        return len(data)
 
     def sprintf(self, args):
         """sprintf emulation"""
         buf = args[0]
         fmt = self.read_string(args[1])
         text = self._format_string(fmt, args[2:])
+        data = text.encode(ANSI_CODEPAGE, errors='replace')
         log.debug(f"sprintf(0x{buf:08x}, \"{fmt}\") -> \"{text}\"")
         try:
-            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
-        except:
+            self.emu.uc.mem_write(buf, data + b'\x00')
+        except UcError:
             pass
-        return len(text)
+        return len(data)
+
+    def _stdout_stream(self):
+        self._ensure_iob()
+        return self.std_streams[1]
 
     def printf(self, args):
         """printf emulation"""
         fmt = self.read_string(args[0])
-        text = self._format_string(fmt, args[1:])
-        log.info(f"[PRINTF] {text}")
-        if self.gui and self.gui.running:
-            self.gui.console_write_stdout(text)
-        return len(text)
+        data = self._format_string(fmt, args[1:]).encode(ANSI_CODEPAGE, errors='replace')
+        self._stdout_stream().write(data)
+        return len(data)
     
     def puts(self, args):
         """puts emulation"""
         s = self.read_string(args[0])
-        log.info(f"[PUTS] {s}")
-        if self.gui and self.gui.running:
-            self.gui.console_write_stdout(s + "\n")
+        self._stdout_stream().write((s + "\n").encode(ANSI_CODEPAGE, errors='replace'))
         return len(s) + 1
 
     # Numeric / time CRT functions
@@ -4972,7 +5390,7 @@ class WinAPIHandler:
         if idx == -1:
             return 0
         # byte offset (haystack is decoded, but ASCII demos map 1:1)
-        return hay_addr + len(haystack[:idx].encode('utf-8'))
+        return hay_addr + len(haystack[:idx].encode(ANSI_CODEPAGE, errors='replace'))
 
     def strncmp(self, args):
         """strncmp emulation"""
@@ -5014,7 +5432,7 @@ class WinAPIHandler:
         dest_str = self.read_string(dest)
         src_str = self.read_string(src)[:n]
         try:
-            self.emu.uc.mem_write(dest, (dest_str + src_str).encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(dest, (dest_str + src_str).encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return dest
@@ -5056,7 +5474,7 @@ class WinAPIHandler:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s[::-1].encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(s_addr, s[::-1].encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -5066,7 +5484,7 @@ class WinAPIHandler:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s.lower().encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(s_addr, s.lower().encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -5076,7 +5494,7 @@ class WinAPIHandler:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s.upper().encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(s_addr, s.upper().encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -5084,7 +5502,7 @@ class WinAPIHandler:
     def _strdup(self, args):
         """_strdup emulation - allocate a copy of the string"""
         s = self.read_string(args[0])
-        data = s.encode('utf-8') + b'\x00'
+        data = s.encode(ANSI_CODEPAGE, errors='replace') + b'\x00'
         addr = self.emu.heap_alloc(len(data))
         try:
             self.emu.uc.mem_write(addr, data)
@@ -5204,7 +5622,7 @@ class WinAPIHandler:
                 v //= radix
             text = ('-' + out) if neg else out
         try:
-            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(buf, text.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return buf
@@ -5231,7 +5649,7 @@ class WinAPIHandler:
                 v //= radix
             text = out
         try:
-            self.emu.uc.mem_write(buf, text.encode('utf-8') + b'\x00')
+            self.emu.uc.mem_write(buf, text.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
         except Exception:
             pass
         return buf
@@ -5443,7 +5861,7 @@ class WinAPIHandler:
                     arg_index += 1
                     if ptr:
                         try:
-                            self.emu.uc.mem_write(ptr, chunk.encode('utf-8'))
+                            self.emu.uc.mem_write(ptr, chunk.encode(ANSI_CODEPAGE, errors='replace'))
                         except Exception:
                             pass
                     assigned += 1
@@ -5463,7 +5881,7 @@ class WinAPIHandler:
                     arg_index += 1
                     if ptr:
                         try:
-                            self.emu.uc.mem_write(ptr, token.encode('utf-8') + b'\x00')
+                            self.emu.uc.mem_write(ptr, token.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
                         except Exception:
                             pass
                     assigned += 1
@@ -5565,7 +5983,7 @@ class WinAPIHandler:
             return 0
 
         if fp is None:
-            text = data.decode('utf-8', errors='replace')
+            text = data.decode(ANSI_CODEPAGE, errors='replace')
             print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
             self.console_output.append(text)
             if self.gui and self.gui.running:
@@ -5662,6 +6080,61 @@ class WinAPIHandler:
             return 0xFFFFFFFF
         return c
 
+    def getc(self, args):
+        """getc emulation - same as fgetc"""
+        return self.fgetc(args)
+
+    def putc(self, args):
+        """putc emulation - same as fputc"""
+        return self.fputc(args)
+
+    def getchar(self, args):
+        """getchar emulation - fgetc(stdin)"""
+        self._ensure_iob()
+        return self.fgetc([self._iob_addr])
+
+    def putchar(self, args):
+        """putchar emulation - fputc(c, stdout)"""
+        c = args[0] & 0xFF
+        self._stdout_stream().write(bytes([c]))
+        return c
+
+    def ungetc(self, args):
+        """ungetc emulation - push one byte back onto an input stream"""
+        c = args[0]
+        stream = args[1]
+        if c == 0xFFFFFFFF:
+            return 0xFFFFFFFF  # ungetc(EOF) fails and leaves the stream alone
+        c &= 0xFF
+        fp = self._p_stream(stream)
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            if isinstance(fp, ConsoleStream):
+                fp.unread(bytes([c]))
+                return c
+            # Real file: step back over the byte that was just read. Pushing
+            # back a different byte can't be represented, so report failure.
+            fp.seek(-1, os.SEEK_CUR)
+            if fp.read(1) != bytes([c]):
+                return 0xFFFFFFFF
+            fp.seek(-1, os.SEEK_CUR)
+            return c
+        except (OSError, ValueError):
+            return 0xFFFFFFFF
+
+    def setlocale(self, args):
+        """setlocale emulation - only the "C" locale is available"""
+        locale_ptr = args[1]
+        requested = self.read_string(locale_ptr) if locale_ptr else None
+        if requested not in (None, "", "C"):
+            log.debug(f"setlocale: unsupported locale \"{requested}\"")
+            return 0
+        if self._c_locale_addr == 0:
+            self._c_locale_addr = self.emu.heap_alloc(2)
+            self.emu.uc.mem_write(self._c_locale_addr, b'C\x00')
+        return self._c_locale_addr
+
     def fgets(self, args):
         """fgets emulation - fgets(buf, n, FILE*)"""
         buf = args[0]
@@ -5705,7 +6178,7 @@ class WinAPIHandler:
                 self.gui.console_write_stdout(text)
             return 0
         try:
-            fp.write(text.encode('utf-8', errors='replace'))
+            fp.write(text.encode(ANSI_CODEPAGE, errors='replace'))
         except OSError:
             return 0xFFFFFFFF  # EOF
         return 0
@@ -5723,19 +6196,33 @@ class WinAPIHandler:
     def api__iob_func(self, args):
         """__iob_func emulation - stdin/stdout/stderr file handles"""
         log.debug("__iob_func()")
-        # Return an address for FILE structures
-        if not hasattr(self, '_iob_addr') or self._iob_addr == 0:
-            self._iob_addr = self.emu.heap_alloc(0x60)  # 3 FILE struct
-        return self._iob_addr
+        return self._ensure_iob()
     
     def api__acrt_iob_func(self, args):
         """__acrt_iob_func emulation - UCRT version"""
         index = args[0]
         log.debug(f"__acrt_iob_func({index})")
-        if not hasattr(self, '_iob_addr') or self._iob_addr == 0:
-            self._iob_addr = self.emu.heap_alloc(0x60)
-        return self._iob_addr + (index * 0x20)
+        return self._ensure_iob() + (index * self._FILE_SIZE)
     
+    def _errno(self, args):
+        """_errno emulation - address of the thread's errno variable"""
+        if self._errno_addr == 0:
+            self._errno_addr = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(self._errno_addr, struct.pack('<I', 0))
+        return self._errno_addr
+
+    def localeconv(self, args):
+        """localeconv emulation - struct lconv for the "C" locale"""
+        if self._lconv_addr == 0:
+            strings = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(strings, b'.\x00\x00\x00')  # "." and ""
+            point, empty = strings, strings + 1
+            # decimal_point, then 9 empty strings, then 8 CHAR_MAX fields
+            lconv = struct.pack('<10I', point, *([empty] * 9)) + bytes([127] * 8)
+            self._lconv_addr = self.emu.heap_alloc(len(lconv))
+            self.emu.uc.mem_write(self._lconv_addr, lconv)
+        return self._lconv_addr
+
     def _get_osfhandle(self, args):
         """_get_osfhandle emulation"""
         fd = args[0]
@@ -5789,10 +6276,28 @@ class WinAPIHandler:
         return addr
     
     def realloc(self, args):
-        """realloc emulation"""
+        """realloc emulation - preserves the old block's contents"""
         ptr = args[0]
         size = args[1]
+        if ptr == 0:
+            return self.malloc([size])
+        if size == 0:
+            self.free([ptr])
+            return 0
+
+        old_size = self.emu.heap_block_size(ptr)
+        if old_size is not None and self.emu.heap_resize_last(ptr, size):
+            log.debug(f"realloc(0x{ptr:08x}, {size}) -> 0x{ptr:08x} (in place)")
+            return ptr
+
         addr = self.emu.heap_alloc(size)
+        if addr == 0:
+            return 0  # Old block stays valid, as in C
+        copy_size = min(old_size, size) if old_size is not None else size
+        try:
+            self.emu.uc.mem_write(addr, bytes(self.emu.uc.mem_read(ptr, copy_size)))
+        except UcError as e:
+            log.error(f"realloc copy error: {e}")
         log.debug(f"realloc(0x{ptr:08x}, {size}) -> 0x{addr:08x}")
         return addr
     
@@ -7886,12 +8391,15 @@ class CPUEmulator:
         
         # Memory management
         self.heap_current = self.HEAP_BASE
+        self.heap_blocks = {}  # addr -> requested size (for realloc)
         self.mapped_regions = []
         
         # API hook system
         self.api_hooks = {}
         self.api_handler = None
+        self.crashed = False
         self.next_hook_addr = self.API_HOOK_BASE
+        self.unknown_convention_warned = set()
         
         # Callback system
         self.callback_stack = []  # Stack for nested callback support
@@ -8025,12 +8533,13 @@ class CPUEmulator:
         log.info(f"Stack pointer: ESP = 0x{esp:08x}")
         
         # Allocate memory for command line
-        self.cmdline_addr = self.heap_alloc(256)
-        cmdline = self.pe_loader.filepath + "\x00"
-        self.uc.mem_write(self.cmdline_addr, cmdline.encode('utf-8'))
-        
-        self.cmdline_wide_addr = self.heap_alloc(512)
-        cmdline_wide = self.pe_loader.filepath.encode('utf-16-le') + b'\x00\x00'
+        cmdline = self.api_handler.windows_command_line()
+        cmdline_bytes = cmdline.encode(ANSI_CODEPAGE, errors='replace') + b'\x00'
+        self.cmdline_addr = self.heap_alloc(len(cmdline_bytes))
+        self.uc.mem_write(self.cmdline_addr, cmdline_bytes)
+
+        cmdline_wide = cmdline.encode('utf-16-le') + b'\x00\x00'
+        self.cmdline_wide_addr = self.heap_alloc(len(cmdline_wide))
         self.uc.mem_write(self.cmdline_wide_addr, cmdline_wide)
     
     def _setup_peb_teb(self):
@@ -8124,11 +8633,34 @@ class CPUEmulator:
         log.info(f"PEB configured: 0x{self.peb_addr:08x}")
     
     def heap_alloc(self, size):
-        """Allocate memory from heap"""
-        aligned_size = self._align_size(size, 16)
+        """Allocate memory from heap (bump allocator). Returns 0 when exhausted."""
+        aligned_size = self._align_size(max(size, 1), 16)
         addr = self.heap_current
+        if addr + aligned_size > self.HEAP_BASE + self.HEAP_SIZE:
+            log.error(f"Heap exhausted: cannot allocate {size} bytes "
+                      f"(increase with -m/--memory)")
+            return 0
         self.heap_current += aligned_size
+        self.heap_blocks[addr] = size
         return addr
+
+    def heap_block_size(self, addr):
+        """Requested size of a heap_alloc() block, or None if unknown."""
+        return self.heap_blocks.get(addr)
+
+    def heap_resize_last(self, addr, new_size):
+        """Grow/shrink the most recent block in place. Returns True on success."""
+        old_size = self.heap_blocks.get(addr)
+        if old_size is None:
+            return False
+        if addr + self._align_size(max(old_size, 1), 16) != self.heap_current:
+            return False
+        new_end = addr + self._align_size(max(new_size, 1), 16)
+        if new_end > self.HEAP_BASE + self.HEAP_SIZE:
+            return False
+        self.heap_current = new_end
+        self.heap_blocks[addr] = new_size
+        return True
     
     def _setup_import_hooks(self):
         """Setup hooks for import functions"""
@@ -8141,6 +8673,14 @@ class CPUEmulator:
             for func_info in functions:
                 func_name = func_info['name']
                 iat_addr = func_info['address']
+
+                # CRT variables (e.g. _iob) are dereferenced, not called:
+                # point the IAT entry at real memory instead of a hook stub.
+                data_addr = self.api_handler.resolve_data_import(dll_name, func_name)
+                if data_addr:
+                    self.uc.mem_write(iat_addr, struct.pack('<I', data_addr))
+                    log.debug(f"  Data: {func_name} -> 0x{data_addr:08x}")
+                    continue
                 
                 # Create hook address
                 hook_addr = self.next_hook_addr
@@ -8355,11 +8895,17 @@ class CPUEmulator:
         # Return address
         ret_addr = struct.unpack('<I', self.uc.mem_read(esp, 4))[0]
         
-        # Arguments (maximum 16 - CreateWindowEx takes 12 arguments)
-        args = []
-        for i in range(16):
-            arg = struct.unpack('<I', self.uc.mem_read(esp + 4 + i * 4, 4))[0]
-            args.append(arg)
+        # Up to 32 argument slots (varargs functions such as printf may use
+        # many); slots beyond the top of the stack read as zero.
+        try:
+            args = list(struct.unpack('<32I', self.uc.mem_read(esp + 4, 128)))
+        except UcError:
+            args = []
+            for i in range(32):
+                try:
+                    args.append(struct.unpack('<I', self.uc.mem_read(esp + 4 + i * 4, 4))[0])
+                except UcError:
+                    args.append(0)
         
         # Find and call handler
         handler = self.api_handler.get_api_handler(func_name)
@@ -8373,10 +8919,17 @@ class CPUEmulator:
         # Write result to EAX
         self.uc.reg_write(UC_X86_REG_EAX, result & 0xFFFFFFFF)
         
-        # Clean up stack (stdcall convention)
-        # Simple approach: jump to return address
+        # Return to caller. stdcall APIs (kernel32, user32, gdi32, ...) pop
+        # their own arguments; cdecl CRT functions leave them to the caller.
+        cleanup = self.api_handler.stack_cleanup_bytes(dll_name, func_name)
+        if cleanup is None:
+            if func_name not in self.unknown_convention_warned:
+                self.unknown_convention_warned.add(func_name)
+                log.warning(f"Unknown stdcall argument count for {func_name}, "
+                            f"stack may become unbalanced")
+            cleanup = 0
         self.uc.reg_write(UC_X86_REG_EIP, ret_addr)
-        self.uc.reg_write(UC_X86_REG_ESP, esp + 4)  # Pop return address
+        self.uc.reg_write(UC_X86_REG_ESP, esp + 4 + cleanup)
     
     def _hook_mem_invalid(self, uc, access, address, size, value, user_data):
         """Invalid memory access hook"""
@@ -8386,16 +8939,16 @@ class CPUEmulator:
             UC_MEM_FETCH_UNMAPPED: "FETCH",
         }
         access_type = access_types.get(access, f"Unknown({access})")
-        
-        log.error(f"Invalid memory access: {access_type} @ 0x{address:08x}, size={size}")
-        
-        # Try to auto-map memory
-        try:
-            aligned_addr = self._align_address(address)
-            self._map_memory(aligned_addr, 0x10000)
-            return True  # Continue
-        except:
-            return False  # Stop
+        eip = uc.reg_read(UC_X86_REG_EIP)
+
+        # Like Windows, an access to unmapped memory is fatal (there is no
+        # SEH support to hand it to the program). Mapping memory on demand
+        # would silently turn NULL-pointer bugs into reads of zeros.
+        log.error(f"Access violation: {access_type} @ 0x{address:08x}, "
+                  f"size={size}, EIP=0x{eip:08x}")
+        self.crashed = True
+        self.stop_emulation = True
+        return False
     
     def _hook_interrupt(self, uc, intno, user_data):
         """Interrupt hook"""
@@ -8422,19 +8975,23 @@ class CPUEmulator:
                  f"{self.max_instructions if self.max_instructions > 0 else 'unlimited'}")
 
         try:
-            # Start emulation (count 0 = unlimited in Unicorn)
-            self.uc.emu_start(entry_point, 0, 0, max(0, self.max_instructions))
+            # The instruction limit is enforced in _hook_code. Passing a count
+            # to Unicorn would break nested emu_start calls (callbacks,
+            # _initterm, atexit) and can crash the process.
+            self.uc.emu_start(entry_point, 0, 0, 0)
 
         except UcError as e:
             eip = self.uc.reg_read(UC_X86_REG_EIP)
             esp = self.uc.reg_read(UC_X86_REG_ESP)
             log.error(f"Emulation error: {e}")
             log.error(f"EIP: 0x{eip:08x}, ESP: 0x{esp:08x}")
+            self.crashed = True
         finally:
             # However the emulation ended (ExitProcess, error, instruction
             # limit), the process is gone and can't consume messages anymore
             if self.api_handler:
                 self.api_handler.process_exited = True
+                self.api_handler.flush_std_streams()
 
         log.header("Emulation Completed")
         log.info(f"Total instruction count: {self.instruction_count}")
@@ -8507,8 +9064,18 @@ def main():
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
                         help="Run without GUI")
+    parser.add_argument("--codepage", default="utf-8",
+                        help="ANSI code page for 'A' APIs and CRT strings "
+                             "(default: utf-8; e.g. cp1254, cp1252)")
 
     args = parser.parse_args()
+
+    global ANSI_CODEPAGE
+    try:
+        ANSI_CODEPAGE = codecs.lookup(args.codepage).name
+    except LookupError:
+        log.error(f"Unknown code page: {args.codepage}")
+        sys.exit(1)
 
     # Determine EXE path
     exe_path = args.exe
@@ -8574,6 +9141,7 @@ def main():
             emulator.run(max_instr)
         except Exception as e:
             log.error(f"Emulation error: {e}")
+            emulator.crashed = True
         finally:
             log.success("Emulation completed!")
     
@@ -8596,6 +9164,16 @@ def main():
         if gui:
             gui.running = False
             gui.stop()
+        sys.exit(130)
+
+    # Propagate the guest's exit code (like a real process would)
+    if emu_thread.is_alive():
+        return
+    if emulator.crashed:
+        sys.exit(1)
+    exit_code = emulator.api_handler.exit_code if emulator.api_handler else None
+    if exit_code:
+        sys.exit(exit_code & 0xFF)
 
 
 if __name__ == "__main__":
