@@ -6693,6 +6693,12 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
+        # Start menu: open flag, EXE names listed, and the callback that
+        # runs one of them (set by main)
+        self.start_menu_open = False
+        self.start_menu_items = []
+        self.launcher = None
+
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
         self.key_states = {}
 
@@ -6885,6 +6891,97 @@ class PseudoWindowsGUI:
 
         # Open combobox dropdown is drawn over all windows too
         self._draw_open_combo()
+
+        # Start menu is the topmost layer
+        self._draw_start_menu()
+
+    # ==================== START MENU ====================
+
+    START_ITEM_H = 22
+    START_MENU_W = 200
+    START_STRIP_W = 22
+
+    def _start_button_rect(self):
+        return pygame.Rect(2, self.height - 28, 60, 26)
+
+    def _start_menu_rects(self):
+        """Start menu rect and its item rects (one per EXE, at least one row)"""
+        rows = max(1, len(self.start_menu_items))
+        height = rows * self.START_ITEM_H + 6
+        menu = pygame.Rect(0, self.height - 30 - height, self.START_MENU_W, height)
+        rects = [pygame.Rect(menu.x + self.START_STRIP_W + 2,
+                             menu.y + 3 + i * self.START_ITEM_H,
+                             menu.width - self.START_STRIP_W - 5, self.START_ITEM_H)
+                 for i in range(rows)]
+        return menu, rects
+
+    def _draw_start_menu(self):
+        """Draw the Start menu listing the programs in c_drive/"""
+        if not self.start_menu_open:
+            return
+        menu, rects = self._start_menu_rects()
+        pygame.draw.rect(self.screen, self.COLOR_BUTTON, menu)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, menu.topleft, menu.topright)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, menu.topleft, menu.bottomleft)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                         (menu.right - 1, menu.top), (menu.right - 1, menu.bottom))
+        strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3, menu.height - 6)
+        pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
+
+        if not self.start_menu_items:
+            text = self.font.render("(no programs in c_drive/)", True, (128, 128, 128))
+            self.screen.blit(text, (rects[0].x + 6, rects[0].y + 3))
+            return
+
+        mouse_pos = pygame.mouse.get_pos()
+        for name, rect in zip(self.start_menu_items, rects):
+            hovered = rect.collidepoint(mouse_pos)
+            if hovered:
+                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
+            color = self.COLOR_TITLE_TEXT if hovered else self.COLOR_TEXT
+            text = self.font.render(os.path.splitext(name)[0], True, color)
+            self.screen.blit(text, (rect.x + 6, rect.y + (rect.height - text.get_height()) // 2))
+
+    def _handle_start_menu_click(self, pos, button):
+        """Start button toggles the menu; returns True if the click was consumed"""
+        if self._start_button_rect().collidepoint(pos):
+            self.start_menu_open = not self.start_menu_open
+            if self.start_menu_open:
+                self.open_menu = None
+                self.open_combo = None
+                try:
+                    self.start_menu_items = sorted(
+                        f for f in os.listdir(C_DRIVE_PATH) if f.lower().endswith('.exe'))
+                except OSError:
+                    self.start_menu_items = []
+            return True
+        if not self.start_menu_open:
+            return False
+
+        self.start_menu_open = False
+        menu, rects = self._start_menu_rects()
+        if not menu.collidepoint(pos):
+            return False
+        for name, rect in zip(self.start_menu_items, rects):
+            if button == 1 and rect.collidepoint(pos) and self.launcher:
+                self.launcher(name)
+        return True
+
+    @gui_locked
+    def reset_for_new_program(self):
+        """Drop the previous program's windows, controls and console output"""
+        for hwnd in [h for h in self.windows if h != self.console_hwnd]:
+            del self.windows[hwnd]
+        self.controls.clear()
+        self.z_order = [h for h in self.z_order if h == self.console_hwnd]
+        self.active_window = self.console_hwnd
+        self.focused_control = None
+        self.open_menu = None
+        self.open_combo = None
+        self.dragging_window = None
+        self.resizing_window = None
+        self.dragging_scrollbar = None
+        self.console_lines = []
     
     def _draw_taskbar(self):
         """Draw taskbar"""
@@ -6897,8 +6994,8 @@ class PseudoWindowsGUI:
                         (self.width, self.height - taskbar_height))
         
         # Start button
-        start_rect = pygame.Rect(2, self.height - taskbar_height + 2, 60, taskbar_height - 4)
-        self._draw_button_3d(start_rect, "Start", pressed=False)
+        self._draw_button_3d(self._start_button_rect(), "Start",
+                             pressed=self.start_menu_open)
         
         # System tray area (right side)
         tray_width = 80
@@ -8016,6 +8113,10 @@ class PseudoWindowsGUI:
         """Handle mouse click"""
         x, y = pos
 
+        # The Start menu grabs clicks first
+        if self._handle_start_menu_click(pos, button):
+            return
+
         # An open dropdown menu grabs clicks first
         if self.open_menu and self._handle_menu_click(pos, button):
             return
@@ -8568,15 +8669,19 @@ class PseudoWindowsGUI:
         elif stream == "stdin":
             color = (64, 255, 64)  # Green
         
-        # Split into lines
+        # CR has no glyph; console lines are split on LF only
+        text = text.replace('\r\n', '\n').replace('\r', '')
+
+        # Split into lines; a trailing LF ends the last line, it doesn't add an empty one
         lines = text.split('\n')
+        if lines[-1] == '':
+            lines.pop()
         for line in lines:
-            if line or text.endswith('\n'):
-                self.console_lines.append({
-                    'text': line,
-                    'color': color,
-                    'stream': stream
-                })
+            self.console_lines.append({
+                'text': line,
+                'color': color,
+                'stream': stream
+            })
         
         # Check maximum line count
         while len(self.console_lines) > self.console_max_lines:
@@ -9409,7 +9514,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"EXE files are searched in c_drive/ folder by default.\nExample: python3 winexe32emu.py hello_messagebox.exe"
     )
-    parser.add_argument("exe", help="PE file to run (inside c_drive/)")
+    parser.add_argument("exe", nargs="?",
+                        help="PE file to run (inside c_drive/); optional with the GUI, "
+                             "programs can also be started from the Start menu")
     parser.add_argument("-n", "--max-instructions", type=int, default=None,
                         help="Maximum instructions to execute "
                              "(default: 5000000 with GUI, 100000 without; "
@@ -9441,18 +9548,14 @@ def main():
         log.error(f"Unknown code page: {args.codepage}")
         sys.exit(1)
 
-    # Determine EXE path
-    exe_path = args.exe
-    c_drive_exe_path = os.path.join(C_DRIVE_PATH, exe_path)
+    use_gui = not args.no_gui
 
-    if os.path.isfile(c_drive_exe_path):
-        exe_path = c_drive_exe_path
-        log.info(f"Loading EXE from emulation C drive: {exe_path}")
-    else:
+    if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
+        log.error("An EXE name is required when the GUI is not available")
+        sys.exit(1)
+    if args.exe is not None and not os.path.isfile(os.path.join(C_DRIVE_PATH, args.exe)):
         log.error(f"File not found in emulation C drive: {args.exe}")
         sys.exit(1)
-    
-    use_gui = not args.no_gui
 
     if args.max_instructions is not None:
         max_instr = args.max_instructions
@@ -9469,15 +9572,6 @@ def main():
     CPUEmulator.HEAP_SIZE = heap_size_mib * 1024 * 1024
     log.info(f"Heap size: {heap_size_mib} MiB ({CPUEmulator.HEAP_SIZE} bytes)")
 
-    # Load PE file
-    loader = PELoader(exe_path)
-
-    if not loader.load():
-        log.error("Failed to load PE file!")
-        sys.exit(1)
-
-    loader.print_summary()
-
     # Start GUI (optional)
     gui = None
     if use_gui and PYGAME_AVAILABLE:
@@ -9491,32 +9585,73 @@ def main():
     elif use_gui and not PYGAME_AVAILABLE:
         log.warning("Pygame not installed, continuing without GUI...")
 
-    # Start CPU emulator (with GUI reference)
-    emulator = CPUEmulator(loader, gui)
+    # The running program: (CPUEmulator, emulation thread)
+    current = {'emulator': None, 'thread': None}
+    launch_lock = threading.Lock()
 
-    if not emulator.initialize():
-        log.error("Failed to initialize CPU emulator!")
+    def load_program(name):
+        """Load c_drive/<name> and emulate it in a new thread. Returns success."""
+        exe_path = os.path.join(C_DRIVE_PATH, name)
+        log.info(f"Loading EXE from emulation C drive: {exe_path}")
+        loader = PELoader(exe_path)
+        if not loader.load():
+            log.error("Failed to load PE file!")
+            return False
+        loader.print_summary()
+
+        emulator = CPUEmulator(loader, gui)
+        if not emulator.initialize():
+            log.error("Failed to initialize CPU emulator!")
+            return False
+        emulator.disassemble(loader.image_base + loader.entry_point, 20)
+
+        def run_emulation():
+            try:
+                emulator.run(max_instr)
+            except Exception as e:
+                log.error(f"Emulation error: {e}")
+                emulator.crashed = True
+            finally:
+                log.success("Emulation completed!")
+
+        # Separate thread so the GUI stays responsive
+        thread = threading.Thread(target=run_emulation, daemon=True)
+        current['emulator'], current['thread'] = emulator, thread
+        thread.start()
+        return True
+
+    def stop_program():
+        """Stop the running program. Returns False if it did not stop in time."""
+        emulator, thread = current['emulator'], current['thread']
+        if thread is None or not thread.is_alive():
+            return True
+        emulator.stop_emulation = True
+        emulator.api_handler.quit_requested = True
+        # Unblock a pending console read
+        gui.console_input_active = False
+        gui.console_input_ready.set()
+        thread.join(timeout=5)
+        return not thread.is_alive()
+
+    def launch(name):
+        """Start menu: replace the running program with c_drive/<name>"""
+        def worker():
+            with launch_lock:
+                if not stop_program():
+                    log.error("The running program did not stop; cannot start another one")
+                    return
+                gui.reset_for_new_program()
+                load_program(name)
+        # Not on the GUI thread: stopping the old program needs the GUI lock
+        threading.Thread(target=worker, daemon=True).start()
+
+    if gui:
+        gui.launcher = launch
+
+    if args.exe is not None and not load_program(args.exe):
         if gui:
             gui.stop()
         sys.exit(1)
-
-    # Disassemble entry point
-    entry_point = loader.image_base + loader.entry_point
-    emulator.disassemble(entry_point, 20)
-    
-    # Run emulation in separate thread (for GUI interaction)
-    def run_emulation():
-        try:
-            emulator.run(max_instr)
-        except Exception as e:
-            log.error(f"Emulation error: {e}")
-            emulator.crashed = True
-        finally:
-            log.success("Emulation completed!")
-    
-    # Start emulation thread
-    emu_thread = threading.Thread(target=run_emulation, daemon=True)
-    emu_thread.start()
     
     # Wait while GUI is open
     try:
@@ -9527,13 +9662,17 @@ def main():
             gui.stop()
         else:
             # If no GUI, wait for emulation to finish
-            emu_thread.join()
+            current['thread'].join()
     except KeyboardInterrupt:
         log.warning("Stopped by user (Ctrl+C)!")
         if gui:
             gui.running = False
             gui.stop()
         sys.exit(130)
+
+    emulator, emu_thread = current['emulator'], current['thread']
+    if emulator is None:
+        return
 
     # Propagate the guest's exit code (like a real process would)
     if emu_thread.is_alive():

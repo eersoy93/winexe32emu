@@ -22,6 +22,8 @@ Use `-h` parameter for command-line help. For programs using a legacy ANSI code 
 
 Use `-v` to see every API call and other debug output, or `-q` to see only the program output, warnings and errors.
 
+With the GUI, the EXE name is optional: the Start menu on the fake desktop lists the EXE files in `c_drive/` and runs the selected one (replacing the running program).
+
 The emulator exits with the program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
@@ -40,7 +42,7 @@ The emulator exits with the program's exit code (1 if the emulated program crash
 
 ## Versioning
 
-- First version is 0.0.1, every version is bumped to 0.0.5, 0.0.10, 0.0.15 etc.
+- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc.
 
 ## Disclaimer
 
