@@ -20,6 +20,8 @@ python3 winexe32emu.py gdi_demo.exe
 
 Use `-h` parameter for command-line help. For programs using a legacy ANSI code page (e.g. Turkish text), add `--codepage cp1254` (default: `utf-8`).
 
+Use `-v` to see every API call and other debug output, or `-q` to see only the program output, warnings and errors.
+
 The emulator exits with the program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
