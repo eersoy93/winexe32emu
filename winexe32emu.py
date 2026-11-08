@@ -6179,6 +6179,12 @@ class WinAPIHandler:
                                                     pts[i + 1][0], pts[i + 1][1],
                                                     max(1, width) / 2.0 + 0.5):
                             return color
+            elif stype == 'image':
+                (left, top), (w, h) = shape['pos'], shape['dim']
+                if (shape.get('rop') == self.SRCCOPY and shape['size'] == (w, h) and
+                        left <= x < left + w and top <= y < top + h):
+                    i = ((y - top) * w + (x - left)) * 3
+                    return tuple(shape['data'][i:i + 3])
             # arc/text: no reliable hit test, skip
         return None
 
@@ -6532,6 +6538,12 @@ class WinAPIHandler:
                     shape = dict(shape, rect=(max(l, sx), max(t, sy),
                                               min(r, sx + cx), min(b, sy + cy)))
             shapes.append(self._translate_shape(shape, dx, dy))
+
+        # Shapes under a later one covering the whole copied area are invisible
+        for i in range(len(shapes) - 1, 0, -1):
+            if PseudoWindowsGUI.covers_rect(shapes[i], (x, y, x + cx, y + cy)):
+                shapes = shapes[i:]
+                break
 
         dest_state = self.dc_state.get(hdcDest)
         if dest_state and dest_state.get('memory'):
@@ -12048,57 +12060,59 @@ class PseudoWindowsGUI:
 
         self.screen.set_clip(None)
 
-    def _draw_shape(self, shape, ox, oy):
-        """Render one GDI display list entry at client origin (ox, oy)"""
+    def _draw_shape(self, shape, ox, oy, target=None):
+        """Render one GDI display list entry at client origin (ox, oy) on target
+        (default: the screen)"""
+        screen = self.screen if target is None else target
         stype = shape['type']
 
         if stype == 'line':
             color, width = shape['pen']
             x1, y1 = shape['from']
             x2, y2 = shape['to']
-            pygame.draw.line(self.screen, color, (ox + x1, oy + y1), (ox + x2, oy + y2), width)
+            pygame.draw.line(screen, color, (ox + x1, oy + y1), (ox + x2, oy + y2), width)
 
         elif stype in ('rect', 'ellipse'):
             left, top, right, bottom = shape['rect']
             rect = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
             draw_func = pygame.draw.rect if stype == 'rect' else pygame.draw.ellipse
             if shape.get('fill') is not None:
-                draw_func(self.screen, shape['fill'], rect)
+                draw_func(screen, shape['fill'], rect)
             if shape.get('pen') is not None:
                 color, width = shape['pen']
-                draw_func(self.screen, color, rect, width)
+                draw_func(screen, color, rect, width)
 
         elif stype == 'roundrect':
             left, top, right, bottom = shape['rect']
             rect = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
             radius = shape.get('radius', 0)
             if shape.get('fill') is not None:
-                pygame.draw.rect(self.screen, shape['fill'], rect, border_radius=radius)
+                pygame.draw.rect(screen, shape['fill'], rect, border_radius=radius)
             if shape.get('pen') is not None:
                 color, width = shape['pen']
-                pygame.draw.rect(self.screen, color, rect, width, border_radius=radius)
+                pygame.draw.rect(screen, color, rect, width, border_radius=radius)
 
         elif stype == 'polygon':
             points = [(ox + x, oy + y) for x, y in shape['points']]
             if len(points) >= 3:
                 if shape.get('fill') is not None:
-                    pygame.draw.polygon(self.screen, shape['fill'], points)
+                    pygame.draw.polygon(screen, shape['fill'], points)
                 if shape.get('pen') is not None:
                     color, width = shape['pen']
-                    pygame.draw.polygon(self.screen, color, points, width)
+                    pygame.draw.polygon(screen, color, points, width)
 
         elif stype == 'polyline':
             points = [(ox + x, oy + y) for x, y in shape['points']]
             if len(points) >= 2 and shape.get('pen') is not None:
                 color, width = shape['pen']
-                pygame.draw.lines(self.screen, color, False, points, width)
+                pygame.draw.lines(screen, color, False, points, width)
 
         elif stype == 'arc':
             left, top, right, bottom = shape['rect']
             rect = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
             if shape.get('pen') is not None:
                 color, width = shape['pen']
-                pygame.draw.arc(self.screen, color, rect,
+                pygame.draw.arc(screen, color, rect,
                                 shape['start'], shape['end'], width)
 
         elif stype == 'text':
@@ -12106,21 +12120,21 @@ class PseudoWindowsGUI:
             font = self._get_render_font(shape.get('font'))
             surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT,
                                   shape.get('bk'))
-            self.screen.blit(surface, (ox + x, oy + y))
+            screen.blit(surface, (ox + x, oy + y))
             if shape.get('font') and shape['font'].get('underline'):
                 line_y = oy + y + surface.get_height() - 2
-                pygame.draw.line(self.screen, shape.get('color') or self.COLOR_TEXT,
+                pygame.draw.line(screen, shape.get('color') or self.COLOR_TEXT,
                                  (ox + x, line_y), (ox + x + surface.get_width(), line_y))
 
         elif stype == 'pixel':
             x, y = shape['pos']
             rect = pygame.Rect(ox + x, oy + y, 1, 1)
-            pygame.draw.rect(self.screen, shape['color'], rect)
+            pygame.draw.rect(screen, shape['color'], rect)
 
         elif stype == 'image':
             x, y = shape['pos']
             if shape['size'][0] > 0 and shape['size'][1] > 0:
-                self.screen.blit(self._image_surface(shape), (ox + x, oy + y))
+                screen.blit(self._image_surface(shape), (ox + x, oy + y))
 
     def _image_surface(self, shape):
         """Pygame surface of an image shape, cached in the shape.
@@ -12710,15 +12724,21 @@ class PseudoWindowsGUI:
     @staticmethod
     def covers_area(shape, width, height):
         """True if shape is an opaque rect hiding everything in a width x height area"""
+        return PseudoWindowsGUI.covers_rect(shape, (0, 0, width, height))
+
+    @staticmethod
+    def covers_rect(shape, area):
+        """True if shape opaquely hides everything in area (left, top, right, bottom)"""
         if shape['type'] == 'image':
             if shape.get('rop') not in (0x00CC0020, 0x00330008):  # SRCCOPY, NOTSRCCOPY
                 return False
             (left, top), (w, h) = shape['pos'], shape['size']
-            return left <= 0 and top <= 0 and left + w >= width and top + h >= height
-        if shape['type'] != 'rect' or shape.get('fill') is None:
+            right, bottom = left + w, top + h
+        elif shape['type'] != 'rect' or shape.get('fill') is None:
             return False
-        left, top, right, bottom = shape['rect']
-        return left <= 0 and top <= 0 and right >= width and bottom >= height
+        else:
+            left, top, right, bottom = shape['rect']
+        return left <= area[0] and top <= area[1] and right >= area[2] and bottom >= area[3]
 
     @gui_locked
     def add_shape(self, hwnd, shape):
@@ -12731,9 +12751,32 @@ class PseudoWindowsGUI:
             win.drawn_shapes = [shape]
             return
         shapes = self.add_to_display_list(win.drawn_shapes, shape)
+        if len(shapes) > self.FLATTEN_SHAPES:
+            flat = self._flatten_shapes(win, shapes)
+            if flat is not None:
+                shapes = [flat]
         if len(shapes) > self.MAX_SHAPES:
             shapes = shapes[-(self.MAX_SHAPES // 2):]
         win.drawn_shapes = shapes
+
+    # Longer window display lists are rasterized into one image shape, so
+    # partially overlapping game updates don't slow every frame down
+    FLATTEN_SHAPES = 256
+
+    def _flatten_shapes(self, win, shapes):
+        """Client-area image shape showing shapes over the window background, or None"""
+        width, height = self.client_size(win)
+        if width <= 0 or height <= 0:
+            return None
+        surface = pygame.Surface((width, height))
+        surface.fill(win.bg_color)
+        for shape in shapes:
+            self._draw_shape(shape, 0, 0, surface)
+        to_bytes = getattr(pygame.image, 'tobytes', None) or pygame.image.tostring
+        rop = WinAPIHandler.SRCCOPY
+        return {'type': 'image', 'pos': (0, 0), 'dim': (width, height),
+                'size': (width, height), 'data': to_bytes(surface, 'RGB'), 'rop': rop,
+                '_surface': (((width, height), rop), surface)}
 
     # Only this many recent entries are checked for being hidden by a new shape
     HIDDEN_SCAN = 1024
