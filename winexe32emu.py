@@ -1036,6 +1036,9 @@ class WinAPIHandler:
     # Button control messages
     BM_GETCHECK = 0x00F0
     BM_SETCHECK = 0x00F1
+    # BS_CHECKBOX, BS_AUTOCHECKBOX, BS_RADIOBUTTON, BS_3STATE, BS_AUTO3STATE,
+    # BS_AUTORADIOBUTTON
+    CHECK_BUTTON_STYLES = (0x2, 0x3, 0x4, 0x5, 0x6, 0x9)
 
     # Listbox control messages
     LB_ADDSTRING = 0x0180
@@ -4259,10 +4262,11 @@ class WinAPIHandler:
                 hwnd = self._create_status_bar(hWndParent, window_name, dwStyle, hMenu)
             elif class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
                                         "SCROLLBAR"]:
-                # BUTTON with a checkbox style (BS_CHECKBOX/BS_AUTOCHECKBOX)
-                # is drawn and clicked as a checkbox
+                # BUTTON with a checkbox or radio button style is drawn and
+                # clicked as a checkbox
                 control_class = class_name
-                if class_name.upper() == "BUTTON" and (dwStyle & 0xF) in (0x2, 0x3):
+                if (class_name.upper() == "BUTTON" and
+                        (dwStyle & 0xF) in self.CHECK_BUTTON_STYLES):
                     control_class = "CHECKBOX"
                 # For child controls hMenu carries the control ID (used by WM_COMMAND)
                 hwnd = self.gui.create_control(hWndParent, control_class, window_name,
@@ -5614,7 +5618,7 @@ class WinAPIHandler:
             cls = self.DIALOG_CLASS_ATOMS.get(cls, 'STATIC') if isinstance(cls, int) else cls
             text = item['text'] if isinstance(item['text'], str) else ''
             style = item['style']
-            if cls.upper() == 'BUTTON' and (style & 0xF) in (0x2, 0x3, 0x5, 0x6):
+            if cls.upper() == 'BUTTON' and (style & 0xF) in self.CHECK_BUTTON_STYLES:
                 cls = 'CHECKBOX'
             elif cls.upper() == 'MSCTLS_STATUSBAR32':
                 cls = 'STATUSBAR'
@@ -15046,7 +15050,9 @@ class PseudoWindowsGUI:
             self._draw_statusbar(control, abs_x, abs_y)
         elif control.class_name == "BUTTON":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            if (control.style & 0xF) == 1:  # BS_DEFPUSHBUTTON: black outer frame
+            if (control.style & 0xF) == 7:  # BS_GROUPBOX
+                self._draw_group_box(control, rect)
+            elif (control.style & 0xF) == 1:  # BS_DEFPUSHBUTTON: black outer frame
                 self._draw_button_3d(rect.inflate(-2, -2), control.text)
                 pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
             else:
@@ -15128,6 +15134,15 @@ class PseudoWindowsGUI:
             self._draw_button_3d(arrow_rect, "", small=True, arrow='down')
             
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
+            if (control.style & 0xF) in (0x4, 0x9):  # Radio button
+                center = (abs_x + 6, abs_y + 8)
+                pygame.draw.circle(self.screen, self.COLOR_EDIT_BG, center, 6)
+                pygame.draw.circle(self.screen, (128, 128, 128), center, 6, 1)
+                if control.checked:
+                    pygame.draw.circle(self.screen, self.COLOR_TEXT, center, 2)
+                text = self.font.render(control.text, True, self.COLOR_TEXT)
+                self.screen.blit(text, (abs_x + 18, abs_y))
+                return
             # Checkbox box
             box_rect = pygame.Rect(abs_x, abs_y + 2, 13, 13)
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, box_rect)
@@ -15171,6 +15186,18 @@ class PseudoWindowsGUI:
                         self.dragging_scrollbar[0] == control.hwnd)
             self._draw_button_3d(m['thumb'], "", pressed=dragging)
     
+    def _draw_group_box(self, control, rect):
+        """BS_GROUPBOX: etched frame with the caption on its top edge"""
+        text = self.font.render(control.text, True, self.COLOR_TEXT) if control.text else None
+        top = rect.y + (text.get_height() // 2 if text else 0)
+        frame = pygame.Rect(rect.x, top, rect.width - 1, rect.bottom - top - 1)
+        pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame, 1)
+        pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, frame.move(1, 1), 1)
+        if text:
+            label = pygame.Rect(rect.x + 8, rect.y, text.get_width() + 4, text.get_height())
+            pygame.draw.rect(self.screen, self.COLOR_BUTTON, label)
+            self.screen.blit(text, (label.x + 2, label.y))
+
     def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None):
         """Draw 3D-style button.
 
@@ -15809,6 +15836,22 @@ class PseudoWindowsGUI:
         """Notify a window's WndProc that one of its buttons was clicked."""
         self._post_control_command(win, control, self.winapi.BN_CLICKED)
 
+    def _check_auto_radio(self, win, control):
+        """Check a BS_AUTORADIOBUTTON and uncheck the other radio buttons of its
+        group (controls from a WS_GROUP control up to the next one)"""
+        WS_GROUP = 0x00020000
+        controls = win.controls
+        index = controls.index(control)
+        first = index
+        while first > 0 and not controls[first].style & WS_GROUP:
+            first -= 1
+        last = index + 1
+        while last < len(controls) and not controls[last].style & WS_GROUP:
+            last += 1
+        for other in controls[first:last]:
+            if other.class_name == "CHECKBOX" and (other.style & 0xF) == 0x9:
+                other.checked = other is control
+
     def _handle_combo_click(self, pos, button):
         """Handle clicks while a combobox dropdown is open.
 
@@ -16107,6 +16150,8 @@ class PseudoWindowsGUI:
                             continue
 
                         if control.class_name == "BUTTON":
+                            if (control.style & 0xF) == 7:
+                                continue  # A group box lets clicks through to its buttons
                             # Clicking a button takes focus away from edits
                             self.focused_control = None
                             # If dialog window (MessageBox) - OK/Cancel button closes it
@@ -16128,6 +16173,8 @@ class PseudoWindowsGUI:
                                 # BS_AUTOCHECKBOX (0x3) toggles by itself
                                 if (control.style & 0xF) == 0x3:
                                     control.checked = not control.checked
+                                elif (control.style & 0xF) == 0x9:  # BS_AUTORADIOBUTTON
+                                    self._check_auto_radio(win, control)
                                 if self.winapi:
                                     self._post_button_command(win, control)
                             return
