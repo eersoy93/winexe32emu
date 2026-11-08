@@ -1234,6 +1234,8 @@ class WinAPIHandler:
     def request_termination(self):
         """Stop the process from another thread (console closed, emulator shutdown)"""
         self.emu.stop_emulation = True
+        # Also breaks guest loops that make no API calls
+        self.emu.uc.emu_stop()
         self.quit_requested = True
         console = self.console
         if console is not None and self.gui:
@@ -14393,9 +14395,6 @@ class CPUEmulator:
                          begin=self.callback_return_addr,
                          end=self.callback_return_addr)
 
-        # Instruction counting, limit and stop requests (once per basic block)
-        self.uc.hook_add(UC_HOOK_BLOCK, self._hook_block)
-        
         # Memory access error hook
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._hook_mem_invalid)
         
@@ -14548,6 +14547,13 @@ class CPUEmulator:
         if max_instructions is not None:
             self.max_instructions = max_instructions
 
+        # Instruction counting costs a Python call per basic block: only for the
+        # instruction limit and the verbose start-up disassembly
+        count_instructions = (self.max_instructions > 0 or
+                              DebugLogger.level <= DebugLogger.DEBUG)
+        if count_instructions:
+            self.uc.hook_add(UC_HOOK_BLOCK, self._hook_block)
+
         log.header("Starting Emulation")
 
         entry_point = self.pe_loader.image_base + self.pe_loader.entry_point
@@ -14588,7 +14594,8 @@ class CPUEmulator:
                     self.gui.unregister_process(self.api_handler)
 
         log.header("Emulation Completed")
-        log.info(f"Total instruction count: {self.instruction_count}")
+        if count_instructions:
+            log.info(f"Total instruction count: {self.instruction_count}")
         
         # Show register state
         self._print_registers()
