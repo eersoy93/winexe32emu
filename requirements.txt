@@ -2,4 +2,4 @@ pefile
 colorama
 unicorn>=2.1
 capstone>=5.0
-pygame-ce  # optional (only needed for the pseudo-GUI)
+pygame-ce  # optional (only needed for the pseudo-GUI and sound)

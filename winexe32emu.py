@@ -22,7 +22,10 @@ Fake Windows GUI environment with Pygame
 
 import sys
 import os
+import io
 import re
+import shutil
+import array
 import struct
 import math
 import codecs
@@ -34,7 +37,7 @@ from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
 
 # Version info
-WINEXE32EMU_VERSION = "0.1.0"
+WINEXE32EMU_VERSION = "0.1.1"
 
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +55,13 @@ DEFAULT_ENVIRONMENT = {
 }
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
+
+# Emulated folder holding the example programs (c_drive/Windows/Demos/)
+DEMOS_FOLDER = 'C:\\Windows\\Demos'
+
+# Folders searched for a bare EXE name (command line) and listed in the
+# Start menu, in this order
+PROGRAM_FOLDERS = ('C:\\', DEMOS_FOLDER)
 
 # Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
 # default because MinGW emits string literals as UTF-8; set via --codepage
@@ -547,8 +557,9 @@ def environment_folders(environment):
 
 
 def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
-    """Create the folders named by the environment (C:\\Windows, ...) in c_drive/."""
-    for folder in environment_folders(environment):
+    """Create the folders named by the environment (C:\\Windows, ...) and the
+    demo folder (C:\\Windows\\Demos) in c_drive/."""
+    for folder in environment_folders(environment) + [DEMOS_FOLDER]:
         path = resolve_c_drive_path(folder)
         if path is None:
             continue
@@ -558,6 +569,170 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
         except OSError as e:
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
+
+def _program_folder_host_path(folder):
+    """Host directory of an emulated program folder (C:\\ is c_drive/ itself)."""
+    if folder.rstrip('\\/') in ('C:', 'c:'):
+        return os.path.realpath(C_DRIVE_PATH)
+    return resolve_c_drive_path(folder)
+
+
+def find_program(name):
+    """Host path of the EXE to run, or None if it does not exist.
+
+    A Windows path (C:\\Windows\\Demos\\gdi_demo.exe, Windows\\Demos\\...)
+    is resolved inside c_drive/; a bare file name is searched in
+    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Demos).
+    """
+    if not name:
+        return None
+    if any(sep in name for sep in '\\/:'):
+        path = resolve_c_drive_path(name)
+        return path if path and os.path.isfile(path) else None
+    for folder in PROGRAM_FOLDERS:
+        path = resolve_c_drive_path(folder.rstrip('\\') + '\\' + name)
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def list_programs():
+    """Windows paths of the EXE files in PROGRAM_FOLDERS (for the Start menu)."""
+    programs = []
+    for folder in PROGRAM_FOLDERS:
+        directory = _program_folder_host_path(folder)
+        try:
+            names = sorted((f for f in os.listdir(directory)
+                            if f.lower().endswith('.exe')
+                            and os.path.isfile(os.path.join(directory, f))),
+                           key=str.lower)
+        except (OSError, TypeError):
+            continue
+        prefix = folder.rstrip('\\') + '\\'
+        programs.extend(prefix + f for f in names)
+    return programs
+
+
+class SoundPlayer:
+    """Audio output for Beep, MessageBeep and PlaySound (pygame.mixer).
+
+    Without pygame or an audio device every sound is silent; callers still
+    keep the right timing (e.g. Beep blocks for its duration).
+    """
+
+    _lock = threading.Lock()
+    _format = None        # None: not tried yet, False: no audio, else mixer format
+    _play_sound = None    # Sound started by PlaySound (only one at a time)
+
+    # Sample packing per mixer sample size: (array typecode, scale, offset)
+    _SAMPLE_FORMATS = {-16: ('h', 32767, 0), 16: ('H', 32767, 32768),
+                       -8: ('b', 127, 0), 8: ('B', 127, 128),
+                       32: ('f', 1.0, 0), -32: ('f', 1.0, 0)}
+
+    @classmethod
+    def _mixer(cls):
+        """Initialize pygame.mixer once; returns (rate, size, channels) or False."""
+        with cls._lock:
+            if cls._format is None:
+                cls._format = False
+                if PYGAME_AVAILABLE:
+                    try:
+                        if not pygame.mixer.get_init():
+                            pygame.mixer.init(frequency=44100, size=-16, channels=1)
+                        cls._format = pygame.mixer.get_init() or False
+                    except pygame.error as e:
+                        log.warning(f"No audio device, sounds are silent: {e}")
+            return cls._format
+
+    @classmethod
+    def available(cls):
+        return bool(cls._mixer())
+
+    @classmethod
+    def tone(cls, frequency, duration_ms, volume=0.2):
+        """Start a square-wave tone (PC speaker style); returns the Sound or None"""
+        fmt = cls._mixer()
+        if not fmt or frequency <= 0 or duration_ms <= 0:
+            return None
+        rate, size, channels = fmt
+        packing = cls._SAMPLE_FORMATS.get(size)
+        if packing is None:
+            return None
+        typecode, scale, offset = packing
+        count = int(rate * duration_ms / 1000)
+        half_period = rate / (2.0 * frequency)
+        amplitude = volume * scale
+        values = [amplitude if int(i / half_period) % 2 == 0 else -amplitude
+                  for i in range(count)]
+        # Short linear fade in/out avoids clicks at the edges
+        fade = min(count // 2, max(1, rate // 500))
+        for i in range(fade):
+            k = i / fade
+            values[i] *= k
+            values[count - 1 - i] *= k
+        values = [v + offset for v in values]
+        if typecode != 'f':
+            values = [int(v) for v in values]
+        if channels > 1:
+            values = [v for v in values for _ in range(channels)]
+        samples = array.array(typecode, values)
+        try:
+            sound = pygame.mixer.Sound(buffer=samples.tobytes())
+            sound.play()
+            return sound
+        except pygame.error as e:
+            log.debug(f"Tone playback failed: {e}")
+            return None
+
+    @classmethod
+    def play(cls, source, loop=False):
+        """Play a WAV file path or file-like object as the PlaySound sound.
+
+        Returns the length in seconds, or None if it cannot be decoded.
+        """
+        if not cls._mixer():
+            return 0.0
+        try:
+            sound = pygame.mixer.Sound(file=source)
+        except (pygame.error, OSError) as e:
+            log.debug(f"Cannot play sound: {e}")
+            return None
+        cls.stop()
+        cls._play_sound = sound
+        sound.play(loops=-1 if loop else 0)
+        return sound.get_length()
+
+    @classmethod
+    def play_tone(cls, frequency, duration_ms):
+        """Play a tone as the PlaySound sound (system sound aliases)"""
+        cls.stop()
+        cls._play_sound = cls.tone(frequency, duration_ms)
+
+    @classmethod
+    def playing(cls):
+        """True while the PlaySound sound is still playing"""
+        sound = cls._play_sound
+        return bool(sound and sound.get_num_channels())
+
+    @classmethod
+    def stop(cls):
+        """Stop the PlaySound sound"""
+        sound, cls._play_sound = cls._play_sound, None
+        if sound is not None:
+            try:
+                sound.stop()
+            except pygame.error:
+                pass
+
+    @classmethod
+    def stop_all(cls):
+        """Silence everything (the program that made the sounds has ended)"""
+        if cls._format:
+            cls._play_sound = None
+            try:
+                pygame.mixer.stop()
+            except pygame.error:
+                pass
 
 class WinAPIHandler:
     """Windows API emulation"""
@@ -601,7 +776,14 @@ class WinAPIHandler:
         'ExpandEnvironmentStringsA': 3, 'InitializeCriticalSection': 1,
         'InitializeCriticalSectionAndSpinCount': 2, 'EnterCriticalSection': 1,
         'TryEnterCriticalSection': 1, 'LeaveCriticalSection': 1,
-        'DeleteCriticalSection': 1,
+        'DeleteCriticalSection': 1, 'GetFileAttributesW': 1, 'DeleteFileW': 1,
+        'CreateDirectoryW': 2, 'RemoveDirectoryW': 1, 'CopyFileA': 3,
+        'CopyFileW': 3, 'MoveFileA': 2, 'MoveFileW': 2,
+        'GetCurrentDirectoryA': 2, 'GetCurrentDirectoryW': 2,
+        'GetComputerNameA': 2, 'GetComputerNameW': 2, 'GetSystemInfo': 1,
+        'GlobalMemoryStatus': 1, 'QueryPerformanceFrequency': 1,
+        'GetTickCount64': 0, 'GetACP': 0, 'GetOEMCP': 0,
+        'SetConsoleTitleA': 1, 'SetConsoleTitleW': 1,
         # user32
         'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
         'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
@@ -634,6 +816,10 @@ class WinAPIHandler:
         'FillRect': 3, 'FrameRect': 3, 'GetDC': 1, 'ReleaseDC': 2,
         'DrawTextA': 5, 'DrawTextW': 5, 'CreateMenu': 0, 'CreatePopupMenu': 0,
         'AppendMenuA': 4, 'SetMenu': 2, 'DrawMenuBar': 1, 'DestroyMenu': 1,
+        'GetSysColor': 1, 'GetSysColorBrush': 1, 'GetDesktopWindow': 0,
+        'GetForegroundWindow': 0, 'GetActiveWindow': 0, 'GetDoubleClickTime': 0,
+        'CharUpperA': 1, 'CharLowerA': 1, 'IsCharAlphaA': 1,
+        'IsCharAlphaNumericA': 1,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
         'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
@@ -649,6 +835,10 @@ class WinAPIHandler:
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
         'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
         'RegSetValueExW': 6, 'RegCreateKeyExA': 9, 'RegCreateKeyExW': 9,
+        'GetUserNameA': 2, 'GetUserNameW': 2,
+        # winmm
+        'timeGetTime': 0, 'timeBeginPeriod': 1, 'timeEndPeriod': 1,
+        'PlaySoundA': 3, 'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2,
         # ole32
         'OleInitialize': 1, 'OleUninitialize': 0, 'CoInitialize': 1,
         'CoUninitialize': 0,
@@ -768,6 +958,7 @@ class WinAPIHandler:
         self.dc_map = {}       # hdc -> hwnd the DC draws into
         self.dc_state = {}     # hdc -> {'pen','brush','pos','text_color','bk_mode','bk_color'}
         self._stock_objects = {}  # GetStockObject index -> handle
+        self._sys_color_brushes = {}  # GetSysColorBrush index -> handle
 
         # Timers: (hwnd, timer_id) -> {'elapse': sec, 'callback': addr, 'next_fire': time}
         self.timers = {}
@@ -905,8 +1096,8 @@ class WinAPIHandler:
 
     def windows_exe_path(self):
         """Path of the main EXE as the program sees it (C:\\...)."""
-        rel = os.path.relpath(os.path.abspath(self.emu.pe_loader.filepath),
-                              os.path.abspath(C_DRIVE_PATH))
+        rel = os.path.relpath(os.path.realpath(self.emu.pe_loader.filepath),
+                              os.path.realpath(C_DRIVE_PATH))
         if rel.startswith('..'):
             rel = os.path.basename(self.emu.pe_loader.filepath)
         return "C:\\" + rel.replace('/', '\\')
@@ -1096,7 +1287,7 @@ class WinAPIHandler:
 
     # DLLs whose APIs the emulator implements (always "loaded")
     EMULATED_DLLS = {'kernel32.dll', 'user32.dll', 'gdi32.dll', 'msvcrt.dll',
-                     'advapi32.dll', 'ole32.dll', 'ntdll.dll'}
+                     'advapi32.dll', 'ole32.dll', 'ntdll.dll', 'winmm.dll'}
 
     def _module_handle(self, name, load):
         """Fake HMODULE for a DLL name; 0 if not loaded and load is False"""
@@ -1505,8 +1696,14 @@ class WinAPIHandler:
         return 0
 
     def Beep(self, args):
-        """Beep emulation (no audio device: logged only)"""
-        log.debug(f"Beep({args[0]} Hz, {args[1]} ms)")
+        """Beep emulation - plays a square-wave tone and blocks for its duration"""
+        frequency, duration = args[0], args[1]
+        log.debug(f"Beep({frequency} Hz, {duration} ms)")
+        if not 0x25 <= frequency <= 0x7FFF:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        SoundPlayer.tone(frequency, min(duration, 10000))
+        self._wait_ms(duration)
         return 1
 
     def QueryPerformanceCounter(self, args):
@@ -1985,14 +2182,18 @@ class WinAPIHandler:
         """Sleep emulation - real wait so game loops pace correctly"""
         dwMilliseconds = args[0]
         log.debug(f"Sleep({dwMilliseconds}ms)")
-        # Sleep in short chunks so a stop request is not delayed
-        end = time.time() + min(dwMilliseconds, 10000) / 1000.0
+        self._wait_ms(dwMilliseconds)
+        return 0
+
+    def _wait_ms(self, milliseconds, until=None):
+        """Block for up to 10 s (or until until() is False), in short chunks
+        so a stop request is not delayed"""
+        end = time.time() + min(milliseconds, 10000) / 1000.0
         while not self.emu.stop_emulation:
             remaining = end - time.time()
-            if remaining <= 0:
+            if remaining <= 0 or (until is not None and not until()):
                 break
             time.sleep(min(0.05, remaining))
-        return 0
     
     # Critical sections: the emulated process is single-threaded, so these
     # never contend and need no real locking.
@@ -2025,11 +2226,10 @@ class WinAPIHandler:
         """DeleteCriticalSection emulation"""
         return 0
 
-    def GetFileAttributesA(self, args):
-        """GetFileAttributesA emulation (sandboxed to c_drive/)"""
-        lpFileName = args[0]
-        filename = self.read_string(lpFileName)
-        log.debug(f"GetFileAttributesA(\"{filename}\")")
+    def GetFileAttributesA(self, args, wide=False):
+        """GetFileAttributesA/W emulation (sandboxed to c_drive/)"""
+        filename = self._read_text(args[0], wide)
+        log.debug(f"GetFileAttributes{'W' if wide else 'A'}(\"{filename}\")")
 
         path = self.resolve_c_drive_path(filename)
         if path is None or not os.path.exists(path):
@@ -2156,9 +2356,9 @@ class WinAPIHandler:
         except OSError:
             return 0xFFFFFFFF
 
-    def DeleteFileA(self, args):
-        """DeleteFileA emulation (sandboxed)"""
-        filename = self.read_string(args[0])
+    def DeleteFileA(self, args, wide=False):
+        """DeleteFileA/W emulation (sandboxed)"""
+        filename = self._read_text(args[0], wide)
         log.debug(f"DeleteFileA(\"{filename}\")")
         path = self.resolve_c_drive_path(filename)
         if path is None or not os.path.isfile(path):
@@ -2172,9 +2372,9 @@ class WinAPIHandler:
             self._last_error = 5
             return 0
 
-    def CreateDirectoryA(self, args):
-        """CreateDirectoryA emulation (sandboxed)"""
-        dirname = self.read_string(args[0])
+    def CreateDirectoryA(self, args, wide=False):
+        """CreateDirectoryA/W emulation (sandboxed)"""
+        dirname = self._read_text(args[0], wide)
         log.debug(f"CreateDirectoryA(\"{dirname}\")")
         path = self.resolve_c_drive_path(dirname)
         if path is None:
@@ -2192,9 +2392,9 @@ class WinAPIHandler:
             self._last_error = 5
         return 0
 
-    def RemoveDirectoryA(self, args):
-        """RemoveDirectoryA emulation (sandboxed, directory must be empty)"""
-        dirname = self.read_string(args[0])
+    def RemoveDirectoryA(self, args, wide=False):
+        """RemoveDirectoryA/W emulation (sandboxed, directory must be empty)"""
+        dirname = self._read_text(args[0], wide)
         log.debug(f"RemoveDirectoryA(\"{dirname}\")")
         path = self.resolve_c_drive_path(dirname)
         if path is None or not os.path.isdir(path):
@@ -2206,6 +2406,223 @@ class WinAPIHandler:
         except OSError:
             self._last_error = 145  # ERROR_DIR_NOT_EMPTY
             return 0
+
+    def GetFileAttributesW(self, args):
+        return self.GetFileAttributesA(args, wide=True)
+
+    def DeleteFileW(self, args):
+        return self.DeleteFileA(args, wide=True)
+
+    def CreateDirectoryW(self, args):
+        return self.CreateDirectoryA(args, wide=True)
+
+    def RemoveDirectoryW(self, args):
+        return self.RemoveDirectoryA(args, wide=True)
+
+    def CopyFileA(self, args, wide=False):
+        """CopyFileA/W emulation (sandboxed)"""
+        src = self._read_text(args[0], wide)
+        dst = self._read_text(args[1], wide)
+        fail_if_exists = args[2]
+        log.debug(f"CopyFile(\"{src}\", \"{dst}\", {fail_if_exists})")
+        src_path = self.resolve_c_drive_path(src)
+        dst_path = self.resolve_c_drive_path(dst)
+        if src_path is None or dst_path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if not os.path.isfile(src_path):
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return 0
+        if os.path.isdir(dst_path):
+            self._last_error = 5
+            return 0
+        if fail_if_exists and os.path.exists(dst_path):
+            self._last_error = 80  # ERROR_FILE_EXISTS
+            return 0
+        try:
+            shutil.copyfile(src_path, dst_path)
+        except FileNotFoundError:
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        except OSError as e:
+            log.error(f"CopyFile(\"{src}\", \"{dst}\") failed: {e}")
+            self._last_error = 5
+            return 0
+        return 1
+
+    def CopyFileW(self, args):
+        return self.CopyFileA(args, wide=True)
+
+    def MoveFileA(self, args, wide=False):
+        """MoveFileA/W emulation (sandboxed; files and directories)"""
+        src = self._read_text(args[0], wide)
+        dst = self._read_text(args[1], wide)
+        log.debug(f"MoveFile(\"{src}\", \"{dst}\")")
+        src_path = self.resolve_c_drive_path(src)
+        dst_path = self.resolve_c_drive_path(dst)
+        if src_path is None or dst_path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if not os.path.exists(src_path):
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return 0
+        if os.path.exists(dst_path):
+            self._last_error = 183  # ERROR_ALREADY_EXISTS
+            return 0
+        try:
+            os.rename(src_path, dst_path)
+        except FileNotFoundError:
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        except OSError as e:
+            log.error(f"MoveFile(\"{src}\", \"{dst}\") failed: {e}")
+            self._last_error = 5
+            return 0
+        return 1
+
+    def MoveFileW(self, args):
+        return self.MoveFileA(args, wide=True)
+
+    def GetCurrentDirectoryA(self, args, wide=False):
+        """GetCurrentDirectoryA/W emulation - the current directory is C:\\"""
+        nBufferLength, lpBuffer = args[0], args[1]
+        cwd = "C:\\"
+        log.debug(f"GetCurrentDirectory() -> \"{cwd}\"")
+        if not lpBuffer or nBufferLength <= len(cwd):
+            return len(cwd) + 1  # required size including the terminator
+        self._write_text(lpBuffer, cwd, wide)
+        return len(cwd)
+
+    def GetCurrentDirectoryW(self, args):
+        return self.GetCurrentDirectoryA(args, wide=True)
+
+    def _write_text(self, address, text, wide):
+        """Write a NUL-terminated ANSI or UTF-16 string"""
+        if wide:
+            data = text.encode('utf-16-le') + b'\x00\x00'
+        else:
+            data = text.encode(ANSI_CODEPAGE, errors='replace') + b'\x00'
+        self.emu.uc.mem_write(address, data)
+
+    def _get_name_common(self, name, lpBuffer, lpnSize, wide, size_includes_nul,
+                         error_code):
+        """Shared GetComputerName/GetUserName logic (size is in/out in *lpnSize)"""
+        try:
+            size = struct.unpack('<I', self.emu.uc.mem_read(lpnSize, 4))[0]
+        except UcError:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if not lpBuffer or size <= len(name):
+            self.emu.uc.mem_write(lpnSize, struct.pack('<I', len(name) + 1))
+            self._last_error = error_code
+            return 0
+        self._write_text(lpBuffer, name, wide)
+        written = len(name) + (1 if size_includes_nul else 0)
+        self.emu.uc.mem_write(lpnSize, struct.pack('<I', written))
+        return 1
+
+    COMPUTER_NAME = "WINEXE32EMU"
+    USER_NAME = "User"
+
+    def GetComputerNameA(self, args, wide=False):
+        """GetComputerNameA/W emulation"""
+        log.debug(f"GetComputerName() -> \"{self.COMPUTER_NAME}\"")
+        # ERROR_BUFFER_OVERFLOW; the returned size excludes the terminator
+        return self._get_name_common(self.COMPUTER_NAME, args[0], args[1], wide, False, 111)
+
+    def GetComputerNameW(self, args):
+        return self.GetComputerNameA(args, wide=True)
+
+    def GetUserNameA(self, args, wide=False):
+        """GetUserNameA/W emulation (advapi32)"""
+        log.debug(f"GetUserName() -> \"{self.USER_NAME}\"")
+        # ERROR_INSUFFICIENT_BUFFER; the returned size includes the terminator
+        return self._get_name_common(self.USER_NAME, args[0], args[1], wide, True, 122)
+
+    def GetUserNameW(self, args):
+        return self.GetUserNameA(args, wide=True)
+
+    def GetSystemInfo(self, args):
+        """GetSystemInfo emulation - one x86 processor, 4 KiB pages"""
+        lpSystemInfo = args[0]
+        log.debug(f"GetSystemInfo(0x{lpSystemInfo:08x})")
+        data = struct.pack('<HHIIIIIIIHH',
+                           0,           # wProcessorArchitecture (INTEL)
+                           0,           # wReserved
+                           0x1000,      # dwPageSize
+                           0x00010000,  # lpMinimumApplicationAddress
+                           0x7FFEFFFF,  # lpMaximumApplicationAddress
+                           1,           # dwActiveProcessorMask
+                           1,           # dwNumberOfProcessors
+                           586,         # dwProcessorType (PROCESSOR_INTEL_PENTIUM)
+                           0x10000,     # dwAllocationGranularity
+                           6,           # wProcessorLevel
+                           0)           # wProcessorRevision
+        try:
+            self.emu.uc.mem_write(lpSystemInfo, data)
+        except UcError:
+            pass
+        return 0
+
+    def GlobalMemoryStatus(self, args):
+        """GlobalMemoryStatus emulation - physical memory is the emulated heap"""
+        lpBuffer = args[0]
+        total = self.emu.HEAP_SIZE
+        avail = max(0, self.emu.HEAP_BASE + total - self.emu.heap_current)
+        load = 100 - avail * 100 // total if total else 0
+        log.debug(f"GlobalMemoryStatus() -> {avail}/{total} bytes free")
+        data = struct.pack('<8I', 32, load, total, avail, total, avail,
+                           0x7FFE0000, 0x7FFE0000 - (total - avail))
+        try:
+            self.emu.uc.mem_write(lpBuffer, data)
+        except UcError:
+            pass
+        return 0
+
+    def QueryPerformanceFrequency(self, args):
+        """QueryPerformanceFrequency emulation (the counter ticks in microseconds)"""
+        lpFrequency = args[0]
+        log.debug("QueryPerformanceFrequency() -> 1000000")
+        if not lpFrequency:
+            return 0
+        self.emu.uc.mem_write(lpFrequency, struct.pack('<Q', 1000000))
+        return 1
+
+    def GetTickCount64(self, args):
+        """GetTickCount64 emulation"""
+        return QWordResult(int(time.time() * 1000))
+
+    # ANSI code page -> OEM (console) code page of the same Windows locale
+    OEM_CODEPAGES = {1250: 852, 1251: 866, 1252: 850, 1253: 737, 1254: 857,
+                     1255: 862, 1256: 720, 1257: 775}
+
+    @staticmethod
+    def _ansi_codepage_number():
+        """Windows number of ANSI_CODEPAGE (e.g. 1254 for cp1254, 65001 for UTF-8)"""
+        if ANSI_CODEPAGE.replace('_', '-') == 'utf-8':
+            return 65001
+        match = re.fullmatch(r'cp(\d+)', ANSI_CODEPAGE)
+        return int(match.group(1)) if match else 1252
+
+    def GetACP(self, args):
+        """GetACP emulation - the code page chosen with --codepage"""
+        return self._ansi_codepage_number()
+
+    def GetOEMCP(self, args):
+        """GetOEMCP emulation"""
+        return self.OEM_CODEPAGES.get(self._ansi_codepage_number(), 437)
+
+    def SetConsoleTitleA(self, args, wide=False):
+        """SetConsoleTitleA/W emulation - renames the GUI console window"""
+        title = self._read_text(args[0], wide)
+        log.debug(f"SetConsoleTitle(\"{title}\")")
+        if self.gui and self.gui.console_hwnd in self.gui.windows:
+            with self.gui.lock:
+                self.gui.windows[self.gui.console_hwnd].title = title
+        return 1
+
+    def SetConsoleTitleW(self, args):
+        return self.SetConsoleTitleA(args, wide=True)
 
     def ReadFile(self, args):
         """ReadFile emulation - reads from a real sandboxed file"""
@@ -3145,10 +3562,231 @@ class WinAPIHandler:
                 return 1 if self.gui.controls[hWnd].enabled else 0
         return 0
 
+    # MessageBeep/PlaySound system sounds as (frequency Hz, duration ms)
+    SYSTEM_SOUND_TONES = {
+        0xFFFFFFFF: (750, 150),   # simple beep (PC speaker)
+        0x00: (800, 150),         # MB_OK / SystemDefault
+        0x10: (400, 300),         # MB_ICONHAND / SystemHand
+        0x20: (600, 150),         # MB_ICONQUESTION / SystemQuestion
+        0x30: (900, 200),         # MB_ICONEXCLAMATION / SystemExclamation
+        0x40: (1000, 150),        # MB_ICONASTERISK / SystemAsterisk
+    }
+
     def MessageBeep(self, args):
-        """MessageBeep emulation (no audio device: logged only)"""
-        log.debug(f"MessageBeep(0x{args[0]:x})")
+        """MessageBeep emulation - plays a system tone asynchronously"""
+        uType = args[0]
+        log.debug(f"MessageBeep(0x{uType:x})")
+        key = uType if uType == 0xFFFFFFFF else uType & 0xF0
+        SoundPlayer.tone(*self.SYSTEM_SOUND_TONES.get(key, self.SYSTEM_SOUND_TONES[0]))
         return 1
+
+    # Classic Windows colors for GetSysColor, as (r, g, b)
+    SYS_COLORS = {
+        0: (212, 208, 200),   # COLOR_SCROLLBAR
+        1: (0, 128, 128),     # COLOR_BACKGROUND (desktop)
+        2: (0, 0, 128),       # COLOR_ACTIVECAPTION
+        3: (128, 128, 128),   # COLOR_INACTIVECAPTION
+        4: (212, 208, 200),   # COLOR_MENU
+        5: (255, 255, 255),   # COLOR_WINDOW
+        6: (0, 0, 0),         # COLOR_WINDOWFRAME
+        7: (0, 0, 0),         # COLOR_MENUTEXT
+        8: (0, 0, 0),         # COLOR_WINDOWTEXT
+        9: (255, 255, 255),   # COLOR_CAPTIONTEXT
+        10: (212, 208, 200),  # COLOR_ACTIVEBORDER
+        11: (212, 208, 200),  # COLOR_INACTIVEBORDER
+        12: (128, 128, 128),  # COLOR_APPWORKSPACE
+        13: (0, 0, 128),      # COLOR_HIGHLIGHT
+        14: (255, 255, 255),  # COLOR_HIGHLIGHTTEXT
+        15: (212, 208, 200),  # COLOR_BTNFACE
+        16: (128, 128, 128),  # COLOR_BTNSHADOW
+        17: (128, 128, 128),  # COLOR_GRAYTEXT
+        18: (0, 0, 0),        # COLOR_BTNTEXT
+        19: (192, 192, 192),  # COLOR_INACTIVECAPTIONTEXT
+        20: (255, 255, 255),  # COLOR_BTNHIGHLIGHT
+        21: (64, 64, 64),     # COLOR_3DDKSHADOW
+        22: (212, 208, 200),  # COLOR_3DLIGHT
+        23: (0, 0, 0),        # COLOR_INFOTEXT
+        24: (255, 255, 225),  # COLOR_INFOBK
+    }
+
+    def GetSysColor(self, args):
+        """GetSysColor emulation - classic Windows color scheme (COLORREF)"""
+        r, g, b = self.SYS_COLORS.get(args[0], (0, 0, 0))
+        return r | (g << 8) | (b << 16)
+
+    def GetSysColorBrush(self, args):
+        """GetSysColorBrush emulation - one cached solid brush per color index"""
+        nIndex = args[0]
+        if nIndex not in self.SYS_COLORS:
+            return 0
+        cache = self._sys_color_brushes
+        if nIndex not in cache:
+            cache[nIndex] = self.CreateSolidBrush([self.GetSysColor([nIndex])])
+        return cache[nIndex]
+
+    DESKTOP_HWND = 0x00010010
+
+    def GetDesktopWindow(self, args):
+        """GetDesktopWindow emulation - fixed pseudo handle"""
+        return self.DESKTOP_HWND
+
+    def GetForegroundWindow(self, args):
+        """GetForegroundWindow emulation - the active window of the fake desktop"""
+        if self.gui and self.gui.active_window in self.gui.windows:
+            return self.gui.active_window
+        return 0
+
+    def GetActiveWindow(self, args):
+        """GetActiveWindow emulation"""
+        return self.GetForegroundWindow(args)
+
+    def GetDoubleClickTime(self, args):
+        """GetDoubleClickTime emulation - Windows default (500 ms)"""
+        return 500
+
+    def _ansi_char(self, value):
+        """Decode one ANSI code unit; None if it is not a character on its own"""
+        try:
+            return bytes([value & 0xFF]).decode(ANSI_CODEPAGE)
+        except UnicodeDecodeError:
+            return None
+
+    def _char_case_common(self, lpsz, upper):
+        """CharUpperA/CharLowerA: a single char (HIWORD 0) or an in-place string"""
+        convert = str.upper if upper else str.lower
+        if lpsz < 0x10000:
+            ch = self._ansi_char(lpsz)
+            if ch is None:
+                return lpsz
+            converted = convert(ch).encode(ANSI_CODEPAGE, errors='replace')
+            return converted[0] if len(converted) == 1 else lpsz
+        raw = self.read_cstring(lpsz)
+        text = raw.decode(ANSI_CODEPAGE, errors='surrogateescape')
+        data = convert(text).encode(ANSI_CODEPAGE, errors='surrogateescape')
+        if len(data) == len(raw):  # never change the buffer length in place
+            self.emu.uc.mem_write(lpsz, data)
+        return lpsz
+
+    def CharUpperA(self, args):
+        """CharUpperA emulation"""
+        return self._char_case_common(args[0], True)
+
+    def CharLowerA(self, args):
+        """CharLowerA emulation"""
+        return self._char_case_common(args[0], False)
+
+    def IsCharAlphaA(self, args):
+        """IsCharAlphaA emulation"""
+        ch = self._ansi_char(args[0])
+        return 1 if ch and ch.isalpha() else 0
+
+    def IsCharAlphaNumericA(self, args):
+        """IsCharAlphaNumericA emulation"""
+        ch = self._ansi_char(args[0])
+        return 1 if ch and ch.isalnum() else 0
+
+    # ---------- winmm ----------
+
+    def timeGetTime(self, args):
+        """timeGetTime emulation - milliseconds, like GetTickCount"""
+        return int(time.time() * 1000) & 0xFFFFFFFF
+
+    def timeBeginPeriod(self, args):
+        """timeBeginPeriod emulation - TIMERR_NOERROR"""
+        return 0
+
+    def timeEndPeriod(self, args):
+        """timeEndPeriod emulation - TIMERR_NOERROR"""
+        return 0
+
+    SND_ASYNC = 0x0001
+    SND_NODEFAULT = 0x0002
+    SND_MEMORY = 0x0004
+    SND_LOOP = 0x0008
+    SND_NOSTOP = 0x0010
+    SND_PURGE = 0x0040
+    SND_ALIAS = 0x00010000
+    SND_FILENAME = 0x00020000
+    SND_RESOURCE = 0x00040004
+
+    # PlaySound system sound aliases -> MessageBeep sound type
+    SOUND_ALIASES = {
+        'systemdefault': 0x00, '.default': 0x00, 'systemasterisk': 0x40,
+        'systemexclamation': 0x30, 'systemhand': 0x10, 'systemquestion': 0x20,
+        'systemstart': 0x40, 'systemexit': 0x40,
+    }
+
+    def _read_wav_memory(self, address):
+        """Read a RIFF/WAVE image from emulated memory (SND_MEMORY)"""
+        try:
+            header = bytes(self.emu.uc.mem_read(address, 8))
+            if header[:4] != b'RIFF':
+                return None
+            size = struct.unpack('<I', header[4:8])[0] + 8
+            return bytes(self.emu.uc.mem_read(address, min(size, 64 * 1024 * 1024)))
+        except UcError:
+            return None
+
+    def _play_sound_common(self, pszSound, flags, wide):
+        """Shared PlaySound/sndPlaySound logic; returns TRUE/FALSE"""
+        if not pszSound or (flags & self.SND_PURGE):
+            log.debug("PlaySound(NULL) - stop")
+            SoundPlayer.stop()
+            return 1
+        if (flags & self.SND_NOSTOP) and SoundPlayer.playing():
+            return 0
+        loop = bool(flags & self.SND_LOOP) and bool(flags & self.SND_ASYNC)
+
+        length = None
+        if (flags & self.SND_RESOURCE) == self.SND_RESOURCE:
+            log.debug("PlaySound(SND_RESOURCE) - resources are not supported")
+        elif flags & self.SND_MEMORY:
+            data = self._read_wav_memory(pszSound)
+            log.debug(f"PlaySound(memory 0x{pszSound:08x}, 0x{flags:x})")
+            if data is not None:
+                length = SoundPlayer.play(io.BytesIO(data), loop)
+        else:
+            name = self._read_text(pszSound, wide)
+            log.debug(f"PlaySound(\"{name}\", 0x{flags:x})")
+            alias = self.SOUND_ALIASES.get(name.lower())
+            if alias is not None and not (flags & self.SND_FILENAME):
+                frequency, duration = self.SYSTEM_SOUND_TONES[alias]
+                SoundPlayer.play_tone(frequency, duration)
+                length = duration / 1000.0
+            elif not (flags & self.SND_ALIAS):
+                path = self.resolve_c_drive_path(name)
+                if path is None or not os.path.isfile(path):
+                    # Windows also tries the name with a .wav extension
+                    path = self.resolve_c_drive_path(name + '.wav')
+                if path is not None and os.path.isfile(path):
+                    length = SoundPlayer.play(path, loop)
+
+        if length is None:
+            if not (flags & self.SND_NODEFAULT):
+                SoundPlayer.tone(*self.SYSTEM_SOUND_TONES[0])
+            return 0
+        if not (flags & self.SND_ASYNC):
+            # SND_SYNC: return once the sound has finished
+            self._wait_ms(int(length * 1000),
+                          until=SoundPlayer.playing if SoundPlayer.available() else None)
+        return 1
+
+    def PlaySoundA(self, args, wide=False):
+        """PlaySoundA/W emulation (winmm) - WAV files in c_drive/, memory
+        images and system sound aliases"""
+        return self._play_sound_common(args[0], args[2], wide)
+
+    def PlaySoundW(self, args):
+        return self.PlaySoundA(args, wide=True)
+
+    def sndPlaySoundA(self, args, wide=False):
+        """sndPlaySoundA/W emulation (winmm) - alias or file name"""
+        flags = args[1] & (self.SND_ASYNC | self.SND_NODEFAULT | self.SND_MEMORY |
+                           self.SND_LOOP | self.SND_NOSTOP)
+        return self._play_sound_common(args[0], flags, wide)
+
+    def sndPlaySoundW(self, args):
+        return self.sndPlaySoundA(args, wide=True)
 
     # ---------- Scrollbar APIs (user32) ----------
 
@@ -9112,6 +9750,7 @@ class PseudoWindowsGUI:
     COLOR_TEXT = (0, 0, 0)
     COLOR_EDIT_BG = (255, 255, 255)
     COLOR_TASKBAR = (192, 192, 192)
+    CONSOLE_TITLE = "Console - Program Output"
 
     # Resize settings
     RESIZE_BORDER = 6      # Edge grab margin (pixels)
@@ -9148,8 +9787,8 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
-        # Start menu: open flag, EXE names listed, and the callback that
-        # runs one of them (set by main)
+        # Start menu: open flag, EXE Windows paths listed (C:\\ and
+        # C:\\Windows\\Demos), and the callback that runs one (set by main)
         self.start_menu_open = False
         self.start_menu_items = []
         self.launcher = None
@@ -9371,7 +10010,7 @@ class PseudoWindowsGUI:
         return menu, rects
 
     def _draw_start_menu(self):
-        """Draw the Start menu listing the programs in c_drive/"""
+        """Draw the Start menu listing the programs in C:\\ and C:\\Windows\\Demos"""
         if not self.start_menu_open:
             return
         menu, rects = self._start_menu_rects()
@@ -9384,7 +10023,7 @@ class PseudoWindowsGUI:
         pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
 
         if not self.start_menu_items:
-            text = self.font.render("(no programs in c_drive/)", True, (128, 128, 128))
+            text = self.font.render("(no programs found)", True, (128, 128, 128))
             self.screen.blit(text, (rects[0].x + 6, rects[0].y + 3))
             return
 
@@ -9394,7 +10033,8 @@ class PseudoWindowsGUI:
             if hovered:
                 pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
             color = self.COLOR_TITLE_TEXT if hovered else self.COLOR_TEXT
-            text = self.font.render(os.path.splitext(name)[0], True, color)
+            text = self.font.render(os.path.splitext(name.rsplit('\\', 1)[-1])[0],
+                                    True, color)
             self.screen.blit(text, (rect.x + 6, rect.y + (rect.height - text.get_height()) // 2))
 
     def _handle_start_menu_click(self, pos, button):
@@ -9404,11 +10044,7 @@ class PseudoWindowsGUI:
             if self.start_menu_open:
                 self.open_menu = None
                 self.open_combo = None
-                try:
-                    self.start_menu_items = sorted(
-                        f for f in os.listdir(C_DRIVE_PATH) if f.lower().endswith('.exe'))
-                except OSError:
-                    self.start_menu_items = []
+                self.start_menu_items = list_programs()
             return True
         if not self.start_menu_open:
             return False
@@ -9437,6 +10073,8 @@ class PseudoWindowsGUI:
         self.resizing_window = None
         self.dragging_scrollbar = None
         self.console_lines = []
+        if self.console_hwnd in self.windows:
+            self.windows[self.console_hwnd].title = self.CONSOLE_TITLE
     
     def _draw_taskbar(self):
         """Draw taskbar"""
@@ -11005,8 +11643,7 @@ class PseudoWindowsGUI:
     
     def _create_console_window(self):
         """Create console window"""
-        self.console_hwnd = self.create_window("Console - Program Output", 
-                                                50, 400, 600, 280)
+        self.console_hwnd = self.create_window(self.CONSOLE_TITLE, 50, 400, 600, 280)
         self.windows[self.console_hwnd].bg_color = (12, 12, 12)  # Black background
         self.show_window(self.console_hwnd)
     
@@ -12002,10 +12639,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"EXE files are searched in c_drive/ folder by default.\nExample: python3 winexe32emu.py hello_messagebox.exe"
+        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Demos/ "
+               "(C:\\Windows\\Demos).\nExample: python3 winexe32emu.py gdi_demo.exe"
     )
     parser.add_argument("exe", nargs="?",
-                        help="PE file to run (inside c_drive/); optional with the GUI, "
+                        help="PE file to run: a name in C:\\ or C:\\Windows\\Demos, or a "
+                             "Windows path inside c_drive/; optional with the GUI, "
                              "programs can also be started from the Start menu")
     parser.add_argument("-n", "--max-instructions", type=int, default=None,
                         help="Maximum instructions to execute "
@@ -12045,7 +12684,7 @@ def main():
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
         log.error("An EXE name is required when the GUI is not available")
         sys.exit(1)
-    if args.exe is not None and not os.path.isfile(os.path.join(C_DRIVE_PATH, args.exe)):
+    if args.exe is not None and find_program(args.exe) is None:
         log.error(f"File not found in emulation C drive: {args.exe}")
         sys.exit(1)
 
@@ -12082,8 +12721,12 @@ def main():
     launch_lock = threading.Lock()
 
     def load_program(name):
-        """Load c_drive/<name> and emulate it in a new thread. Returns success."""
-        exe_path = os.path.join(C_DRIVE_PATH, name)
+        """Load an EXE from the emulated C drive and emulate it in a new thread.
+        Returns success."""
+        exe_path = find_program(name)
+        if exe_path is None:
+            log.error(f"File not found in emulation C drive: {name}")
+            return False
         log.info(f"Loading EXE from emulation C drive: {exe_path}")
         loader = PELoader(exe_path)
         if not loader.load():
@@ -12104,6 +12747,8 @@ def main():
                 log.error(f"Emulation error: {e}")
                 emulator.crashed = True
             finally:
+                # Sounds do not outlive their process
+                SoundPlayer.stop_all()
                 log.success("Emulation completed!")
 
         # Separate thread so the GUI stays responsive
@@ -12126,7 +12771,7 @@ def main():
         return not thread.is_alive()
 
     def launch(name):
-        """Start menu: replace the running program with c_drive/<name>"""
+        """Start menu: replace the running program with the EXE at Windows path name"""
         def worker():
             with launch_lock:
                 if not stop_program():
