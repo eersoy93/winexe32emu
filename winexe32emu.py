@@ -9983,7 +9983,8 @@ class PseudoWindowsGUI:
     def _gui_loop(self):
         """Main GUI loop"""
         pygame.init()
-        pygame.display.set_caption("Windows 32-bit Emulator - Fake Desktop")
+        pygame.display.set_caption(
+            f"Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION} - Fake Desktop")
         
         self.screen = pygame.display.set_mode((self.width, self.height), pygame.SCALED)
         self.clock = pygame.time.Clock()
