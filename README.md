@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Put EXE files in the c_drive/ folder (the emulated `C:\`) or compile the examples with `./compile-examples.sh`; the demo EXEs are placed in `c_drive/Windows/Demos/`, which the program sees as `C:\Windows\Demos`. After that, run:
+Put EXE files in the c_drive/ folder (the emulated `C:\`) or compile the examples with `./create_c_drive_environment.sh`; the demo EXEs are placed in `c_drive/Windows/Demos/`, which the program sees as `C:\Windows\Demos`. After that, run:
 
 ```bash
 python3 winexe32emu.py gdi_demo.exe
@@ -24,16 +24,18 @@ Use `-h` parameter for command-line help. For programs using a legacy ANSI code 
 
 Use `-v` to see every API call and other debug output, or `-q` to see only the program output, warnings and errors.
 
-With the GUI, the EXE name is optional: the Start menu on the fake desktop lists the EXE files in `C:\` and `C:\Windows\Demos` and runs the selected one (replacing the running program).
+With the GUI, the EXE name is optional: the Start menu on the fake desktop lists the EXE files in `C:\`, and the demos in `C:\Windows\Demos` under its own *Demos* submenu. Each selected program starts next to the ones already running.
 
-The emulator exits with the program's exit code (1 if the emulated program crashes).
+Like on Windows, only console (`SUBSYSTEM_CONSOLE`) programs start with a console window; GUI programs get one only if they call `AllocConsole`. Every program has its own console, which stays open after the program ends; closing it while the program runs ends the program.
+
+The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
 - `c_drive/Windows/Demos/` - Compiled example EXEs (`C:\Windows\Demos`)
 - `examples/` - Example C source codes
-- `compile-examples.sh` - Script to compile examples into `c_drive/Windows/Demos/`
+- `create_cdrive_environment.sh` - Script to compile examples into `c_drive/Windows/Demos/`
 - `winexe32emu.py` - The main script
 
 ## Features

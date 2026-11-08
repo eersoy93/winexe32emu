@@ -133,6 +133,7 @@ class PELoader:
         self.pe = None
         self.image_base = 0
         self.entry_point = 0
+        self.subsystem = 0
         self.sections = []
         self.imports = {}
         self.exports = []
@@ -186,6 +187,7 @@ class PELoader:
 
         # Subsystem
         subsystem = self.pe.OPTIONAL_HEADER.Subsystem
+        self.subsystem = subsystem
         subsystem_names = {
             1: "Native",
             2: "Windows GUI",
@@ -349,6 +351,10 @@ class PELoader:
         log.success(f"Total {len(self.exports)} exports!")
         log.info(f"Entry point: 0x{self.image_base + self.entry_point:08x}")
 
+    def is_console_program(self):
+        """True for IMAGE_SUBSYSTEM_WINDOWS_CUI EXEs (they start with a console)"""
+        return self.subsystem == 3
+
 
 class ConsoleStream:
     """File-like object backing the CRT stdin/stdout/stderr FILE* streams.
@@ -382,12 +388,7 @@ class ConsoleStream:
         else:
             print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
         self.handler.console_output.append(text)
-        gui = self.handler.gui
-        if gui and gui.running:
-            if self.kind == 'stderr':
-                gui.console_write_stderr(text)
-            else:
-                gui.console_write_stdout(text)
+        self.handler.console_write(text, self.kind)
 
     def _fill(self):
         """Read one more line of input. Returns False at EOF."""
@@ -397,7 +398,8 @@ class ConsoleStream:
         self.handler.flush_std_streams()
         gui = self.handler.gui
         if gui:
-            line = gui.request_console_input()
+            # No console (GUI program): stdin is at EOF
+            line = self.handler.console_read_line()
             if line is None:
                 return False
             self._in += (line + "\n").encode(ANSI_CODEPAGE, errors='replace')
@@ -597,8 +599,9 @@ def find_program(name):
 
 
 def list_programs():
-    """Windows paths of the EXE files in PROGRAM_FOLDERS (for the Start menu)."""
-    programs = []
+    """Windows paths of the EXE files in each PROGRAM_FOLDERS entry
+    (for the Start menu): {folder: [paths]}."""
+    programs = {}
     for folder in PROGRAM_FOLDERS:
         directory = _program_folder_host_path(folder)
         try:
@@ -607,9 +610,9 @@ def list_programs():
                             and os.path.isfile(os.path.join(directory, f))),
                            key=str.lower)
         except (OSError, TypeError):
-            continue
+            names = []
         prefix = folder.rstrip('\\') + '\\'
-        programs.extend(prefix + f for f in names)
+        programs[folder] = [prefix + f for f in names]
     return programs
 
 
@@ -623,6 +626,7 @@ class SoundPlayer:
     _lock = threading.Lock()
     _format = None        # None: not tried yet, False: no audio, else mixer format
     _play_sound = None    # Sound started by PlaySound (only one at a time)
+    _play_owner = None    # Process (WinAPIHandler) that started _play_sound
 
     # Sample packing per mixer sample size: (array typecode, scale, offset)
     _SAMPLE_FORMATS = {-16: ('h', 32767, 0), 16: ('H', 32767, 32768),
@@ -685,7 +689,7 @@ class SoundPlayer:
             return None
 
     @classmethod
-    def play(cls, source, loop=False):
+    def play(cls, source, loop=False, owner=None):
         """Play a WAV file path or file-like object as the PlaySound sound.
 
         Returns the length in seconds, or None if it cannot be decoded.
@@ -698,15 +702,15 @@ class SoundPlayer:
             log.debug(f"Cannot play sound: {e}")
             return None
         cls.stop()
-        cls._play_sound = sound
+        cls._play_sound, cls._play_owner = sound, owner
         sound.play(loops=-1 if loop else 0)
         return sound.get_length()
 
     @classmethod
-    def play_tone(cls, frequency, duration_ms):
+    def play_tone(cls, frequency, duration_ms, owner=None):
         """Play a tone as the PlaySound sound (system sound aliases)"""
         cls.stop()
-        cls._play_sound = cls.tone(frequency, duration_ms)
+        cls._play_sound, cls._play_owner = cls.tone(frequency, duration_ms), owner
 
     @classmethod
     def playing(cls):
@@ -718,6 +722,7 @@ class SoundPlayer:
     def stop(cls):
         """Stop the PlaySound sound"""
         sound, cls._play_sound = cls._play_sound, None
+        cls._play_owner = None
         if sound is not None:
             try:
                 sound.stop()
@@ -725,14 +730,10 @@ class SoundPlayer:
                 pass
 
     @classmethod
-    def stop_all(cls):
-        """Silence everything (the program that made the sounds has ended)"""
-        if cls._format:
-            cls._play_sound = None
-            try:
-                pygame.mixer.stop()
-            except pygame.error:
-                pass
+    def stop_owned_by(cls, owner):
+        """Stop the PlaySound sound if the given process started it"""
+        if cls._play_sound is not None and cls._play_owner is owner:
+            cls.stop()
 
 class WinAPIHandler:
     """Windows API emulation"""
@@ -935,6 +936,10 @@ class WinAPIHandler:
         self.virtual_allocs = {}  # VirtualAlloc base -> reserved size
         self.next_handle = 0x1000
         self.console_output = []
+        # Own console: has_console follows AllocConsole/FreeConsole, console is
+        # the GUI console window (FakeConsole) when the GUI is running
+        self.has_console = False
+        self.console = None
         # msvcrt FILE* streams: fake FILE pointer -> {'fp': python file, 'path': str}
         self.file_streams = {}
         self.next_file_ptr = 0x0F000000  # dedicated range for fake FILE* pointers
@@ -1105,6 +1110,49 @@ class WinAPIHandler:
     def windows_command_line(self):
         path = self.windows_exe_path()
         return f'"{path}"' if ' ' in path else path
+
+    # ==================== CONSOLE ====================
+
+    def alloc_console(self):
+        """Give the process its own console (window). False if it already has one."""
+        if self.has_console:
+            return False
+        self.has_console = True
+        if self.gui and self.gui.running:
+            self.console = self.gui.create_console(self.windows_exe_path(), self)
+        return True
+
+    def free_console(self):
+        """Detach from the console; its window closes. False if there was none."""
+        if not self.has_console:
+            return False
+        self.flush_std_streams()
+        self.has_console = False
+        console, self.console = self.console, None
+        if console is not None and self.gui:
+            self.gui.close_console(console)
+        return True
+
+    def console_write(self, text, stream='stdout'):
+        """Show program output in the process's GUI console, if it has one"""
+        console = self.console
+        if console is not None and self.gui and self.gui.running:
+            self.gui.console_write(console, text, stream)
+
+    def console_read_line(self):
+        """Read a line typed into the GUI console; None without a console or when cancelled"""
+        console = self.console
+        if console is None or not self.gui:
+            return None
+        return self.gui.request_console_input(console)
+
+    def request_termination(self):
+        """Stop the process from another thread (console closed, emulator shutdown)"""
+        self.emu.stop_emulation = True
+        self.quit_requested = True
+        console = self.console
+        if console is not None and self.gui:
+            self.gui.cancel_console_input(console)
 
     def _set_exit_code(self, code):
         if self.exit_code is None:
@@ -1376,15 +1424,20 @@ class WinAPIHandler:
         return self.LoadIconA(args)
 
     def AllocConsole(self, args):
-        """AllocConsole emulation"""
-        log.debug("AllocConsole() - Creating console window")
-        # Assume console always exists in emulator
-        return 1  # Success
+        """AllocConsole emulation - opens the process's console window"""
+        log.debug("AllocConsole()")
+        if not self.alloc_console():
+            self._last_error = 5  # ERROR_ACCESS_DENIED: already has a console
+            return 0
+        return 1
     
     def FreeConsole(self, args):
         """FreeConsole emulation"""
         log.debug("FreeConsole()")
-        return 1  # Success
+        if not self.free_console():
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        return 1
     
     def GetStdHandle(self, args):
         """GetStdHandle emulation"""
@@ -1425,16 +1478,12 @@ class WinAPIHandler:
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
                 print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
-                # Write to GUI console
-                if self.gui and self.gui.running:
-                    self.gui.console_write_stdout(text)
+                self.console_write(text)
             elif hFile in [0x12]:  # stderr
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
                 print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
                 self.console_output.append(text)
-                # Write to GUI console
-                if self.gui and self.gui.running:
-                    self.gui.console_write_stderr(text)
+                self.console_write(text, 'stderr')
             else:
                 # Real file handle (opened via CreateFile, inside c_drive/)
                 info = self.handles.get(hFile)
@@ -1475,10 +1524,7 @@ class WinAPIHandler:
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
             print(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}", end='')
             self.console_output.append(text)
-            
-            # Write to GUI console
-            if self.gui and self.gui.running:
-                self.gui.console_write_stdout(text)
+            self.console_write(text)
             
             if lpNumberOfCharsWritten != 0:
                 self.emu.uc.mem_write(lpNumberOfCharsWritten,
@@ -2616,9 +2662,11 @@ class WinAPIHandler:
         """SetConsoleTitleA/W emulation - renames the GUI console window"""
         title = self._read_text(args[0], wide)
         log.debug(f"SetConsoleTitle(\"{title}\")")
-        if self.gui and self.gui.console_hwnd in self.gui.windows:
+        console = self.console
+        if console is not None and self.gui:
             with self.gui.lock:
-                self.gui.windows[self.gui.console_hwnd].title = title
+                if console.hwnd in self.gui.windows:
+                    self.gui.windows[console.hwnd].title = title
         return 1
 
     def SetConsoleTitleW(self, args):
@@ -2665,7 +2713,10 @@ class WinAPIHandler:
         log.debug(f"ReadConsoleA(0x{hConsoleInput:x}, max {nNumberOfCharsToRead} chars)")
         
         if self.gui:
-            user_input = self.gui.request_console_input()
+            if self.console is None:
+                self._last_error = 6  # ERROR_INVALID_HANDLE: no console
+                return 0
+            user_input = self.console_read_line()
             if user_input is None:
                 user_input = ""
             data = (user_input + "\r\n").encode(ANSI_CODEPAGE, errors='replace')
@@ -2888,7 +2939,8 @@ class WinAPIHandler:
                                                x, y, nWidth, nHeight, dwStyle,
                                                control_id=hMenu)
             else:
-                hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle)
+                hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle,
+                                              owner=self)
 
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
@@ -3731,7 +3783,7 @@ class WinAPIHandler:
         """Shared PlaySound/sndPlaySound logic; returns TRUE/FALSE"""
         if not pszSound or (flags & self.SND_PURGE):
             log.debug("PlaySound(NULL) - stop")
-            SoundPlayer.stop()
+            SoundPlayer.stop_owned_by(self)
             return 1
         if (flags & self.SND_NOSTOP) and SoundPlayer.playing():
             return 0
@@ -3744,14 +3796,14 @@ class WinAPIHandler:
             data = self._read_wav_memory(pszSound)
             log.debug(f"PlaySound(memory 0x{pszSound:08x}, 0x{flags:x})")
             if data is not None:
-                length = SoundPlayer.play(io.BytesIO(data), loop)
+                length = SoundPlayer.play(io.BytesIO(data), loop, owner=self)
         else:
             name = self._read_text(pszSound, wide)
             log.debug(f"PlaySound(\"{name}\", 0x{flags:x})")
             alias = self.SOUND_ALIASES.get(name.lower())
             if alias is not None and not (flags & self.SND_FILENAME):
                 frequency, duration = self.SYSTEM_SOUND_TONES[alias]
-                SoundPlayer.play_tone(frequency, duration)
+                SoundPlayer.play_tone(frequency, duration, owner=self)
                 length = duration / 1000.0
             elif not (flags & self.SND_ALIAS):
                 path = self.resolve_c_drive_path(name)
@@ -3759,7 +3811,7 @@ class WinAPIHandler:
                     # Windows also tries the name with a .wav extension
                     path = self.resolve_c_drive_path(name + '.wav')
                 if path is not None and os.path.isfile(path):
-                    length = SoundPlayer.play(path, loop)
+                    length = SoundPlayer.play(path, loop, owner=self)
 
         if length is None:
             if not (flags & self.SND_NODEFAULT):
@@ -4136,7 +4188,7 @@ class WinAPIHandler:
                 windows = list(self.gui.windows.items())
         for hwnd, window in windows:
             if (hwnd not in self.painted_windows and window.visible
-                    and matches(hwnd, self.WM_PAINT)):
+                    and window.owner is self and matches(hwnd, self.WM_PAINT)):
                 if remove:
                     self.painted_windows.add(hwnd)
                 return (hwnd, self.WM_PAINT, 0, 0)
@@ -4274,13 +4326,11 @@ class WinAPIHandler:
     
     def _find_wndproc_for_hwnd(self, hwnd):
         """Find WndProc address for a specific hwnd"""
-        # No WndProc for console window
-        if self.gui and hwnd == self.gui.console_hwnd:
-            return 0
-        
-        # Get window class from GUI
+        # Get window class from GUI (only this process's own windows, no consoles)
         if self.gui and hwnd in self.gui.windows:
             window = self.gui.windows[hwnd]
+            if window.owner is not self or hwnd in self.gui.consoles:
+                return 0
             # Find WndProc from window class name
             class_name = getattr(window, 'class_name', None)
             if class_name and class_name in self.registered_classes:
@@ -4342,7 +4392,9 @@ class WinAPIHandler:
         """Window a DC belongs to (fall back to the active window)"""
         hwnd = self.dc_map.get(hdc, 0)
         if not hwnd and self.gui:
-            hwnd = self.gui.active_window
+            active = self.gui.active_window
+            if self.gui.window_owner(active) is self:
+                hwnd = active
         return hwnd
 
     def _dc_pen(self, hdc):
@@ -4607,7 +4659,7 @@ class WinAPIHandler:
         
         if self.gui:
             state = self.dc_state.get(hdc, {})
-            if state.get('memory') or self._dc_hwnd(hdc) != self.gui.console_hwnd:
+            if state.get('memory') or self._dc_hwnd(hdc) not in self.gui.consoles:
                 self._add_text(hdc, text, draw_x, draw_y)
 
         return height  # Text height
@@ -7112,8 +7164,7 @@ class WinAPIHandler:
             text = data.decode(ANSI_CODEPAGE, errors='replace')
             print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
             self.console_output.append(text)
-            if self.gui and self.gui.running:
-                self.gui.console_write_stdout(text)
+            self.console_write(text)
             return nmemb
 
         try:
@@ -7300,8 +7351,7 @@ class WinAPIHandler:
             # Treat unknown stream as stdout.
             print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
             self.console_output.append(text)
-            if self.gui and self.gui.running:
-                self.gui.console_write_stdout(text)
+            self.console_write(text)
             return 0
         try:
             fp.write(text.encode(ANSI_CODEPAGE, errors='replace'))
@@ -9634,6 +9684,7 @@ class FakeWindow:
         self.children = []
         self.controls = []  # Buttons, text boxes, etc.
         self.wndproc = 0
+        self.owner = None  # WinAPIHandler of the process that created it (None: emulator's own)
         self.bg_color = (240, 240, 240)  # Windows classic gray
         self.text = title
 
@@ -9735,6 +9786,47 @@ class FakeControl:
                 abs_y <= py <= abs_y + self.height)
 
 
+class FakeConsole:
+    """Console of one process: its output lines and a pending line read"""
+
+    MAX_LINES = 100
+
+    def __init__(self, hwnd):
+        self.hwnd = hwnd  # Console window
+        self.lines = []  # {'text', 'color', 'stream'}
+        self.scroll = 0
+        self.input = ""  # Line being typed
+        self.input_active = False  # A ReadConsole/stdin read is waiting
+        self.input_result = None
+        self.input_ready = threading.Event()
+        self.cancelled = False  # Process ending or console closed: reads return None
+
+
+class _ProcessRouter:
+    """GUI-side stand-in for a WinAPIHandler while several programs run at once.
+
+    Window messages go to the process owning the target window; other
+    attributes (message constants, scroll_pos_max) come from WinAPIHandler.
+    """
+
+    def __init__(self, gui):
+        self._gui = gui
+
+    def __getattr__(self, name):
+        return getattr(WinAPIHandler, name)
+
+    def post_window_message(self, hwnd, message, wParam, lParam):
+        owner = self._gui.window_owner(hwnd)
+        if owner is not None and not owner.process_exited:
+            owner.post_window_message(hwnd, message, wParam, lParam)
+
+    @property
+    def capture_hwnd(self):
+        for process in list(self._gui.processes):
+            if process.capture_hwnd:
+                return process.capture_hwnd
+        return 0
+
 class PseudoWindowsGUI:
     """Pygame-based fake Windows GUI environment"""
     
@@ -9750,7 +9842,6 @@ class PseudoWindowsGUI:
     COLOR_TEXT = (0, 0, 0)
     COLOR_EDIT_BG = (255, 255, 255)
     COLOR_TASKBAR = (192, 192, 192)
-    CONSOLE_TITLE = "Console - Program Output"
 
     # Resize settings
     RESIZE_BORDER = 6      # Edge grab margin (pixels)
@@ -9769,7 +9860,9 @@ class PseudoWindowsGUI:
         self.screen = None
         self.running = False
         self.clock = None
-        self.winapi = None  # WinAPIHandler back-reference (set by CPUEmulator.initialize)
+        # Running programs (WinAPIHandler each); winapi routes messages to them
+        self.processes = []
+        self.winapi = _ProcessRouter(self)
         
         # Window management
         self.windows = {}  # hwnd -> FakeWindow
@@ -9787,10 +9880,12 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
-        # Start menu: open flag, EXE Windows paths listed (C:\\ and
-        # C:\\Windows\\Demos), and the callback that runs one (set by main)
+        # Start menu: open flag, rows (C:\ programs, then a Demos submenu
+        # listing C:\Windows\Demos), and the callback that runs one (set by main)
         self.start_menu_open = False
-        self.start_menu_items = []
+        self.start_menu_rows = []
+        self.start_menu_demos = []
+        self.start_submenu_open = False
         self.launcher = None
 
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
@@ -9818,21 +9913,10 @@ class PseudoWindowsGUI:
         # Thread
         self.gui_thread = None
         
-        # Console window
-        self.console_lines = []  # Console output lines
-        self.console_max_lines = 100  # Maximum line count
-        self.console_input = ""  # Current input
-        self.console_visible = True  # Console visibility
-        self.console_scroll = 0  # Scroll position
-        self.console_hwnd = None  # Console window handle
+        # Console windows of the programs: hwnd -> FakeConsole
+        self.consoles = {}
         self.font_console = None  # Monospace font
-        
-        # Console input system (thread-safe)
-        self.console_input_pending = False  # Is input pending?
-        self.console_input_ready = threading.Event()  # Input ready signal
-        self.console_input_result = ""  # Received input
-        self.console_input_active = False  # Is input mode active?
-        self.console_cursor_visible = True  # Cursor blinking
+        self.console_cursor_visible = True  # Input cursor blinking
         self.console_cursor_timer = 0
         
         # Window dragging
@@ -9883,9 +9967,6 @@ class PseudoWindowsGUI:
         self.font_small = pygame.font.SysFont('arial', 11)
         self.font_bold = pygame.font.SysFont('arial', 14, bold=True)
         self.font_console = pygame.font.SysFont('consolas,courier,monospace', 12)
-        
-        # Create console window
-        self._create_console_window()
         
         self.running = True
         
@@ -9954,8 +10035,8 @@ class PseudoWindowsGUI:
         # MessageBox check
         self._check_messagebox()
         
-        # Cursor blinking (when console input is active)
-        if self.console_input_active:
+        # Cursor blinking (when a console waits for input)
+        if any(c.input_active for c in self.consoles.values()):
             self.console_cursor_timer += 1
             if self.console_cursor_timer >= 30:  # ~0.5 seconds
                 self.console_cursor_timer = 0
@@ -9975,8 +10056,8 @@ class PseudoWindowsGUI:
         # Draw windows (according to z-order)
         for hwnd in self.z_order:
             if hwnd in self.windows:
-                if hwnd == self.console_hwnd:
-                    self._draw_console_window(self.windows[hwnd])
+                if hwnd in self.consoles:
+                    self._draw_console_window(self.windows[hwnd], self.consoles[hwnd])
                 else:
                     self._draw_window(self.windows[hwnd])
 
@@ -9992,50 +10073,123 @@ class PseudoWindowsGUI:
     # ==================== START MENU ====================
 
     START_ITEM_H = 22
+    START_SEP_H = 8
     START_MENU_W = 200
     START_STRIP_W = 22
 
     def _start_button_rect(self):
         return pygame.Rect(2, self.height - 28, 60, 26)
 
+    def _fill_start_menu(self):
+        """Read the Start menu rows: C:\\ programs, then the Demos submenu"""
+        programs = list_programs()
+        self.start_menu_demos = programs.get(DEMOS_FOLDER, [])
+        rows = [('program', path) for path in programs.get('C:\\', [])]
+        if self.start_menu_demos:
+            if rows:
+                rows.append(('separator', None))
+            rows.append(('demos', None))
+        self.start_menu_rows = rows or [('empty', None)]
+        self.start_submenu_open = False
+
     def _start_menu_rects(self):
-        """Start menu rect and its item rects (one per EXE, at least one row)"""
-        rows = max(1, len(self.start_menu_items))
-        height = rows * self.START_ITEM_H + 6
-        menu = pygame.Rect(0, self.height - 30 - height, self.START_MENU_W, height)
-        rects = [pygame.Rect(menu.x + self.START_STRIP_W + 2,
-                             menu.y + 3 + i * self.START_ITEM_H,
-                             menu.width - self.START_STRIP_W - 5, self.START_ITEM_H)
-                 for i in range(rows)]
+        """Start menu rect and one rect per row"""
+        heights = [self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
+                   for kind, _ in self.start_menu_rows]
+        menu_h = sum(heights) + 6
+        menu = pygame.Rect(0, self.height - 30 - menu_h, self.START_MENU_W, menu_h)
+        rects = []
+        y = menu.y + 3
+        for h in heights:
+            rects.append(pygame.Rect(menu.x + self.START_STRIP_W + 2, y,
+                                     menu.width - self.START_STRIP_W - 5, h))
+            y += h
         return menu, rects
 
+    def _start_submenu_rects(self, demos_rect):
+        """Demos submenu rect (right of its row) and its item rects"""
+        count = len(self.start_menu_demos)
+        sub_h = count * self.START_ITEM_H + 6
+        top = max(0, min(demos_rect.y - 3, self.height - 30 - sub_h))
+        sub = pygame.Rect(demos_rect.right + 2, top, self.START_MENU_W, sub_h)
+        rects = [pygame.Rect(sub.x + 3, sub.y + 3 + i * self.START_ITEM_H,
+                             sub.width - 6, self.START_ITEM_H)
+                 for i in range(count)]
+        return sub, rects
+
+    def _demos_row_rect(self, rects):
+        for (kind, _), rect in zip(self.start_menu_rows, rects):
+            if kind == 'demos':
+                return rect
+        return None
+
+    def _draw_menu_panel(self, rect):
+        """Raised 3D panel behind a menu"""
+        pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, rect.topleft, rect.topright)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, rect.topleft, rect.bottomleft)
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                         (rect.right - 1, rect.top), (rect.right - 1, rect.bottom))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                         (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1))
+
+    def _draw_menu_row(self, rect, label, highlighted):
+        if highlighted:
+            pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
+        color = self.COLOR_TITLE_TEXT if highlighted else self.COLOR_TEXT
+        text = self.font.render(label, True, color)
+        self.screen.blit(text, (rect.x + 6, rect.y + (rect.height - text.get_height()) // 2))
+        return color
+
+    @staticmethod
+    def _program_label(path):
+        return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
+
     def _draw_start_menu(self):
-        """Draw the Start menu listing the programs in C:\\ and C:\\Windows\\Demos"""
+        """Draw the Start menu: C:\\ programs and a Demos submenu (C:\\Windows\\Demos)"""
         if not self.start_menu_open:
             return
         menu, rects = self._start_menu_rects()
-        pygame.draw.rect(self.screen, self.COLOR_BUTTON, menu)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, menu.topleft, menu.topright)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, menu.topleft, menu.bottomleft)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                         (menu.right - 1, menu.top), (menu.right - 1, menu.bottom))
+        self._draw_menu_panel(menu)
         strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3, menu.height - 6)
         pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
 
-        if not self.start_menu_items:
-            text = self.font.render("(no programs found)", True, (128, 128, 128))
-            self.screen.blit(text, (rects[0].x + 6, rects[0].y + 3))
-            return
-
         mouse_pos = pygame.mouse.get_pos()
-        for name, rect in zip(self.start_menu_items, rects):
-            hovered = rect.collidepoint(mouse_pos)
-            if hovered:
-                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
-            color = self.COLOR_TITLE_TEXT if hovered else self.COLOR_TEXT
-            text = self.font.render(os.path.splitext(name.rsplit('\\', 1)[-1])[0],
-                                    True, color)
-            self.screen.blit(text, (rect.x + 6, rect.y + (rect.height - text.get_height()) // 2))
+        demos_rect = self._demos_row_rect(rects)
+        sub, sub_rects = (self._start_submenu_rects(demos_rect) if demos_rect
+                          else (None, []))
+
+        # Hovering a row opens the Demos submenu or closes it
+        if not (sub and self.start_submenu_open and sub.collidepoint(mouse_pos)):
+            for (kind, _), rect in zip(self.start_menu_rows, rects):
+                if rect.collidepoint(mouse_pos) and kind != 'separator':
+                    self.start_submenu_open = (kind == 'demos')
+
+        for (kind, path), rect in zip(self.start_menu_rows, rects):
+            if kind == 'separator':
+                y = rect.centery
+                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                                 (rect.x + 2, y - 1), (rect.right - 2, y - 1))
+                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                                 (rect.x + 2, y), (rect.right - 2, y))
+            elif kind == 'empty':
+                text = self.font.render("(no programs found)", True, (128, 128, 128))
+                self.screen.blit(text, (rect.x + 6, rect.y + 3))
+            elif kind == 'demos':
+                color = self._draw_menu_row(rect, "Demos", self.start_submenu_open)
+                # Submenu arrow
+                ax, ay = rect.right - 12, rect.centery
+                pygame.draw.polygon(self.screen, color,
+                                    [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
+            else:
+                self._draw_menu_row(rect, self._program_label(path),
+                                    rect.collidepoint(mouse_pos))
+
+        if sub and self.start_submenu_open:
+            self._draw_menu_panel(sub)
+            for path, rect in zip(self.start_menu_demos, sub_rects):
+                self._draw_menu_row(rect, self._program_label(path),
+                                    rect.collidepoint(mouse_pos))
 
     def _handle_start_menu_click(self, pos, button):
         """Start button toggles the menu; returns True if the click was consumed"""
@@ -10044,37 +10198,85 @@ class PseudoWindowsGUI:
             if self.start_menu_open:
                 self.open_menu = None
                 self.open_combo = None
-                self.start_menu_items = list_programs()
+                self._fill_start_menu()
             return True
         if not self.start_menu_open:
             return False
 
-        self.start_menu_open = False
         menu, rects = self._start_menu_rects()
+        demos_rect = self._demos_row_rect(rects)
+        if demos_rect and self.start_submenu_open:
+            sub, sub_rects = self._start_submenu_rects(demos_rect)
+            if sub.collidepoint(pos):
+                for path, rect in zip(self.start_menu_demos, sub_rects):
+                    if button == 1 and rect.collidepoint(pos) and self.launcher:
+                        self.start_menu_open = False
+                        self.launcher(path)
+                return True
+        if demos_rect and demos_rect.collidepoint(pos):
+            self.start_submenu_open = True
+            return True
+
+        self.start_menu_open = False
         if not menu.collidepoint(pos):
             return False
-        for name, rect in zip(self.start_menu_items, rects):
-            if button == 1 and rect.collidepoint(pos) and self.launcher:
-                self.launcher(name)
+        for (kind, path), rect in zip(self.start_menu_rows, rects):
+            if kind == 'program' and button == 1 and rect.collidepoint(pos) and self.launcher:
+                self.launcher(path)
         return True
 
     @gui_locked
-    def reset_for_new_program(self):
-        """Drop the previous program's windows, controls and console output"""
-        for hwnd in [h for h in self.windows if h != self.console_hwnd]:
-            del self.windows[hwnd]
-        self.controls.clear()
-        self.z_order = [h for h in self.z_order if h == self.console_hwnd]
-        self.active_window = self.console_hwnd
-        self.focused_control = None
-        self.open_menu = None
-        self.open_combo = None
-        self.dragging_window = None
-        self.resizing_window = None
-        self.dragging_scrollbar = None
-        self.console_lines = []
-        if self.console_hwnd in self.windows:
-            self.windows[self.console_hwnd].title = self.CONSOLE_TITLE
+    def register_process(self, process):
+        """A program starts: its windows get input from now on"""
+        self.processes.append(process)
+
+    @gui_locked
+    def unregister_process(self, process):
+        """A program ended: close its windows; its console stays to show the output"""
+        if process in self.processes:
+            self.processes.remove(process)
+        for hwnd, win in list(self.windows.items()):
+            if win.owner is not process:
+                continue
+            console = self.consoles.get(hwnd)
+            if console is None:
+                self._remove_window(hwnd)
+                continue
+            self.cancel_console_input(console)
+            win.owner = None
+            win.title += " [finished]"
+
+    def window_owner(self, hwnd):
+        """Process (WinAPIHandler) owning a window or control, or None"""
+        win = self.windows.get(hwnd)
+        if win is None:
+            control = self.controls.get(hwnd)
+            win = self.windows.get(control.parent_hwnd) if control else None
+        return win.owner if win else None
+
+    @gui_locked
+    def _remove_window(self, hwnd):
+        """Delete a window and its controls, dropping every reference to them"""
+        if self.windows.pop(hwnd, None) is None:
+            return
+        for chwnd in [h for h, c in self.controls.items() if c.parent_hwnd == hwnd]:
+            del self.controls[chwnd]
+            if self.focused_control == chwnd:
+                self.focused_control = None
+            if self.open_combo == chwnd:
+                self.open_combo = None
+            if self.dragging_scrollbar and self.dragging_scrollbar[0] == chwnd:
+                self.dragging_scrollbar = None
+        if hwnd in self.z_order:
+            self.z_order.remove(hwnd)
+        if self.active_window == hwnd:
+            self.active_window = self.z_order[-1] if self.z_order else None
+        if self.open_menu and self.open_menu[0] == hwnd:
+            self.open_menu = None
+        if self.dragging_window == hwnd:
+            self.dragging_window = None
+        if self.resizing_window == hwnd:
+            self.resizing_window = None
     
     def _draw_taskbar(self):
         """Draw taskbar"""
@@ -10785,15 +10987,15 @@ class PseudoWindowsGUI:
     def _is_app_window(self, hwnd):
         """True if hwnd is an emulated application window with a WndProc.
 
-        Once the emulated process has exited, its windows are dead: nothing
+        Once the owning process has exited, its windows are dead: nothing
         consumes their messages, so they are treated as plain windows again
         (X click hides directly, input is no longer forwarded).
         """
-        if not self.winapi or hwnd == self.console_hwnd:
+        win = self.windows.get(hwnd)
+        owner = win.owner if win else None
+        if owner is None or owner.process_exited or hwnd in self.consoles:
             return False
-        if self.winapi.process_exited:
-            return False
-        return bool(self.winapi._find_wndproc_for_hwnd(hwnd))
+        return bool(owner._find_wndproc_for_hwnd(hwnd))
 
     def client_origin(self, win):
         """Screen coordinates of a window's client area origin."""
@@ -11466,27 +11668,28 @@ class PseudoWindowsGUI:
 
     def _handle_key_press(self, event):
         """Handle keyboard key press"""
-        # If console input mode is active
-        if self.console_input_active:
-            if event.key == pygame.K_RETURN:
+        # The active console window takes the line its program is waiting for
+        console = self.consoles.get(self.active_window)
+        if console is not None and console.input_active:
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 # Enter - input completed
-                self.console_input_result = self.console_input
-                self.console_input = ""
-                self.console_input_active = False
-                self.console_input_ready.set()  # Send signal to waiting thread
+                console.input_result = console.input
+                console.input = ""
+                console.input_active = False
+                console.input_ready.set()  # Send signal to waiting thread
             elif event.key == pygame.K_BACKSPACE:
                 # Backspace - delete last character
-                self.console_input = self.console_input[:-1]
+                console.input = console.input[:-1]
             elif event.key == pygame.K_ESCAPE:
                 # ESC - cancel
-                self.console_input_result = ""
-                self.console_input = ""
-                self.console_input_active = False
-                self.console_input_ready.set()
+                console.input_result = ""
+                console.input = ""
+                console.input_active = False
+                console.input_ready.set()
             else:
                 # Printable character
                 if event.unicode and event.unicode.isprintable():
-                    self.console_input += event.unicode
+                    console.input += event.unicode
             return
 
         # A focused EDIT control consumes keystrokes
@@ -11557,6 +11760,15 @@ class PseudoWindowsGUI:
         if hwnd not in self.windows:
             return
 
+        console = self.consoles.get(hwnd)
+        if console is not None:
+            # Closing a console ends the program attached to it (like Windows)
+            owner = self.windows[hwnd].owner
+            if owner is not None:
+                owner.request_termination()
+            self.close_console(console)
+            return
+
         if notify_app and self._is_app_window(hwnd):
             self.winapi.post_window_message(hwnd, self.winapi.WM_CLOSE, 0, 0)
             return
@@ -11577,10 +11789,11 @@ class PseudoWindowsGUI:
         return hwnd
     
     @gui_locked
-    def create_window(self, title, x, y, width, height, style=0):
+    def create_window(self, title, x, y, width, height, style=0, owner=None):
         """Create new window"""
         hwnd = self.get_next_hwnd()
         window = FakeWindow(hwnd, title, x, y, width, height, style)
+        window.owner = owner
         self.windows[hwnd] = window
         self.z_order.append(hwnd)
         
@@ -11641,13 +11854,33 @@ class PseudoWindowsGUI:
     
     # ==================== CONSOLE WINDOW ====================
     
-    def _create_console_window(self):
-        """Create console window"""
-        self.console_hwnd = self.create_window(self.CONSOLE_TITLE, 50, 400, 600, 280)
-        self.windows[self.console_hwnd].bg_color = (12, 12, 12)  # Black background
-        self.show_window(self.console_hwnd)
+    @gui_locked
+    def create_console(self, title, owner):
+        """Open a console window for a process (called on its emulation thread)"""
+        offset = 24 * (len(self.consoles) % 8)  # Cascade several consoles
+        hwnd = self.create_window(title, 50 + offset, 400 - offset, 600, 280, owner=owner)
+        self.windows[hwnd].bg_color = (12, 12, 12)  # Black background
+        console = FakeConsole(hwnd)
+        self.consoles[hwnd] = console
+        self.show_window(hwnd)
+        return console
+
+    @gui_locked
+    def cancel_console_input(self, console):
+        """Unblock a pending read for good (process ending or console closing)"""
+        console.cancelled = True
+        console.input_active = False
+        console.input_result = None
+        console.input_ready.set()
+
+    @gui_locked
+    def close_console(self, console):
+        """Close a console window"""
+        self.cancel_console_input(console)
+        self.consoles.pop(console.hwnd, None)
+        self._remove_window(console.hwnd)
     
-    def _draw_console_window(self, window):
+    def _draw_console_window(self, window, console):
         """Draw console window"""
         if not window.visible or window.minimized:
             return
@@ -11710,13 +11943,13 @@ class PseudoWindowsGUI:
         max_visible_lines = content_height // line_height
         
         # Scroll calculation
-        start_line = max(0, len(self.console_lines) - max_visible_lines - self.console_scroll)
-        end_line = min(len(self.console_lines), start_line + max_visible_lines)
+        start_line = max(0, len(console.lines) - max_visible_lines - console.scroll)
+        end_line = min(len(console.lines), start_line + max_visible_lines)
         
         y_offset = content_y + 2
         for i in range(start_line, end_line):
-            if i < len(self.console_lines):
-                line_data = self.console_lines[i]
+            if i < len(console.lines):
+                line_data = console.lines[i]
                 text = line_data['text']
                 color = line_data.get('color', (192, 192, 192))
                 
@@ -11731,7 +11964,7 @@ class PseudoWindowsGUI:
         input_rect = pygame.Rect(content_x, input_y, content_width, 18)
         
         # Different background color if input mode is active
-        if self.console_input_active:
+        if console.input_active:
             pygame.draw.rect(self.screen, (32, 32, 64), input_rect)  # Blue tint
             pygame.draw.rect(self.screen, (128, 128, 255), input_rect, 1)  # Blue border
         else:
@@ -11740,26 +11973,22 @@ class PseudoWindowsGUI:
         
         # Prompt and input
         prompt = "> "
-        cursor = "|" if (self.console_input_active and self.console_cursor_visible) else ""
-        input_text = prompt + self.console_input + cursor
-        input_color = (0, 255, 0) if self.console_input_active else (128, 128, 128)
+        cursor = "|" if (console.input_active and self.console_cursor_visible) else ""
+        input_text = prompt + console.input + cursor
+        input_color = (0, 255, 0) if console.input_active else (128, 128, 128)
         prompt_surface = self.font_console.render(input_text, True, input_color)
         self.screen.blit(prompt_surface, (content_x + 3, input_y + 2))
         
         # Input waiting hint
-        if self.console_input_active:
+        if console.input_active:
             hint_text = "[Waiting for input - Enter: Send, ESC: Cancel]"
             hint_surface = self.font_small.render(hint_text, True, (255, 255, 128))
             self.screen.blit(hint_surface, (content_x + 3, input_y - 16))
     
     @gui_locked
-    def console_write(self, text, color=(192, 192, 192), stream="stdout"):
-        """Write to console (thread-safe)"""
-        # Determine color
-        if stream == "stderr":
-            color = (255, 64, 64)  # Red
-        elif stream == "stdin":
-            color = (64, 255, 64)  # Green
+    def console_write(self, console, text, stream="stdout"):
+        """Write to a process's console (thread-safe)"""
+        color = {"stderr": (255, 64, 64), "stdin": (64, 255, 64)}.get(stream, (192, 192, 192))
         
         # CR has no glyph; console lines are split on LF only
         text = text.replace('\r\n', '\n').replace('\r', '')
@@ -11769,52 +11998,39 @@ class PseudoWindowsGUI:
         if lines[-1] == '':
             lines.pop()
         for line in lines:
-            self.console_lines.append({
+            console.lines.append({
                 'text': line,
                 'color': color,
                 'stream': stream
             })
         
         # Check maximum line count
-        while len(self.console_lines) > self.console_max_lines:
-            self.console_lines.pop(0)
+        del console.lines[:-FakeConsole.MAX_LINES]
     
-    def console_write_stdout(self, text):
-        """Write to stdout"""
-        self.console_write(text, color=(192, 192, 192), stream="stdout")
-    
-    def console_write_stderr(self, text):
-        """Write to stderr"""
-        self.console_write(text, color=(255, 64, 64), stream="stderr")
-    
-    def console_read_line(self):
-        """Read line from console (blocking - called from emulator thread)"""
-        return self.request_console_input()
-    
-    def request_console_input(self):
+    def request_console_input(self, console):
         """
-        Request console input - thread-safe
-        Called from emulator thread, waits for GUI thread to get input
+        Read a line typed into a console - called from the emulation thread,
+        blocks until the GUI thread delivers it. None if the read is cancelled.
         """
-        # Activate input mode
-        self.console_input = ""
-        self.console_input_result = ""
-        self.console_input_ready.clear()
-        self.console_input_active = True
-        self.console_cursor_visible = True
-        self.console_cursor_timer = 0
+        with self.lock:
+            if console.cancelled or console.hwnd not in self.consoles:
+                return None
+            console.input = ""
+            console.input_result = None
+            console.input_ready.clear()
+            console.input_active = True
+            self.console_cursor_visible = True
+            self.console_cursor_timer = 0
+            # Bring the console to the front so typing goes to it
+            win = self.windows[console.hwnd]
+            win.minimized = False
+            if console.hwnd in self.z_order:
+                self.z_order.remove(console.hwnd)
+            self.z_order.append(console.hwnd)
+            self.active_window = console.hwnd
         
-        # Wait for GUI thread to get input
-        self.console_input_ready.wait()  # Blocking wait
-        
-        # Get and return result
-        result = self.console_input_result
-        
-        return result
-    
-    def console_clear(self):
-        """Clear console"""
-        self.console_lines.clear()
+        console.input_ready.wait()  # Blocking wait
+        return console.input_result
 
 
 class CPUEmulator:
@@ -11891,10 +12107,6 @@ class CPUEmulator:
         
         # Create API handler (with GUI reference)
         self.api_handler = WinAPIHandler(self, self.gui)
-
-        # Give the GUI thread a back-reference so it can post window messages
-        if self.gui:
-            self.gui.winapi = self.api_handler
         
         # Setup memory
         if not self._setup_memory():
@@ -12556,6 +12768,13 @@ class CPUEmulator:
         log.info(f"Maximum instructions: "
                  f"{self.max_instructions if self.max_instructions > 0 else 'unlimited'}")
 
+        # Let the GUI route window messages to this process
+        if self.gui:
+            self.gui.register_process(self.api_handler)
+        # Like Windows, only console (CUI) programs start with a console
+        if self.pe_loader.is_console_program():
+            self.api_handler.alloc_console()
+
         try:
             # The instruction limit is enforced in _hook_code. Passing a count
             # to Unicorn would break nested emu_start calls (callbacks,
@@ -12578,6 +12797,8 @@ class CPUEmulator:
             if self.api_handler:
                 self.api_handler.process_exited = True
                 self.api_handler.flush_std_streams()
+                if self.gui:
+                    self.gui.unregister_process(self.api_handler)
 
         log.header("Emulation Completed")
         log.info(f"Total instruction count: {self.instruction_count}")
@@ -12716,9 +12937,8 @@ def main():
     elif use_gui and not PYGAME_AVAILABLE:
         log.warning("Pygame not installed, continuing without GUI...")
 
-    # The running program: (CPUEmulator, emulation thread)
-    current = {'emulator': None, 'thread': None}
-    launch_lock = threading.Lock()
+    # Started programs: [(CPUEmulator, emulation thread)]; they run side by side
+    programs = []
 
     def load_program(name):
         """Load an EXE from the emulated C drive and emulate it in a new thread.
@@ -12748,39 +12968,19 @@ def main():
                 emulator.crashed = True
             finally:
                 # Sounds do not outlive their process
-                SoundPlayer.stop_all()
+                SoundPlayer.stop_owned_by(emulator.api_handler)
                 log.success("Emulation completed!")
 
         # Separate thread so the GUI stays responsive
         thread = threading.Thread(target=run_emulation, daemon=True)
-        current['emulator'], current['thread'] = emulator, thread
+        programs.append((emulator, thread))
         thread.start()
         return True
 
-    def stop_program():
-        """Stop the running program. Returns False if it did not stop in time."""
-        emulator, thread = current['emulator'], current['thread']
-        if thread is None or not thread.is_alive():
-            return True
-        emulator.stop_emulation = True
-        emulator.api_handler.quit_requested = True
-        # Unblock a pending console read
-        gui.console_input_active = False
-        gui.console_input_ready.set()
-        thread.join(timeout=5)
-        return not thread.is_alive()
-
     def launch(name):
-        """Start menu: replace the running program with the EXE at Windows path name"""
-        def worker():
-            with launch_lock:
-                if not stop_program():
-                    log.error("The running program did not stop; cannot start another one")
-                    return
-                gui.reset_for_new_program()
-                load_program(name)
-        # Not on the GUI thread: stopping the old program needs the GUI lock
-        threading.Thread(target=worker, daemon=True).start()
+        """Start menu: run the EXE at Windows path name next to the running programs"""
+        # Loading takes a while: keep it off the GUI thread
+        threading.Thread(target=load_program, args=(name,), daemon=True).start()
 
     if gui:
         gui.launcher = launch
@@ -12799,7 +12999,7 @@ def main():
             gui.stop()
         else:
             # If no GUI, wait for emulation to finish
-            current['thread'].join()
+            programs[0][1].join()
     except KeyboardInterrupt:
         log.warning("Stopped by user (Ctrl+C)!")
         if gui:
@@ -12807,9 +13007,10 @@ def main():
             gui.stop()
         sys.exit(130)
 
-    emulator, emu_thread = current['emulator'], current['thread']
-    if emulator is None:
+    # Exit code of the program named on the command line (Start menu ones don't count)
+    if args.exe is None:
         return
+    emulator, emu_thread = programs[0]
 
     # Propagate the guest's exit code (like a real process would)
     if emu_thread.is_alive():
