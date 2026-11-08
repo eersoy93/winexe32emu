@@ -24,6 +24,7 @@ import sys
 import os
 import re
 import struct
+import math
 import codecs
 import pefile
 import threading
@@ -33,7 +34,7 @@ from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
 
 # Version info
-WINEXE32EMU_VERSION = "0.0.20"
+WINEXE32EMU_VERSION = "0.0.21"
 
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -414,6 +415,61 @@ class ConsoleStream:
         # Never close the host's real stdio
         self.flush()
 
+    def has_input(self):
+        """True if buffered input is available without blocking (_kbhit)."""
+        return self.kind == 'stdin' and bool(self._in)
+
+
+class X87Result:
+    """API return value the caller expects in ST(0) (double functions)."""
+    __slots__ = ('value',)
+
+    def __init__(self, value):
+        self.value = float(value)
+
+
+class QWordResult:
+    """64-bit API return value in EDX:EAX (also 8-byte structs like div_t)."""
+    __slots__ = ('value',)
+
+    def __init__(self, value):
+        self.value = value & 0xFFFFFFFFFFFFFFFF
+
+
+class ApiJump:
+    """API result that transfers control elsewhere (longjmp)."""
+    __slots__ = ('eip', 'esp', 'eax')
+
+    def __init__(self, eip, esp, eax):
+        self.eip = eip
+        self.esp = esp
+        self.eax = eax
+
+
+class _ScanSource:
+    """One-unit lookahead input for the scanf family (bytes or UTF-16 units)."""
+
+    def __init__(self, getc):
+        self._getc = getc
+        self._la = None
+        self.count = 0
+
+    def peek(self):
+        if self._la is None:
+            self._la = self._getc()
+        return self._la
+
+    def get(self):
+        c = self.peek()
+        self._la = None
+        if c != -1:
+            self.count += 1
+        return c
+
+    def pending(self):
+        """Lookahead unit that was read but not consumed (to push back)."""
+        return self._la if self._la not in (None, -1) else None
+
 
 class WinAPIHandler:
     """Windows API emulation"""
@@ -642,6 +698,24 @@ class WinAPIHandler:
         self._rand_seed = 1
         self._clock_epoch = time.time()
 
+        # Process environment (GetEnvironmentVariable, getenv, _putenv);
+        # keys are upper-case since Windows names are case-insensitive
+        self.environment = {
+            'PATH': 'C:\\Windows\\System32;C:\\Windows',
+            'TEMP': 'C:\\Windows\\Temp',
+            'TMP': 'C:\\Windows\\Temp',
+            'WINDIR': 'C:\\Windows',
+            'SYSTEMROOT': 'C:\\Windows',
+            'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
+        }
+
+        # Additional CRT state (strtok, getenv strings, signals, time buffers)
+        self.next_fd = 3  # CRT file descriptors handed out by fopen
+        self._strtok_next = {}  # unit size -> next strtok/wcstok position
+        self._getenv_cache = {}  # (name, wide) -> (value, heap address)
+        self._signal_handlers = {}
+        self._crt_static = {}  # name -> static CRT buffer (strerror, asctime...)
+
         # MSVCRT global variable memory addresses (lazy init)
         self._fmode_addr = 0
         self._commode_addr = 0
@@ -686,6 +760,7 @@ class WinAPIHandler:
             '__iob_func': self.api__iob_func,
             '__acrt_iob_func': self.api__acrt_iob_func,
         }
+        self._api_map.update(self._crt_extra_api_map())
 
     def get_api_handler(self, func_name):
         """Find API handler"""
@@ -2129,16 +2204,7 @@ class WinAPIHandler:
         log.debug(f"GetEnvironmentVariableA(\"{name}\")")
         
         # Simple environment variables
-        env_vars = {
-            'PATH': 'C:\\Windows\\System32;C:\\Windows',
-            'TEMP': 'C:\\Windows\\Temp',
-            'TMP': 'C:\\Windows\\Temp',
-            'WINDIR': 'C:\\Windows',
-            'SYSTEMROOT': 'C:\\Windows',
-            'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
-        }
-        
-        value = env_vars.get(name.upper(), '')
+        value = self.environment.get(name.upper(), '')
         if value and lpBuffer != 0 and len(value) < nSize:
             self.emu.uc.mem_write(lpBuffer, value.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
             return len(value)
@@ -5260,13 +5326,14 @@ class WinAPIHandler:
         r'%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d*))?'
         r'(hh|h|ll|l|L|I64|I32|I|j|z|t|w)?([diouxXcCsSpnfFeEgGaA%])')
 
-    def _format_string(self, fmt, varargs):
+    def _format_string(self, fmt, varargs, wide_fmt=False):
         """printf/wsprintf style formatting with 32-bit stack arguments.
 
         Supports flags (-+ #0), '*' width/precision, length modifiers
         (hh h l ll L I I32 I64 j z t w) and d i o u x X c C s S p n f F e E
         g G a A. 64-bit integers and doubles consume two stack slots.
         varargs is the argument list starting at the first value.
+        wide_fmt selects the wprintf meaning of %s/%c (wide by default).
         """
         result = []
         arg_index = 0
@@ -5358,14 +5425,14 @@ class WinAPIHandler:
                 continue
             elif conv in 'cC':
                 value = next_arg()
-                if conv == 'C' or length in ('l', 'w'):
+                if self._wide_spec(conv, length, wide_fmt):
                     text = chr(value & 0xFFFF)
                 else:
                     text = bytes([value & 0xFF]).decode(ANSI_CODEPAGE, errors='replace')
                 text = ('%' + flags.replace('0', '') + (width or '') + 's') % text
             else:  # 's' / 'S'
                 ptr = next_arg()
-                wide = conv == 'S' or length in ('l', 'w')
+                wide = self._wide_spec(conv, length, wide_fmt)
                 if not ptr:
                     text = "(null)"
                 elif wide:
@@ -5380,6 +5447,15 @@ class WinAPIHandler:
             result.append(text)
 
         return ''.join(result)
+
+    @staticmethod
+    def _wide_spec(conv, length, wide_fmt):
+        """Whether a %c/%s style conversion refers to wide characters."""
+        if length in ('l', 'w'):
+            return True
+        if length == 'h':
+            return False
+        return conv.isupper() != wide_fmt
 
     def wsprintfA(self, args):
         """wsprintfA emulation (user32, cdecl varargs)"""
@@ -5934,174 +6010,303 @@ class WinAPIHandler:
                 lo = mid + 1
         return 0
 
-    def sscanf(self, args):
-        """sscanf emulation (basic: %d %i %u %o %x %c %s %f %lf, with widths).
+    _SCAN_WS = frozenset(b' \t\n\r\v\f')
 
-        Reads from the source string and stores results through the pointer
-        arguments that follow the format string. Returns the number of
-        successfully assigned fields (matching the C contract).
+    def _scan(self, src, fmt, varargs, wide_src=False, wide_fmt=False, secure=False):
+        """scanf-family engine.
+
+        src is a _ScanSource yielding bytes (or UTF-16 units when wide_src),
+        fmt is the format as a list of units. Supports %d %i %u %o %x %X %p
+        %e %f %g %a %c %s %[set] %n %% with '*', widths and the length
+        modifiers hh h l ll L I64 I32 j z t w. Secure (_s) variants take a
+        buffer size after each %c/%s/%[ pointer. Returns the number of
+        assigned fields, or EOF if input ended before the first conversion.
         """
-        src = self.read_string(args[0])
-        fmt = self.read_string(args[1])
-        varargs = args[2:]
-        si = 0          # index into source
-        arg_index = 0   # index into varargs
+        WS = self._SCAN_WS
+        arg_index = 0
         assigned = 0
+        converted = False
+        eof_failure = False
         fi = 0
         n = len(fmt)
 
+        def next_arg():
+            nonlocal arg_index
+            value = varargs[arg_index] if arg_index < len(varargs) else 0
+            arg_index += 1
+            return value
+
         def skip_ws():
-            nonlocal si
-            while si < len(src) and src[si] in ' \t\n\r\v\f':
-                si += 1
+            while src.peek() in WS:
+                src.get()
+
+        def store_int(ptr, value, size):
+            if ptr:
+                self._mem_write(ptr, (value & ((1 << (size * 8)) - 1)).to_bytes(size, 'little'))
+
+        def store_text(ptr, units, as_wide, terminate, limit):
+            if not ptr:
+                return
+            if as_wide == wide_src:
+                text_units = list(units)
+            elif as_wide:
+                raw = bytes(units).decode(ANSI_CODEPAGE, errors='replace').encode('utf-16-le')
+                text_units = list(struct.unpack(f'<{len(raw) // 2}H', raw))
+            else:
+                text = ''.join(chr(u) for u in units)
+                text_units = list(text.encode(ANSI_CODEPAGE, errors='replace'))
+            if terminate:
+                text_units.append(0)
+            if limit is not None and len(text_units) > limit:
+                text_units = text_units[:limit]
+            self._mem_write(ptr, self._pack_units(text_units, as_wide))
 
         while fi < n:
             fc = fmt[fi]
-            if fc in ' \t\n\r\v\f':
+            if fc in WS:
                 skip_ws()
                 fi += 1
                 continue
-            if fc != '%':
-                # Literal must match
-                if si < len(src) and src[si] == fc:
-                    si += 1
-                    fi += 1
-                    continue
-                break
-            # Parse a conversion: %[*][width][l]type
+            if fc != 0x25:  # literal character
+                if src.peek() == -1:
+                    eof_failure = True
+                    break
+                if src.peek() != fc:
+                    break
+                src.get()
+                fi += 1
+                continue
+
             fi += 1
-            suppress = False
-            if fi < n and fmt[fi] == '*':
-                suppress = True
+            if fi < n and fmt[fi] == 0x25:  # %%
+                skip_ws()
+                if src.peek() != 0x25:
+                    eof_failure = src.peek() == -1
+                    break
+                src.get()
                 fi += 1
-            width = ''
-            while fi < n and fmt[fi].isdigit():
-                width += fmt[fi]
+                continue
+            suppress = fi < n and fmt[fi] == 0x2A  # '*'
+            if suppress:
                 fi += 1
+            width = 0
+            while fi < n and 0x30 <= fmt[fi] <= 0x39:
+                width = width * 10 + fmt[fi] - 0x30
+                fi += 1
+            spec = ''.join(chr(u) for u in fmt[fi:fi + 3])
             length = ''
-            while fi < n and fmt[fi] in 'lhL':
-                length += fmt[fi]
-                fi += 1
+            for candidate in ('I64', 'I32', 'hh', 'll', 'h', 'l', 'L', 'w', 'j', 'z', 't', 'I'):
+                if spec.startswith(candidate):
+                    length = candidate
+                    break
+            fi += len(length)
             if fi >= n:
                 break
-            conv = fmt[fi]
+            conv = chr(fmt[fi])
             fi += 1
-            maxw = int(width) if width else None
 
-            if conv == '%':
-                if si < len(src) and src[si] == '%':
-                    si += 1
+            scanset = None
+            if conv == '[':
+                negate = fi < n and fmt[fi] == 0x5E  # '^'
+                if negate:
+                    fi += 1
+                members = set()
+                first = True
+                while fi < n and (first or fmt[fi] != 0x5D):
+                    lo = fmt[fi]
+                    if (fi + 2 < n and fmt[fi + 1] == 0x2D and fmt[fi + 2] != 0x5D):
+                        members.update(range(lo, fmt[fi + 2] + 1))
+                        fi += 3
+                    else:
+                        members.add(lo)
+                        fi += 1
+                    first = False
+                fi += 1  # closing ']'
+                scanset = (members, negate)
+
+            maxw = width or None
+            if conv not in 'c[n':
+                skip_ws()
+
+            if conv == 'n':
+                if not suppress:
+                    store_int(next_arg(), src.count, 8 if length in ('ll', 'I64', 'j') else
+                              {'hh': 1, 'h': 2}.get(length, 4))
                 continue
 
-            if conv in 'diuxXo':
-                skip_ws()
-                start = si
-                token = ''
-                if si < len(src) and src[si] in '+-':
-                    token += src[si]
-                    si += 1
-                base = {'d': 10, 'i': 10, 'u': 10, 'x': 16, 'X': 16, 'o': 8}[conv]
-                if conv in 'xX' and src[si:si + 2].lower() == '0x':
-                    token += src[si:si + 2]
-                    si += 2
-                digitset = {10: '0123456789', 16: '0123456789abcdefABCDEF',
-                            8: '01234567'}[base]
-                while si < len(src) and src[si] in digitset:
-                    if maxw and (si - start) >= maxw:
+            if src.peek() == -1:
+                eof_failure = True
+                break
+
+            if conv in 'diouxXp':
+                base = {'d': 10, 'u': 10, 'o': 8, 'x': 16, 'X': 16, 'p': 16}.get(conv, 0)
+                remaining = maxw if maxw else 1 << 30
+                sign = 1
+                digits = ''
+                if remaining and src.peek() in (0x2B, 0x2D):
+                    sign = -1 if src.get() == 0x2D else 1
+                    remaining -= 1
+                if remaining and src.peek() == 0x30 and base in (0, 16):
+                    src.get()
+                    remaining -= 1
+                    digits = '0'
+                    if remaining and src.peek() in (0x78, 0x58):  # 0x prefix
+                        src.get()
+                        remaining -= 1
+                        base = 16
+                    elif base == 0:
+                        base = 8
+                if base == 0:
+                    base = 10
+                while remaining:
+                    c = src.peek()
+                    ch = chr(c).lower() if 0 <= c < 0x80 else ''
+                    if not ch or not ch.isalnum() or int(ch, 36) >= base:
                         break
-                    token += src[si]
-                    si += 1
+                    digits += ch
+                    src.get()
+                    remaining -= 1
+                if not digits:
+                    break
+                converted = True
+                if not suppress:
+                    size = 8 if length in ('ll', 'I64', 'j') else {'hh': 1, 'h': 2}.get(length, 4)
+                    store_int(next_arg(), sign * int(digits, base), size)
+                    assigned += 1
+            elif conv in 'eEfFgGaA':
+                remaining = maxw if maxw else 1 << 30
+                token = ''
+                seen_dot = seen_exp = seen_digit = False
+
+                def take():
+                    nonlocal token, remaining
+                    token += chr(src.get())
+                    remaining -= 1
+
+                if remaining and src.peek() in (0x2B, 0x2D):
+                    take()
+                while remaining:
+                    c = src.peek()
+                    if 0x30 <= c <= 0x39:
+                        seen_digit = True
+                        take()
+                    elif c == 0x2E and not seen_dot and not seen_exp:
+                        seen_dot = True
+                        take()
+                    elif c in (0x65, 0x45) and seen_digit and not seen_exp:
+                        seen_exp = True
+                        take()
+                        if remaining and src.peek() in (0x2B, 0x2D):
+                            take()
+                    else:
+                        break
+                if not seen_digit:
+                    break
                 try:
-                    val = int(token, base)
+                    value = float(token.rstrip('eE+-') if token[-1:] in 'eE+-' else token)
                 except ValueError:
                     break
+                converted = True
                 if not suppress:
-                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
-                    arg_index += 1
+                    ptr = next_arg()
                     if ptr:
-                        try:
-                            # Store as a 32-bit int (signed or unsigned both fit
-                            # the same 4 bytes once masked)
-                            self.emu.uc.mem_write(ptr, struct.pack('<I', val & 0xFFFFFFFF))
-                        except Exception:
-                            pass
+                        self._mem_write(ptr, struct.pack('<d' if length in ('l', 'L') else '<f', value))
                     assigned += 1
-            elif conv in 'fFeEgG':
-                skip_ws()
-                start = si
-                token = ''
-                if si < len(src) and src[si] in '+-':
-                    token += src[si]
-                    si += 1
-                while si < len(src) and (src[si].isdigit() or src[si] in '.eE+-'):
-                    if maxw and (si - start) >= maxw:
+            elif conv in 'cCsS[':
+                as_wide = self._wide_spec(conv if conv != '[' else 's', length, wide_fmt)
+                count = maxw if maxw else (1 if conv in 'cC' else 1 << 30)
+                units = []
+                while len(units) < count:
+                    c = src.peek()
+                    if c == -1:
                         break
-                    token += src[si]
-                    si += 1
-                try:
-                    fval = float(token)
-                except ValueError:
-                    break
-                if not suppress:
-                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
-                    arg_index += 1
-                    if ptr:
-                        # %lf/%Lf store a double (MSVC long double is 8 bytes too)
-                        packed = struct.pack('<d' if length in ('l', 'L') else '<f', fval)
-                        try:
-                            self.emu.uc.mem_write(ptr, packed)
-                        except UcError:
-                            pass
-                    assigned += 1
-            elif conv == 'c':
-                count = maxw if maxw else 1
-                if si + count > len(src):
-                    count = len(src) - si
-                if count <= 0:
-                    break
-                chunk = src[si:si + count]
-                si += count
-                if not suppress:
-                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
-                    arg_index += 1
-                    if ptr:
-                        try:
-                            self.emu.uc.mem_write(ptr, chunk.encode(ANSI_CODEPAGE, errors='replace'))
-                        except Exception:
-                            pass
-                    assigned += 1
-            elif conv == 's':
-                skip_ws()
-                start = si
-                token = ''
-                while si < len(src) and src[si] not in ' \t\n\r\v\f':
-                    if maxw and (si - start) >= maxw:
+                    if conv in 'sS' and c in WS:
                         break
-                    token += src[si]
-                    si += 1
-                if token == '':
+                    if scanset and ((c in scanset[0]) == scanset[1]):
+                        break
+                    units.append(src.get())
+                if not units:
                     break
+                converted = True
                 if not suppress:
-                    ptr = varargs[arg_index] if arg_index < len(varargs) else 0
-                    arg_index += 1
-                    if ptr:
-                        try:
-                            self.emu.uc.mem_write(ptr, token.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
-                        except Exception:
-                            pass
+                    ptr = next_arg()
+                    limit = next_arg() if secure else None
+                    store_text(ptr, units, as_wide, conv not in 'cC', limit)
                     assigned += 1
             else:
                 break
 
-        log.debug(f"sscanf(...) -> {assigned}")
-        return assigned & 0xFFFFFFFF
+        if eof_failure and not converted:
+            return 0xFFFFFFFF  # EOF
+        return assigned
+
+    def _scan_string(self, src_addr, fmt_addr, varargs, wide=False, secure=False,
+                     max_count=None):
+        """sscanf/swscanf helper: scan a NUL-terminated (or counted) string."""
+        data = self._read_units(src_addr, wide)
+        if max_count is not None:
+            data = data[:max_count]
+        fmt = self._read_units(fmt_addr, wide)
+        pos = 0
+
+        def getc():
+            nonlocal pos
+            if pos >= len(data):
+                return -1
+            pos += 1
+            return data[pos - 1]
+
+        return self._scan(_ScanSource(getc), fmt, varargs, wide, wide, secure)
+
+    def _scan_stream(self, stream_ptr, fmt_addr, varargs, wide_fmt=False, secure=False):
+        """fscanf/scanf helper: scan bytes from a FILE*, pushing back lookahead."""
+        fp = self._p_stream(stream_ptr)
+        if fp is None:
+            return 0xFFFFFFFF
+        if isinstance(fp, ConsoleStream):
+            self.flush_std_streams()
+
+        def getc():
+            try:
+                b = fp.read(1)
+            except OSError:
+                return -1
+            return b[0] if b else -1
+
+        src = _ScanSource(getc)
+        fmt = self._read_units(fmt_addr, wide_fmt)
+        if wide_fmt:
+            # Narrow input with a wide format: compare units as ANSI-range text
+            fmt = list(''.join(chr(u) for u in fmt).encode(ANSI_CODEPAGE, errors='replace'))
+        result = self._scan(src, fmt, varargs, False, wide_fmt, secure)
+        pending = src.pending()
+        if pending is not None:
+            self._stream_unread(fp, pending)
+        return result
+
+    def _stream_unread(self, fp, byte):
+        """Push one byte back onto a stream (scanf lookahead / ungetc)."""
+        try:
+            if isinstance(fp, ConsoleStream):
+                fp.unread(bytes([byte]))
+            else:
+                fp.seek(-1, os.SEEK_CUR)
+        except (OSError, ValueError):
+            pass
+
+    def sscanf(self, args):
+        """sscanf emulation (see _scan for supported conversions)"""
+        result = self._scan_string(args[0], args[1], args[2:])
+        log.debug(f"sscanf(...) -> {self._signed32(result)}")
+        return result
 
     # File functions
     def _alloc_file_ptr(self, fp, path):
         """Register a Python file object and hand back a fake FILE* pointer."""
         ptr = self.next_file_ptr
         self.next_file_ptr += 0x20
-        self.file_streams[ptr] = {'fp': fp, 'path': path}
+        self.file_streams[ptr] = {'fp': fp, 'path': path, 'fd': self.next_fd}
+        self.next_fd += 1
         return ptr
 
     def fopen(self, args):
@@ -6113,6 +6318,7 @@ class WinAPIHandler:
         path = self.resolve_c_drive_path(filename)
         if path is None:
             self._last_error = 13  # EACCES
+            self._store_errno(13)
             return 0  # NULL
 
         try:
@@ -6120,6 +6326,7 @@ class WinAPIHandler:
         except OSError as e:
             log.debug(f"fopen(\"{filename}\") failed: {e}")
             self._last_error = 2  # ENOENT
+            self._store_errno(self._oserror_errno(e))
             return 0
 
         return self._alloc_file_ptr(fp, path)
@@ -6510,6 +6717,2178 @@ class WinAPIHandler:
         log.debug(f"free(0x{ptr:08x})")
         if ptr:
             self.emu.heap_free(ptr)
+        return 0
+
+    # ==================== ADDITIONAL CRT APIs ====================
+
+    # CRT errno values used by the emulated functions
+    EDOM = 33
+    ERANGE = 34
+    EINVAL = 22
+    ENOENT = 2
+    EEXIST = 17
+    EACCES = 13
+
+    _ERRNO_MESSAGES = {
+        0: "No error", 1: "Operation not permitted", 2: "No such file or directory",
+        3: "No such process", 4: "Interrupted function call", 5: "Input/output error",
+        6: "No such device or address", 7: "Arg list too long", 8: "Exec format error",
+        9: "Bad file descriptor", 10: "No child processes",
+        11: "Resource temporarily unavailable", 12: "Not enough space",
+        13: "Permission denied", 14: "Bad address", 16: "Resource device",
+        17: "File exists", 18: "Improper link", 19: "No such device",
+        20: "Not a directory", 21: "Is a directory", 22: "Invalid argument",
+        23: "Too many open files in system", 24: "Too many open files",
+        25: "Inappropriate I/O control operation", 27: "File too large",
+        28: "No space left on device", 29: "Invalid seek", 30: "Read-only file system",
+        31: "Too many links", 32: "Broken pipe", 33: "Domain error",
+        34: "Result too large", 36: "Resource deadlock avoided", 38: "Filename too long",
+        39: "No locks available", 40: "Function not implemented",
+        41: "Directory not empty", 42: "Illegal byte sequence",
+    }
+
+    # Helpers taking their arguments in x87 registers: name -> ST(i) count.
+    # Their stubs spill ST(0..n-1) to X87_ARGS_ADDR before the hooked RET.
+    X87_ARG_FUNCTIONS = {
+        '_CIsin': 1, '_CIcos': 1, '_CItan': 1, '_CIasin': 1, '_CIacos': 1,
+        '_CIatan': 1, '_CIsinh': 1, '_CIcosh': 1, '_CItanh': 1, '_CIexp': 1,
+        '_CIlog': 1, '_CIlog10': 1, '_CIsqrt': 1, '_CIpow': 2, '_CIatan2': 2,
+        '_CIfmod': 2, '_ftol': 1, '_ftol2': 1, '_ftol2_sse': 1,
+    }
+
+    def native_prologue(self, func_name):
+        """Machine code run in an API stub before the hooked RET."""
+        count = self.X87_ARG_FUNCTIONS.get(func_name)
+        if count:
+            base = self.emu.X87_ARGS_ADDR
+            # fstp qword ptr [slot i] for ST(0), then ST(1)...
+            return b''.join(b'\xDD\x1D' + struct.pack('<I', base + 8 * i)
+                            for i in range(count))
+        if func_name == '_fpreset':
+            return b'\xDB\xE3'  # fninit
+        return b''
+
+    def _x87_args(self, count):
+        """x87 register arguments spilled by the stub, in source order."""
+        data = bytes(self.emu.uc.mem_read(self.emu.X87_ARGS_ADDR, 8 * count))
+        values = list(struct.unpack(f'<{count}d', data))
+        return values[::-1]  # slot 0 held ST(0), the last operand
+
+    @staticmethod
+    def _signed32(value):
+        value &= 0xFFFFFFFF
+        return value - 0x100000000 if value & 0x80000000 else value
+
+    @staticmethod
+    def _signed64(value):
+        value &= 0xFFFFFFFFFFFFFFFF
+        return value - (1 << 64) if value >> 63 else value
+
+    @staticmethod
+    def _arg_double(args, index):
+        """A double passed in two stack slots starting at args[index]."""
+        return struct.unpack('<d', struct.pack('<II', args[index], args[index + 1]))[0]
+
+    @staticmethod
+    def _arg_qword(args, index):
+        return args[index] | (args[index + 1] << 32)
+
+    def _mem_write(self, addr, data):
+        try:
+            self.emu.uc.mem_write(addr, bytes(data))
+            return True
+        except UcError:
+            return False
+
+    def _read_u32(self, addr):
+        try:
+            return struct.unpack('<I', self.emu.uc.mem_read(addr, 4))[0]
+        except UcError:
+            return 0
+
+    def _read_units(self, addr, wide):
+        """NUL-terminated string as a list of code units (bytes or UTF-16)."""
+        if not addr:
+            return []
+        if wide:
+            data = self._read_until_null(addr, 0x10000, 2)
+            if data is None:
+                self._string_access_violation(addr)
+                return []
+            return list(struct.unpack(f'<{len(data) // 2}H', data))
+        return list(self.read_cstring(addr))
+
+    @staticmethod
+    def _pack_units(units, wide):
+        if wide:
+            return struct.pack(f'<{len(units)}H', *(u & 0xFFFF for u in units))
+        return bytes(u & 0xFF for u in units)
+
+    def _write_units(self, addr, units, wide, terminate=True):
+        units = list(units) + ([0] if terminate else [])
+        return self._mem_write(addr, self._pack_units(units, wide))
+
+    @staticmethod
+    def _text_units(text, wide):
+        """Encode Python text to code units (ANSI bytes or UTF-16)."""
+        if wide:
+            raw = text.encode('utf-16-le', errors='surrogatepass')
+            return list(struct.unpack(f'<{len(raw) // 2}H', raw))
+        return list(text.encode(ANSI_CODEPAGE, errors='replace'))
+
+    @staticmethod
+    def _units_text(units, wide):
+        if wide:
+            return struct.pack(f'<{len(units)}H', *units).decode('utf-16-le', errors='replace')
+        return bytes(units).decode(ANSI_CODEPAGE, errors='replace')
+
+    def _alloc_units(self, units, wide):
+        """Heap copy of a string (with terminator); returns its address."""
+        data = self._pack_units(list(units) + [0], wide)
+        addr = self.emu.heap_alloc(len(data))
+        if addr:
+            self._mem_write(addr, data)
+        return addr
+
+    def _static_buffer(self, name, size):
+        """Per-function static buffer (like the CRT's internal ones)."""
+        addr = self._crt_static.get(name)
+        if not addr:
+            addr = self.emu.heap_alloc(size)
+            self._crt_static[name] = addr
+        return addr
+
+    def _store_errno(self, value):
+        self._mem_write(self._errno([]), struct.pack('<I', value & 0xFFFFFFFF))
+
+    def _load_errno(self):
+        return self._read_u32(self._errno([]))
+
+    def _oserror_errno(self, error):
+        """Map a host OSError to the CRT errno value."""
+        mapping = {
+            getattr(__import__('errno'), name): value
+            for name, value in (('ENOENT', 2), ('EACCES', 13), ('EPERM', 13),
+                                ('EEXIST', 17), ('ENOTDIR', 20), ('EISDIR', 13),
+                                ('ENOTEMPTY', 41), ('EINVAL', 22))
+        }
+        return mapping.get(error.errno, self.EACCES)
+
+    def _va_args(self, va_list, count=32):
+        """Read up to count DWORD arguments from a va_list pointer."""
+        values = []
+        for i in range(count):
+            try:
+                values.append(struct.unpack('<I', self.emu.uc.mem_read(va_list + 4 * i, 4))[0])
+            except UcError:
+                break
+        return values + [0] * (count - len(values))
+
+    def _crt_extra_api_map(self):
+        """Handlers whose names start with '__' or are generated from tables."""
+        api = {
+            '__setusermatherr': self._crt_noop,
+            '__p__environ': lambda args: self._ensure_env_ptr('_environ_ptr_addr'),
+            '__p__wenviron': lambda args: self._ensure_env_ptr('_wenviron_ptr_addr', wide=True),
+            '__stdio_common_vfprintf': self.api__stdio_common_vfprintf,
+            '__stdio_common_vfwprintf': self.api__stdio_common_vfwprintf,
+            '__stdio_common_vsprintf': self.api__stdio_common_vsprintf,
+            '__stdio_common_vswprintf': self.api__stdio_common_vswprintf,
+            '__stdio_common_vsprintf_s': self.api__stdio_common_vsprintf_s,
+            '__stdio_common_vswprintf_s': self.api__stdio_common_vswprintf_s,
+            '__stdio_common_vsnprintf_s': self.api__stdio_common_vsnprintf_s,
+            '__stdio_common_vsscanf': self.api__stdio_common_vsscanf,
+            '__stdio_common_vswscanf': self.api__stdio_common_vswscanf,
+            '__stdio_common_vfscanf': self.api__stdio_common_vfscanf,
+            'raise': self._crt_raise,  # Python keyword
+        }
+        # Double math functions: cdecl versions take stack arguments, the
+        # MSVC _CI* intrinsics take them in x87 registers
+        for name, (func, argc) in self._MATH_FUNCTIONS.items():
+            api[name] = self._make_math_handler(name, func, argc, x87=False)
+            ci_name = '_CI' + name
+            if ci_name in self.X87_ARG_FUNCTIONS:
+                api[ci_name] = self._make_math_handler(ci_name, func, argc, x87=True)
+        api['_hypot'] = api['hypot']
+        # Wide character classification (wctype) functions
+        for name, test in self._WCTYPE_TESTS.items():
+            api[name] = (lambda t: lambda args: 1 if t(chr(args[0] & 0xFFFF)) else 0)(test)
+        return api
+
+    def _crt_noop(self, args):
+        return 0
+
+    # ---- Math (double results are returned in ST(0)) ----
+
+    @staticmethod
+    def _c_floor(x):
+        return float(math.floor(x)) if math.isfinite(x) else x
+
+    @staticmethod
+    def _c_ceil(x):
+        return float(math.ceil(x)) if math.isfinite(x) else x
+
+    class _MathRange(Exception):
+        """Range error with a defined C result (e.g. log(0) == -HUGE_VAL)."""
+        def __init__(self, value):
+            super().__init__(value)
+            self.value = value
+
+    @staticmethod
+    def _c_log(x, log_func=math.log):
+        if x == 0:
+            raise WinAPIHandler._MathRange(-math.inf)
+        return log_func(x)
+
+    @staticmethod
+    def _c_pow(x, y):
+        odd_int = float(y).is_integer() and int(y) % 2 == 1
+        if x == 0 and y < 0:
+            raise WinAPIHandler._MathRange(math.copysign(math.inf, x) if odd_int else math.inf)
+        try:
+            return math.pow(x, y)
+        except OverflowError:
+            raise WinAPIHandler._MathRange(-math.inf if x < 0 and odd_int else math.inf)
+
+    _MATH_FUNCTIONS = {
+        'sin': (math.sin, 1), 'cos': (math.cos, 1), 'tan': (math.tan, 1),
+        'asin': (math.asin, 1), 'acos': (math.acos, 1), 'atan': (math.atan, 1),
+        'sinh': (math.sinh, 1), 'cosh': (math.cosh, 1), 'tanh': (math.tanh, 1),
+        'exp': (math.exp, 1), 'sqrt': (math.sqrt, 1), 'fabs': (math.fabs, 1),
+        'log': (lambda x: WinAPIHandler._c_log(x), 1),
+        'log10': (lambda x: WinAPIHandler._c_log(x, math.log10), 1),
+        'floor': (lambda x: WinAPIHandler._c_floor(x), 1),
+        'ceil': (lambda x: WinAPIHandler._c_ceil(x), 1),
+        'atan2': (math.atan2, 2), 'fmod': (math.fmod, 2), 'hypot': (math.hypot, 2),
+        'pow': (lambda x, y: WinAPIHandler._c_pow(x, y), 2),
+        '_copysign': (math.copysign, 2),
+    }
+
+    def _math_call(self, func, values):
+        """Run a math function with C error semantics (errno, NaN, HUGE_VAL)."""
+        try:
+            return func(*values)
+        except ValueError:
+            self._store_errno(self.EDOM)
+            return math.nan
+        except WinAPIHandler._MathRange as e:
+            self._store_errno(self.ERANGE)
+            return e.value
+        except OverflowError:
+            self._store_errno(self.ERANGE)
+            if func is math.sinh:
+                return math.copysign(math.inf, values[0])
+            return math.inf
+
+    def _make_math_handler(self, name, func, argc, x87):
+        def handler(args):
+            if x87:
+                values = self._x87_args(argc)
+            else:
+                values = [self._arg_double(args, 2 * i) for i in range(argc)]
+            result = self._math_call(func, values)
+            log.debug(f"{name}{tuple(values)} -> {result}")
+            return X87Result(result)
+        return handler
+
+    def ldexp(self, args):
+        """ldexp emulation (x * 2^exp)"""
+        x = self._arg_double(args, 0)
+        try:
+            return X87Result(math.ldexp(x, self._signed32(args[2])))
+        except OverflowError:
+            self._store_errno(self.ERANGE)
+            return X87Result(math.copysign(math.inf, x))
+
+    def frexp(self, args):
+        """frexp emulation (mantissa, *exp)"""
+        x = self._arg_double(args, 0)
+        mantissa, exponent = math.frexp(x) if math.isfinite(x) else (x, 0)
+        if args[2]:
+            self._mem_write(args[2], struct.pack('<i', exponent))
+        return X87Result(mantissa)
+
+    def modf(self, args):
+        """modf emulation (fractional part, *integer part)"""
+        x = self._arg_double(args, 0)
+        if math.isinf(x):
+            frac, whole = math.copysign(0.0, x), x
+        else:
+            frac, whole = math.modf(x)
+        if args[2]:
+            self._mem_write(args[2], struct.pack('<d', whole))
+        return X87Result(frac)
+
+    def _chgsign(self, args):
+        """_chgsign emulation"""
+        return X87Result(-self._arg_double(args, 0))
+
+    def _isnan(self, args):
+        """_isnan emulation"""
+        return 1 if math.isnan(self._arg_double(args, 0)) else 0
+
+    def _finite(self, args):
+        """_finite emulation"""
+        return 1 if math.isfinite(self._arg_double(args, 0)) else 0
+
+    def _ftol_common(self):
+        value = self._x87_args(1)[0]
+        if not math.isfinite(value) or not -(1 << 63) <= value < (1 << 63):
+            return QWordResult(1 << 63)  # integer indefinite
+        return QWordResult(int(value))  # truncation toward zero
+
+    def _ftol(self, args):
+        """_ftol emulation - ST(0) truncated to a 64-bit integer in EDX:EAX"""
+        return self._ftol_common()
+
+    def _ftol2(self, args):
+        return self._ftol_common()
+
+    def _ftol2_sse(self, args):
+        return self._ftol_common()
+
+    def _fpreset(self, args):
+        """_fpreset emulation (the stub already executed FNINIT)"""
+        return 0
+
+    def _clearfp(self, args):
+        """_clearfp emulation - no exception flags are tracked"""
+        return 0
+
+    def _statusfp(self, args):
+        """_statusfp emulation"""
+        return 0
+
+    def _controlfp_s(self, args):
+        """_controlfp_s emulation"""
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<I', 0x9001F))
+        return 0
+
+    def _control87(self, args):
+        return self._controlfp(args)
+
+    # ---- Formatted output ----
+
+    def _stream_write(self, stream_ptr, data):
+        """Write bytes to a FILE*; unknown streams go to stdout. Returns success."""
+        fp = self._p_stream(stream_ptr)
+        if fp is None:
+            fp = self._stdout_stream()
+        try:
+            fp.write(data)
+            return True
+        except OSError:
+            return False
+
+    def _printf_text(self, fmt_addr, varargs, wide=False, wide_fmt=None):
+        fmt = self._read_text(fmt_addr, wide)
+        return self._format_string(fmt, varargs, wide if wide_fmt is None else wide_fmt)
+
+    def _fprintf_common(self, stream_ptr, text):
+        data = text.encode(ANSI_CODEPAGE, errors='replace')
+        if not self._stream_write(stream_ptr, data):
+            return 0xFFFFFFFF
+        return len(text)
+
+    def _store_formatted(self, buf, count, text, wide, mode):
+        """Store printf output into a buffer.
+
+        mode: 'unbounded' (sprintf), 'legacy' (_snprintf: -1 on truncation,
+        no terminator when it exactly fills), 'c99' (snprintf: always
+        terminated, returns the full length), 'secure' (sprintf_s: empty
+        string and -1 when it does not fit).
+        """
+        units = self._text_units(text, wide)
+        length = len(units)
+        if mode == 'unbounded':
+            self._write_units(buf, units, wide)
+            return length
+        if mode == 'c99':
+            if buf and count:
+                self._write_units(buf, units[:count - 1], wide)
+            return length
+        if mode == 'secure':
+            if length >= count:
+                if buf and count:
+                    self._write_units(buf, [], wide)
+                self._store_errno(self.ERANGE)
+                return 0xFFFFFFFF
+            self._write_units(buf, units, wide)
+            return length
+        # legacy
+        if buf:
+            self._write_units(buf, units[:count], wide, terminate=length < count)
+        return length if length <= count else 0xFFFFFFFF
+
+    def fprintf(self, args):
+        """fprintf emulation"""
+        return self._fprintf_common(args[0], self._printf_text(args[1], args[2:]))
+
+    def vfprintf(self, args):
+        """vfprintf emulation"""
+        return self._fprintf_common(args[0], self._printf_text(args[1], self._va_args(args[2])))
+
+    def vprintf(self, args):
+        """vprintf emulation"""
+        return self._fprintf_common(0, self._printf_text(args[0], self._va_args(args[1])))
+
+    def vsprintf(self, args):
+        """vsprintf emulation"""
+        text = self._printf_text(args[1], self._va_args(args[2]))
+        return self._store_formatted(args[0], 0, text, False, 'unbounded')
+
+    def _snprintf(self, args):
+        """_snprintf emulation (-1 when truncated)"""
+        text = self._printf_text(args[2], args[3:])
+        return self._store_formatted(args[0], args[1], text, False, 'legacy')
+
+    def _vsnprintf(self, args):
+        """_vsnprintf emulation"""
+        text = self._printf_text(args[2], self._va_args(args[3]))
+        return self._store_formatted(args[0], args[1], text, False, 'legacy')
+
+    def snprintf(self, args):
+        """snprintf emulation (C99: always terminated, returns full length)"""
+        text = self._printf_text(args[2], args[3:])
+        return self._store_formatted(args[0], args[1], text, False, 'c99')
+
+    def vsnprintf(self, args):
+        """vsnprintf emulation (C99)"""
+        text = self._printf_text(args[2], self._va_args(args[3]))
+        return self._store_formatted(args[0], args[1], text, False, 'c99')
+
+    def sprintf_s(self, args):
+        """sprintf_s emulation"""
+        text = self._printf_text(args[2], args[3:])
+        return self._store_formatted(args[0], args[1], text, False, 'secure')
+
+    def vsprintf_s(self, args):
+        """vsprintf_s emulation"""
+        text = self._printf_text(args[2], self._va_args(args[3]))
+        return self._store_formatted(args[0], args[1], text, False, 'secure')
+
+    def _scprintf(self, args):
+        """_scprintf emulation - length of the formatted text"""
+        return len(self._printf_text(args[0], args[1:]))
+
+    def _vscprintf(self, args):
+        """_vscprintf emulation"""
+        return len(self._printf_text(args[0], self._va_args(args[1])))
+
+    def wprintf(self, args):
+        """wprintf emulation"""
+        return self._fprintf_common(0, self._printf_text(args[0], args[1:], wide=True))
+
+    def vwprintf(self, args):
+        """vwprintf emulation"""
+        return self._fprintf_common(0, self._printf_text(args[0], self._va_args(args[1]), wide=True))
+
+    def fwprintf(self, args):
+        """fwprintf emulation"""
+        return self._fprintf_common(args[0], self._printf_text(args[1], args[2:], wide=True))
+
+    def vfwprintf(self, args):
+        """vfwprintf emulation"""
+        return self._fprintf_common(args[0], self._printf_text(args[1], self._va_args(args[2]), wide=True))
+
+    def swprintf(self, args):
+        """swprintf emulation (msvcrt legacy form without a count)"""
+        text = self._printf_text(args[1], args[2:], wide=True)
+        return self._store_formatted(args[0], 0, text, True, 'unbounded')
+
+    def _swprintf(self, args):
+        return self.swprintf(args)
+
+    def vswprintf(self, args):
+        """vswprintf emulation (msvcrt legacy form without a count)"""
+        text = self._printf_text(args[1], self._va_args(args[2]), wide=True)
+        return self._store_formatted(args[0], 0, text, True, 'unbounded')
+
+    def _snwprintf(self, args):
+        """_snwprintf emulation"""
+        text = self._printf_text(args[2], args[3:], wide=True)
+        return self._store_formatted(args[0], args[1], text, True, 'legacy')
+
+    def _vsnwprintf(self, args):
+        """_vsnwprintf emulation"""
+        text = self._printf_text(args[2], self._va_args(args[3]), wide=True)
+        return self._store_formatted(args[0], args[1], text, True, 'legacy')
+
+    def swprintf_s(self, args):
+        """swprintf_s emulation"""
+        text = self._printf_text(args[2], args[3:], wide=True)
+        return self._store_formatted(args[0], args[1], text, True, 'secure')
+
+    def _scwprintf(self, args):
+        """_scwprintf emulation"""
+        return len(self._text_units(self._printf_text(args[0], args[1:], wide=True), True))
+
+    # UCRT stdio entry points: (unsigned __int64 options, ..., _locale_t, va_list)
+    _UCRT_STANDARD_SNPRINTF = 0x2
+    _UCRT_LEGACY_WIDE_SPECIFIERS = 0x4
+    _UCRT_SECURE_SCANF = 0x1
+
+    def _ucrt_wide_fmt(self, options):
+        return bool(options & self._UCRT_LEGACY_WIDE_SPECIFIERS)
+
+    def api__stdio_common_vfprintf(self, args):
+        """__stdio_common_vfprintf (UCRT)"""
+        text = self._printf_text(args[3], self._va_args(args[5]))
+        return self._fprintf_common(args[2], text)
+
+    def api__stdio_common_vfwprintf(self, args):
+        """__stdio_common_vfwprintf (UCRT)"""
+        text = self._printf_text(args[3], self._va_args(args[5]), wide=True,
+                                 wide_fmt=self._ucrt_wide_fmt(args[0]))
+        return self._fprintf_common(args[2], text)
+
+    def _ucrt_vsprintf(self, args, wide):
+        options, buf, count = args[0], args[2], args[3]
+        text = self._printf_text(args[4], self._va_args(args[6]), wide=wide,
+                                 wide_fmt=self._ucrt_wide_fmt(options) if wide else False)
+        if options & self._UCRT_STANDARD_SNPRINTF or (not buf and not count):
+            return self._store_formatted(buf, count, text, wide, 'c99')
+        if count == 0xFFFFFFFF:
+            return self._store_formatted(buf, 0, text, wide, 'unbounded')
+        return self._store_formatted(buf, count, text, wide, 'legacy')
+
+    def api__stdio_common_vsprintf(self, args):
+        """__stdio_common_vsprintf (UCRT)"""
+        return self._ucrt_vsprintf(args, False)
+
+    def api__stdio_common_vswprintf(self, args):
+        """__stdio_common_vswprintf (UCRT)"""
+        return self._ucrt_vsprintf(args, True)
+
+    def api__stdio_common_vsprintf_s(self, args):
+        """__stdio_common_vsprintf_s (UCRT)"""
+        text = self._printf_text(args[4], self._va_args(args[6]))
+        return self._store_formatted(args[2], args[3], text, False, 'secure')
+
+    def api__stdio_common_vswprintf_s(self, args):
+        """__stdio_common_vswprintf_s (UCRT)"""
+        text = self._printf_text(args[4], self._va_args(args[6]), wide=True,
+                                 wide_fmt=self._ucrt_wide_fmt(args[0]))
+        return self._store_formatted(args[2], args[3], text, True, 'secure')
+
+    def api__stdio_common_vsnprintf_s(self, args):
+        """__stdio_common_vsnprintf_s (UCRT): (options, buf, size, max_count, fmt, locale, va)"""
+        buf, size, max_count = args[2], args[3], args[4]
+        text = self._printf_text(args[5], self._va_args(args[7]))
+        full = self._text_units(text, False)
+        units = full if max_count == 0xFFFFFFFF else full[:max_count]
+        if len(units) < size:
+            self._write_units(buf, units, False)
+            return len(units) if len(units) == len(full) else 0xFFFFFFFF
+        if max_count == 0xFFFFFFFF and size:  # _TRUNCATE
+            self._write_units(buf, units[:size - 1], False)
+            return 0xFFFFFFFF
+        if buf and size:
+            self._write_units(buf, [], False)
+        self._store_errno(self.ERANGE)
+        return 0xFFFFFFFF
+
+    def api__stdio_common_vsscanf(self, args):
+        """__stdio_common_vsscanf (UCRT): (options, buf, count, fmt, locale, va)"""
+        count = None if args[3] == 0xFFFFFFFF else args[3]
+        return self._scan_string(args[2], args[4], self._va_args(args[6]),
+                                 secure=bool(args[0] & self._UCRT_SECURE_SCANF), max_count=count)
+
+    def api__stdio_common_vswscanf(self, args):
+        """__stdio_common_vswscanf (UCRT)"""
+        count = None if args[3] == 0xFFFFFFFF else args[3]
+        return self._scan_string(args[2], args[4], self._va_args(args[6]), wide=True,
+                                 secure=bool(args[0] & self._UCRT_SECURE_SCANF), max_count=count)
+
+    def api__stdio_common_vfscanf(self, args):
+        """__stdio_common_vfscanf (UCRT): (options, stream, fmt, locale, va)"""
+        return self._scan_stream(args[2], args[3], self._va_args(args[5]),
+                                 secure=bool(args[0] & self._UCRT_SECURE_SCANF))
+
+    # ---- Formatted input ----
+
+    def _stdin_ptr(self):
+        return self._ensure_iob()
+
+    def scanf(self, args):
+        """scanf emulation"""
+        return self._scan_stream(self._stdin_ptr(), args[0], args[1:])
+
+    def scanf_s(self, args):
+        """scanf_s emulation"""
+        return self._scan_stream(self._stdin_ptr(), args[0], args[1:], secure=True)
+
+    def vscanf(self, args):
+        """vscanf emulation"""
+        return self._scan_stream(self._stdin_ptr(), args[0], self._va_args(args[1]))
+
+    def fscanf(self, args):
+        """fscanf emulation"""
+        return self._scan_stream(args[0], args[1], args[2:])
+
+    def fscanf_s(self, args):
+        """fscanf_s emulation"""
+        return self._scan_stream(args[0], args[1], args[2:], secure=True)
+
+    def vfscanf(self, args):
+        """vfscanf emulation"""
+        return self._scan_stream(args[0], args[1], self._va_args(args[2]))
+
+    def sscanf_s(self, args):
+        """sscanf_s emulation"""
+        return self._scan_string(args[0], args[1], args[2:], secure=True)
+
+    def vsscanf(self, args):
+        """vsscanf emulation"""
+        return self._scan_string(args[0], args[1], self._va_args(args[2]))
+
+    def swscanf(self, args):
+        """swscanf emulation"""
+        return self._scan_string(args[0], args[1], args[2:], wide=True)
+
+    def wscanf(self, args):
+        """wscanf emulation"""
+        return self._scan_stream(self._stdin_ptr(), args[0], args[1:], wide_fmt=True)
+
+    # ---- Character / line I/O ----
+
+    def gets(self, args):
+        """gets emulation - read a line from stdin without the newline"""
+        buf = args[0]
+        fp = self._p_stream(self._stdin_ptr())
+        out = bytearray()
+        self.flush_std_streams()
+        while True:
+            ch = fp.read(1)
+            if not ch:
+                if not out:
+                    return 0
+                break
+            if ch == b'\n':
+                break
+            out += ch
+        if out.endswith(b'\r'):
+            out = out[:-1]
+        self._mem_write(buf, bytes(out) + b'\x00')
+        return buf
+
+    def fputws(self, args):
+        """fputws emulation"""
+        text = self.read_wide_string(args[0])
+        return 0 if self._stream_write(args[1], text.encode(ANSI_CODEPAGE, errors='replace')) else 0xFFFFFFFF
+
+    def _putws(self, args):
+        """_putws emulation"""
+        text = self.read_wide_string(args[0]) + "\n"
+        self._stdout_stream().write(text.encode(ANSI_CODEPAGE, errors='replace'))
+        return 0
+
+    def fputwc(self, args):
+        """fputwc emulation"""
+        ch = args[0] & 0xFFFF
+        ok = self._stream_write(args[1], chr(ch).encode(ANSI_CODEPAGE, errors='replace'))
+        return ch if ok else 0xFFFF  # WEOF
+
+    def putwc(self, args):
+        return self.fputwc(args)
+
+    def putwchar(self, args):
+        """putwchar emulation"""
+        return self.fputwc([args[0], 0])
+
+    def _fputchar(self, args):
+        return self.putchar(args)
+
+    def _fgetchar(self, args):
+        return self.getchar(args)
+
+    # ---- Stream state ----
+
+    def ferror(self, args):
+        """ferror emulation - I/O errors are reported by the calls themselves"""
+        return 0
+
+    def clearerr(self, args):
+        """clearerr emulation"""
+        return 0
+
+    def _fileno(self, args):
+        """_fileno emulation"""
+        stream = args[0]
+        if self._iob_addr and self._iob_addr <= stream < self._iob_addr + 3 * self._FILE_SIZE:
+            return (stream - self._iob_addr) // self._FILE_SIZE
+        info = self.file_streams.get(stream)
+        if info and 'fd' in info:
+            return info['fd']
+        self._store_errno(self.EINVAL)
+        return 0xFFFFFFFF
+
+    def fileno(self, args):
+        return self._fileno(args)
+
+    def setvbuf(self, args):
+        """setvbuf emulation - buffering is handled by the host"""
+        return 0
+
+    def setbuf(self, args):
+        """setbuf emulation"""
+        return 0
+
+    def fgetpos(self, args):
+        """fgetpos emulation (fpos_t is 64-bit)"""
+        fp = self._p_stream(args[0])
+        try:
+            pos = fp.tell()
+        except (OSError, AttributeError):
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        self._mem_write(args[1], struct.pack('<q', pos))
+        return 0
+
+    def fsetpos(self, args):
+        """fsetpos emulation"""
+        fp = self._p_stream(args[0])
+        try:
+            pos = struct.unpack('<q', self.emu.uc.mem_read(args[1], 8))[0]
+            fp.seek(pos, os.SEEK_SET)
+        except (OSError, AttributeError, UcError):
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        return 0
+
+    def _wfopen(self, args):
+        """_wfopen emulation - fopen with wide file name and mode"""
+        filename = self.read_wide_string(args[0])
+        mode = self.read_wide_string(args[1])
+        path = self.resolve_c_drive_path(filename)
+        if path is None:
+            self._store_errno(self.EACCES)
+            return 0
+        try:
+            fp = open(path, self._c_mode_to_python(mode))
+        except OSError as e:
+            self._store_errno(self._oserror_errno(e))
+            return 0
+        return self._alloc_file_ptr(fp, path)
+
+    def fopen_s(self, args):
+        """fopen_s emulation - returns errno, FILE* through the first argument"""
+        stream = self.fopen(args[1:])
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<I', stream))
+        return 0 if stream else (self._load_errno() or self.ENOENT)
+
+    def perror(self, args):
+        """perror emulation - "<prefix>: <strerror(errno)>" on stderr"""
+        prefix = self.read_string(args[0]) if args[0] else ''
+        message = self._ERRNO_MESSAGES.get(self._load_errno(), "Unknown error")
+        text = f"{prefix}: {message}\n" if prefix else f"{message}\n"
+        self._ensure_iob()
+        self.std_streams[2].write(text.encode(ANSI_CODEPAGE, errors='replace'))
+        return 0
+
+    # ---- File system (sandboxed in c_drive/) ----
+
+    def _sandbox_op(self, name_addr, op, wide=False):
+        """Run op(host_path) for a program path; returns 0 or -1 with errno."""
+        filename = self._read_text(name_addr, wide)
+        path = self.resolve_c_drive_path(filename)
+        if path is None:
+            self._store_errno(self.EACCES)
+            return 0xFFFFFFFF
+        try:
+            op(path)
+        except OSError as e:
+            self._store_errno(self._oserror_errno(e))
+            return 0xFFFFFFFF
+        return 0
+
+    def remove(self, args):
+        """remove emulation"""
+        return self._sandbox_op(args[0], os.remove)
+
+    def _unlink(self, args):
+        return self.remove(args)
+
+    def unlink(self, args):
+        return self.remove(args)
+
+    def _wremove(self, args):
+        return self._sandbox_op(args[0], os.remove, wide=True)
+
+    def rename(self, args):
+        """rename emulation (fails if the target exists, like Windows)"""
+        new_path = self.resolve_c_drive_path(self.read_string(args[1]))
+        if new_path is None:
+            self._store_errno(self.EACCES)
+            return 0xFFFFFFFF
+
+        def do_rename(old_path):
+            if os.path.exists(new_path):
+                raise FileExistsError(__import__('errno').EEXIST, "exists")
+            os.rename(old_path, new_path)
+        return self._sandbox_op(args[0], do_rename)
+
+    def _access(self, args):
+        """_access emulation (mode 0 exists, 2 write, 4 read, 6 read/write)"""
+        mode = args[1]
+
+        def check(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(__import__('errno').ENOENT, "missing")
+            if mode & 2 and not os.access(path, os.W_OK):
+                raise PermissionError(__import__('errno').EACCES, "read-only")
+        return self._sandbox_op(args[0], check)
+
+    def access(self, args):
+        return self._access(args)
+
+    def _mkdir(self, args):
+        """_mkdir emulation"""
+        return self._sandbox_op(args[0], os.mkdir)
+
+    def _rmdir(self, args):
+        """_rmdir emulation"""
+        return self._sandbox_op(args[0], os.rmdir)
+
+    def _getcwd(self, args):
+        """_getcwd emulation - the emulated current directory is C:\\"""
+        buf, size = args[0], args[1]
+        units = self._text_units("C:\\", False)
+        if not buf:
+            return self._alloc_units(units, False)
+        if size < len(units) + 1:
+            self._store_errno(self.ERANGE)
+            return 0
+        self._write_units(buf, units, False)
+        return buf
+
+    def _getdrive(self, args):
+        """_getdrive emulation - drive C: is 3"""
+        return 3
+
+    # ---- Console I/O (conio) ----
+
+    def _getch(self, args):
+        """_getch emulation - next byte of console input (line buffered)"""
+        self._ensure_iob()
+        return self.fgetc([self._iob_addr])
+
+    def _getche(self, args):
+        return self._getch(args)
+
+    def _kbhit(self, args):
+        """_kbhit emulation - 1 if console input is already buffered"""
+        self._ensure_iob()
+        return 1 if self.std_streams[0].has_input() else 0
+
+    def _putch(self, args):
+        """_putch emulation"""
+        return self.putchar(args)
+
+    def _cputs(self, args):
+        """_cputs emulation"""
+        self._stdout_stream().write(self.read_cstring(args[0]))
+        return 0
+
+    def _cprintf(self, args):
+        """_cprintf emulation"""
+        return self._fprintf_common(0, self._printf_text(args[0], args[1:]))
+
+    # ---- Strings (narrow and wide share unit-based helpers) ----
+
+    @staticmethod
+    def _fold_unit(u):
+        """Case-fold one code unit (per-character lower case, like _stricmp)."""
+        lowered = chr(u).lower()
+        return ord(lowered) if len(lowered) == 1 else u
+
+    @staticmethod
+    def _cmp_units(a, b):
+        for x, y in zip(a, b):
+            if x != y:
+                return -1 if x < y else 1
+        if len(a) != len(b):
+            return -1 if len(a) < len(b) else 1
+        return 0
+
+    def _str_compare(self, args, wide, n=None, fold=False):
+        a = self._read_units(args[0], wide)
+        b = self._read_units(args[1], wide)
+        if n is not None:
+            a, b = a[:n], b[:n]
+        if fold:
+            if not wide:
+                # Narrow case folding is ASCII-only in the C locale
+                a = [u + 32 if 0x41 <= u <= 0x5A else u for u in a]
+                b = [u + 32 if 0x41 <= u <= 0x5A else u for u in b]
+            else:
+                a = [self._fold_unit(u) for u in a]
+                b = [self._fold_unit(u) for u in b]
+        return self._cmp_units(a, b) & 0xFFFFFFFF
+
+    def _str_copy(self, args, wide, n=None):
+        dest, src = args[0], args[1]
+        units = self._read_units(src, wide)
+        if n is None:
+            self._write_units(dest, units, wide)
+        else:
+            units = units[:n]
+            self._write_units(dest, units + [0] * (n - len(units)), wide, terminate=False)
+        return dest
+
+    def _str_cat(self, args, wide, n=None):
+        dest = args[0]
+        dest_len = len(self._read_units(dest, wide))
+        units = self._read_units(args[1], wide)
+        if n is not None:
+            units = units[:n]
+        self._write_units(dest + dest_len * (2 if wide else 1), units, wide)
+        return dest
+
+    def _str_find_unit(self, args, wide, last=False):
+        s = args[0]
+        units = self._read_units(s, wide) + [0]  # the terminator can be searched for
+        c = args[1] & (0xFFFF if wide else 0xFF)
+        if c not in units:
+            return 0
+        index = len(units) - 1 - units[::-1].index(c) if last else units.index(c)
+        return s + index * (2 if wide else 1)
+
+    def _str_span(self, args, wide, accept):
+        units = self._read_units(args[0], wide)
+        chars = set(self._read_units(args[1], wide))
+        count = 0
+        for u in units:
+            if (u in chars) != accept:
+                break
+            count += 1
+        return count
+
+    def _str_map(self, s, wide, func):
+        units = self._read_units(s, wide)
+        text = self._units_text(units, wide)
+        mapped = self._text_units(func(text), wide)
+        if len(mapped) == len(units):
+            self._write_units(s, mapped, wide)
+        return s
+
+    def _tokenize(self, s, delim_addr, wide, context=None):
+        """strtok/wcstok/strtok_s: tokens are terminated in place."""
+        unit = 2 if wide else 1
+        if s == 0:
+            s = self._read_u32(context) if context else self._strtok_next.get(unit, 0)
+        delims = set(self._read_units(delim_addr, wide))
+        units = self._read_units(s, wide) if s else []
+        i = 0
+        while i < len(units) and units[i] in delims:
+            i += 1
+        if i >= len(units):
+            next_pos = 0
+            token = 0
+        else:
+            j = i
+            while j < len(units) and units[j] not in delims:
+                j += 1
+            token = s + i * unit
+            if j < len(units):
+                self._write_units(s + j * unit, [], wide)  # terminate the token
+                next_pos = s + (j + 1) * unit
+            else:
+                next_pos = s + j * unit
+        if context:
+            self._mem_write(context, struct.pack('<I', next_pos))
+        else:
+            self._strtok_next[unit] = next_pos
+        return token
+
+    def strtok(self, args):
+        """strtok emulation"""
+        return self._tokenize(args[0], args[1], False)
+
+    def strtok_s(self, args):
+        """strtok_s emulation (context pointer instead of static state)"""
+        return self._tokenize(args[0], args[1], False, context=args[2])
+
+    def wcstok(self, args):
+        """wcstok emulation (msvcrt two-argument form)"""
+        return self._tokenize(args[0], args[1], True)
+
+    def strerror(self, args):
+        """strerror emulation"""
+        message = self._ERRNO_MESSAGES.get(args[0], "Unknown error")
+        buf = self._static_buffer('strerror', 96)
+        self._write_units(buf, self._text_units(message, False), False)
+        return buf
+
+    def strcoll(self, args):
+        return self._str_compare(args, False)
+
+    def _stricoll(self, args):
+        return self._str_compare(args, False, fold=True)
+
+    def _strcmpi(self, args):
+        return self._str_compare(args, False, fold=True)
+
+    def strxfrm(self, args):
+        """strxfrm emulation (C locale: plain copy)"""
+        units = self._read_units(args[1], False)
+        if args[0] and len(units) < args[2]:
+            self._write_units(args[0], units, False)
+        return len(units)
+
+    def _strset(self, args):
+        """_strset emulation"""
+        n = len(self._read_units(args[0], False))
+        self._write_units(args[0], [args[1] & 0xFF] * n, False)
+        return args[0]
+
+    def _strnset(self, args):
+        """_strnset emulation"""
+        n = min(len(self._read_units(args[0], False)), args[2])
+        self._write_units(args[0], [args[1] & 0xFF] * n, False, terminate=False)
+        return args[0]
+
+    def strnlen(self, args):
+        """strnlen emulation"""
+        return len(self.read_cstring(args[0], args[1])) if args[0] else 0
+
+    def _memicmp(self, args):
+        """_memicmp emulation"""
+        try:
+            a = bytes(self.emu.uc.mem_read(args[0], args[2])).lower()
+            b = bytes(self.emu.uc.mem_read(args[1], args[2])).lower()
+        except UcError:
+            return 0
+        return self._cmp_units(a, b) & 0xFFFFFFFF
+
+    def _memccpy(self, args):
+        """_memccpy emulation - copy up to and including byte c"""
+        dest, src, c, n = args[0], args[1], args[2] & 0xFF, args[3]
+        try:
+            data = bytes(self.emu.uc.mem_read(src, n))
+        except UcError:
+            return 0
+        idx = data.find(bytes([c]))
+        if idx != -1:
+            data = data[:idx + 1]
+        self._mem_write(dest, data)
+        return dest + idx + 1 if idx != -1 else 0
+
+    def memccpy(self, args):
+        return self._memccpy(args)
+
+    # Secure (_s) string functions: return 0 or an errno value
+    def _secure_copy(self, dest, size, units, wide):
+        if not dest or size == 0:
+            return self.EINVAL
+        if len(units) >= size:
+            self._write_units(dest, [], wide)
+            return self.ERANGE
+        self._write_units(dest, units, wide)
+        return 0
+
+    def strcpy_s(self, args):
+        """strcpy_s emulation"""
+        return self._secure_copy(args[0], args[1], self._read_units(args[2], False), False)
+
+    def wcscpy_s(self, args):
+        """wcscpy_s emulation"""
+        return self._secure_copy(args[0], args[1], self._read_units(args[2], True), True)
+
+    def strcat_s(self, args):
+        """strcat_s emulation"""
+        units = self._read_units(args[0], False) + self._read_units(args[2], False)
+        return self._secure_copy(args[0], args[1], units, False)
+
+    def wcscat_s(self, args):
+        """wcscat_s emulation"""
+        units = self._read_units(args[0], True) + self._read_units(args[2], True)
+        return self._secure_copy(args[0], args[1], units, True)
+
+    def strncpy_s(self, args):
+        """strncpy_s emulation (count may be _TRUNCATE)"""
+        dest, size, count = args[0], args[1], args[3]
+        units = self._read_units(args[2], False)
+        if count == 0xFFFFFFFF:  # _TRUNCATE
+            if len(units) >= size and dest and size:
+                self._write_units(dest, units[:size - 1], False)
+                return 80  # STRUNCATE
+            return self._secure_copy(dest, size, units, False)
+        return self._secure_copy(dest, size, units[:count], False)
+
+    def strncat_s(self, args):
+        """strncat_s emulation"""
+        units = self._read_units(args[2], False)
+        if args[3] != 0xFFFFFFFF:
+            units = units[:args[3]]
+        return self._secure_copy(args[0], args[1], self._read_units(args[0], False) + units, False)
+
+    def memcpy_s(self, args):
+        """memcpy_s emulation"""
+        dest, size, src, count = args[0], args[1], args[2], args[3]
+        if count > size:
+            if dest and size:
+                self._mem_write(dest, b'\x00' * size)
+            return self.ERANGE
+        self.memcpy([dest, src, count])
+        return 0
+
+    def memmove_s(self, args):
+        """memmove_s emulation"""
+        return self.memcpy_s(args)
+
+    # Wide string functions
+    def wcscpy(self, args):
+        return self._str_copy(args, True)
+
+    def wcsncpy(self, args):
+        return self._str_copy(args, True, args[2])
+
+    def wcscat(self, args):
+        return self._str_cat(args, True)
+
+    def wcsncat(self, args):
+        return self._str_cat(args, True, args[2])
+
+    def wcscmp(self, args):
+        return self._str_compare(args, True)
+
+    def wcsncmp(self, args):
+        return self._str_compare(args, True, n=args[2])
+
+    def _wcsicmp(self, args):
+        return self._str_compare(args, True, fold=True)
+
+    def _wcsnicmp(self, args):
+        return self._str_compare(args, True, n=args[2], fold=True)
+
+    def wcscoll(self, args):
+        return self._str_compare(args, True)
+
+    def _wcsicoll(self, args):
+        return self._str_compare(args, True, fold=True)
+
+    def wcschr(self, args):
+        return self._str_find_unit(args, True)
+
+    def wcsrchr(self, args):
+        return self._str_find_unit(args, True, last=True)
+
+    def wcsspn(self, args):
+        return self._str_span(args, True, accept=True)
+
+    def wcscspn(self, args):
+        return self._str_span(args, True, accept=False)
+
+    def wcspbrk(self, args):
+        """wcspbrk emulation"""
+        count = self._str_span(args, True, accept=False)
+        return args[0] + 2 * count if count < len(self._read_units(args[0], True)) else 0
+
+    def wcsstr(self, args):
+        """wcsstr emulation"""
+        hay = self._read_units(args[0], True)
+        needle = self._read_units(args[1], True)
+        for i in range(len(hay) - len(needle) + 1):
+            if hay[i:i + len(needle)] == needle:
+                return args[0] + 2 * i
+        return 0
+
+    def wcsnlen(self, args):
+        return min(len(self._read_units(args[0], True)), args[1]) if args[0] else 0
+
+    def _wcsdup(self, args):
+        """_wcsdup emulation"""
+        return self._alloc_units(self._read_units(args[0], True), True) if args[0] else 0
+
+    def _wcslwr(self, args):
+        return self._str_map(args[0], True, str.lower)
+
+    def _wcsupr(self, args):
+        return self._str_map(args[0], True, str.upper)
+
+    def _wcsrev(self, args):
+        units = self._read_units(args[0], True)
+        self._write_units(args[0], units[::-1], True)
+        return args[0]
+
+    def towupper(self, args):
+        """towupper emulation"""
+        return self._case_unit(args[0] & 0xFFFF, str.upper)
+
+    def towlower(self, args):
+        """towlower emulation"""
+        return self._case_unit(args[0] & 0xFFFF, str.lower)
+
+    @staticmethod
+    def _case_unit(u, func):
+        mapped = func(chr(u))
+        return ord(mapped) if len(mapped) == 1 and ord(mapped) <= 0xFFFF else u
+
+    _WCTYPE_TESTS = {
+        'iswalpha': str.isalpha,
+        'iswdigit': lambda c: '0' <= c <= '9',
+        'iswxdigit': lambda c: c in '0123456789abcdefABCDEF',
+        'iswspace': lambda c: c in ' \t\n\v\f\r' or c.isspace(),
+        'iswupper': str.isupper,
+        'iswlower': str.islower,
+        'iswalnum': str.isalnum,
+        'iswcntrl': lambda c: ord(c) < 0x20 or 0x7F <= ord(c) < 0xA0,
+        'iswprint': lambda c: c == ' ' or c.isprintable(),
+        'iswgraph': lambda c: c.isprintable() and not c.isspace(),
+        'iswpunct': lambda c: c.isprintable() and not c.isalnum() and not c.isspace(),
+    }
+
+    # CRT ctype mask bits (_UPPER, _LOWER, _DIGIT, _SPACE, _PUNCT, _CONTROL, _BLANK, _HEX, _ALPHA)
+    _CTYPE_MASK_TESTS = (
+        (0x0001, 'iswupper'), (0x0002, 'iswlower'), (0x0004, 'iswdigit'),
+        (0x0008, 'iswspace'), (0x0010, 'iswpunct'), (0x0020, 'iswcntrl'),
+        (0x0040, lambda c: c in ' \t'), (0x0080, 'iswxdigit'),
+        (0x0100, 'iswalpha'),
+    )
+
+    def _wctype_mask(self, ch):
+        c = chr(ch & 0xFFFF)
+        mask = 0
+        for bit, test in self._CTYPE_MASK_TESTS:
+            if (self._WCTYPE_TESTS[test] if isinstance(test, str) else test)(c):
+                mask |= bit
+        return mask
+
+    def iswctype(self, args):
+        """iswctype emulation - test a wide character against a ctype mask"""
+        return self._wctype_mask(args[0]) & (args[1] & 0xFFFF)
+
+    def is_wctype(self, args):
+        """is_wctype emulation (obsolete alias of iswctype)"""
+        return self.iswctype(args)
+
+    def _isctype(self, args):
+        """_isctype emulation"""
+        ch = args[0] & 0xFFFFFFFF
+        if ch > 0xFF:
+            return 0
+        return self._wctype_mask(ch) & (args[1] & 0xFFFF)
+
+    # Multibyte <-> wide conversion (ANSI code page)
+    def mbstowcs(self, args):
+        """mbstowcs emulation"""
+        units = self._text_units(self.read_string(args[1]), True)
+        if not args[0]:
+            return len(units)
+        count = min(len(units), args[2])
+        self._write_units(args[0], units[:count], True, terminate=count < args[2])
+        return count
+
+    def wcstombs(self, args):
+        """wcstombs emulation"""
+        units = self._text_units(self.read_wide_string(args[1]), False)
+        if not args[0]:
+            return len(units)
+        count = min(len(units), args[2])
+        self._write_units(args[0], units[:count], False, terminate=count < args[2])
+        return count
+
+    def _decode_mb_char(self, addr, n):
+        """(wide unit, byte length) of the multibyte char at addr, or None."""
+        try:
+            data = bytes(self.emu.uc.mem_read(addr, min(n, 4)))
+        except UcError:
+            return None
+        if not data or data[0] == 0:
+            return 0, 0
+        for k in range(1, len(data) + 1):
+            try:
+                ch = data[:k].decode(ANSI_CODEPAGE)
+            except UnicodeDecodeError:
+                continue
+            return (ord(ch) if ord(ch) <= 0xFFFF else 0xFFFD), k
+        return None
+
+    def mbtowc(self, args):
+        """mbtowc emulation"""
+        if not args[1]:
+            return 0
+        decoded = self._decode_mb_char(args[1], args[2])
+        if decoded is None:
+            self._store_errno(42)  # EILSEQ
+            return 0xFFFFFFFF
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<H', decoded[0]))
+        return decoded[1]
+
+    def mblen(self, args):
+        """mblen emulation"""
+        if not args[0]:
+            return 0
+        decoded = self._decode_mb_char(args[0], args[1])
+        return 0xFFFFFFFF if decoded is None else decoded[1]
+
+    def wctomb(self, args):
+        """wctomb emulation"""
+        if not args[0]:
+            return 0
+        data = chr(args[1] & 0xFFFF).encode(ANSI_CODEPAGE, errors='replace')
+        self._mem_write(args[0], data)
+        return len(data)
+
+    # ---- Number conversion ----
+
+    _FLOAT_RE = re.compile(
+        r'[ \t\n\r\v\f]*([+-]?(?:0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)'
+        r'(?:[pP][+-]?\d+)?|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|'
+        r'inf(?:inity)?|nan))', re.IGNORECASE)
+
+    def _parse_c_double(self, text):
+        """strtod parsing: returns (value, characters consumed)."""
+        match = self._FLOAT_RE.match(text)
+        if not match:
+            return 0.0, 0
+        token = match.group(1)
+        unsigned = token.lstrip('+-')
+        if unsigned[:2].lower() == '0x':
+            value = float.fromhex(token)
+        else:
+            value = float(token)
+        if math.isinf(value) and not unsigned[:1].lower() == 'i':
+            self._store_errno(self.ERANGE)
+        return value, match.end()
+
+    def _string_arg_text(self, addr, wide):
+        """String argument as text whose indices equal unit offsets."""
+        return ''.join(map(chr, self._read_units(addr, wide)))
+
+    def _strtod_common(self, args, wide):
+        nptr, endptr = args[0], args[1]
+        value, consumed = self._parse_c_double(self._string_arg_text(nptr, wide))
+        if endptr:
+            self._mem_write(endptr, struct.pack('<I', nptr + consumed * (2 if wide else 1)))
+        return X87Result(value)
+
+    def strtod(self, args):
+        """strtod emulation"""
+        return self._strtod_common(args, False)
+
+    def wcstod(self, args):
+        """wcstod emulation"""
+        return self._strtod_common(args, True)
+
+    def atof(self, args):
+        """atof emulation"""
+        return self._strtod_common([args[0], 0], False)
+
+    def _wtof(self, args):
+        """_wtof emulation"""
+        return self._strtod_common([args[0], 0], True)
+
+    def _strtoint_common(self, args, wide, bits, signed):
+        """strtol-family core: clamps with ERANGE like the CRT."""
+        nptr, endptr, base = args[0], args[1], args[2]
+        value, consumed = self._parse_c_integer(self._string_arg_text(nptr, wide), base)
+        if endptr:
+            self._mem_write(endptr, struct.pack('<I', nptr + consumed * (2 if wide else 1)))
+        if signed:
+            lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        else:
+            lo, hi = -((1 << bits) - 1), (1 << bits) - 1  # negation wraps for unsigned
+        if value > hi or value < lo:
+            self._store_errno(self.ERANGE)
+            value = hi if value > hi else (lo if signed else hi)
+        value &= (1 << bits) - 1
+        return QWordResult(value) if bits == 64 else value
+
+    def wcstol(self, args):
+        return self._strtoint_common(args, True, 32, True)
+
+    def wcstoul(self, args):
+        return self._strtoint_common(args, True, 32, False)
+
+    def _strtoi64(self, args):
+        return self._strtoint_common(args, False, 64, True)
+
+    def _strtoui64(self, args):
+        return self._strtoint_common(args, False, 64, False)
+
+    def strtoll(self, args):
+        return self._strtoi64(args)
+
+    def strtoull(self, args):
+        return self._strtoui64(args)
+
+    def _wcstoi64(self, args):
+        return self._strtoint_common(args, True, 64, True)
+
+    def _wcstoui64(self, args):
+        return self._strtoint_common(args, True, 64, False)
+
+    def _atoi64(self, args):
+        """_atoi64 emulation"""
+        value, _ = self._parse_c_integer(self._string_arg_text(args[0], False), 10)
+        return QWordResult(value)
+
+    def atoll(self, args):
+        return self._atoi64(args)
+
+    def _wtoi(self, args):
+        """_wtoi emulation"""
+        value, _ = self._parse_c_integer(self._string_arg_text(args[0], True), 10)
+        return value & 0xFFFFFFFF
+
+    def _wtol(self, args):
+        return self._wtoi(args)
+
+    def _wtoi64(self, args):
+        value, _ = self._parse_c_integer(self._string_arg_text(args[0], True), 10)
+        return QWordResult(value)
+
+    @staticmethod
+    def _int_to_units(value, radix, wide):
+        digits = '0123456789abcdefghijklmnopqrstuvwxyz'
+        if not 2 <= radix <= 36:
+            radix = 10
+        neg = value < 0
+        v = -value if neg else value
+        out = ''
+        while True:
+            out = digits[v % radix] + out
+            v //= radix
+            if not v:
+                break
+        return [ord(c) for c in ('-' + out if neg else out)]
+
+    def _i64toa(self, args):
+        """_i64toa emulation (value, buffer, radix)"""
+        value = self._signed64(self._arg_qword(args, 0))
+        radix = args[3]
+        if radix != 10:
+            value &= (1 << 64) - 1
+        self._write_units(args[2], self._int_to_units(value, radix, False), False)
+        return args[2]
+
+    def _ui64toa(self, args):
+        """_ui64toa emulation"""
+        self._write_units(args[2], self._int_to_units(self._arg_qword(args, 0), args[3], False), False)
+        return args[2]
+
+    def _i64tow(self, args):
+        value = self._signed64(self._arg_qword(args, 0))
+        if args[3] != 10:
+            value &= (1 << 64) - 1
+        self._write_units(args[2], self._int_to_units(value, args[3], True), True)
+        return args[2]
+
+    def _itow(self, args):
+        """_itow emulation"""
+        value = self._signed32(args[0]) if args[2] == 10 else args[0]
+        self._write_units(args[1], self._int_to_units(value, args[2], True), True)
+        return args[1]
+
+    def _ltow(self, args):
+        return self._itow(args)
+
+    def _ultow(self, args):
+        self._write_units(args[1], self._int_to_units(args[0], args[2], True), True)
+        return args[1]
+
+    def _itoa_s(self, args):
+        """_itoa_s emulation (value, buffer, size, radix)"""
+        value = self._signed32(args[0]) if args[3] == 10 else args[0]
+        units = self._int_to_units(value, args[3], False)
+        return self._secure_copy(args[1], args[2], units, False)
+
+    def _abs64(self, args):
+        """_abs64 emulation"""
+        return QWordResult(abs(self._signed64(self._arg_qword(args, 0))))
+
+    def llabs(self, args):
+        return self._abs64(args)
+
+    def div(self, args):
+        """div emulation - div_t {quot, rem} returned in EDX:EAX"""
+        num, den = self._signed32(args[0]), self._signed32(args[1])
+        if den == 0:
+            log.error("div: integer division by zero")
+            self.emu.crashed = True
+            self.emu.stop_emulation = True
+            return QWordResult(0)
+        quot = abs(num) // abs(den) * (1 if (num < 0) == (den < 0) else -1)
+        rem = num - quot * den
+        return QWordResult((quot & 0xFFFFFFFF) | ((rem & 0xFFFFFFFF) << 32))
+
+    def ldiv(self, args):
+        return self.div(args)
+
+    def _rotl(self, args):
+        """_rotl emulation"""
+        value, shift = args[0] & 0xFFFFFFFF, args[1] & 31
+        return ((value << shift) | (value >> (32 - shift))) & 0xFFFFFFFF
+
+    def _rotr(self, args):
+        """_rotr emulation"""
+        value, shift = args[0] & 0xFFFFFFFF, args[1] & 31
+        return ((value >> shift) | (value << (32 - shift))) & 0xFFFFFFFF
+
+    def _lrotl(self, args):
+        return self._rotl(args)
+
+    def _lrotr(self, args):
+        return self._rotr(args)
+
+    def _swab(self, args):
+        """_swab emulation - swap adjacent bytes"""
+        n = args[2] & ~1
+        try:
+            data = bytearray(self.emu.uc.mem_read(args[0], n))
+        except UcError:
+            return 0
+        data[0::2], data[1::2] = data[1::2], data[0::2]
+        self._mem_write(args[1], data)
+        return 0
+
+    # ---- Paths ----
+
+    def _splitpath(self, args):
+        """_splitpath emulation (path, drive, dir, fname, ext)"""
+        path = self.read_string(args[0])
+        drive = path[:2] if len(path) >= 2 and path[1] == ':' else ''
+        rest = path[len(drive):]
+        cut = max(rest.rfind('\\'), rest.rfind('/')) + 1
+        directory, name = rest[:cut], rest[cut:]
+        dot = name.rfind('.')
+        fname, ext = (name[:dot], name[dot:]) if dot != -1 else (name, '')
+        for addr, part in zip(args[1:5], (drive, directory, fname, ext)):
+            if addr:
+                self._write_units(addr, self._text_units(part, False), False)
+        return 0
+
+    def _makepath(self, args):
+        """_makepath emulation (path, drive, dir, fname, ext)"""
+        drive, directory, fname, ext = (self.read_string(a) if a else '' for a in args[1:5])
+        if drive and not drive.endswith(':'):
+            drive += ':'
+        if directory and directory[-1] not in '\\/':
+            directory += '\\'
+        if ext and not ext.startswith('.'):
+            ext = '.' + ext
+        self._write_units(args[0], self._text_units(drive + directory + fname + ext, False), False)
+        return 0
+
+    def _fullpath(self, args):
+        """_fullpath emulation - resolve against the emulated C:\\ directory"""
+        rel = self.read_string(args[1]).replace('/', '\\')
+        if len(rel) >= 2 and rel[1] == ':':
+            drive, rel = rel[:2].upper(), rel[2:]
+        else:
+            drive = 'C:'
+        parts = []
+        for part in rel.split('\\'):
+            if part in ('', '.'):
+                continue
+            if part == '..':
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(part)
+        units = self._text_units(drive + '\\' + '\\'.join(parts), False)
+        if not args[0]:
+            return self._alloc_units(units, False)
+        if len(units) >= args[2]:
+            self._store_errno(self.ERANGE)
+            return 0
+        self._write_units(args[0], units, False)
+        return args[0]
+
+    # ---- Environment ----
+
+    def _getenv_common(self, name, wide):
+        value = self.environment.get(name.upper())
+        if value is None:
+            return 0
+        key = (name.upper(), wide)
+        cached = self._getenv_cache.get(key)
+        if cached and cached[0] == value:
+            return cached[1]
+        addr = self._alloc_units(self._text_units(value, wide), wide)
+        self._getenv_cache[key] = (value, addr)
+        return addr
+
+    def getenv(self, args):
+        """getenv emulation"""
+        return self._getenv_common(self.read_string(args[0]), False)
+
+    def _wgetenv(self, args):
+        """_wgetenv emulation"""
+        return self._getenv_common(self.read_wide_string(args[0]), True)
+
+    def _putenv_common(self, text):
+        name, sep, value = text.partition('=')
+        if not sep or not name:
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        if value:
+            self.environment[name.upper()] = value
+        else:
+            self.environment.pop(name.upper(), None)
+        return 0
+
+    def _putenv(self, args):
+        """_putenv emulation ("NAME=value", empty value removes)"""
+        return self._putenv_common(self.read_string(args[0]))
+
+    def putenv(self, args):
+        return self._putenv(args)
+
+    def _wputenv(self, args):
+        return self._putenv_common(self.read_wide_string(args[0]))
+
+    def _get_narrow_winmain_command_line(self, args):
+        """UCRT: command line after the program name (WinMain lpCmdLine)"""
+        return self._winmain_command_line(False)
+
+    def _get_wide_winmain_command_line(self, args):
+        return self._winmain_command_line(True)
+
+    def _winmain_command_line(self, wide):
+        key = 'winmain_cmdline_w' if wide else 'winmain_cmdline'
+        if key not in self._crt_static:
+            line = self.windows_command_line()
+            if line.startswith('"'):
+                end = line.find('"', 1)
+                rest = line[end + 1:] if end != -1 else ''
+            else:
+                rest = line.partition(' ')[2]
+            self._crt_static[key] = self._alloc_units(self._text_units(rest.lstrip(' \t'), wide), wide)
+        return self._crt_static[key]
+
+    # ---- Process control and signals ----
+
+    SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGBREAK, SIGABRT = 2, 4, 8, 11, 15, 21, 22
+
+    def _crt_terminate(self, code, message=None):
+        if message:
+            self._ensure_iob()
+            self.std_streams[2].write(message.encode(ANSI_CODEPAGE, errors='replace'))
+        self._set_exit_code(code)
+        self.flush_std_streams()
+        self.emu.stop_emulation = True
+        return 0
+
+    def system(self, args):
+        """system emulation - there is no command processor"""
+        if not args[0]:
+            return 0
+        log.warning(f"system(\"{self.read_string(args[0])}\") is not supported")
+        self._store_errno(self.ENOENT)
+        return 0xFFFFFFFF
+
+    def abort(self, args):
+        """abort emulation - raise(SIGABRT), then exit code 3"""
+        handler = self._signal_handlers.get(self.SIGABRT, 0)
+        if handler not in (0, 1):
+            self._signal_handlers[self.SIGABRT] = 0
+            self.emu.call_callback(handler, [self.SIGABRT])
+        return self._crt_terminate(3, "\nabnormal program termination\n")
+
+    def terminate(self, args):
+        return self.abort(args)
+
+    def quick_exit(self, args):
+        return self._exit(args)
+
+    def _c_exit(self, args):
+        """_c_exit emulation - flush without running exit handlers"""
+        self.flush_std_streams()
+        return 0
+
+    def signal(self, args):
+        """signal emulation - returns the previous handler"""
+        sig, handler = args[0], args[1]
+        if sig not in (self.SIGINT, self.SIGILL, self.SIGFPE, self.SIGSEGV,
+                       self.SIGTERM, self.SIGBREAK, self.SIGABRT, 6):
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF  # SIG_ERR
+        previous = self._signal_handlers.get(sig, 0)
+        self._signal_handlers[sig] = handler
+        return previous
+
+    def _crt_raise(self, args):
+        """raise emulation"""
+        sig = args[0]
+        handler = self._signal_handlers.get(sig, 0)
+        if handler == 1:  # SIG_IGN
+            return 0
+        if handler == 0:  # SIG_DFL terminates the process
+            return self._crt_terminate(3)
+        self._signal_handlers[sig] = 0  # reset to SIG_DFL before the call
+        self.emu.call_callback(handler, [sig])
+        return 0
+
+    def _sleep(self, args):
+        """_sleep emulation"""
+        return self.Sleep(args)
+
+    # ---- Non-local jumps (MSVC _JUMP_BUFFER: Ebp Ebx Edi Esi Esp Eip ...) ----
+
+    def _setjmp(self, args):
+        """_setjmp emulation - save the caller's context; returns 0"""
+        buf = args[0]
+        esp = self.emu.api_call_esp
+        ret_addr = self._read_u32(esp)
+        uc = self.emu.uc
+        context = struct.pack('<6I', uc.reg_read(UC_X86_REG_EBP), uc.reg_read(UC_X86_REG_EBX),
+                              uc.reg_read(UC_X86_REG_EDI), uc.reg_read(UC_X86_REG_ESI),
+                              esp + 4, ret_addr)
+        self._mem_write(buf, context + b'\x00' * 40)
+        return 0
+
+    def _setjmp3(self, args):
+        return self._setjmp(args)
+
+    def setjmp(self, args):
+        return self._setjmp(args)
+
+    def longjmp(self, args):
+        """longjmp emulation - resume after the matching setjmp"""
+        buf, value = args[0], args[1]
+        try:
+            ebp, ebx, edi, esi, esp, eip = struct.unpack('<6I', self.emu.uc.mem_read(buf, 24))
+        except UcError:
+            ebp = ebx = edi = esi = esp = eip = 0
+        if not eip:
+            log.error("longjmp with an uninitialized jmp_buf")
+            self.emu.crashed = True
+            self.emu.stop_emulation = True
+            return 0
+        uc = self.emu.uc
+        uc.reg_write(UC_X86_REG_EBP, ebp)
+        uc.reg_write(UC_X86_REG_EBX, ebx)
+        uc.reg_write(UC_X86_REG_EDI, edi)
+        uc.reg_write(UC_X86_REG_ESI, esi)
+        return ApiJump(eip, esp, value or 1)
+
+    # ---- Time ----
+
+    _DAY_NAMES = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
+    _MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
+                    'August', 'September', 'October', 'November', 'December')
+
+    @staticmethod
+    def _struct_time_to_tm(st):
+        """Python struct_time -> C struct tm fields."""
+        return [st.tm_sec, st.tm_min, st.tm_hour, st.tm_mday, st.tm_mon - 1,
+                st.tm_year - 1900, (st.tm_wday + 1) % 7, st.tm_yday - 1,
+                max(st.tm_isdst, 0)]
+
+    def _read_tm(self, addr):
+        try:
+            return list(struct.unpack('<9i', self.emu.uc.mem_read(addr, 36)))
+        except UcError:
+            return None
+
+    def _time_to_tm(self, t, local, buffer_name='tm'):
+        """Fill the static struct tm for time_t t (NULL for invalid times)."""
+        if t < 0:
+            self._store_errno(self.EINVAL)
+            return 0
+        try:
+            st = time.localtime(t) if local else time.gmtime(t)
+        except (OverflowError, OSError, ValueError):
+            self._store_errno(self.EINVAL)
+            return 0
+        buf = self._static_buffer(buffer_name, 36)
+        self._mem_write(buf, struct.pack('<9i', *self._struct_time_to_tm(st)))
+        return buf
+
+    def _read_time_arg(self, ptr, bits):
+        """Read a time_t through a pointer (32- or 64-bit)."""
+        if not ptr:
+            return None
+        try:
+            if bits == 64:
+                return struct.unpack('<q', self.emu.uc.mem_read(ptr, 8))[0]
+            return struct.unpack('<i', self.emu.uc.mem_read(ptr, 4))[0]
+        except UcError:
+            return None
+
+    def _tm_time_common(self, ptr, bits, local):
+        t = self._read_time_arg(ptr, bits)
+        if t is None:
+            self._store_errno(self.EINVAL)
+            return 0
+        return self._time_to_tm(t, local)
+
+    def localtime(self, args):
+        """localtime emulation (32-bit time_t)"""
+        return self._tm_time_common(args[0], 32, True)
+
+    def _localtime32(self, args):
+        return self._tm_time_common(args[0], 32, True)
+
+    def _localtime64(self, args):
+        return self._tm_time_common(args[0], 64, True)
+
+    def gmtime(self, args):
+        """gmtime emulation (32-bit time_t)"""
+        return self._tm_time_common(args[0], 32, False)
+
+    def _gmtime32(self, args):
+        return self._tm_time_common(args[0], 32, False)
+
+    def _gmtime64(self, args):
+        return self._tm_time_common(args[0], 64, False)
+
+    def _tm_s_common(self, args, bits, local):
+        """localtime_s/gmtime_s style: (struct tm *dest, const time_t *t) -> errno"""
+        t = self._read_time_arg(args[1], bits)
+        if not args[0] or t is None:
+            return self.EINVAL
+        src = self._time_to_tm(t, local, buffer_name='tm_s')
+        if not src:
+            return self.EINVAL
+        self.memcpy([args[0], src, 36])
+        return 0
+
+    def _localtime32_s(self, args):
+        return self._tm_s_common(args, 32, True)
+
+    def _localtime64_s(self, args):
+        return self._tm_s_common(args, 64, True)
+
+    def _gmtime32_s(self, args):
+        return self._tm_s_common(args, 32, False)
+
+    def _gmtime64_s(self, args):
+        return self._tm_s_common(args, 64, False)
+
+    def _mktime_common(self, tm_addr, bits, local):
+        """mktime/_mkgmtime: normalize struct tm in place, return time_t."""
+        fields = self._read_tm(tm_addr) if tm_addr else None
+        fail = QWordResult(-1) if bits == 64 else 0xFFFFFFFF
+        if fields is None:
+            self._store_errno(self.EINVAL)
+            return fail
+        sec, minute, hour, mday, mon, year, _, _, isdst = fields
+        year += 1900 + mon // 12
+        mon %= 12
+        try:
+            import datetime
+            base = datetime.datetime(year, mon + 1, 1)
+            dt = base + datetime.timedelta(days=mday - 1, hours=hour, minutes=minute, seconds=sec)
+            if local:
+                t = int(time.mktime(dt.timetuple()[:8] + (isdst if isdst >= 0 else -1,)))
+            else:
+                import calendar
+                t = calendar.timegm(dt.timetuple())
+        except (OverflowError, ValueError, OSError):
+            return fail
+        if t < 0 or (bits == 32 and t > 0x7FFFFFFF):
+            return fail
+        st = time.localtime(t) if local else time.gmtime(t)
+        self._mem_write(tm_addr, struct.pack('<9i', *self._struct_time_to_tm(st)))
+        return QWordResult(t) if bits == 64 else t
+
+    def mktime(self, args):
+        """mktime emulation"""
+        return self._mktime_common(args[0], 32, True)
+
+    def _mktime32(self, args):
+        return self._mktime_common(args[0], 32, True)
+
+    def _mktime64(self, args):
+        return self._mktime_common(args[0], 64, True)
+
+    def _mkgmtime(self, args):
+        return self._mktime_common(args[0], 32, False)
+
+    def _mkgmtime32(self, args):
+        return self._mktime_common(args[0], 32, False)
+
+    def _mkgmtime64(self, args):
+        return self._mktime_common(args[0], 64, False)
+
+    def difftime(self, args):
+        """difftime emulation (32-bit time_t)"""
+        return X87Result(self._signed32(args[0]) - self._signed32(args[1]))
+
+    def _difftime32(self, args):
+        return self.difftime(args)
+
+    def _difftime64(self, args):
+        """_difftime64 emulation"""
+        return X87Result(self._signed64(self._arg_qword(args, 0)) -
+                         self._signed64(self._arg_qword(args, 2)))
+
+    def _time_common(self, ptr, bits):
+        t = int(time.time())
+        if ptr:
+            self._mem_write(ptr, struct.pack('<q' if bits == 64 else '<i', t))
+        return QWordResult(t) if bits == 64 else t & 0xFFFFFFFF
+
+    def _time32(self, args):
+        return self._time_common(args[0], 32)
+
+    def _time64(self, args):
+        """_time64 emulation"""
+        return self._time_common(args[0], 64)
+
+    def _asctime_text(self, fields):
+        sec, minute, hour, mday, mon, year, wday = fields[:7]
+        return (f"{self._DAY_NAMES[wday % 7][:3]} {self._MONTH_NAMES[mon % 12][:3]} "
+                f"{mday:02d} {hour:02d}:{minute:02d}:{sec:02d} {year + 1900}\n")
+
+    def _asctime_store(self, fields, wide=False):
+        if fields is None:
+            self._store_errno(self.EINVAL)
+            return 0
+        buf = self._static_buffer('asctime_w' if wide else 'asctime', 64)
+        self._write_units(buf, self._text_units(self._asctime_text(fields), wide), wide)
+        return buf
+
+    def asctime(self, args):
+        """asctime emulation"""
+        return self._asctime_store(self._read_tm(args[0]) if args[0] else None)
+
+    def _ctime_common(self, ptr, bits, wide=False):
+        t = self._read_time_arg(ptr, bits)
+        tm = self._time_to_tm(t, True, buffer_name='ctime_tm') if t is not None else 0
+        return self._asctime_store(self._read_tm(tm) if tm else None, wide)
+
+    def ctime(self, args):
+        """ctime emulation (32-bit time_t)"""
+        return self._ctime_common(args[0], 32)
+
+    def _ctime32(self, args):
+        return self._ctime_common(args[0], 32)
+
+    def _ctime64(self, args):
+        return self._ctime_common(args[0], 64)
+
+    def _wctime(self, args):
+        return self._ctime_common(args[0], 32, wide=True)
+
+    def _wctime64(self, args):
+        return self._ctime_common(args[0], 64, wide=True)
+
+    def _strftime_text(self, fmt, fields):
+        """strftime for the "C" locale (supports the '#' flag)."""
+        sec, minute, hour, mday, mon, year, wday, yday, isdst = fields
+        year += 1900
+        hour12 = hour % 12 or 12
+
+        def week(first_day):  # %U (Sunday) / %W (Monday)
+            offset = (wday - first_day) % 7
+            return (yday + 7 - offset) // 7
+
+        tz_name = time.tzname[1 if isdst > 0 else 0]
+        tz_minutes = -(time.altzone if isdst > 0 else time.timezone) // 60
+        out = []
+        i = 0
+        while i < len(fmt):
+            ch = fmt[i]
+            if ch != '%' or i + 1 >= len(fmt):
+                out.append(ch)
+                i += 1
+                continue
+            i += 1
+            alt = fmt[i] == '#'
+            if alt:
+                i += 1
+                if i >= len(fmt):
+                    break
+            spec = fmt[i]
+            i += 1
+
+            def num(value, width=2):
+                return str(value) if alt else str(value).zfill(width)
+
+            values = {
+                'a': self._DAY_NAMES[wday % 7][:3], 'A': self._DAY_NAMES[wday % 7],
+                'b': self._MONTH_NAMES[mon % 12][:3], 'h': self._MONTH_NAMES[mon % 12][:3],
+                'B': self._MONTH_NAMES[mon % 12],
+                'd': num(mday), 'e': f"{mday:2d}", 'H': num(hour), 'I': num(hour12),
+                'j': num(yday + 1, 3), 'm': num(mon + 1), 'M': num(minute),
+                'p': 'AM' if hour < 12 else 'PM', 'S': num(sec),
+                'U': num(week(0)), 'W': num(week(1)), 'w': str(wday),
+                'y': num(year % 100), 'Y': str(year), 'C': num(year // 100),
+                'Z': tz_name,
+                'z': f"{'+' if tz_minutes >= 0 else '-'}{abs(tz_minutes) // 60:02d}{abs(tz_minutes) % 60:02d}",
+                'n': '\n', 't': '\t', '%': '%',
+                'D': f"{mon + 1:02d}/{mday:02d}/{year % 100:02d}",
+                'F': f"{year}-{mon + 1:02d}-{mday:02d}",
+                'R': f"{hour:02d}:{minute:02d}", 'T': f"{hour:02d}:{minute:02d}:{sec:02d}",
+                'r': f"{hour12:02d}:{minute:02d}:{sec:02d} {'AM' if hour < 12 else 'PM'}",
+                'u': str(wday or 7),
+            }
+            if spec == 'c':
+                out.append(f"{self._DAY_NAMES[wday % 7][:3]} {self._MONTH_NAMES[mon % 12][:3]} "
+                           f"{mday:2d} {hour:02d}:{minute:02d}:{sec:02d} {year}"
+                           if alt else
+                           f"{mon + 1:02d}/{mday:02d}/{year % 100:02d} "
+                           f"{hour:02d}:{minute:02d}:{sec:02d}")
+            elif spec == 'x':
+                out.append(f"{self._DAY_NAMES[wday % 7]}, {self._MONTH_NAMES[mon % 12]} "
+                           f"{mday:02d}, {year}" if alt else values['D'])
+            elif spec == 'X':
+                out.append(values['T'])
+            else:
+                out.append(values.get(spec, ''))
+        return ''.join(out)
+
+    def _strftime_common(self, args, wide):
+        buf, max_size, fmt_addr, tm_addr = args[0], args[1], args[2], args[3]
+        fields = self._read_tm(tm_addr) if tm_addr else None
+        if fields is None:
+            self._store_errno(self.EINVAL)
+            return 0
+        text = self._strftime_text(self._read_text(fmt_addr, wide), fields)
+        units = self._text_units(text, wide)
+        if len(units) + 1 > max_size:
+            if buf and max_size:
+                self._write_units(buf, [], wide)
+            self._store_errno(self.ERANGE)
+            return 0
+        self._write_units(buf, units, wide)
+        return len(units)
+
+    def strftime(self, args):
+        """strftime emulation"""
+        return self._strftime_common(args, False)
+
+    def wcsftime(self, args):
+        """wcsftime emulation"""
+        return self._strftime_common(args, True)
+
+    def _strdate(self, args):
+        """_strdate emulation - "MM/DD/YY" """
+        st = time.localtime()
+        self._write_units(args[0], self._text_units(time.strftime('%m/%d/%y', st), False), False)
+        return args[0]
+
+    def _strtime(self, args):
+        """_strtime emulation - "HH:MM:SS" """
+        st = time.localtime()
+        self._write_units(args[0], self._text_units(time.strftime('%H:%M:%S', st), False), False)
+        return args[0]
+
+    def _ftime_common(self, ptr, bits):
+        now = time.time()
+        st = time.localtime(now)
+        tz = (time.altzone if st.tm_isdst > 0 else time.timezone) // 60
+        fixed = struct.pack('<Hhh', int((now % 1) * 1000), tz, max(st.tm_isdst, 0))
+        if bits == 64:
+            data = struct.pack('<q', int(now)) + fixed + b'\x00\x00'
+        else:
+            data = struct.pack('<i', int(now)) + fixed + b'\x00\x00'
+        if ptr:
+            self._mem_write(ptr, data)
+        return 0
+
+    def _ftime(self, args):
+        """_ftime emulation (struct _timeb with 32-bit time)"""
+        return self._ftime_common(args[0], 32)
+
+    def _ftime32(self, args):
+        return self._ftime_common(args[0], 32)
+
+    def _ftime64(self, args):
+        return self._ftime_common(args[0], 64)
+
+    def _tzset(self, args):
+        return 0
+
+    # ---- UCRT startup / runtime configuration ----
+
+    def _set_app_type(self, args):
+        return 0
+
+    def _configure_narrow_argv(self, args):
+        return 0
+
+    def _configure_wide_argv(self, args):
+        return 0
+
+    def _initialize_narrow_environment(self, args):
+        return 0
+
+    def _initialize_wide_environment(self, args):
+        return 0
+
+    def _get_initial_narrow_environment(self, args):
+        """UCRT: the initial char **environ"""
+        return self._read_u32(self._ensure_env_ptr('_environ_ptr_addr'))
+
+    def _get_initial_wide_environment(self, args):
+        return self._read_u32(self._ensure_env_ptr('_wenviron_ptr_addr', wide=True))
+
+    def _seh_filter_exe(self, args):
+        return 0  # EXCEPTION_CONTINUE_SEARCH
+
+    def _seh_filter_dll(self, args):
+        return 0
+
+    def _initialize_onexit_table(self, args):
+        return 0
+
+    def _register_onexit_function(self, args):
+        """UCRT: register an exit handler (the table is kept internally)"""
+        if args[1]:
+            self.exit_handlers.append(args[1])
+        return 0
+
+    def _execute_onexit_table(self, args):
+        return 0
+
+    def _crt_atexit(self, args):
+        return self.atexit(args)
+
+    def _crt_at_quick_exit(self, args):
+        return 0
+
+    def _set_fmode(self, args):
+        """_set_fmode emulation"""
+        self._mem_write(self._ensure_fmode_addr(), struct.pack('<I', args[0]))
+        return 0
+
+    def _get_fmode(self, args):
+        """_get_fmode emulation"""
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<I', self._read_u32(self._ensure_fmode_addr())))
+        return 0
+
+    def _configthreadlocale(self, args):
+        return 0
+
+    def _set_new_mode(self, args):
+        return 0
+
+    def _register_thread_local_exe_atexit_callback(self, args):
+        return 0
+
+    def _set_invalid_parameter_handler(self, args):
+        return 0
+
+    def _set_abort_behavior(self, args):
+        return 0
+
+    def _invalid_parameter_noinfo(self, args):
+        """Invalid parameter detected by a CRT function: fatal, like Windows"""
+        return self._invoke_watson(args)
+
+    def _invalid_parameter_noinfo_noreturn(self, args):
+        return self._invoke_watson(args)
+
+    def _get_errno(self, args):
+        """_get_errno emulation"""
+        if not args[0]:
+            return self.EINVAL
+        self._mem_write(args[0], struct.pack('<I', self._load_errno()))
+        return 0
+
+    def _set_errno(self, args):
+        """_set_errno emulation"""
+        self._store_errno(args[0])
         return 0
 
 
@@ -8737,6 +11116,11 @@ class CPUEmulator:
     API_HOOK_SIZE = 0x100000
     CALLBACK_RETURN_ADDR = 0x6FFF0000
     PROCESS_EXIT_ADDR = CALLBACK_RETURN_ADDR + 0x10  # return address of the entry point
+    # Double-returning APIs return through "fld qword [X87_RESULT_ADDR]; ret"
+    X87_RETURN_STUB = CALLBACK_RETURN_ADDR + 0x20
+    X87_RESULT_ADDR = CALLBACK_RETURN_ADDR + 0x100
+    # x87-register-argument APIs (_CIsin, _ftol...) spill ST(i) here
+    X87_ARGS_ADDR = CALLBACK_RETURN_ADDR + 0x110
     
     def __init__(self, pe_loader, gui=None):
         self.pe_loader = pe_loader
@@ -8765,6 +11149,7 @@ class CPUEmulator:
         # Callback system
         self.callback_stack = []  # Stack for nested callback support
         self.callback_return_addr = self.CALLBACK_RETURN_ADDR
+        self.api_call_esp = 0  # ESP at the current API stub (setjmp needs it)
         self.pending_callback = None  # Pending callback info
         
         # Console input system
@@ -9132,15 +11517,21 @@ class CPUEmulator:
                 log.debug(f"  Hook: {func_name} -> 0x{hook_addr:08x}")
 
     def _create_api_stub(self, dll_name, func_name):
-        """Write a RET stub that _hook_code intercepts; returns its address (0 if full)"""
-        if self.next_hook_addr >= self.API_HOOK_BASE + self.API_HOOK_SIZE:
+        """Write a RET stub that _hook_code intercepts; returns its address (0 if full)
+
+        Some CRT helpers take their arguments in x87 registers; their stub
+        starts with native code that spills them to memory before the RET.
+        """
+        prologue = self.api_handler.native_prologue(func_name)
+        entry = self.next_hook_addr
+        hook_addr = entry + len(prologue)
+        if hook_addr >= self.API_HOOK_BASE + self.API_HOOK_SIZE:
             log.error(f"API stub region full, cannot hook {func_name}")
             return 0
-        hook_addr = self.next_hook_addr
-        self.next_hook_addr += 4
-        self.uc.mem_write(hook_addr, b'\xC3')  # RET
+        self.next_hook_addr = (hook_addr + 4) & ~3
+        self.uc.mem_write(entry, prologue + b'\xC3')  # RET
         self.api_hooks[hook_addr] = {'dll': dll_name, 'name': func_name}
-        return hook_addr
+        return entry
 
     def get_api_stub(self, dll_name, func_name):
         """Stub address for GetProcAddress, or 0 if the API is not emulated"""
@@ -9159,6 +11550,9 @@ class CPUEmulator:
             self.uc.mem_map(self.callback_return_addr, 0x1000, UC_PROT_ALL)
             # Write RET instruction (0xC3) - will be hooked
             self.uc.mem_write(self.callback_return_addr, b'\xC3')
+            # fld qword ptr [X87_RESULT_ADDR]; ret
+            self.uc.mem_write(self.X87_RETURN_STUB,
+                              b'\xDD\x05' + struct.pack('<I', self.X87_RESULT_ADDR) + b'\xC3')
             log.debug(f"Callback return hook: 0x{self.callback_return_addr:08x}")
         except UcError as e:
             log.warning(f"Could not setup callback return hook: {e}")
@@ -9355,6 +11749,7 @@ class CPUEmulator:
         
         # Find and call handler
         handler = self.api_handler.get_api_handler(func_name)
+        self.api_call_esp = esp
         
         if handler:
             try:
@@ -9369,6 +11764,20 @@ class CPUEmulator:
         else:
             log.warning(f"Unemulated API: {func_name}")
             result = 0
+
+        if isinstance(result, ApiJump):
+            self.uc.reg_write(UC_X86_REG_EAX, result.eax & 0xFFFFFFFF)
+            self.uc.reg_write(UC_X86_REG_ESP, result.esp)
+            self.uc.reg_write(UC_X86_REG_EIP, result.eip)
+            return
+
+        x87_result = isinstance(result, X87Result)
+        if x87_result:
+            self.uc.mem_write(self.X87_RESULT_ADDR, struct.pack('<d', result.value))
+            result = 0
+        elif isinstance(result, QWordResult):
+            self.uc.reg_write(UC_X86_REG_EDX, result.value >> 32)
+            result = result.value
         
         # Write result to EAX
         self.uc.reg_write(UC_X86_REG_EAX, result & 0xFFFFFFFF)
@@ -9383,6 +11792,11 @@ class CPUEmulator:
             self.crashed = True
             self.stop_emulation = True
             cleanup = 0
+        if x87_result and cleanup == 0:
+            # Leave the return address on the stack: the stub loads ST(0) and RETs
+            self.uc.reg_write(UC_X86_REG_EIP, self.X87_RETURN_STUB)
+            self.uc.reg_write(UC_X86_REG_ESP, esp)
+            return
         self.uc.reg_write(UC_X86_REG_EIP, ret_addr)
         self.uc.reg_write(UC_X86_REG_ESP, esp + 4 + cleanup)
     

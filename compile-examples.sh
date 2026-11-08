@@ -30,6 +30,11 @@ for src in examples/*.c; do
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
                 -lkernel32 -mconsole
             ;;
+        crt_demo)
+            # Console application - C runtime (msvcrt) coverage tests
+            i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
+                -lkernel32 -mconsole
+            ;;
         *)
             # Default: GUI application
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
