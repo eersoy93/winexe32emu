@@ -44,7 +44,7 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 
 ## Versioning
 
-- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc. Every bigger changes version is bumped to 0.1.0, 0.2.0 etc.
+- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc. Every bigger changes version is bumped to 0.1.0, 0.2.0 etc. Every biggest changes version is bumped to 1.0.0, 2.0.0 etc.
 
 ## Disclaimer
 
