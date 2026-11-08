@@ -18,3 +18,5 @@ venv/
 
 # Executables
 *.exe
+*.EXE
+*.Exe
