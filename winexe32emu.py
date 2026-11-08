@@ -4029,7 +4029,9 @@ class WinAPIHandler:
         hWnd = args[0]
         log.debug(f"DestroyWindow(0x{hWnd:x})")
 
-        if self.gui and hWnd in self.gui.windows:
+        if self.gui and hWnd in self.gui.controls:
+            self.gui.destroy_control(hWnd)
+        elif self.gui and hWnd in self.gui.windows:
             self.gui._close_window(hWnd, notify_app=False)
             # Deliver WM_DESTROY via the queue: a synchronous call here would
             # nest emu_start inside an already-running callback
@@ -5230,6 +5232,15 @@ class WinAPIHandler:
         """
         items = control.items
 
+        WM_SETFONT, WM_GETFONT = 0x0030, 0x0031
+        if Msg == WM_SETFONT:
+            font = self.gdi_objects.get(wParam)
+            control.font_handle = wParam
+            control.font = font if font and font['type'] == 'font' else None
+            return 0
+        if Msg == WM_GETFONT:
+            return control.font_handle
+
         # ----- Checkbox / button messages -----
         if Msg == self.BM_GETCHECK:
             return 1 if control.checked else 0
@@ -6112,6 +6123,15 @@ class WinAPIHandler:
             return self.CreateHatchBrush([hatch, color])
         return self.CreateSolidBrush([color])
 
+    # Stock fonts: index -> (face, pixel height)
+    STOCK_FONTS = {
+        10: ('courier new', 16),    # OEM_FIXED_FONT
+        11: ('courier new', 16),    # ANSI_FIXED_FONT
+        12: ('ms sans serif', 16),  # ANSI_VAR_FONT
+        16: ('courier new', 16),    # SYSTEM_FIXED_FONT
+        17: ('ms sans serif', 16),  # DEFAULT_GUI_FONT
+    }
+
     def GetStockObject(self, args):
         """GetStockObject emulation"""
         index = args[0]
@@ -6139,6 +6159,10 @@ class WinAPIHandler:
             if color is None and obj_type == 'pen':
                 obj['style'] = 5  # PS_NULL
             self.gdi_objects[handle] = obj
+        elif index in self.STOCK_FONTS:
+            face, height = self.STOCK_FONTS[index]
+            self.gdi_objects[handle] = {'type': 'font', 'height': height, 'bold': False,
+                                        'italic': False, 'underline': False, 'face': face}
         else:
             # Fonts and other stock objects: return a generic handle
             self.gdi_objects[handle] = {'type': 'other', 'color': (0, 0, 0), 'width': 0}
@@ -11532,7 +11556,9 @@ class FakeControl:
         self.scroll_max = 100
         self.scroll_pos = 0
         self.scroll_page = 0  # 0 = no page size set (SetScrollInfo SIF_PAGE)
-        
+        self.font = None      # GDI font dict set by WM_SETFONT (None: GUI font)
+        self.font_handle = 0
+
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
         abs_x = parent_x + self.x
@@ -12181,8 +12207,15 @@ class PseudoWindowsGUI:
         title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
         pygame.draw.rect(self.screen, title_color, title_rect)
         
-        # Title text
-        title_text = self.font_bold.render(window.title[:40], True, self.COLOR_TITLE_TEXT)
+        # Title text, cut with "..." before the caption buttons
+        buttons_w = 18 * (1 if window.is_dialog else 3) + 5
+        max_title_w = window.width - 8 - buttons_w - 6
+        title = window.title
+        if self.font_bold.size(title)[0] > max_title_w:
+            while title and self.font_bold.size(title + "...")[0] > max_title_w:
+                title = title[:-1]
+            title += "..."
+        title_text = self.font_bold.render(title, True, self.COLOR_TITLE_TEXT)
         self.screen.blit(title_text, (window.x + 8, window.y + 6))
         
         # Window buttons (Minimize, Maximize, Close)
@@ -12443,20 +12476,85 @@ class PseudoWindowsGUI:
             self.screen.blit(text, (rect.x + 3, rect.y + 1))
 
     def _draw_control(self, control, parent_x, parent_y):
-        """Draw control"""
+        """Draw control in its WM_SETFONT font"""
         if not control.visible:
             return
-        
-        abs_x = parent_x + control.x
-        abs_y = parent_y + control.y
-        
+        gui_font = self.font
+        if control.font:
+            self.font = self._get_render_font(control.font)
+        try:
+            self._draw_control_body(control, parent_x + control.x, parent_y + control.y)
+        finally:
+            self.font = gui_font
+
+    def _wrap_text(self, text, width):
+        """Split text into lines that fit width pixels (word wrap)"""
+        lines = []
+        for paragraph in text.split('\n'):
+            line = ''
+            for word in paragraph.split(' '):
+                candidate = f"{line} {word}" if line else word
+                if line and self.font.size(candidate)[0] > width:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            lines.append(line)
+        return lines
+
+    SS_NOPREFIX = 0x80
+
+    def _draw_static(self, control, rect):
+        """Draw a STATIC control by its SS_* type"""
+        kind = control.style & 0x1F
+        dark, light = (128, 128, 128), (255, 255, 255)
+        x, y, w, h = rect
+        if kind == 0x10:    # SS_ETCHEDHORZ
+            pygame.draw.line(self.screen, dark, (x, y), (x + w - 1, y))
+            pygame.draw.line(self.screen, light, (x, y + 1), (x + w - 1, y + 1))
+        elif kind == 0x11:  # SS_ETCHEDVERT
+            pygame.draw.line(self.screen, dark, (x, y), (x, y + h - 1))
+            pygame.draw.line(self.screen, light, (x + 1, y), (x + 1, y + h - 1))
+        elif kind == 0x12:  # SS_ETCHEDFRAME
+            pygame.draw.rect(self.screen, light, (x + 1, y + 1, w - 1, h - 1), 1)
+            pygame.draw.rect(self.screen, dark, (x, y, w - 1, h - 1), 1)
+        elif kind in (4, 5, 6):  # SS_BLACKRECT, SS_GRAYRECT, SS_WHITERECT
+            pygame.draw.rect(self.screen, ((0, 0, 0), dark, light)[kind - 4], rect)
+        elif kind in (7, 8, 9):  # SS_BLACKFRAME, SS_GRAYFRAME, SS_WHITEFRAME
+            pygame.draw.rect(self.screen, ((0, 0, 0), dark, light)[kind - 7], rect, 1)
+        elif kind in (0, 1, 2, 0xB, 0xC):  # Text: left, center, right, simple, no wrap
+            text = control.text
+            if not control.style & self.SS_NOPREFIX:
+                text = re.sub(r'&(.)', r'\1', text)
+            lines = self._wrap_text(text, w) if kind <= 2 else text.split('\n')
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(rect.clip(prev_clip) if prev_clip else rect)
+            line_y = y
+            for line in lines:
+                surface = self.font.render(line, True, self.COLOR_TEXT)
+                if kind == 1:
+                    line_x = x + (w - surface.get_width()) // 2
+                elif kind == 2:
+                    line_x = x + w - surface.get_width()
+                else:
+                    line_x = x
+                self.screen.blit(surface, (line_x, line_y))
+                line_y += self.font.get_linesize()
+                if line_y >= y + h:
+                    break
+            self.screen.set_clip(prev_clip)
+
+    def _draw_control_body(self, control, abs_x, abs_y):
         if control.class_name == "BUTTON":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            self._draw_button_3d(rect, control.text)
+            if (control.style & 0xF) == 1:  # BS_DEFPUSHBUTTON: black outer frame
+                self._draw_button_3d(rect.inflate(-2, -2), control.text)
+                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
+            else:
+                self._draw_button_3d(rect, control.text)
             
         elif control.class_name == "STATIC":
-            text = self.font.render(control.text, True, self.COLOR_TEXT)
-            self.screen.blit(text, (abs_x, abs_y))
+            self._draw_static(control, pygame.Rect(abs_x, abs_y, control.width, control.height))
             
         elif control.class_name == "EDIT":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
@@ -13777,6 +13875,20 @@ class PseudoWindowsGUI:
         
         log.debug(f"GUI: Control created - HWND=0x{hwnd:08x}, {class_name}, '{text}'")
         return hwnd
+
+    @gui_locked
+    def destroy_control(self, hwnd):
+        """Remove a child control (DestroyWindow)"""
+        control = self.controls.pop(hwnd, None)
+        if control is None:
+            return
+        parent = self.windows.get(control.parent_hwnd)
+        if parent is not None:
+            parent.controls = [c for c in parent.controls if c.hwnd != hwnd]
+        if self.focused_control == hwnd:
+            self.focused_control = None
+        if self.open_combo == hwnd:
+            self.open_combo = None
     
     @gui_locked
     def show_window(self, hwnd, show=True):
