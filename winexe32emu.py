@@ -954,6 +954,7 @@ class WinAPIHandler:
         'StretchBlt': 11, 'SetTextAlign': 2, 'GetTextColor': 1, 'GetBkColor': 1,
         'CreatePenIndirect': 1, 'CreateBrushIndirect': 1, 'GetTextMetricsA': 2,
         'SetROP2': 2, 'GetObjectA': 3, 'CreateBitmap': 5,
+        'CreatePalette': 1, 'SelectPalette': 3, 'RealizePalette': 1,
         # advapi32
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
         'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
@@ -6103,6 +6104,39 @@ class WinAPIHandler:
         log.debug(f"CreateSolidBrush(0x{colorref:06x}) -> 0x{handle:x}")
         return handle
 
+    def CreatePalette(self, args):
+        """CreatePalette emulation (LOGPALETTE: version, count, PALETTEENTRY[])"""
+        try:
+            _, count = struct.unpack('<HH', self.emu.uc.mem_read(args[0], 4))
+            raw = bytes(self.emu.uc.mem_read(args[0] + 4, count * 4)) if count else b''
+        except UcError:
+            return 0
+        if not count:
+            return 0
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {
+            'type': 'palette',
+            'entries': [tuple(raw[i:i + 4]) for i in range(0, len(raw), 4)],
+        }
+        log.debug(f"CreatePalette({count} entries) -> 0x{handle:x}")
+        return handle
+
+    def SelectPalette(self, args):
+        """SelectPalette emulation - returns the previously selected palette"""
+        hdc, hpal = args[0], args[1]
+        state = self.dc_state.get(hdc)
+        obj = self.gdi_objects.get(hpal)
+        if state is None or obj is None:
+            return 0
+        prev = state.get('palette') or self.GetStockObject([15])  # DEFAULT_PALETTE
+        state['palette'] = hpal
+        log.debug(f"SelectPalette(0x{hdc:x}, 0x{hpal:x}) -> 0x{prev:x}")
+        return prev
+
+    def RealizePalette(self, args):
+        """RealizePalette emulation - true-color display, nothing to remap"""
+        return 0
+
     def CreatePenIndirect(self, args):
         """CreatePenIndirect emulation (LOGPEN: style, POINT width, color)"""
         try:
@@ -6217,8 +6251,8 @@ class WinAPIHandler:
             return 1
         # Windows refuses to delete an object that is selected into a DC
         for state in self.dc_state.values():
-            if hobj in (state.get('pen'), state.get('brush'),
-                        state.get('font'), state.get('bitmap')):
+            if hobj in (state.get('pen'), state.get('brush'), state.get('font'),
+                        state.get('bitmap'), state.get('palette')):
                 return 0
         return 1 if self.gdi_objects.pop(hobj, None) else 0
 
@@ -6981,6 +7015,8 @@ class WinAPIHandler:
                                700 if obj.get('bold') else 400,
                                1 if obj.get('italic') else 0,
                                1 if obj.get('underline') else 0, 0, 0, 0, 0, 0, 0, face)
+        elif kind == 'palette':
+            data = struct.pack('<H', len(obj['entries']))
         else:
             return 0
         if not lpvObject:
