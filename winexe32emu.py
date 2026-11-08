@@ -117,36 +117,56 @@ class DebugLogger:
 
     DEBUG, INFO, WARNING = 0, 1, 2
     level = INFO
+    _lock = threading.Lock()
+    _at_line_start = True
+
+    @classmethod
+    def write(cls, text):
+        """Write text in one piece (the emulation and GUI threads both print)"""
+        if not text:
+            return
+        with cls._lock:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            cls._at_line_start = text.endswith('\n')
+
+    @classmethod
+    def _line(cls, text):
+        with cls._lock:
+            # Program output may have left the cursor mid-line
+            prefix = '' if cls._at_line_start else '\n'
+            sys.stdout.write(f"{prefix}{text}\n")
+            sys.stdout.flush()
+            cls._at_line_start = True
 
     @classmethod
     def info(cls, msg):
         if cls.level <= cls.INFO:
-            print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} {msg}")
+            cls._line(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} {msg}")
 
     @classmethod
     def success(cls, msg):
         if cls.level <= cls.INFO:
-            print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {msg}")
+            cls._line(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {msg}")
 
-    @staticmethod
-    def warning(msg):
-        print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {msg}")
+    @classmethod
+    def warning(cls, msg):
+        cls._line(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {msg}")
 
-    @staticmethod
-    def error(msg):
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {msg}")
+    @classmethod
+    def error(cls, msg):
+        cls._line(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {msg}")
 
     @classmethod
     def debug(cls, msg):
         if cls.level <= cls.DEBUG:
-            print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} {msg}")
+            cls._line(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} {msg}")
 
     @classmethod
     def header(cls, msg):
         if cls.level <= cls.INFO:
-            print(f"\n{Fore.WHITE}{Style.BRIGHT}{'='*60}")
-            print(f"{Fore.WHITE}{Style.BRIGHT}{msg}")
-            print(f"{Fore.WHITE}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}\n")
+            bar = f"{Fore.WHITE}{Style.BRIGHT}{'='*60}"
+            cls._line(f"\n{bar}\n{Fore.WHITE}{Style.BRIGHT}{msg}\n{bar}{Style.RESET_ALL}\n")
 
 
 log = DebugLogger()
@@ -154,6 +174,9 @@ log = DebugLogger()
 
 class PELoader:
     """PE file loader and analyzer"""
+
+    # Imports by ordinal that the emulator implements by name: (dll, ordinal) -> name
+    KNOWN_ORDINALS = {('comctl32.dll', 17): 'InitCommonControls'}
 
     def __init__(self, filepath):
         self.filepath = filepath
@@ -295,7 +318,8 @@ class PELoader:
                 if imp.name:
                     func_name = imp.name.decode('utf-8')
                 else:
-                    func_name = f"Ordinal_{imp.ordinal}"
+                    func_name = self.KNOWN_ORDINALS.get(
+                        (dll_name.lower(), imp.ordinal), f"Ordinal_{imp.ordinal}")
 
                 self.imports[dll_name].append({
                     'name': func_name,
@@ -411,9 +435,9 @@ class ConsoleStream:
         text = self._out.decode(ANSI_CODEPAGE, errors='replace')
         self._out.clear()
         if self.kind == 'stderr':
-            print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
+            log.write(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}")
         else:
-            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
         self.handler.console_output.append(text)
         self.handler.console_write(text, self.kind)
 
@@ -835,7 +859,9 @@ class WinAPIHandler:
         'GetCurrentDirectoryA': 2, 'GetCurrentDirectoryW': 2,
         'GetComputerNameA': 2, 'GetComputerNameW': 2, 'GetSystemInfo': 1,
         'GlobalMemoryStatus': 1, 'QueryPerformanceFrequency': 1,
-        'GetTickCount64': 0, 'GetACP': 0, 'GetOEMCP': 0,
+        'GetTickCount64': 0, 'GetACP': 0, 'GetOEMCP': 0, 'GetUserDefaultLangID': 0,
+        'InitCommonControls': 0, 'GetDiskFreeSpaceA': 5,
+        'LocalFileTimeToFileTime': 2, 'SetFileTime': 4,
         'SetConsoleTitleA': 1, 'SetConsoleTitleW': 1,
         'FindFirstFileA': 2, 'FindFirstFileW': 2, 'FindNextFileA': 2,
         'FindNextFileW': 2, 'FindClose': 1, 'SetCurrentDirectoryA': 1,
@@ -890,7 +916,7 @@ class WinAPIHandler:
         'CharNextA': 1, 'CharPrevA': 2, 'IsCharUpperA': 1, 'IsCharLowerA': 1,
         'wvsprintfA': 3, 'FindWindowA': 2, 'GetClassNameA': 3,
         'GetWindowTextLengthA': 1, 'BringWindowToTop': 1,
-        'SetForegroundWindow': 1, 'AdjustWindowRect': 3, 'LoadStringA': 4,
+        'SetForegroundWindow': 1, 'AdjustWindowRect': 3, 'AdjustWindowRectEx': 4, 'LoadStringA': 4,
         'LoadBitmapA': 2, 'IsIconic': 1, 'OpenIcon': 1,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
@@ -1008,6 +1034,7 @@ class WinAPIHandler:
         self.handles = {}
         self.module_handles = {}  # lowercase DLL name -> fake HMODULE
         self.virtual_allocs = {}  # VirtualAlloc base -> reserved size
+        self.mapped_virtual_allocs = set()  # Bases mapped at a requested address
         self.next_handle = 0x1000
         self.console_output = []
         # Own console: has_console follows AllocConsole/FreeConsole, console is
@@ -1715,12 +1742,12 @@ class WinAPIHandler:
 
             if hFile in [0x11]:  # stdout
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-                print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+                log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
                 self.console_output.append(text)
                 self.console_write(text)
             elif hFile in [0x12]:  # stderr
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-                print(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}", end='')
+                log.write(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}")
                 self.console_output.append(text)
                 self.console_write(text, 'stderr')
             else:
@@ -1761,7 +1788,7 @@ class WinAPIHandler:
             else:
                 data = self.emu.uc.mem_read(lpBuffer, nNumberOfCharsToWrite)
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-            print(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}", end='')
+            log.write(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}")
             self.console_output.append(text)
             self.console_write(text)
             
@@ -1867,8 +1894,10 @@ class WinAPIHandler:
             for base, size in self.virtual_allocs.items():
                 if base <= lpAddress and lpAddress + dwSize <= base + size:
                     return lpAddress & ~0xFFF
-            self._last_error = 487  # ERROR_INVALID_ADDRESS
-            return 0
+            addr = self._map_virtual_at(lpAddress, dwSize)
+            if not addr:
+                self._last_error = 487  # ERROR_INVALID_ADDRESS
+            return addr
 
         size = self.emu._align_size(dwSize, 0x1000)
         addr = self.emu.heap_alloc(size, alignment=0x10000)  # allocation granularity
@@ -1877,6 +1906,27 @@ class WinAPIHandler:
         else:
             self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
         return addr
+
+    def _map_virtual_at(self, address, size):
+        """Map a new region at a requested address (rounded down to the 64K
+        allocation granularity) if it is free; returns its base or 0"""
+        emu = self.emu
+        base = address & ~0xFFFF
+        size = emu._align_size(address + size - base, 0x1000)
+        end = base + size
+        if base < 0x10000 or end > 0x80000000:
+            return 0
+        used = [(start, last + 1) for start, last, _ in emu.uc.mem_regions()]
+        if any(base < stop and end > start for start, stop in used + emu._reserved_regions()):
+            return 0
+        try:
+            emu.uc.mem_map(base, size, UC_PROT_ALL)
+        except UcError:
+            return 0
+        emu.mapped_regions.append((base, end))
+        self.virtual_allocs[base] = size
+        self.mapped_virtual_allocs.add(base)
+        return base
     
     def VirtualFree(self, args):
         """VirtualFree emulation"""
@@ -1885,10 +1935,16 @@ class WinAPIHandler:
         dwFreeType = args[2]
         log.debug(f"VirtualFree(0x{lpAddress:08x}, 0x{dwSize:x}, 0x{dwFreeType:x})")
         if dwFreeType & 0x8000:  # MEM_RELEASE
-            if self.virtual_allocs.pop(lpAddress, None) is None:
+            size = self.virtual_allocs.pop(lpAddress, None)
+            if size is None:
                 self._last_error = 487  # ERROR_INVALID_ADDRESS
                 return 0
-            self.emu.heap_free(lpAddress)
+            if lpAddress in self.mapped_virtual_allocs:
+                self.mapped_virtual_allocs.discard(lpAddress)
+                self.emu.uc.mem_unmap(lpAddress, size)
+                self.emu.mapped_regions.remove((lpAddress, lpAddress + size))
+            else:
+                self.emu.heap_free(lpAddress)
         return 1
     
     def HeapCreate(self, args):
@@ -2194,6 +2250,49 @@ class WinAPIHandler:
         
         log.debug("GetSystemTimeAsFileTime()")
         return 0
+
+    # FILETIME of the Unix epoch (100 ns units since 1601-01-01)
+    UNIX_EPOCH_FILETIME = 116444736000000000
+
+    def LocalFileTimeToFileTime(self, args):
+        """LocalFileTimeToFileTime emulation - local FILETIME -> UTC FILETIME"""
+        lpLocalFileTime, lpFileTime = args[0], args[1]
+        try:
+            local = struct.unpack('<Q', self.emu.uc.mem_read(lpLocalFileTime, 8))[0]
+            seconds = (local - self.UNIX_EPOCH_FILETIME) // 10000000
+            # UTC offset in effect at that local time (DST aware)
+            offset = time.localtime(max(0, min(seconds, 0x7FFFFFFF))).tm_gmtoff
+            utc = (local - offset * 10000000) & 0xFFFFFFFFFFFFFFFF
+            self.emu.uc.mem_write(lpFileTime, struct.pack('<Q', utc))
+        except UcError:
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        return 1
+
+    def SetFileTime(self, args):
+        """SetFileTime emulation - last access/write times of the host file
+        (the creation time can't be set on the host)"""
+        hFile, lpLastAccess, lpLastWrite = args[0], args[2], args[3]
+        info = self.handles.get(hFile)
+        if not info or info.get('type') != 'file' or not info.get('path'):
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        path = info['path']
+        try:
+            if info.get('fp'):
+                info['fp'].flush()  # Pending writes would bump the new time
+            st = os.stat(path)
+            times = [st.st_atime_ns, st.st_mtime_ns]
+            for i, ptr in enumerate((lpLastAccess, lpLastWrite)):
+                if ptr:
+                    ft = struct.unpack('<Q', self.emu.uc.mem_read(ptr, 8))[0]
+                    if ft:
+                        times[i] = (ft - self.UNIX_EPOCH_FILETIME) * 100
+            os.utime(path, ns=tuple(times))
+        except (OSError, ValueError, UcError):
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        return 1
     
     def IsDebuggerPresent(self, args):
         """IsDebuggerPresent emulation"""
@@ -2991,6 +3090,25 @@ class WinAPIHandler:
             self.emu.uc.mem_write(lpFilePart, struct.pack('<I', part))
         return len(data)
 
+    def GetDiskFreeSpaceA(self, args):
+        """GetDiskFreeSpaceA emulation - space of the host disk holding c_drive/"""
+        root = self.read_string(args[0]) if args[0] else "C:\\"
+        log.debug(f"GetDiskFreeSpaceA(\"{root}\")")
+        if root[1:2] == ':' and root[0].upper() != 'C':
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        usage = shutil.disk_usage(C_DRIVE_PATH)
+        sectors, sector_size = 8, 512
+        cluster = sectors * sector_size
+        # Old programs compute bytes in 32 bits: report at most 2 GB like Windows 9x
+        limit = 0x7FFFFFFF // cluster
+        values = (sectors, sector_size, min(usage.free // cluster, limit),
+                  min(usage.total // cluster, limit))
+        for ptr, value in zip(args[1:5], values):
+            if ptr:
+                self.emu.uc.mem_write(ptr, struct.pack('<I', value))
+        return 1
+
     def GetTempFileNameA(self, args):
         """GetTempFileNameA emulation - <path>\\<pre><hex>.TMP (created if uUnique is 0)"""
         path_name = self.read_string(args[0])
@@ -3297,6 +3415,14 @@ class WinAPIHandler:
     def GetOEMCP(self, args):
         """GetOEMCP emulation"""
         return self.OEM_CODEPAGES.get(self._ansi_codepage_number(), 437)
+
+    def GetUserDefaultLangID(self, args):
+        """GetUserDefaultLangID emulation - English (United States)"""
+        return 0x0409
+
+    def InitCommonControls(self, args):
+        """InitCommonControls emulation (comctl32 ordinal 17) - nothing to register"""
+        return 0
 
     def SetConsoleTitleA(self, args, wide=False):
         """SetConsoleTitleA/W emulation - renames the GUI console window"""
@@ -3610,6 +3736,8 @@ class WinAPIHandler:
             4: 25,     # SM_CYCAPTION
             5: 1,      # SM_CXBORDER
             6: 1,      # SM_CYBORDER
+            16: width,  # SM_CXFULLSCREEN
+            17: height - 30 - 25,  # SM_CYFULLSCREEN: minus taskbar and caption
             80: 1,     # SM_CMONITORS
         }
         
@@ -3729,10 +3857,12 @@ class WinAPIHandler:
         lpClassName = args[1]
         lpWindowName = args[2]
         dwStyle = args[3]
-        x = args[4] if args[4] != 0x80000000 else 100  # CW_USEDEFAULT
-        y = args[5] if args[5] != 0x80000000 else 100
-        nWidth = args[6] if args[6] != 0x80000000 else 400
-        nHeight = args[7] if args[7] != 0x80000000 else 300
+        CW_USEDEFAULT = -0x80000000
+        x, y, nWidth, nHeight = self._read_signed_args(args, 4, 4)
+        x = x if x != CW_USEDEFAULT else 100
+        y = y if y != CW_USEDEFAULT else 100
+        nWidth = nWidth if nWidth != CW_USEDEFAULT else 400
+        nHeight = nHeight if nHeight != CW_USEDEFAULT else 300
         hWndParent = args[8]
         hMenu = args[9]
         hInstance = args[10]
@@ -3789,6 +3919,13 @@ class WinAPIHandler:
                 self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
                 if dwStyle & (self.WS_CHILD | self.WS_POPUP):
                     self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
+            # WS_VISIBLE windows are shown without an explicit ShowWindow call
+            win = self.gui.windows.get(hwnd)
+            if (dwStyle & self.WS_VISIBLE and isinstance(win, FakeWindow)
+                    and not win.visible):
+                self.gui.show_window(hwnd, True)
+                if win.size_state is None:
+                    self._send_size(hwnd)
         else:
             hwnd = self.get_next_handle()
 
@@ -3799,6 +3936,7 @@ class WinAPIHandler:
 
     WS_CHILD = 0x40000000
     WS_POPUP = 0x80000000
+    WS_VISIBLE = 0x10000000
     WM_SIZE = 0x0005
     WM_ACTIVATE = 0x0006
 
@@ -4677,6 +4815,10 @@ class WinAPIHandler:
         caption = PseudoWindowsGUI.TITLE_BAR_H + (PseudoWindowsGUI.MENU_H if bMenu else 0)
         return 1 if self._write_rect(lpRect, left - border, top - border - caption,
                                      right + border, bottom + border) else 0
+
+    def AdjustWindowRectEx(self, args):
+        """AdjustWindowRectEx emulation (the extended style has no extra frame here)"""
+        return self.AdjustWindowRect(args[:3])
 
     def _ansi_char(self, value):
         """Decode one ANSI code unit; None if it is not a character on its own"""
@@ -8759,7 +8901,7 @@ class WinAPIHandler:
 
         if fp is None:
             text = data.decode(ANSI_CODEPAGE, errors='replace')
-            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
             self.console_output.append(text)
             self.console_write(text)
             return nmemb
@@ -8946,7 +9088,7 @@ class WinAPIHandler:
         fp = self._p_stream(stream)
         if fp is None:
             # Treat unknown stream as stdout.
-            print(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}", end='')
+            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
             self.console_output.append(text)
             self.console_write(text)
             return 0
@@ -14810,6 +14952,7 @@ def main():
 
     if gui:
         gui.launcher = launch
+        log.info("GUI window is open, close the window to exit!")
 
     if args.exe is not None and not load_program(args.exe):
         if gui:
@@ -14819,7 +14962,6 @@ def main():
     # Wait while GUI is open
     try:
         if gui:
-            log.info("GUI window is open, close the window to exit!")
             while gui.running:
                 time.sleep(0.1)
             gui.stop()
