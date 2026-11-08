@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Put EXE files in the c_drive/ folder (the emulated `C:\`) or compile the examples with `./create_c_drive_environment.sh`; the demo EXEs are placed in `c_drive/Windows/Demos/`, which the program sees as `C:\Windows\Demos`. After that, run:
+Put EXE files in the c_drive/ folder (the emulated `C:\`). At startup the emulator runs `./create_c_drive_environment.sh`, which creates the c_drive/ folders and compiles the examples into `c_drive/Windows/Demos/` (seen by the program as `C:\Windows\Demos`); use `--no-setup` to skip it. Then run:
 
 ```bash
 python3 winexe32emu.py

@@ -32,6 +32,7 @@ import codecs
 import pefile
 import threading
 import queue
+import subprocess
 import time
 from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
@@ -570,6 +571,29 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.debug(f"Environment folder ready: {folder} -> {path}")
         except OSError as e:
             log.warning(f"Cannot create environment folder {folder}: {e}")
+
+
+# Prepares c_drive/ (folders and the compiled demos); run at startup
+C_DRIVE_SETUP_SCRIPT = os.path.join(SCRIPT_DIR, "create_c_drive_environment.sh")
+
+
+def run_c_drive_setup():
+    """Run create_c_drive_environment.sh; failures are reported, not fatal."""
+    if not os.path.isfile(C_DRIVE_SETUP_SCRIPT):
+        log.warning(f"C drive setup script not found: {C_DRIVE_SETUP_SCRIPT}")
+        return
+    log.header("Preparing C Drive")
+    try:
+        result = subprocess.run(['sh', C_DRIVE_SETUP_SCRIPT], cwd=SCRIPT_DIR,
+                                capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning(f"C drive setup failed: {e}")
+        return
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith('OK:'):
+            log.info(line)
+        elif line.strip():
+            log.warning(line)
 
 
 def _program_folder_host_path(folder):
@@ -12877,6 +12901,9 @@ def main():
     parser.add_argument("--codepage", default="utf-8",
                         help="ANSI code page for 'A' APIs and CRT strings "
                              "(default: utf-8; e.g. cp1254, cp1252)")
+    parser.add_argument("--no-setup", action="store_true",
+                        help="Don't run create_c_drive_environment.sh at startup "
+                             "(c_drive/ folders and compiling the demos)")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true",
                            help="Show debug output (every API call, disassembly)")
@@ -12899,6 +12926,8 @@ def main():
 
     use_gui = not args.no_gui
 
+    if not args.no_setup:
+        run_c_drive_setup()
     create_environment_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
