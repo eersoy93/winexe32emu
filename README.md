@@ -27,8 +27,8 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
 - `c_drive/Windows/Examples/` - Compiled example EXEs (`C:\Windows\Examples`)
 - `examples/` - Example C source codes
-- `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
 - `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Examples/`
+- `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
 - `scripts/remove_examples.sh` - Script to remove the compiled examples
 - `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders
 - `scripts/test_examples.sh` - Script to compile the examples and run each one in the emulator without the GUI (exit code: number of failed examples)
