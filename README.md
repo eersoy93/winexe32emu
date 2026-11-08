@@ -40,12 +40,9 @@ The emulator exits with the program's exit code (1 if the emulated program crash
 
 - PE file loading and analysis
 - x86 CPU emulation (Unicorn)
-- Fake Windows desktop with Pygame
+- Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt)
-- Sound output with Pygame: `Beep` plays a PC-speaker style tone (and blocks for its duration), `MessageBeep` plays system sounds, `PlaySound`/`sndPlaySound` play WAV files from the emulated drive, WAV images in memory and system sound aliases (see `examples/sound_demo.c`); without an audio device sounds are silent but keep their timing
-- System information APIs (computer/user name, system info, memory status, code pages, system colors, high resolution timers) and wide/copy/move file APIs (see `examples/sysinfo_demo.c`)
-- Folders named by the emulated environment variables (`C:\Windows`, `C:\Windows\System32`, `C:\Windows\Temp`) and the demo folder `C:\Windows\Demos` are created inside `c_drive/` at startup
-- Broad C runtime support (msvcrt, crtdll, msvcr*, ucrtbase / api-ms-win-crt-*): printf/scanf families (narrow, wide, secure and UCRT `__stdio_common_*`), string and wide string functions, number conversions, math (including x87 `_CI*` and `_ftol` helpers), time, environment, sandboxed file system calls, signals and setjmp/longjmp (see `examples/crt_demo.c`)
+- Fake C drive support
 
 ## Versioning
 
