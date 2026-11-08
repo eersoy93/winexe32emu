@@ -803,7 +803,7 @@ class WinAPIHandler:
         'GetModuleHandleA': 1, 'GetModuleHandleW': 1, 'GetProcAddress': 2,
         'ExitProcess': 1, 'GetCommandLineA': 0, 'GetCommandLineW': 0,
         'SetUnhandledExceptionFilter': 1, 'AllocConsole': 0, 'FreeConsole': 0,
-        'GetStdHandle': 1, 'WriteFile': 5, 'WriteConsoleA': 5, 'WriteConsoleW': 5,
+        'GetStdHandle': 1, 'GetFileType': 1, 'SetHandleCount': 1, 'WriteFile': 5, 'WriteConsoleA': 5, 'WriteConsoleW': 5,
         'MultiByteToWideChar': 6, 'WideCharToMultiByte': 8,
         'GetLastError': 0, 'SetLastError': 1, 'VirtualAlloc': 4,
         'VirtualFree': 3, 'HeapCreate': 3, 'HeapAlloc': 3, 'HeapFree': 3,
@@ -844,6 +844,13 @@ class WinAPIHandler:
         'lstrcmpW': 2, 'lstrcmpiW': 2, 'SetEnvironmentVariableA': 2,
         'SetEnvironmentVariableW': 2, 'GetEnvironmentVariableW': 3,
         'GetPrivateProfileStringA': 6, 'WritePrivateProfileStringA': 4,
+        'HeapReAlloc': 4, 'HeapDestroy': 1, 'GetEnvironmentStrings': 0,
+        'GetEnvironmentStringsA': 0, 'GetEnvironmentStringsW': 0,
+        'FreeEnvironmentStringsA': 1, 'FreeEnvironmentStringsW': 1, 'GetCPInfo': 2,
+        'GetStringTypeA': 5, 'GetStringTypeW': 4, 'LCMapStringA': 6, 'LCMapStringW': 6,
+        'RtlUnwind': 4, 'UnhandledExceptionFilter': 1, 'TerminateProcess': 2,
+        'FindResourceA': 3, 'LoadResource': 2, 'LockResource': 1, 'FreeResource': 1,
+        'SizeofResource': 2,
         # user32
         'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
         'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
@@ -883,7 +890,8 @@ class WinAPIHandler:
         'CharNextA': 1, 'CharPrevA': 2, 'IsCharUpperA': 1, 'IsCharLowerA': 1,
         'wvsprintfA': 3, 'FindWindowA': 2, 'GetClassNameA': 3,
         'GetWindowTextLengthA': 1, 'BringWindowToTop': 1,
-        'SetForegroundWindow': 1, 'AdjustWindowRect': 3,
+        'SetForegroundWindow': 1, 'AdjustWindowRect': 3, 'LoadStringA': 4,
+        'LoadBitmapA': 2, 'IsIconic': 1, 'OpenIcon': 1,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
         'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
@@ -896,7 +904,7 @@ class WinAPIHandler:
         'CreateCompatibleBitmap': 3, 'DeleteDC': 1, 'BitBlt': 9,
         'StretchBlt': 11, 'SetTextAlign': 2, 'GetTextColor': 1, 'GetBkColor': 1,
         'CreatePenIndirect': 1, 'CreateBrushIndirect': 1, 'GetTextMetricsA': 2,
-        'SetROP2': 2,
+        'SetROP2': 2, 'GetObjectA': 3, 'CreateBitmap': 5,
         # advapi32
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
         'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
@@ -1055,6 +1063,9 @@ class WinAPIHandler:
 
         # Current directory (SetCurrentDirectory); relative paths resolve against it
         self.current_directory = "C:\\"
+
+        # (type, name) -> (RVA, size) of the EXE's resources, built on first use
+        self._resource_index = None
 
         # In-memory registry: predefined HKEY -> key node, open HKEY -> key node
         self.registry_roots = {}
@@ -1536,6 +1547,100 @@ class WinAPIHandler:
         """LoadIconW emulation"""
         return self.LoadIconA(args)
 
+    # ---------- Resources of the loaded EXE ----------
+
+    def _resource_key(self, value):
+        """Resource name/type: integer ID (MAKEINTRESOURCE or "#123") or upper-case name"""
+        if value < 0x10000:
+            return value
+        name = self.read_string(value)
+        if name.startswith('#') and name[1:].isdigit():
+            return int(name[1:])
+        return name.upper()
+
+    def _find_resource(self, res_type, name):
+        """(address, size) of a resource of the EXE (first language), or None"""
+        if self._resource_index is None:
+            self._resource_index = {}
+            root = getattr(self.emu.pe_loader.pe, 'DIRECTORY_ENTRY_RESOURCE', None)
+            for type_entry in (root.entries if root else []):
+                tkey = str(type_entry.name).upper() if type_entry.name else type_entry.id
+                for name_entry in getattr(type_entry, 'directory', None).entries:
+                    nkey = str(name_entry.name).upper() if name_entry.name else name_entry.id
+                    languages = getattr(name_entry, 'directory', None)
+                    if languages and languages.entries:
+                        data = languages.entries[0].data.struct
+                        self._resource_index[(tkey, nkey)] = (data.OffsetToData, data.Size)
+        found = self._resource_index.get((res_type, name))
+        if found is None:
+            return None
+        return (self.emu.pe_loader.image_base + found[0], found[1])
+
+    def _is_own_module(self, hModule):
+        return hModule in (0, self.emu.pe_loader.image_base)
+
+    def FindResourceA(self, args):
+        """FindResourceA emulation (resources of the EXE only)"""
+        hModule, lpName, lpType = args[0], args[1], args[2]
+        name, res_type = self._resource_key(lpName), self._resource_key(lpType)
+        resource = self._find_resource(res_type, name) if self._is_own_module(hModule) else None
+        log.debug(f"FindResourceA({name!r}, type {res_type!r}) -> {resource}")
+        if resource is None:
+            self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
+            return 0
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'resource', 'addr': resource[0], 'size': resource[1]}
+        return handle
+
+    def LoadResource(self, args):
+        """LoadResource emulation - resources are already mapped with the image"""
+        info = self.handles.get(args[1])
+        if not info or info.get('type') != 'resource':
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        return info['addr']
+
+    def LockResource(self, args):
+        """LockResource emulation - the HGLOBAL is the data address"""
+        return args[0]
+
+    def FreeResource(self, args):
+        """FreeResource emulation (obsolete, always FALSE)"""
+        return 0
+
+    def SizeofResource(self, args):
+        """SizeofResource emulation"""
+        info = self.handles.get(args[1])
+        return info['size'] if info and info.get('type') == 'resource' else 0
+
+    def LoadStringA(self, args):
+        """LoadStringA emulation - RT_STRING blocks hold 16 counted UTF-16 strings"""
+        hInstance, uID, lpBuffer, cchBufferMax = args[0], args[1] & 0xFFFF, args[2], args[3]
+        text = None
+        resource = self._find_resource(6, uID // 16 + 1) if self._is_own_module(hInstance) \
+            else None
+        if resource:
+            try:
+                block = bytes(self.emu.uc.mem_read(*resource))
+                pos = 0
+                for _ in range(uID % 16):
+                    pos += 2 + 2 * struct.unpack_from('<H', block, pos)[0]
+                length = struct.unpack_from('<H', block, pos)[0]
+                if length:
+                    text = block[pos + 2:pos + 2 + 2 * length].decode('utf-16-le', errors='replace')
+            except (UcError, struct.error):
+                text = None
+        log.debug(f"LoadStringA({uID}) -> {text!r}")
+        if not lpBuffer or cchBufferMax == 0:
+            return 0
+        if text is None:
+            self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
+            self.emu.uc.mem_write(lpBuffer, b'\x00')
+            return 0
+        data = text.encode(ANSI_CODEPAGE, errors='replace')[:cchBufferMax - 1]
+        self.emu.uc.mem_write(lpBuffer, data + b'\x00')
+        return len(data)
+
     def AllocConsole(self, args):
         """AllocConsole emulation - opens the process's console window"""
         log.debug("AllocConsole()")
@@ -1575,6 +1680,25 @@ class WinAPIHandler:
         elif (nStdHandle & 0xFFFFFFFF) == 0xFFFFFFF4:
             return 0x12
         return 0
+
+    def GetFileType(self, args):
+        """GetFileType emulation - std handles are the console, CreateFile handles disk files"""
+        hFile = args[0]
+        if hFile in (0x10, 0x11, 0x12):
+            result = 2  # FILE_TYPE_CHAR
+        elif self.handles.get(hFile, {}).get('type') == 'file':
+            result = 1  # FILE_TYPE_DISK
+        else:
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            result = 0  # FILE_TYPE_UNKNOWN
+        log.debug(f"GetFileType(0x{hFile:x}) -> {result}")
+        if result:
+            self._last_error = 0  # NO_ERROR distinguishes a real FILE_TYPE_UNKNOWN
+        return result
+
+    def SetHandleCount(self, args):
+        """SetHandleCount emulation - Win32 has no handle limit, returns the request"""
+        return args[0]
     
     def WriteFile(self, args):
         """WriteFile emulation"""
@@ -1785,6 +1909,183 @@ class WinAPIHandler:
         lpMem = args[2]
         log.debug(f"HeapFree(0x{lpMem:08x})")
         return 1 if not lpMem or self.emu.heap_free(lpMem) else 0
+
+    def HeapReAlloc(self, args):
+        """HeapReAlloc emulation"""
+        dwFlags, lpMem, dwBytes = args[1], args[2], args[3]
+        log.debug(f"HeapReAlloc(0x{lpMem:08x}, 0x{dwBytes:x}, flags=0x{dwFlags:x})")
+        if not lpMem:
+            return 0
+        old_size = self.emu.heap_block_size(lpMem)
+        if old_size is not None and self.emu.heap_resize_last(lpMem, dwBytes):
+            addr = lpMem
+        elif dwFlags & 0x10:  # HEAP_REALLOC_IN_PLACE_ONLY
+            self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
+            return 0
+        else:
+            addr = self.emu.heap_alloc(dwBytes)
+            if not addr:
+                self._last_error = 8
+                return 0
+            copy_size = min(old_size, dwBytes) if old_size is not None else dwBytes
+            self.emu.uc.mem_write(addr, bytes(self.emu.uc.mem_read(lpMem, copy_size)))
+            self.emu.heap_free(lpMem)
+        if dwFlags & 0x08 and old_size is not None and dwBytes > old_size:  # HEAP_ZERO_MEMORY
+            self.emu.uc.mem_write(addr + old_size, b'\x00' * (dwBytes - old_size))
+        return addr
+
+    def HeapDestroy(self, args):
+        """HeapDestroy emulation - HeapCreate heaps share the process heap"""
+        return 1
+
+    def _environment_block(self, wide):
+        """Heap copy of the environment block: NAME=value\\0 ... \\0"""
+        units = []
+        for name, value in sorted(self.environment.items()):
+            units += self._text_units(f"{name}={value}", wide) + [0]
+        return self._alloc_units(units, wide)
+
+    def GetEnvironmentStrings(self, args):
+        """GetEnvironmentStrings(A) emulation"""
+        return self._environment_block(False)
+
+    def GetEnvironmentStringsA(self, args):
+        return self._environment_block(False)
+
+    def GetEnvironmentStringsW(self, args):
+        """GetEnvironmentStringsW emulation"""
+        return self._environment_block(True)
+
+    def FreeEnvironmentStringsA(self, args):
+        """FreeEnvironmentStringsA/W emulation"""
+        if args[0]:
+            self.emu.heap_free(args[0])
+        return 1
+
+    def FreeEnvironmentStringsW(self, args):
+        return self.FreeEnvironmentStringsA(args)
+
+    def GetCPInfo(self, args):
+        """GetCPInfo emulation - single-byte code pages, UTF-8 up to 4 bytes"""
+        codepage, lpCPInfo = args[0], args[1]
+        ansi = self._ansi_codepage_number()
+        if codepage in (0, 3):  # CP_ACP, CP_THREAD_ACP
+            codepage = ansi
+        elif codepage == 1:  # CP_OEMCP
+            codepage = self.GetOEMCP([])
+        max_size = 4 if codepage == 65001 else 1
+        data = struct.pack('<I2s12s', max_size, b'?\x00', b'')
+        return 1 if self._mem_write(lpCPInfo, data) else 0
+
+    @staticmethod
+    def _ctype1(ch):
+        """CT_CTYPE1 flags of one character (None: not a character)"""
+        if ch is None:
+            return 0
+        flags = 0
+        if ch.isupper():
+            flags |= 0x001  # C1_UPPER
+        if ch.islower():
+            flags |= 0x002  # C1_LOWER
+        if ch in '0123456789':
+            flags |= 0x004  # C1_DIGIT
+        if ch in ' \t\n\v\f\r' or (ch.isspace() and ord(ch) > 0x7F):
+            flags |= 0x008  # C1_SPACE
+        if ch.isprintable() and not ch.isalnum() and not ch.isspace():
+            flags |= 0x010  # C1_PUNCT
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            flags |= 0x020  # C1_CNTRL
+        if ch in ' \t':
+            flags |= 0x040  # C1_BLANK
+        if ch in '0123456789abcdefABCDEF':
+            flags |= 0x080  # C1_XDIGIT
+        if ch.isalpha():
+            flags |= 0x100  # C1_ALPHA
+        return flags
+
+    def _counted_units(self, address, count, wide):
+        """cchSrc code units (-1: up to and including the terminator)"""
+        if count == 0xFFFFFFFF:
+            return self._read_units(address, wide) + [0]
+        try:
+            data = bytes(self.emu.uc.mem_read(address, count * (2 if wide else 1)))
+        except UcError:
+            return None
+        return list(struct.unpack(f'<{count}H', data)) if wide else list(data)
+
+    def _string_type_common(self, info_type, address, count, lpCharType, wide):
+        units = self._counted_units(address, count, wide)
+        if units is None or not lpCharType:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if info_type == 1:  # CT_CTYPE1
+            types = [self._ctype1(chr(u) if wide else self._ansi_char(u)) for u in units]
+        else:  # CT_CTYPE2 / CT_CTYPE3: no type information
+            types = [0] * len(units)
+        return 1 if self._mem_write(lpCharType, struct.pack(f'<{len(types)}H', *types)) else 0
+
+    def GetStringTypeA(self, args):
+        """GetStringTypeA emulation (Locale, dwInfoType, lpSrcStr, cchSrc, lpCharType)"""
+        return self._string_type_common(args[1], args[2], args[3], args[4], False)
+
+    def GetStringTypeW(self, args):
+        """GetStringTypeW emulation (dwInfoType, lpSrcStr, cchSrc, lpCharType)"""
+        return self._string_type_common(args[0], args[1], args[2], args[3], True)
+
+    def LCMapStringA(self, args, wide=False):
+        """LCMapStringA/W emulation - case mapping; sort keys are the code units"""
+        flags, lpSrcStr, cchSrc, lpDestStr, cchDest = args[1], args[2], args[3], args[4], args[5]
+        units = self._counted_units(lpSrcStr, cchSrc, wide)
+        if units is None:
+            self._last_error = 87
+            return 0
+        if flags & 0x400:  # LCMAP_SORTKEY: bytes, compared like strcmp
+            key = bytes(self._pack_units(units, wide)).rstrip(b'\x00') + b'\x00'
+            if cchDest:
+                if cchDest < len(key):
+                    self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+                    return 0
+                self._mem_write(lpDestStr, key)
+            return len(key)
+        if flags & 0x300:  # LCMAP_LOWERCASE / LCMAP_UPPERCASE
+            convert = str.lower if flags & 0x100 else str.upper
+            if wide:
+                mapped = [ord(convert(chr(u))) if len(convert(chr(u))) == 1 else u for u in units]
+            else:
+                mapped = []
+                for u in units:
+                    ch = self._ansi_char(u)
+                    out = convert(ch).encode(ANSI_CODEPAGE, errors='replace') if ch else b''
+                    mapped.append(out[0] if len(out) == 1 else u)
+            units = mapped
+        if cchDest:
+            if cchDest < len(units):
+                self._last_error = 122
+                return 0
+            self._write_units(lpDestStr, units, wide, terminate=False)
+        return len(units)
+
+    def LCMapStringW(self, args):
+        return self.LCMapStringA(args, wide=True)
+
+    def RtlUnwind(self, args):
+        """RtlUnwind emulation - drops SEH records above TargetFrame (handlers are not called)"""
+        target_frame, return_value = args[0], args[3]
+        if target_frame:
+            self._mem_write(self.emu.teb_addr, struct.pack('<I', target_frame))
+        return return_value
+
+    def UnhandledExceptionFilter(self, args):
+        """UnhandledExceptionFilter emulation - EXCEPTION_EXECUTE_HANDLER (terminate)"""
+        return 1
+
+    def TerminateProcess(self, args):
+        """TerminateProcess emulation - only the current process can be terminated"""
+        hProcess, exit_code = args[0], args[1]
+        if hProcess != 0xFFFFFFFF:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        return self.ExitProcess([exit_code])
     
     def GetProcessHeap(self, args):
         """GetProcessHeap emulation"""
@@ -3288,13 +3589,20 @@ class WinAPIHandler:
         return len(result) + 1
     
     # USER32.DLL APIs
+    def _screen_size(self):
+        """Size of the fake desktop (fixed 1920x1080 without the GUI)"""
+        if self.gui:
+            return self.gui.width, self.gui.height
+        return 1920, 1080
+
     def GetSystemMetrics(self, args):
         """GetSystemMetrics emulation"""
         nIndex = args[0]
+        width, height = self._screen_size()
         
         metrics = {
-            0: 1920,   # SM_CXSCREEN
-            1: 1080,   # SM_CYSCREEN
+            0: width,  # SM_CXSCREEN
+            1: height, # SM_CYSCREEN
             2: 20,     # SM_CXVSCROLL
             3: 20,     # SM_CYHSCROLL
             4: 25,     # SM_CYCAPTION
@@ -3454,8 +3762,9 @@ class WinAPIHandler:
                                                x, y, nWidth, nHeight, dwStyle,
                                                control_id=hMenu)
             else:
+                parent = hWndParent if dwStyle & self.WS_CHILD else 0
                 hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle,
-                                              owner=self)
+                                              owner=self, parent=parent)
 
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
@@ -3476,6 +3785,8 @@ class WinAPIHandler:
                     lpParam, hInstance, hMenu, hWndParent,
                     nHeight, nWidth, y, x, dwStyle, lpWindowName, lpClassName, dwExStyle)
                 self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
+                if dwStyle & (self.WS_CHILD | self.WS_POPUP):
+                    self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
         else:
             hwnd = self.get_next_handle()
 
@@ -3483,6 +3794,27 @@ class WinAPIHandler:
 
     def CreateWindowExW(self, args):
         return self.CreateWindowExA(args, wide=True)
+
+    WS_CHILD = 0x40000000
+    WS_POPUP = 0x80000000
+    WM_SIZE = 0x0005
+    WM_ACTIVATE = 0x0006
+
+    def _send_size(self, hwnd):
+        """Send WM_SIZE now if the window's client size or state changed
+        (window creation, MoveWindow, SetWindowPos)"""
+        if not self.gui or hwnd not in self.gui.windows:
+            return
+        win = self.gui.windows[hwnd]
+        state = self.gui.size_state(win)
+        if state == win.size_state:
+            return
+        win.size_state = state
+        wndproc = self._find_wndproc_for_hwnd(hwnd)
+        if wndproc:
+            kind, width, height = state
+            self.emu.call_wndproc(wndproc, hwnd, self.WM_SIZE, kind,
+                                  ((height & 0xFFFF) << 16) | (width & 0xFFFF))
 
     def _build_createstruct(self, lpCreateParams, hInstance, hMenu, hwndParent,
                             cy, cx, y, x, style, lpszName, lpszClass, dwExStyle):
@@ -3515,6 +3847,9 @@ class WinAPIHandler:
         if self.gui and self.gui.running:
             show = nCmdShow in [1, 3, 5, 6, 7, 8, 9, 10]
             self.gui.show_window(hWnd, show)
+            win = self.gui.windows.get(hWnd)
+            if show and win is not None and win.size_state is None:
+                self._send_size(hWnd)
         
         return 1
     
@@ -3763,6 +4098,7 @@ class WinAPIHandler:
             win = self.gui.windows[hWnd]
             win.x, win.y = X, Y
             win.width, win.height = nWidth, nHeight
+            self._send_size(hWnd)
         
         return 1
     
@@ -3784,6 +4120,7 @@ class WinAPIHandler:
                 win.x, win.y = X, Y
             if not (uFlags & 0x0001):  # SWP_NOSIZE
                 win.width, win.height = cx, cy
+            self._send_size(hWnd)
         
         return 1
     
@@ -4254,7 +4591,7 @@ class WinAPIHandler:
             order += [h for h in self.gui.windows if h not in order]
             for hwnd in order:
                 win = self.gui.windows.get(hwnd)
-                if win is None:
+                if win is None or win.parent:
                     continue
                 if class_name is not None and \
                         (self._window_class_name(hwnd) or '').lower() != class_name.lower():
@@ -4304,6 +4641,23 @@ class WinAPIHandler:
     def SetForegroundWindow(self, args):
         """SetForegroundWindow emulation"""
         return self.BringWindowToTop(args)
+
+    def IsIconic(self, args):
+        """IsIconic emulation - is the window minimized?"""
+        win = self.gui.windows.get(args[0]) if self.gui else None
+        return 1 if win and win.minimized else 0
+
+    def OpenIcon(self, args):
+        """OpenIcon emulation - restore a minimized window and activate it"""
+        hWnd = args[0]
+        if not self.gui or hWnd not in self.gui.windows:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        with self.gui.lock:
+            win = self.gui.windows[hWnd]
+            if win.minimized:
+                win.restore()
+        return self.BringWindowToTop([hWnd])
 
     def AdjustWindowRect(self, args):
         """AdjustWindowRect emulation - client rect -> window rect.
@@ -5087,8 +5441,16 @@ class WinAPIHandler:
 
     def _delete_dc(self, hdc):
         """Release a DC handle"""
+        self._store_bitmap_shapes(self.dc_state.get(hdc))
         self.dc_map.pop(hdc, None)
         self.dc_state.pop(hdc, None)
+
+    def _store_bitmap_shapes(self, state):
+        """Keep a memory DC's drawing with its selected bitmap (it outlives the selection)"""
+        if state and state.get('memory') and state.get('bitmap'):
+            bmp = self.gdi_objects.get(state['bitmap'])
+            if bmp and bmp['type'] == 'bitmap':
+                bmp['shapes'] = state['shapes']
 
     def _dc_hwnd(self, hdc):
         """Window a DC belongs to (fall back to the active window)"""
@@ -5148,10 +5510,12 @@ class WinAPIHandler:
         if state and state.get('memory'):
             size = self._memdc_size(hdc)
             if size and PseudoWindowsGUI.covers_area(shape, *size):
-                state['shapes'] = []
-            elif len(state['shapes']) >= PseudoWindowsGUI.MAX_SHAPES:
-                state['shapes'] = state['shapes'][-(PseudoWindowsGUI.MAX_SHAPES // 2):]
-            state['shapes'].append(shape)
+                state['shapes'] = [shape]
+                return
+            shapes = PseudoWindowsGUI.add_to_display_list(state['shapes'], shape)
+            if len(shapes) > PseudoWindowsGUI.MAX_SHAPES:
+                shapes = shapes[-(PseudoWindowsGUI.MAX_SHAPES // 2):]
+            state['shapes'] = shapes
             return
 
         hwnd = self._dc_hwnd(hdc)
@@ -5167,6 +5531,8 @@ class WinAPIHandler:
             'text': text,
             'color': state.get('text_color') or (0, 0, 0),
             'font': self._dc_font(hdc),
+            # OPAQUE background mode fills the text cell with the background color
+            'bk': state.get('bk_color') if state.get('bk_mode', 2) == 2 else None,
         }
         self._add_shape(hdc, shape)
 
@@ -5268,20 +5634,25 @@ class WinAPIHandler:
         """GetDeviceCaps emulation"""
         hdc = args[0]
         index = args[1]
+        width, height = self._screen_size()
         
         caps = {
-            8: 8,      # BITSPIXEL
-            10: 1920,  # HORZRES
-            12: 96,    # LOGPIXELSX
-            88: 32,    # BITSPIXEL
-            90: 96,    # LOGPIXELSX
-            117: 1920, # DESKTOPHORZRES
-            118: 1080, # DESKTOPVERTRES
+            4: 320,     # HORZSIZE (mm)
+            6: 240,     # VERTSIZE (mm)
+            8: width,   # HORZRES
+            10: height, # VERTRES
+            12: 32,     # BITSPIXEL
+            14: 1,      # PLANES
+            24: -1,     # NUMCOLORS (more than 256 colors)
+            88: 96,     # LOGPIXELSX
+            90: 96,     # LOGPIXELSY
+            117: height, # DESKTOPVERTRES
+            118: width,  # DESKTOPHORZRES
         }
         
         result = caps.get(index, 0)
         log.debug(f"GetDeviceCaps(0x{hdc:x}, {index}) -> {result}")
-        return result
+        return result & 0xFFFFFFFF
     
     def TextOutA(self, args):
         """TextOutA emulation - Draw text"""
@@ -5625,6 +5996,9 @@ class WinAPIHandler:
                 kind = default_kind
             if kind in ('pen', 'brush', 'font', 'bitmap'):
                 prev = state.get(kind, 0) or self._dc_default_objects()[kind]
+                if kind == 'bitmap' and state.get('memory'):
+                    self._store_bitmap_shapes(state)
+                    state['shapes'] = list(obj.get('shapes', [])) if not default_kind else []
                 state[kind] = 0 if default_kind else hobj
 
         log.debug(f"SelectObject(0x{hdc:x}, 0x{hobj:x}) -> 0x{prev:x}")
@@ -6088,7 +6462,8 @@ class WinAPIHandler:
         width = args[1]
         height = args[2]
         handle = self.get_next_handle()
-        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height}
+        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height,
+                                    'bpp': 32, 'shapes': []}
         log.debug(f"CreateCompatibleBitmap(0x{hdc:x}, {width}, {height}) -> 0x{handle:x}")
         return handle
 
@@ -6133,16 +6508,38 @@ class WinAPIHandler:
 
         log.debug(f"BitBlt(0x{hdcDest:x}, {x}, {y}, {cx}, {cy}, src=0x{hdcSrc:x}, rop=0x{rop:08x})")
 
+        if rop in (self.BLACKNESS, self.WHITENESS, self.PATCOPY):
+            return self.PatBlt([hdcDest, x, y, cx, cy, rop])
+
         src_state = self.dc_state.get(hdcSrc)
         if not src_state or not src_state.get('memory'):
             return 1  # Only memory DC sources carry shapes
 
         dx, dy = x - sx, y - sy
-        shapes = [self._translate_shape(s, dx, dy) for s in src_state['shapes']]
+        shapes = []
+        for shape in src_state['shapes']:
+            if shape['type'] == 'image':
+                shape = self._crop_image(shape, sx, sy, cx, cy, rop)
+                if shape is None:
+                    continue
+            else:
+                box = PseudoWindowsGUI.shape_bbox(shape)
+                if box and (box[2] <= sx or box[0] >= sx + cx or
+                            box[3] <= sy or box[1] >= sy + cy):
+                    continue  # Outside the copied area
+                if shape['type'] == 'rect':
+                    l, t, r, b = box
+                    shape = dict(shape, rect=(max(l, sx), max(t, sy),
+                                              min(r, sx + cx), min(b, sy + cy)))
+            shapes.append(self._translate_shape(shape, dx, dy))
 
         dest_state = self.dc_state.get(hdcDest)
         if dest_state and dest_state.get('memory'):
-            dest_state['shapes'].extend(shapes)
+            bmp = self.gdi_objects.get(dest_state.get('bitmap', 0))
+            if bmp and bmp.get('bpp') == 1:
+                shapes = [self._to_monochrome(s, src_state['bk_color']) for s in shapes]
+            for shape in shapes:
+                self._add_shape(hdcDest, shape)
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
@@ -6155,8 +6552,236 @@ class WinAPIHandler:
             # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
             window.drawn_shapes = shapes
         else:
-            window.drawn_shapes = window.drawn_shapes + shapes
+            for shape in shapes:
+                self.gui.add_shape(hwnd, shape)
         return 1
+
+    # Raster operations
+    SRCCOPY = 0x00CC0020
+    SRCPAINT = 0x00EE0086
+    SRCAND = 0x008800C6
+    SRCINVERT = 0x00660046
+    NOTSRCCOPY = 0x00330008
+    PATCOPY = 0x00F00021
+    BLACKNESS = 0x00000042
+    WHITENESS = 0x00FF0062
+
+    def _crop_image(self, shape, sx, sy, cx, cy, rop):
+        """Part of an image shape inside the source rect (sx, sy, cx, cy), or None.
+
+        A non-SRCCOPY blit replaces the raster operation the image is drawn with.
+        """
+        x, y = shape['pos']
+        w, h = shape['dim']
+        if shape['size'] != shape['dim']:
+            cropped = dict(shape)  # Stretched images are not cropped
+        else:
+            left, top = max(x, sx), max(y, sy)
+            right, bottom = min(x + w, sx + cx), min(y + h, sy + cy)
+            if right <= left or bottom <= top:
+                return None
+            if (left, top, right, bottom) == (x, y, x + w, y + h):
+                cropped = dict(shape)
+            else:
+                row = w * 3
+                start = (left - x) * 3
+                end = (right - x) * 3
+                data = b''.join(shape['data'][r * row + start:r * row + end]
+                                for r in range(top - y, bottom - y))
+                cropped = dict(shape, pos=(left, top), dim=(right - left, bottom - top),
+                               size=(right - left, bottom - top), data=data)
+        if rop != self.SRCCOPY:
+            cropped['rop'] = rop
+        cropped.pop('_surface', None)
+        return cropped
+
+    def _to_monochrome(self, shape, bk_color):
+        """Shape blitted into a monochrome bitmap: the background color becomes
+        white, every other color black (how masks are built from sprites)"""
+        def mono(color):
+            return (255, 255, 255) if color == bk_color else (0, 0, 0)
+        shape = dict(shape)
+        shape.pop('_surface', None)
+        if shape['type'] == 'image':
+            bk = bytes(bk_color)
+            data = shape['data']
+            shape['data'] = b''.join(b'\xff\xff\xff' if data[i:i + 3] == bk else b'\x00\x00\x00'
+                                     for i in range(0, len(data), 3))
+        for key in ('fill', 'color'):
+            if shape.get(key) is not None:
+                shape[key] = mono(shape[key])
+        return shape
+
+    def _new_bitmap(self, width, height, bpp, rgb=None):
+        """Create a bitmap GDI object; rgb (top-down RGB bytes) becomes its picture"""
+        handle = self.get_next_handle()
+        shapes = []
+        if rgb is not None and width > 0 and height > 0:
+            shapes.append({'type': 'image', 'pos': (0, 0), 'dim': (width, height),
+                           'size': (width, height), 'data': rgb, 'rop': self.SRCCOPY})
+        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height,
+                                    'bpp': bpp, 'shapes': shapes}
+        return handle
+
+    @staticmethod
+    def _decode_dib(data):
+        """(width, height, top-down RGB bytes) of a packed DIB (BITMAPINFOHEADER,
+        color table, bits), or None for unsupported formats"""
+        if len(data) < 40:
+            return None
+        (hdr_size, width, height, _, bpp, compression, _, _, _,
+         clr_used, _) = struct.unpack_from('<IiiHHIIiiII', data)
+        if hdr_size < 40 or width <= 0 or height == 0 or compression not in (0, 3) or \
+                bpp not in (1, 4, 8, 16, 24, 32):
+            return None
+        bottom_up = height > 0
+        height = abs(height)
+        offset = hdr_size
+        masks = None
+        if compression == 3:  # BI_BITFIELDS
+            if bpp not in (16, 32):
+                return None
+            masks = struct.unpack_from('<III', data, offset)
+            offset += 12
+        elif bpp == 16:
+            masks = (0x7C00, 0x03E0, 0x001F)  # 5-5-5
+        palette = []
+        if bpp <= 8:
+            count = clr_used or (1 << bpp)
+            for i in range(count):
+                b, g, r = data[offset + 4 * i:offset + 4 * i + 3]
+                palette.append(bytes((r, g, b)))
+            offset += 4 * count
+        stride = ((width * bpp + 31) // 32) * 4
+        if len(data) < offset + stride * height:
+            return None
+
+        def channel(value, mask):
+            if not mask:
+                return 0
+            shift = (mask & -mask).bit_length() - 1
+            top = mask >> shift
+            return ((value & mask) >> shift) * 255 // top
+
+        rows = []
+        for r in range(height):
+            src_row = (height - 1 - r) if bottom_up else r
+            line = data[offset + src_row * stride:offset + (src_row + 1) * stride]
+            if bpp == 24:
+                out = bytearray(width * 3)
+                out[0::3] = line[2:width * 3:3]
+                out[1::3] = line[1:width * 3:3]
+                out[2::3] = line[0:width * 3:3]
+            elif bpp == 32 and masks is None:
+                out = bytearray(width * 3)
+                out[0::3] = line[2:width * 4:4]
+                out[1::3] = line[1:width * 4:4]
+                out[2::3] = line[0:width * 4:4]
+            elif bpp in (16, 32):
+                fmt = '<H' if bpp == 16 else '<I'
+                step = bpp // 8
+                out = bytearray()
+                for i in range(width):
+                    value = struct.unpack_from(fmt, line, i * step)[0]
+                    out += bytes(channel(value, m) for m in masks)
+            else:
+                per_byte = 8 // bpp
+                mask = (1 << bpp) - 1
+                out = bytearray()
+                for i in range(width):
+                    byte = line[i // per_byte]
+                    index = (byte >> (8 - bpp * (i % per_byte + 1))) & mask
+                    out += palette[index] if index < len(palette) else b'\x00\x00\x00'
+            rows.append(bytes(out))
+        return width, height, b''.join(rows)
+
+    def LoadBitmapA(self, args):
+        """LoadBitmapA emulation - a bitmap resource of the program"""
+        hInstance, lpBitmapName = args[0], args[1]
+        name = self._resource_key(lpBitmapName)
+        if not hInstance:
+            log.warning(f"LoadBitmapA: system bitmap {name} is not available")
+            return 0
+        resource = self._find_resource(2, name)  # RT_BITMAP
+        decoded = None
+        if resource:
+            try:
+                decoded = self._decode_dib(bytes(self.emu.uc.mem_read(*resource)))
+            except UcError:
+                decoded = None
+        if decoded is None:
+            log.warning(f"LoadBitmapA({name!r}): bitmap not found or unsupported")
+            self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
+            return 0
+        width, height, rgb = decoded
+        handle = self._new_bitmap(width, height, 32, rgb)
+        log.debug(f"LoadBitmapA({name!r}) -> 0x{handle:x} ({width}x{height})")
+        return handle
+
+    def CreateBitmap(self, args):
+        """CreateBitmap emulation - monochrome (1 bpp) or 24/32 bpp bits"""
+        width, height = self._read_signed_args(args, 0, 2)
+        planes, bit_count, lpBits = args[2], args[3], args[4]
+        bpp = planes * bit_count
+        if width <= 0 or height <= 0:
+            return 0
+        rgb = None
+        if lpBits and bpp in (1, 24, 32):
+            stride = ((width * bpp + 15) // 16) * 2  # DDB rows are WORD aligned
+            try:
+                bits = bytes(self.emu.uc.mem_read(lpBits, stride * height))
+            except UcError:
+                return 0
+            rows = []
+            for r in range(height):
+                line = bits[r * stride:(r + 1) * stride]
+                if bpp == 1:
+                    rows.append(b''.join(b'\xff\xff\xff' if line[i >> 3] & (0x80 >> (i & 7))
+                                         else b'\x00\x00\x00' for i in range(width)))
+                else:
+                    step = bpp // 8
+                    rows.append(b''.join(bytes((line[i * step + 2], line[i * step + 1],
+                                                line[i * step])) for i in range(width)))
+            rgb = b''.join(rows)
+        handle = self._new_bitmap(width, height, 1 if bpp == 1 else 32, rgb)
+        log.debug(f"CreateBitmap({width}, {height}, {bpp} bpp) -> 0x{handle:x}")
+        return handle
+
+    def GetObjectA(self, args):
+        """GetObjectA emulation - BITMAP, LOGPEN, LOGBRUSH and LOGFONTA"""
+        hObject, cbBuffer, lpvObject = args[0], args[1], args[2]
+        obj = self.gdi_objects.get(hObject)
+        if obj is None:
+            return 0
+        kind = obj['type']
+        if kind == 'bitmap':
+            bpp = obj.get('bpp', 32)
+            width, height = obj['width'], obj['height']
+            data = struct.pack('<iiiiHHI', 0, width, height,
+                               ((width * bpp + 15) // 16) * 2, 1, bpp, 0)
+        elif kind == 'pen':
+            r, g, b = obj['color']
+            data = struct.pack('<IiiI', obj.get('style', 0), obj['width'], 0,
+                               r | (g << 8) | (b << 16))
+        elif kind == 'brush':
+            color = obj.get('color')
+            if color is None:
+                data = struct.pack('<III', 1, 0, 0)  # BS_NULL
+            else:
+                r, g, b = color
+                data = struct.pack('<III', 0, r | (g << 8) | (b << 16), 0)
+        elif kind == 'font':
+            face = obj.get('face', '').encode(ANSI_CODEPAGE, errors='replace')[:31]
+            data = struct.pack('<iiiii8B32s', -obj['height'], 0, 0, 0,
+                               700 if obj.get('bold') else 400,
+                               1 if obj.get('italic') else 0,
+                               1 if obj.get('underline') else 0, 0, 0, 0, 0, 0, 0, face)
+        else:
+            return 0
+        if not lpvObject:
+            return len(data)
+        data = data[:cbBuffer]
+        return len(data) if self._mem_write(lpvObject, data) else 0
 
     @staticmethod
     def _scale_shape(shape, sx_src, sy_src, xd, yd, scale_x, scale_y):
@@ -6188,6 +6813,13 @@ class WinAPIHandler:
         if 'radius' in scaled:
             scale_avg = (abs(scale_x) + abs(scale_y)) / 2.0
             scaled['radius'] = max(0, int(round(scaled['radius'] * scale_avg)))
+        if scaled['type'] == 'image':
+            w, h = scaled['size']
+            x, y = scaled['pos']
+            x2, y2 = tx(shape['pos'][0] + w), ty(shape['pos'][1] + h)
+            scaled['pos'] = (min(x, x2), min(y, y2))
+            scaled['size'] = (abs(x2 - x), abs(y2 - y))
+            scaled.pop('_surface', None)
         return scaled
 
     def StretchBlt(self, args):
@@ -6215,8 +6847,14 @@ class WinAPIHandler:
 
         scale_x = wd / ws
         scale_y = hd / hs
-        shapes = [self._scale_shape(s, xs, ys, xd, yd, scale_x, scale_y)
-                  for s in src_state['shapes']]
+        shapes = []
+        for shape in src_state['shapes']:
+            if shape['type'] == 'image':
+                shape = self._crop_image(shape, min(xs, xs + ws), min(ys, ys + hs),
+                                         abs(ws), abs(hs), rop)
+                if shape is None:
+                    continue
+            shapes.append(self._scale_shape(shape, xs, ys, xd, yd, scale_x, scale_y))
 
         dest_state = self.dc_state.get(hdcDest)
         if dest_state and dest_state.get('memory'):
@@ -10617,6 +11255,7 @@ class FakeWindow:
         self.enabled = True
         self.parent = None
         self.children = []
+        self.size_state = None  # (SIZE_* kind, client w, h) last told to the app (WM_SIZE)
         self.controls = []  # Buttons, text boxes, etc.
         self.wndproc = 0
         self.owner = None  # WinAPIHandler of the process that created it (None: emulator's own)
@@ -10805,6 +11444,7 @@ class PseudoWindowsGUI:
         self.controls = {}  # hwnd -> FakeControl
         self.next_hwnd = 0x10000
         self.active_window = None
+        self.notified_active = None  # Window last told it is active (WM_ACTIVATE)
         self.z_order = []  # Window ordering (topmost is at end)
 
         # Keyboard focus (EDIT controls)
@@ -10916,6 +11556,8 @@ class PseudoWindowsGUI:
             # Window state is shared with the emulation thread
             with self.lock:
                 self._process_frame()
+                self._post_size_changes()
+                self._post_activation_changes()
             
             pygame.display.flip()
             self.clock.tick(60)
@@ -11402,6 +12044,8 @@ class PseudoWindowsGUI:
         for control in window.controls:
             self._draw_control(control, client_x, client_y)
 
+        self._draw_child_windows(window)
+
         self.screen.set_clip(None)
 
     def _draw_shape(self, shape, ox, oy):
@@ -11460,7 +12104,8 @@ class PseudoWindowsGUI:
         elif stype == 'text':
             x, y = shape['pos']
             font = self._get_render_font(shape.get('font'))
-            surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT)
+            surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT,
+                                  shape.get('bk'))
             self.screen.blit(surface, (ox + x, oy + y))
             if shape.get('font') and shape['font'].get('underline'):
                 line_y = oy + y + surface.get_height() - 2
@@ -11471,6 +12116,36 @@ class PseudoWindowsGUI:
             x, y = shape['pos']
             rect = pygame.Rect(ox + x, oy + y, 1, 1)
             pygame.draw.rect(self.screen, shape['color'], rect)
+
+        elif stype == 'image':
+            x, y = shape['pos']
+            if shape['size'][0] > 0 and shape['size'][1] > 0:
+                self.screen.blit(self._image_surface(shape), (ox + x, oy + y))
+
+    def _image_surface(self, shape):
+        """Pygame surface of an image shape, cached in the shape.
+
+        Raster operations are approximated with transparency: SRCAND leaves
+        white pixels out (mask), SRCPAINT/SRCINVERT leave black pixels out.
+        """
+        rop = shape.get('rop')
+        key = (shape['size'], rop)
+        cached = shape.get('_surface')
+        if cached and cached[0] == key:
+            return cached[1]
+        data = shape['data']
+        if rop == WinAPIHandler.NOTSRCCOPY:
+            data = bytes(255 - b for b in data)
+        from_bytes = getattr(pygame.image, 'frombytes', None) or pygame.image.fromstring
+        surface = from_bytes(data, shape['dim'], 'RGB')
+        if shape['size'] != shape['dim']:
+            surface = pygame.transform.scale(surface, shape['size'])
+        if rop == WinAPIHandler.SRCAND:
+            surface.set_colorkey((255, 255, 255))
+        elif rop in (WinAPIHandler.SRCPAINT, WinAPIHandler.SRCINVERT):
+            surface.set_colorkey((0, 0, 0))
+        shape['_surface'] = (key, surface)
+        return surface
 
     def _get_render_font(self, font_dict):
         """Pygame font for a GDI font dict (cached); None -> default GUI font."""
@@ -11942,6 +12617,10 @@ class PseudoWindowsGUI:
 
     def client_origin(self, win):
         """Screen coordinates of a window's client area origin."""
+        if win.parent in self.windows:
+            px, py = self.client_origin(self.windows[win.parent])
+            border = self._child_border(win)
+            return (px + win.x + border, py + win.y + border)
         top = win.y + self.BORDER + self.TITLE_BAR_H
         if win.menu:
             top += self.MENU_H
@@ -11949,10 +12628,76 @@ class PseudoWindowsGUI:
 
     def client_size(self, win):
         """Client area size (width, height) of a window."""
+        if win.parent in self.windows:
+            border = self._child_border(win)
+            return (max(0, win.width - 2 * border), max(0, win.height - 2 * border))
         height = win.height - 2 * self.BORDER - self.TITLE_BAR_H
         if win.menu:
             height -= self.MENU_H
         return (win.width - 2 * self.BORDER, max(0, height))
+
+    @staticmethod
+    def _child_border(win):
+        """Frame width of a child window: 1 with WS_BORDER, else none"""
+        return 1 if win.style & 0x00800000 else 0
+
+    def size_state(self, win):
+        """(SIZE_RESTORED/MINIMIZED/MAXIMIZED, client width, client height) for WM_SIZE"""
+        width, height = self.client_size(win)
+        return (1 if win.minimized else 2 if win.maximized else 0, width, height)
+
+    def _post_size_changes(self):
+        """Post WM_SIZE for windows the user resized, maximized or minimized"""
+        for hwnd, win in list(self.windows.items()):
+            if win.size_state is None:
+                continue  # The app has not been told a size yet
+            state = self.size_state(win)
+            if state != win.size_state:
+                win.size_state = state
+                if self._is_app_window(hwnd):
+                    kind, width, height = state
+                    win.owner.post_window_message(hwnd, win.owner.WM_SIZE, kind,
+                                                  ((height & 0xFFFF) << 16) | (width & 0xFFFF))
+
+    def _post_activation_changes(self):
+        """Post WM_ACTIVATE when the active (not minimized) window changes"""
+        active = self.active_window
+        if active not in self.windows or self.windows[active].minimized:
+            active = None
+        previous = self.notified_active
+        if active == previous:
+            return
+        self.notified_active = active
+        if previous is not None and self._is_app_window(previous):
+            owner = self.windows[previous].owner
+            owner.post_window_message(previous, owner.WM_ACTIVATE, 0, active or 0)  # WA_INACTIVE
+        if active is not None and self._is_app_window(active):
+            owner = self.windows[active].owner
+            owner.post_window_message(active, owner.WM_ACTIVATE, 1, previous or 0)  # WA_ACTIVE
+
+    def _draw_child_windows(self, window):
+        """Draw the visible child windows of window (inside its client area)"""
+        parent_clip = self.screen.get_clip()
+        for hwnd in window.children:
+            child = self.windows.get(hwnd)
+            if child is None or not child.visible:
+                continue
+            cx, cy = self.client_origin(child)
+            cw, ch = self.client_size(child)
+            border = self._child_border(child)
+            frame = pygame.Rect(cx - border, cy - border, cw + 2 * border, ch + 2 * border)
+            self.screen.set_clip(frame.clip(parent_clip))
+            if border:
+                pygame.draw.rect(self.screen, (0, 0, 0), frame, border)
+            content = pygame.Rect(cx, cy, cw, ch)
+            pygame.draw.rect(self.screen, child.bg_color, content)
+            self.screen.set_clip(content.clip(parent_clip))
+            for shape in child.drawn_shapes:
+                self._draw_shape(shape, cx, cy)
+            for control in child.controls:
+                self._draw_control(control, cx, cy)
+            self._draw_child_windows(child)
+        self.screen.set_clip(parent_clip)
 
     def _client_point(self, win, x, y):
         """Convert screen coordinates to a window's client coordinates."""
@@ -11965,6 +12710,11 @@ class PseudoWindowsGUI:
     @staticmethod
     def covers_area(shape, width, height):
         """True if shape is an opaque rect hiding everything in a width x height area"""
+        if shape['type'] == 'image':
+            if shape.get('rop') not in (0x00CC0020, 0x00330008):  # SRCCOPY, NOTSRCCOPY
+                return False
+            (left, top), (w, h) = shape['pos'], shape['size']
+            return left <= 0 and top <= 0 and left + w >= width and top + h >= height
         if shape['type'] != 'rect' or shape.get('fill') is None:
             return False
         left, top, right, bottom = shape['rect']
@@ -11979,10 +12729,63 @@ class PseudoWindowsGUI:
         # New list objects keep the GUI thread's current snapshot intact
         if self.covers_area(shape, *self.client_size(win)):
             win.drawn_shapes = [shape]
-        elif len(win.drawn_shapes) >= self.MAX_SHAPES:
-            win.drawn_shapes = win.drawn_shapes[-(self.MAX_SHAPES // 2):] + [shape]
-        else:
-            win.drawn_shapes.append(shape)
+            return
+        shapes = self.add_to_display_list(win.drawn_shapes, shape)
+        if len(shapes) > self.MAX_SHAPES:
+            shapes = shapes[-(self.MAX_SHAPES // 2):]
+        win.drawn_shapes = shapes
+
+    # Only this many recent entries are checked for being hidden by a new shape
+    HIDDEN_SCAN = 1024
+
+    @staticmethod
+    def shape_bbox(shape):
+        """(left, top, right, bottom) a display list entry can paint, or None"""
+        stype = shape['type']
+        if 'rect' in shape:
+            l, t, r, b = shape['rect']
+            return (min(l, r), min(t, b), max(l, r), max(t, b))
+        if stype == 'image':
+            (x, y), (w, h) = shape['pos'], shape['size']
+            return (x, y, x + w, y + h)
+        if stype == 'pixel':
+            x, y = shape['pos']
+            return (x, y, x + 1, y + 1)
+        if stype == 'text':
+            x, y = shape['pos']
+            height = (shape.get('font') or {}).get('height', 16)
+            return (x, y, x + len(shape['text']) * height, y + height * 2)
+        points = shape.get('points') or [p for p in (shape.get('from'), shape.get('to')) if p]
+        if not points:
+            return None
+        pad = (shape['pen'][1] if shape.get('pen') else 1) + 1
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+    @classmethod
+    def add_to_display_list(cls, shapes, shape):
+        """shapes plus shape, without recent entries the new shape fully hides
+        (keeps redraw-in-place game loops from growing the list)"""
+        cover = None
+        if shape['type'] == 'rect' and shape.get('fill') is not None:
+            cover = cls.shape_bbox(shape)
+        elif shape['type'] == 'image' and shape.get('rop') in (0x00CC0020, 0x00330008):
+            cover = cls.shape_bbox(shape)
+        same_text = shape['type'] == 'text' and shape.get('bk') is not None
+        if cover is None and not same_text:
+            shapes.append(shape)  # Cheap path: most shapes hide nothing
+            return shapes
+
+        def hidden(old):
+            if same_text:
+                return old['type'] == 'text' and old['pos'] == shape['pos'] and \
+                    len(old['text']) <= len(shape['text']) and old.get('font') == shape.get('font')
+            box = cls.shape_bbox(old)
+            return box is not None and box[0] >= cover[0] and box[1] >= cover[1] and \
+                box[2] <= cover[2] and box[3] <= cover[3]
+
+        split = max(0, len(shapes) - cls.HIDDEN_SCAN)
+        return shapes[:split] + [s for s in shapes[split:] if not hidden(s)] + [shape]
 
     @gui_locked
     def clear_drawings(self, hwnd):
@@ -12731,13 +13534,18 @@ class PseudoWindowsGUI:
         return hwnd
     
     @gui_locked
-    def create_window(self, title, x, y, width, height, style=0, owner=None):
-        """Create new window"""
+    def create_window(self, title, x, y, width, height, style=0, owner=None, parent=0):
+        """Create new window (a child window if parent is a window handle)"""
         hwnd = self.get_next_hwnd()
         window = FakeWindow(hwnd, title, x, y, width, height, style)
         window.owner = owner
         self.windows[hwnd] = window
-        self.z_order.append(hwnd)
+        if parent in self.windows:
+            # Child windows are drawn inside their parent, not on the desktop
+            window.parent = parent
+            self.windows[parent].children.append(hwnd)
+        else:
+            self.z_order.append(hwnd)
         
         log.debug(f"GUI: Window created - HWND=0x{hwnd:08x}, '{title}'")
         return hwnd
@@ -12763,7 +13571,7 @@ class PseudoWindowsGUI:
         """Show/hide window"""
         if hwnd in self.windows:
             self.windows[hwnd].visible = show
-            if show:
+            if show and not self.windows[hwnd].parent:
                 self.active_window = hwnd
                 if hwnd not in self.z_order:
                     self.z_order.append(hwnd)
