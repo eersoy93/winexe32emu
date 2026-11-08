@@ -1015,6 +1015,7 @@ class WinAPIHandler:
     WM_KEYUP = 0x0101
     WM_CHAR = 0x0102
     WM_COMMAND = 0x0111
+    WM_DRAWITEM = 0x002B
     WM_TIMER = 0x0113
     WM_MOUSEMOVE = 0x0200
     WM_LBUTTONDOWN = 0x0201
@@ -1115,6 +1116,8 @@ class WinAPIHandler:
         self.message_queue = []
         self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
         self.painted_windows = set()  # Windows that received WM_PAINT
+        self.dirty_controls = {}  # Owner-draw controls waiting for WM_DRAWITEM (ordered)
+        self._drawitem_buf = 0
         self.quit_requested = False
         # True once the emulated process is gone (ExitProcess or emulation end).
         # After that no window can consume messages, so the GUI must stop
@@ -4272,6 +4275,7 @@ class WinAPIHandler:
                 hwnd = self.gui.create_control(hWndParent, control_class, window_name,
                                                x, y, nWidth, nHeight, dwStyle,
                                                control_id=hMenu)
+                self.dirty_controls[hwnd] = True
             else:
                 parent = hWndParent if dwStyle & self.WS_CHILD else 0
                 hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle,
@@ -5626,6 +5630,7 @@ class WinAPIHandler:
                 hwnd, cls, text, round(item['x'] * bx), round(item['y'] * by),
                 round(item['cx'] * bx), round(item['cy'] * by), style,
                 control_id=item['id'] & 0xFFFF)
+            self.dirty_controls[chwnd] = True
             control = self.gui.controls[chwnd]
             control.visible = bool(style & self.WS_VISIBLE)
             control.enabled = not style & 0x08000000  # WS_DISABLED
@@ -5667,8 +5672,47 @@ class WinAPIHandler:
                                   cancel.hwnd if cancel else 0)
         return result
 
+    def _owner_draw_type(self, control):
+        """ODT_* type of an owner-draw control, or 0"""
+        if control.class_name == 'STATIC' and (control.style & 0x1F) == 0xD:  # SS_OWNERDRAW
+            return 5  # ODT_STATIC
+        if control.class_name == 'BUTTON' and (control.style & 0xF) == 0xB:  # BS_OWNERDRAW
+            return 4  # ODT_BUTTON
+        return 0
+
+    def _paint_control(self, hwnd):
+        """WM_PAINT of an owner-draw control: send WM_DRAWITEM to its parent"""
+        control = self.gui.controls.get(hwnd)
+        kind = self._owner_draw_type(control) if control else 0
+        if not kind:
+            return 0
+        if not self._drawitem_buf:
+            self._drawitem_buf = self.emu.heap_alloc(48)
+        hdc = self._create_dc(hwnd)
+        self.gui.clear_drawings(hwnd)
+        # CtlType, CtlID, itemID, itemAction (ODA_DRAWENTIRE), itemState, hwndItem, hDC,
+        # rcItem, itemData
+        self.emu.uc.mem_write(self._drawitem_buf, struct.pack(
+            '<7I4iI', kind, control.control_id, 0, 1, 0, hwnd, hdc,
+            0, 0, control.width, control.height, 0))
+        parent = control.parent_hwnd
+        try:
+            if self._dialog_of(parent):
+                self._dialog_message(parent, self.WM_DRAWITEM, control.control_id,
+                                     self._drawitem_buf)
+            else:
+                wndproc = self._find_wndproc_for_hwnd(parent)
+                if wndproc:
+                    self.emu.call_wndproc(wndproc, parent, self.WM_DRAWITEM,
+                                          control.control_id, self._drawitem_buf)
+        finally:
+            self._delete_dc(hdc)
+        return 0
+
     def _dispatch(self, hwnd, message, wParam, lParam):
         """DispatchMessage for a message already read from the queue"""
+        if message == self.WM_PAINT and hwnd in self.gui.controls:
+            return self._paint_control(hwnd)
         if message == self.WM_TIMER and lParam:
             tick = int(time.time() * 1000) & 0xFFFFFFFF
             return self.emu.call_callback(lParam, [hwnd, message, wParam, tick])
@@ -7473,6 +7517,20 @@ class WinAPIHandler:
                     self.painted_windows.add(hwnd)
                 return (hwnd, self.WM_PAINT, 0, 0)
 
+        # Owner-draw controls paint after their (painted, visible) parent
+        for hwnd in list(self.dirty_controls):
+            control = self.gui.controls.get(hwnd) if self.gui else None
+            if control is None or not self._owner_draw_type(control):
+                self.dirty_controls.pop(hwnd, None)
+                continue
+            parent = self.gui.windows.get(control.parent_hwnd)
+            if (parent is not None and parent.visible and control.visible
+                    and control.parent_hwnd in self.painted_windows
+                    and matches(hwnd, self.WM_PAINT)):
+                if remove:
+                    del self.dirty_controls[hwnd]
+                return (hwnd, self.WM_PAINT, 0, 0)
+
         # Queued message (input forwarded from the GUI thread)
         with self.message_lock:
             for index, msg in enumerate(self.message_queue):
@@ -7576,6 +7634,9 @@ class WinAPIHandler:
             hwnd, message, wParam, lParam, time_val, pt_x, pt_y = struct.unpack("<IIIIIii", msg_data)
             
             log.debug(f"DispatchMessageA: hwnd=0x{hwnd:x}, msg=0x{message:x}")
+
+            if message == self.WM_PAINT and self.gui and hwnd in self.gui.controls:
+                return self._paint_control(hwnd)
 
             # Dialog windows: keyboard navigation and the dialog procedure
             if self._dialog_of(hwnd) and not (message == self.WM_TIMER and lParam):
@@ -7817,6 +7878,8 @@ class WinAPIHandler:
         log.debug(f"InvalidateRect(0x{hWnd:x})")
         # GetMessageA re-synthesizes WM_PAINT for windows not in painted_windows
         self.painted_windows.discard(hWnd)
+        if self.gui and hWnd in self.gui.controls:
+            self.dirty_controls[hWnd] = True
         return 1
 
     def FillRect(self, args):
@@ -13999,6 +14062,7 @@ class FakeControl:
         self.parent_hwnd = 0
         self.control_id = 0  # Control ID (hMenu in CreateWindowEx) for WM_COMMAND
         self.checked = False  # For Checkbox/Radio
+        self.drawn_shapes = []  # GDI drawing on the control's DC (owner-draw)
         self.items = []       # For Listbox/Combobox (LB_ADDSTRING, CB_ADDSTRING)
         self.sel_index = -1   # Selected item index (-1 = none)
         self.top_index = 0    # First visible LISTBOX item (mouse wheel scrolling)
@@ -14944,6 +15008,14 @@ class PseudoWindowsGUI:
             self._draw_control_body(control, parent_x + control.x, parent_y + control.y)
         finally:
             self.font = gui_font
+        if control.drawn_shapes:
+            abs_x, abs_y = parent_x + control.x, parent_y + control.y
+            prev_clip = self.screen.get_clip()
+            rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
+            self.screen.set_clip(rect.clip(prev_clip) if prev_clip else rect)
+            for shape in control.drawn_shapes:
+                self._draw_shape(shape, abs_x, abs_y)
+            self.screen.set_clip(prev_clip)
 
     def _wrap_text(self, text, width):
         """Split text into lines that fit width pixels (word wrap)"""
@@ -15539,6 +15611,13 @@ class PseudoWindowsGUI:
         """Append a GDI shape to a window's display list (emu thread)."""
         win = self.windows.get(hwnd)
         if win is None:
+            control = self.controls.get(hwnd)
+            if control is not None:
+                if self.covers_area(shape, control.width, control.height):
+                    control.drawn_shapes = [shape]
+                else:
+                    control.drawn_shapes = self.add_to_display_list(
+                        control.drawn_shapes, shape)[-self.MAX_SHAPES:]
             return
         # New list objects keep the GUI thread's current snapshot intact
         if self.covers_area(shape, *self.client_size(win)):
@@ -15633,6 +15712,8 @@ class PseudoWindowsGUI:
         """
         if hwnd in self.windows:
             self.windows[hwnd].drawn_shapes = []
+        elif hwnd in self.controls:
+            self.controls[hwnd].drawn_shapes = []
 
     # ==================== MENU BAR ====================
 
