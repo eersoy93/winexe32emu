@@ -27,9 +27,9 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
 - `c_drive/Windows/Demos/` - Compiled example EXEs (`C:\Windows\Demos`)
 - `examples/` - Example C source codes
-- `create_c_drive_environment.sh` - Script to create the `c_drive/` folders
-- `compile_examples.sh` - Script to compile examples into `c_drive/Windows/Demos/`
-- `remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders (`--all` deletes the whole `c_drive/` after confirmation)
+- `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
+- `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Demos/`
+- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders (`--all` deletes the whole `c_drive/` after confirmation)
 - `winexe32emu.py` - The main script
 
 ## Features

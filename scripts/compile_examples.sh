@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Paths are relative to the repository root
-cd "$(dirname "$0")" || exit 1
+cd "$(dirname "$0")/.." || exit 1
 
 # Demo programs live in C:\Windows\Demos of the emulated C drive
 OUT_DIR=c_drive/Windows/Demos

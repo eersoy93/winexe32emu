@@ -18,7 +18,7 @@
 # c_drive/ after a confirmation.
 
 # Paths are relative to the repository root
-cd "$(dirname "$0")" || exit 1
+cd "$(dirname "$0")/.." || exit 1
 
 C_DRIVE=c_drive
 

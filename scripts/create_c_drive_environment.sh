@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Paths are relative to the repository root
-cd "$(dirname "$0")" || exit 1
+cd "$(dirname "$0")/.." || exit 1
 
 # Emulated C drive and the folders the default environment names
 # (WINDIR/SYSTEMROOT, PATH, TEMP/TMP); demos live in C:\Windows\Demos

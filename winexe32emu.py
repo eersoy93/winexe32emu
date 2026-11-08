@@ -574,8 +574,8 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
 
 
 # Startup scripts: c_drive/ folders, and the demos compiled into C:\Windows\Demos
-CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "create_c_drive_environment.sh")
-COMPILE_EXAMPLES_SCRIPT = os.path.join(SCRIPT_DIR, "compile_examples.sh")
+CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "create_c_drive_environment.sh")
+COMPILE_EXAMPLES_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "compile_examples.sh")
 
 
 def run_setup_script(script, title):
