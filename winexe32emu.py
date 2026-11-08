@@ -889,7 +889,7 @@ class WinAPIHandler:
         'GetComputerNameA': 2, 'GetComputerNameW': 2, 'GetSystemInfo': 1,
         'GlobalMemoryStatus': 1, 'QueryPerformanceFrequency': 1,
         'GetTickCount64': 0, 'GetACP': 0, 'GetOEMCP': 0, 'GetUserDefaultLangID': 0,
-        'InitCommonControls': 0, 'GetDiskFreeSpaceA': 5,
+        'GetDiskFreeSpaceA': 5,
         'LocalFileTimeToFileTime': 2, 'SetFileTime': 4,
         'SetConsoleTitleA': 1, 'SetConsoleTitleW': 1,
         'FindFirstFileA': 2, 'FindFirstFileW': 2, 'FindNextFileA': 2,
@@ -906,6 +906,12 @@ class WinAPIHandler:
         'RtlUnwind': 4, 'UnhandledExceptionFilter': 1, 'TerminateProcess': 2,
         'FindResourceA': 3, 'LoadResource': 2, 'LockResource': 1, 'FreeResource': 1,
         'SizeofResource': 2,
+        'CreateProcessA': 10, 'GetExitCodeProcess': 2, 'WaitForSingleObject': 2,
+        'HeapSize': 3, 'SetVolumeLabelA': 2, 'SetLocalTime': 1,
+        'GetVolumeInformationA': 8, 'GetLogicalDrives': 0,
+        'FileTimeToSystemTime': 2, 'SystemTimeToFileTime': 2,
+        'FileTimeToLocalFileTime': 2, 'GetDriveTypeA': 1,
+        'SetFileAttributesA': 2, 'CompareStringA': 6, 'RaiseException': 4,
         # user32
         'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
         'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
@@ -947,6 +953,13 @@ class WinAPIHandler:
         'GetWindowTextLengthA': 1, 'BringWindowToTop': 1,
         'SetForegroundWindow': 1, 'AdjustWindowRect': 3, 'AdjustWindowRectEx': 4, 'LoadStringA': 4,
         'LoadBitmapA': 2, 'IsIconic': 1, 'OpenIcon': 1,
+        'GetWindow': 2, 'CharToOemBuffA': 3, 'OemToCharBuffA': 3,
+        'SetKeyboardState': 1, 'GetKeyboardState': 1, 'IsDialogMessageA': 2,
+        'ChangeDisplaySettingsA': 2, 'EnumDisplaySettingsA': 3, 'SetCursor': 1,
+        'EndDialog': 2, 'RegisterWindowMessageA': 1, 'SystemParametersInfoA': 4,
+        'LoadKeyboardLayoutA': 2, 'CreateCursor': 7, 'DestroyIcon': 1,
+        'DestroyCursor': 1, 'IsZoomed': 1, 'ShowCursor': 1, 'DialogBoxParamA': 5,
+        'GetWindowPlacement': 2, 'SetWindowPlacement': 2,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
         'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
@@ -961,6 +974,8 @@ class WinAPIHandler:
         'CreatePenIndirect': 1, 'CreateBrushIndirect': 1, 'GetTextMetricsA': 2,
         'SetROP2': 2, 'GetObjectA': 3, 'CreateBitmap': 5,
         'CreatePalette': 1, 'SelectPalette': 3, 'RealizePalette': 1,
+        'StretchDIBits': 13, 'SetStretchBltMode': 2, 'GetDIBits': 7,
+        'CreateDCA': 4, 'EnumFontFamiliesA': 4,
         # advapi32
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
         'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
@@ -970,39 +985,23 @@ class WinAPIHandler:
         # winmm
         'timeGetTime': 0, 'timeBeginPeriod': 1, 'timeEndPeriod': 1,
         'PlaySoundA': 3, 'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2,
-        # ole32
-        'OleInitialize': 1, 'OleUninitialize': 0, 'CoInitialize': 1,
-        'CoUninitialize': 0,
-        # kernel32 (processes, volumes, time)
-        'CreateProcessA': 10, 'GetExitCodeProcess': 2, 'WaitForSingleObject': 2,
-        'HeapSize': 3, 'SetVolumeLabelA': 2, 'SetLocalTime': 1,
-        'GetVolumeInformationA': 8, 'GetLogicalDrives': 0,
-        'FileTimeToSystemTime': 2, 'SystemTimeToFileTime': 2,
-        'FileTimeToLocalFileTime': 2, 'GetDriveTypeA': 1,
-        'SetFileAttributesA': 2, 'CompareStringA': 6, 'RaiseException': 4,
-        # user32 (dialogs, cursors, keyboard, display)
-        'GetWindow': 2, 'CharToOemBuffA': 3, 'OemToCharBuffA': 3,
-        'SetKeyboardState': 1, 'GetKeyboardState': 1, 'IsDialogMessageA': 2,
-        'ChangeDisplaySettingsA': 2, 'EnumDisplaySettingsA': 3, 'SetCursor': 1,
-        'EndDialog': 2, 'RegisterWindowMessageA': 1, 'SystemParametersInfoA': 4,
-        'LoadKeyboardLayoutA': 2, 'CreateCursor': 7, 'DestroyIcon': 1,
-        'DestroyCursor': 1, 'IsZoomed': 1, 'ShowCursor': 1, 'DialogBoxParamA': 5,
-        'GetWindowPlacement': 2, 'SetWindowPlacement': 2,
-        # gdi32 (DIBs, display DCs, fonts)
-        'StretchDIBits': 13, 'SetStretchBltMode': 2, 'GetDIBits': 7,
-        'CreateDCA': 4, 'EnumFontFamiliesA': 4,
-        # msacm32
-        'acmStreamOpen': 8, 'acmFormatSuggest': 5, 'acmStreamClose': 2,
-        'acmStreamSize': 4, 'acmStreamPrepareHeader': 3, 'acmStreamConvert': 3,
-        'acmStreamUnprepareHeader': 3,
-        # winmm (wave output, joystick, MCI)
         'waveOutOpen': 6, 'waveOutWrite': 3, 'waveOutPrepareHeader': 3,
         'waveOutUnprepareHeader': 3, 'waveOutReset': 1, 'waveOutPause': 1,
         'waveOutRestart': 1, 'waveOutClose': 1, 'waveOutGetPosition': 3,
         'joyGetPos': 2, 'joyGetDevCapsA': 3, 'mciSendCommandA': 4,
-        # comdlg32, shell32, comctl32
+        # msacm32
+        'acmStreamOpen': 8, 'acmFormatSuggest': 5, 'acmStreamClose': 2,
+        'acmStreamSize': 4, 'acmStreamPrepareHeader': 3, 'acmStreamConvert': 3,
+        'acmStreamUnprepareHeader': 3,
+        # ole32
+        'OleInitialize': 1, 'OleUninitialize': 0, 'CoInitialize': 1,
+        'CoUninitialize': 0,
+        # comdlg32
         'GetOpenFileNameA': 1, 'GetSaveFileNameA': 1, 'FindTextA': 1,
-        'ExtractIconA': 3, 'CreateStatusWindowA': 4,
+        # shell32
+        'ExtractIconA': 3,
+        # comctl32
+        'InitCommonControls': 0, 'CreateStatusWindowA': 4,
     }
 
     # Windows message constants
