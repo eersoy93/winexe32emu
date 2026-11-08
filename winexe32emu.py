@@ -86,6 +86,32 @@ except ImportError:
 init(autoreset=True)
 
 
+class LogFileTee:
+    """Stands in for sys.stdout/sys.stderr (--logfile): writes go to the
+    console as before and, without ANSI color codes, to the log file"""
+
+    ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+    def __init__(self, stream, logfile, lock):
+        self._stream = stream
+        self._logfile = logfile
+        self._lock = lock  # Shared by the stdout and stderr tees
+
+    def write(self, text):
+        result = self._stream.write(text)
+        with self._lock:
+            self._logfile.write(self.ANSI_ESCAPE.sub('', text))
+        return result
+
+    def flush(self):
+        self._stream.flush()
+        with self._lock:
+            self._logfile.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class DebugLogger:
     """Logger for colored debug output"""
 
@@ -2866,7 +2892,8 @@ class WinAPIHandler:
             wndclass_data = self.emu.uc.mem_read(lpWndClass, 40)
             style = struct.unpack("<I", wndclass_data[0:4])[0]
             lpfnWndProc = struct.unpack("<I", wndclass_data[4:8])[0]
-            hInstance = struct.unpack("<I", wndclass_data[20:24])[0]
+            hInstance = struct.unpack("<I", wndclass_data[16:20])[0]
+            hbrBackground = struct.unpack("<I", wndclass_data[28:32])[0]
             lpszClassName = struct.unpack("<I", wndclass_data[36:40])[0]
             
             class_name = self._read_text(lpszClassName, wide)
@@ -2878,7 +2905,8 @@ class WinAPIHandler:
                 'atom': atom,
                 'style': style,
                 'wndproc': lpfnWndProc,
-                'hInstance': hInstance
+                'hInstance': hInstance,
+                'background': hbrBackground,
             }
             self.atoms[atom] = class_name
             
@@ -2900,7 +2928,8 @@ class WinAPIHandler:
             cbSize = struct.unpack("<I", wcex_data[0:4])[0]
             style = struct.unpack("<I", wcex_data[4:8])[0]
             lpfnWndProc = struct.unpack("<I", wcex_data[8:12])[0]
-            hInstance = struct.unpack("<I", wcex_data[24:28])[0]
+            hInstance = struct.unpack("<I", wcex_data[20:24])[0]
+            hbrBackground = struct.unpack("<I", wcex_data[32:36])[0]
             lpszClassName = struct.unpack("<I", wcex_data[40:44])[0]
             
             class_name = self._read_text(lpszClassName, wide)
@@ -2912,7 +2941,8 @@ class WinAPIHandler:
                 'atom': atom,
                 'style': style,
                 'wndproc': lpfnWndProc,
-                'hInstance': hInstance
+                'hInstance': hInstance,
+                'background': hbrBackground,
             }
             self.atoms[atom] = class_name
             
@@ -2971,6 +3001,12 @@ class WinAPIHandler:
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
                 self.gui.windows[hwnd].class_name = class_name
+                # The client area is erased with the class background brush
+                wndclass = self.registered_classes.get(class_name)
+                if wndclass and wndclass.get('background'):
+                    color = self._brush_color(wndclass['background'])
+                    if color is not None:
+                        self.gui.windows[hwnd].bg_color = color
 
             # Real Windows sends WM_CREATE to the WndProc synchronously, before
             # CreateWindowEx returns. Apps often create their child controls here.
@@ -5033,7 +5069,7 @@ class WinAPIHandler:
             if not self.gui or hwnd not in self.gui.windows:
                 return 0xFFFFFFFF  # CLR_INVALID
             shapes = self.gui.windows[hwnd].drawn_shapes
-            background = PseudoWindowsGUI.COLOR_WINDOW_BG
+            background = self.gui.windows[hwnd].bg_color
 
         color = self._shape_color_at(shapes, x, y)
         if color is None:
@@ -5166,11 +5202,8 @@ class WinAPIHandler:
         if brush and brush['type'] == 'brush':
             return brush['color']
         if hbr < 32:
-            syscolors = {
-                5 + 1: (255, 255, 255),   # COLOR_WINDOW+1
-                15 + 1: (240, 240, 240),  # COLOR_3DFACE/COLOR_BTNFACE+1
-            }
-            return syscolors.get(hbr, (240, 240, 240))
+            # COLOR_* + 1 stands for that system color
+            return self.SYS_COLORS.get(hbr - 1, PseudoWindowsGUI.COLOR_WINDOW_BG)
         return None
 
     def FrameRect(self, args):
@@ -9711,7 +9744,7 @@ class FakeWindow:
         self.controls = []  # Buttons, text boxes, etc.
         self.wndproc = 0
         self.owner = None  # WinAPIHandler of the process that created it (None: emulator's own)
-        self.bg_color = (240, 240, 240)  # Windows classic gray
+        self.bg_color = (212, 208, 200)  # Classic Windows gray (COLOR_BTNFACE)
         self.text = title
 
         # Retained drawing list (GDI display list, redrawn every frame):
@@ -9819,7 +9852,8 @@ class FakeConsole:
 
     def __init__(self, hwnd):
         self.hwnd = hwnd  # Console window
-        self.lines = []  # {'text', 'color', 'stream'}
+        self.lines = []  # Each line: [(text, color), ...]
+        self.line_open = False  # Last line not ended by LF yet (output continues it)
         self.scroll = 0
         self.input = ""  # Line being typed
         self.input_active = False  # A ReadConsole/stdin read is waiting
@@ -9858,7 +9892,7 @@ class PseudoWindowsGUI:
     
     # Windows colors
     COLOR_DESKTOP = (58, 110, 165)  # #3a6ea5, Windows 2000 blue
-    COLOR_WINDOW_BG = (240, 240, 240)
+    COLOR_WINDOW_BG = (212, 208, 200)  # Classic Windows gray (COLOR_BTNFACE)
     COLOR_TITLE_BAR = (0, 0, 128)  # Classic blue
     COLOR_TITLE_BAR_INACTIVE = (128, 128, 128)
     COLOR_TITLE_TEXT = (255, 255, 255)
@@ -9939,6 +9973,8 @@ class PseudoWindowsGUI:
         
         # Thread
         self.gui_thread = None
+        self.ready = threading.Event()  # Set once the GUI loop is running
+        self.consoles_opened = 0  # Cascades the console windows
         
         # Console windows of the programs: hwnd -> FakeConsole
         self.consoles = {}
@@ -9970,9 +10006,10 @@ class PseudoWindowsGUI:
         self.gui_thread = threading.Thread(target=self._gui_loop, daemon=True)
         self.gui_thread.start()
         
-        # Wait for GUI to start
-        time.sleep(0.5)
-        return True
+        # Wait until the screen exists; programs started next need it
+        # (e.g. a console program opens its console window at once)
+        self.ready.wait(timeout=30)
+        return self.running
     
     def stop(self):
         """Stop GUI"""
@@ -9997,6 +10034,7 @@ class PseudoWindowsGUI:
         self.font_console = pygame.font.SysFont('consolas,courier,monospace', 12)
         
         self.running = True
+        self.ready.set()
         
         while self.running:
             # Window state is shared with the emulation thread
@@ -11701,20 +11739,19 @@ class PseudoWindowsGUI:
         console = self.consoles.get(self.active_window)
         if console is not None and console.input_active:
             if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                # Enter - input completed
-                console.input_result = console.input
+                # Enter - input completed; it stays on screen like in a real console
+                line = console.input
                 console.input = ""
+                self.console_write(console, line + "\n", "stdin")
+                console.input_result = line
                 console.input_active = False
                 console.input_ready.set()  # Send signal to waiting thread
             elif event.key == pygame.K_BACKSPACE:
                 # Backspace - delete last character
                 console.input = console.input[:-1]
             elif event.key == pygame.K_ESCAPE:
-                # ESC - cancel
-                console.input_result = ""
+                # ESC - clear the line being typed
                 console.input = ""
-                console.input_active = False
-                console.input_ready.set()
             else:
                 # Printable character
                 if event.unicode and event.unicode.isprintable():
@@ -11886,7 +11923,8 @@ class PseudoWindowsGUI:
     @gui_locked
     def create_console(self, title, owner):
         """Open a console window for a process (called on its emulation thread)"""
-        offset = 24 * (len(self.consoles) % 8)  # Cascade several consoles
+        offset = 24 * (self.consoles_opened % 8)  # Cascade, so none hides another
+        self.consoles_opened += 1
         hwnd = self.create_window(title, 50 + offset, 400 - offset, 600, 280, owner=owner)
         self.windows[hwnd].bg_color = (12, 12, 12)  # Black background
         console = FakeConsole(hwnd)
@@ -11957,81 +11995,74 @@ class PseudoWindowsGUI:
         min_rect = pygame.Rect(window.x + window.width - btn_size * 3 - 9, btn_y, btn_size, btn_size)
         self._draw_window_button(min_rect, "─", "min")
         
-        # Content area (console output)
+        # Content area (console output, the line being typed continues it)
         content_x = window.x + 5
         content_y = window.y + 30
         content_width = window.width - 10
-        content_height = window.height - 55
+        content_height = window.height - 35
         
         # Content background
         content_rect = pygame.Rect(content_x, content_y, content_width, content_height)
         pygame.draw.rect(self.screen, (12, 12, 12), content_rect)
-        
-        # Draw console lines
+
+        rows = list(console.lines)
+        if console.input_active:
+            typed = (console.input, self.CONSOLE_COLORS['stdin'])
+            if console.line_open and rows:
+                rows[-1] = rows[-1] + [typed]
+            else:
+                rows.append([typed])
+
+        # Draw the last rows that fit (scrolled back by console.scroll)
         line_height = 14
-        max_visible_lines = content_height // line_height
-        
-        # Scroll calculation
-        start_line = max(0, len(console.lines) - max_visible_lines - console.scroll)
-        end_line = min(len(console.lines), start_line + max_visible_lines)
-        
+        max_visible_lines = max(1, (content_height - 4) // line_height)
+        end_line = max(0, len(rows) - console.scroll)
+        start_line = max(0, end_line - max_visible_lines)
+
+        self.screen.set_clip(content_rect)
         y_offset = content_y + 2
-        for i in range(start_line, end_line):
-            if i < len(console.lines):
-                line_data = console.lines[i]
-                text = line_data['text']
-                color = line_data.get('color', (192, 192, 192))
-                
-                # Render line
-                if text.strip():
-                    text_surface = self.font_console.render(text[:80], True, color)
-                    self.screen.blit(text_surface, (content_x + 3, y_offset))
-                y_offset += line_height
-        
-        # Input area
-        input_y = window.y + window.height - 22
-        input_rect = pygame.Rect(content_x, input_y, content_width, 18)
-        
-        # Different background color if input mode is active
-        if console.input_active:
-            pygame.draw.rect(self.screen, (32, 32, 64), input_rect)  # Blue tint
-            pygame.draw.rect(self.screen, (128, 128, 255), input_rect, 1)  # Blue border
-        else:
-            pygame.draw.rect(self.screen, (24, 24, 24), input_rect)
-            pygame.draw.rect(self.screen, (64, 64, 64), input_rect, 1)
-        
-        # Prompt and input
-        prompt = "> "
-        cursor = "|" if (console.input_active and self.console_cursor_visible) else ""
-        input_text = prompt + console.input + cursor
-        input_color = (0, 255, 0) if console.input_active else (128, 128, 128)
-        prompt_surface = self.font_console.render(input_text, True, input_color)
-        self.screen.blit(prompt_surface, (content_x + 3, input_y + 2))
-        
-        # Input waiting hint
-        if console.input_active:
-            hint_text = "[Waiting for input - Enter: Send, ESC: Cancel]"
-            hint_surface = self.font_small.render(hint_text, True, (255, 255, 128))
-            self.screen.blit(hint_surface, (content_x + 3, input_y - 16))
-    
+        x = content_x + 3
+        for row in rows[start_line:end_line]:
+            x = content_x + 3
+            for text, color in row:
+                if text:
+                    surface = self.font_console.render(text, True, color)
+                    self.screen.blit(surface, (x, y_offset))
+                    x += surface.get_width()
+            y_offset += line_height
+
+        # Blinking block cursor after the typed text
+        if console.input_active and self.console_cursor_visible and console.scroll == 0:
+            cursor_h = self.font_console.get_height()
+            pygame.draw.rect(self.screen, self.CONSOLE_COLORS['stdin'],
+                             (x, y_offset - line_height + cursor_h - 3, 8, 2))
+        self.screen.set_clip(None)
+
+    # Console text colors per stream
+    CONSOLE_COLORS = {'stdout': (192, 192, 192), 'stderr': (255, 64, 64),
+                      'stdin': (192, 192, 192)}
+
     @gui_locked
     def console_write(self, console, text, stream="stdout"):
-        """Write to a process's console (thread-safe)"""
-        color = {"stderr": (255, 64, 64), "stdin": (64, 255, 64)}.get(stream, (192, 192, 192))
+        """Write to a process's console (thread-safe); text without a final LF
+        leaves the line open, so later output (or typed input) continues it"""
+        color = self.CONSOLE_COLORS.get(stream, self.CONSOLE_COLORS['stdout'])
         
         # CR has no glyph; console lines are split on LF only
         text = text.replace('\r\n', '\n').replace('\r', '')
 
-        # Split into lines; a trailing LF ends the last line, it doesn't add an empty one
-        lines = text.split('\n')
-        if lines[-1] == '':
-            lines.pop()
-        for line in lines:
-            console.lines.append({
-                'text': line,
-                'color': color,
-                'stream': stream
-            })
+        for i, part in enumerate(text.split('\n')):
+            if i > 0:
+                # LF: end the open line, or add an empty one at a line start
+                if not console.line_open:
+                    console.lines.append([])
+                console.line_open = False
+            if part:
+                if console.line_open:
+                    console.lines[-1].append((part, color))
+                else:
+                    console.lines.append([(part, color)])
+                    console.line_open = True
         
         # Check maximum line count
         del console.lines[:-FakeConsole.MAX_LINES]
@@ -12878,13 +12909,6 @@ class CPUEmulator:
 
 def main():
     """Main function"""
-    print(f"{Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════════╗")
-    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
-    print(f"{Fore.CYAN}{Style.BRIGHT}║{f'Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}':^58}║")
-    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
-    print(f"{Fore.CYAN}{Style.BRIGHT}╚══════════════════════════════════════════════════════════╝")
-    print(f"{Style.RESET_ALL}")
-
     import argparse
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
@@ -12915,6 +12939,8 @@ def main():
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
                         help="Don't run create_c_drive_environment.sh at startup")
+    parser.add_argument("--logfile", metavar="FILE",
+                        help="Also write the console output to FILE (without colors)")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true",
                            help="Show debug output (every API call, disassembly)")
@@ -12922,6 +12948,24 @@ def main():
                            help="Show only program output, warnings and errors")
 
     args = parser.parse_args()
+
+    if args.logfile:
+        try:
+            logfile = open(args.logfile, 'w', encoding='utf-8', errors='replace',
+                           buffering=1)
+        except OSError as e:
+            log.error(f"Cannot open log file {args.logfile}: {e}")
+            sys.exit(1)
+        lock = threading.Lock()
+        sys.stdout = LogFileTee(sys.stdout, logfile, lock)
+        sys.stderr = LogFileTee(sys.stderr, logfile, lock)
+
+    print(f"{Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════════╗")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{f'Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}':^58}║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}╚══════════════════════════════════════════════════════════╝")
+    print(f"{Style.RESET_ALL}")
 
     if args.verbose:
         DebugLogger.level = DebugLogger.DEBUG
