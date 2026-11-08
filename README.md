@@ -25,11 +25,13 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 ## Folder Structure
 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
-- `c_drive/Windows/Demos/` - Compiled example EXEs (`C:\Windows\Demos`)
+- `c_drive/Windows/Examples/` - Compiled example EXEs (`C:\Windows\Examples`)
 - `examples/` - Example C source codes
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
-- `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Demos/`
-- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders (`--all` deletes the whole `c_drive/` after confirmation)
+- `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Examples/`
+- `scripts/remove_examples.sh` - Script to remove the compiled examples
+- `scripts/test_examples.sh` - Script to compile the examples and run each one in the emulator without the GUI (exit code: number of failed examples)
+- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders
 - `winexe32emu.py` - The main script
 
 ## Features

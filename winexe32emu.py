@@ -57,12 +57,12 @@ DEFAULT_ENVIRONMENT = {
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 
-# Emulated folder holding the example programs (c_drive/Windows/Demos/)
-DEMOS_FOLDER = 'C:\\Windows\\Demos'
+# Emulated folder holding the example programs (c_drive/Windows/Examples/)
+EXAMPLES_FOLDER = 'C:\\Windows\\Examples'
 
 # Folders searched for a bare EXE name (command line) and listed in the
 # Start menu, in this order
-PROGRAM_FOLDERS = ('C:\\', DEMOS_FOLDER)
+PROGRAM_FOLDERS = ('C:\\', EXAMPLES_FOLDER)
 
 # Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
 # default because MinGW emits string literals as UTF-8; set via --codepage
@@ -561,8 +561,8 @@ def environment_folders(environment):
 
 def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
     """Create the folders named by the environment (C:\\Windows, ...) and the
-    demo folder (C:\\Windows\\Demos) in c_drive/."""
-    for folder in environment_folders(environment) + [DEMOS_FOLDER]:
+    examples folder (C:\\Windows\\Examples) in c_drive/."""
+    for folder in environment_folders(environment) + [EXAMPLES_FOLDER]:
         path = resolve_c_drive_path(folder)
         if path is None:
             continue
@@ -573,9 +573,10 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
 
-# Startup scripts: c_drive/ folders, and the demos compiled into C:\Windows\Demos
+# Startup scripts: c_drive/ folders, and the examples compiled into C:\Windows\Examples
 CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "create_c_drive_environment.sh")
 COMPILE_EXAMPLES_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "compile_examples.sh")
+REMOVE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "remove_c_drive_environment.sh")
 
 
 def run_setup_script(script, title):
@@ -607,9 +608,9 @@ def _program_folder_host_path(folder):
 def find_program(name):
     """Host path of the EXE to run, or None if it does not exist.
 
-    A Windows path (C:\\Windows\\Demos\\gdi_demo.exe, Windows\\Demos\\...)
+    A Windows path (C:\\Windows\\Examples\\gdi_example.exe, Windows\\Examples\\...)
     is resolved inside c_drive/; a bare file name is searched in
-    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Demos).
+    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Examples).
     """
     if not name:
         return None
@@ -3660,7 +3661,7 @@ class WinAPIHandler:
     # Classic Windows colors for GetSysColor, as (r, g, b)
     SYS_COLORS = {
         0: (212, 208, 200),   # COLOR_SCROLLBAR
-        1: (0, 128, 128),     # COLOR_BACKGROUND (desktop)
+        1: (58, 110, 165),    # COLOR_BACKGROUND (desktop)
         2: (0, 0, 128),       # COLOR_ACTIVECAPTION
         3: (128, 128, 128),   # COLOR_INACTIVECAPTION
         4: (212, 208, 200),   # COLOR_MENU
@@ -6467,7 +6468,7 @@ class WinAPIHandler:
         idx = haystack.find(needle)
         if idx == -1:
             return 0
-        # byte offset (haystack is decoded, but ASCII demos map 1:1)
+        # byte offset (haystack is decoded, but ASCII examples map 1:1)
         return hay_addr + len(haystack[:idx].encode(ANSI_CODEPAGE, errors='replace'))
 
     def strncmp(self, args):
@@ -9856,7 +9857,7 @@ class PseudoWindowsGUI:
     """Pygame-based fake Windows GUI environment"""
     
     # Windows colors
-    COLOR_DESKTOP = (0, 128, 128)  # Classic teal
+    COLOR_DESKTOP = (58, 110, 165)  # #3a6ea5, Windows 2000 blue
     COLOR_WINDOW_BG = (240, 240, 240)
     COLOR_TITLE_BAR = (0, 0, 128)  # Classic blue
     COLOR_TITLE_BAR_INACTIVE = (128, 128, 128)
@@ -9905,13 +9906,13 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
-        # Start menu: open flag, rows (C:\ programs, then a Demos submenu
-        # listing C:\Windows\Demos), and the callback that runs one (set by main)
+        # Start menu: open flag, rows (C:\ programs, then an Examples submenu
+        # listing C:\Windows\Examples), and the callback that runs one (set by main)
         self.start_menu_open = False
         self.start_menu_rows = []
-        self.start_menu_demos = []
+        self.start_menu_examples = []
         self.start_submenu_open = False
-        self.show_demos = True  # False with --no-demos: no Demos submenu
+        self.show_examples = True  # False with --no-examples: no Examples submenu
         self.launcher = None
 
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
@@ -10107,14 +10108,15 @@ class PseudoWindowsGUI:
         return pygame.Rect(2, self.height - 28, 60, 26)
 
     def _fill_start_menu(self):
-        """Read the Start menu rows: C:\\ programs, then the Demos submenu"""
+        """Read the Start menu rows: C:\\ programs, then the Examples submenu"""
         programs = list_programs()
-        self.start_menu_demos = programs.get(DEMOS_FOLDER, []) if self.show_demos else []
+        self.start_menu_examples = (programs.get(EXAMPLES_FOLDER, [])
+                                    if self.show_examples else [])
         rows = [('program', path) for path in programs.get('C:\\', [])]
-        if self.start_menu_demos:
+        if self.start_menu_examples:
             if rows:
                 rows.append(('separator', None))
-            rows.append(('demos', None))
+            rows.append(('examples', None))
         self.start_menu_rows = rows or [('empty', None)]
         self.start_submenu_open = False
 
@@ -10132,20 +10134,20 @@ class PseudoWindowsGUI:
             y += h
         return menu, rects
 
-    def _start_submenu_rects(self, demos_rect):
-        """Demos submenu rect (right of its row) and its item rects"""
-        count = len(self.start_menu_demos)
+    def _start_submenu_rects(self, examples_rect):
+        """Examples submenu rect (right of its row) and its item rects"""
+        count = len(self.start_menu_examples)
         sub_h = count * self.START_ITEM_H + 6
-        top = max(0, min(demos_rect.y - 3, self.height - 30 - sub_h))
-        sub = pygame.Rect(demos_rect.right + 2, top, self.START_MENU_W, sub_h)
+        top = max(0, min(examples_rect.y - 3, self.height - 30 - sub_h))
+        sub = pygame.Rect(examples_rect.right + 2, top, self.START_MENU_W, sub_h)
         rects = [pygame.Rect(sub.x + 3, sub.y + 3 + i * self.START_ITEM_H,
                              sub.width - 6, self.START_ITEM_H)
                  for i in range(count)]
         return sub, rects
 
-    def _demos_row_rect(self, rects):
+    def _examples_row_rect(self, rects):
         for (kind, _), rect in zip(self.start_menu_rows, rects):
-            if kind == 'demos':
+            if kind == 'examples':
                 return rect
         return None
 
@@ -10172,7 +10174,7 @@ class PseudoWindowsGUI:
         return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
 
     def _draw_start_menu(self):
-        """Draw the Start menu: C:\\ programs and a Demos submenu (C:\\Windows\\Demos)"""
+        """Draw the Start menu: C:\\ programs and an Examples submenu (C:\\Windows\\Examples)"""
         if not self.start_menu_open:
             return
         menu, rects = self._start_menu_rects()
@@ -10181,15 +10183,15 @@ class PseudoWindowsGUI:
         pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
 
         mouse_pos = pygame.mouse.get_pos()
-        demos_rect = self._demos_row_rect(rects)
-        sub, sub_rects = (self._start_submenu_rects(demos_rect) if demos_rect
+        examples_rect = self._examples_row_rect(rects)
+        sub, sub_rects = (self._start_submenu_rects(examples_rect) if examples_rect
                           else (None, []))
 
-        # Hovering a row opens the Demos submenu or closes it
+        # Hovering a row opens the Examples submenu or closes it
         if not (sub and self.start_submenu_open and sub.collidepoint(mouse_pos)):
             for (kind, _), rect in zip(self.start_menu_rows, rects):
                 if rect.collidepoint(mouse_pos) and kind != 'separator':
-                    self.start_submenu_open = (kind == 'demos')
+                    self.start_submenu_open = (kind == 'examples')
 
         for (kind, path), rect in zip(self.start_menu_rows, rects):
             if kind == 'separator':
@@ -10201,8 +10203,8 @@ class PseudoWindowsGUI:
             elif kind == 'empty':
                 text = self.font.render("(no programs found)", True, (128, 128, 128))
                 self.screen.blit(text, (rect.x + 6, rect.y + 3))
-            elif kind == 'demos':
-                color = self._draw_menu_row(rect, "Demos", self.start_submenu_open)
+            elif kind == 'examples':
+                color = self._draw_menu_row(rect, "Examples", self.start_submenu_open)
                 # Submenu arrow
                 ax, ay = rect.right - 12, rect.centery
                 pygame.draw.polygon(self.screen, color,
@@ -10213,7 +10215,7 @@ class PseudoWindowsGUI:
 
         if sub and self.start_submenu_open:
             self._draw_menu_panel(sub)
-            for path, rect in zip(self.start_menu_demos, sub_rects):
+            for path, rect in zip(self.start_menu_examples, sub_rects):
                 self._draw_menu_row(rect, self._program_label(path),
                                     rect.collidepoint(mouse_pos))
 
@@ -10230,16 +10232,16 @@ class PseudoWindowsGUI:
             return False
 
         menu, rects = self._start_menu_rects()
-        demos_rect = self._demos_row_rect(rects)
-        if demos_rect and self.start_submenu_open:
-            sub, sub_rects = self._start_submenu_rects(demos_rect)
+        examples_rect = self._examples_row_rect(rects)
+        if examples_rect and self.start_submenu_open:
+            sub, sub_rects = self._start_submenu_rects(examples_rect)
             if sub.collidepoint(pos):
-                for path, rect in zip(self.start_menu_demos, sub_rects):
+                for path, rect in zip(self.start_menu_examples, sub_rects):
                     if button == 1 and rect.collidepoint(pos) and self.launcher:
                         self.start_menu_open = False
                         self.launcher(path)
                 return True
-        if demos_rect and demos_rect.collidepoint(pos):
+        if examples_rect and examples_rect.collidepoint(pos):
             self.start_submenu_open = True
             return True
 
@@ -12886,11 +12888,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Demos/ "
-               "(C:\\Windows\\Demos).\nExample: python3 winexe32emu.py gdi_demo.exe"
+        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Examples/ "
+               "(C:\\Windows\\Examples).\nExample: python3 winexe32emu.py gdi_example.exe"
     )
     parser.add_argument("exe", nargs="?",
-                        help="PE file to run: a name in C:\\ or C:\\Windows\\Demos, or a "
+                        help="PE file to run: a name in C:\\ or C:\\Windows\\Examples, or a "
                              "Windows path inside c_drive/; optional with the GUI, "
                              "programs can also be started from the Start menu")
     parser.add_argument("-n", "--max-instructions", type=int, default=0,
@@ -12903,9 +12905,12 @@ def main():
     parser.add_argument("--codepage", default="utf-8",
                         help="ANSI code page for 'A' APIs and CRT strings "
                              "(default: utf-8; e.g. cp1254, cp1252)")
-    parser.add_argument("--no-demos", action="store_true",
+    parser.add_argument("--clean", action="store_true",
+                        help="Only delete c_drive/ (scripts/remove_c_drive_environment.sh "
+                             "--all, asks for confirmation) and exit")
+    parser.add_argument("--no-examples", action="store_true",
                         help="Don't compile the examples (compile_examples.sh) and "
-                             "don't show the Demos submenu in the Start menu")
+                             "don't show the Examples submenu in the Start menu")
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
                         help="Don't run create_c_drive_environment.sh at startup")
@@ -12929,11 +12934,20 @@ def main():
         log.error(f"Unknown code page: {args.codepage}")
         sys.exit(1)
 
+    if args.clean:
+        # Interactive: the script asks before deleting everything in c_drive/
+        try:
+            result = subprocess.run(['sh', REMOVE_C_DRIVE_SCRIPT, '--all'], cwd=SCRIPT_DIR)
+        except OSError as e:
+            log.error(f"Cannot run {REMOVE_C_DRIVE_SCRIPT}: {e}")
+            sys.exit(1)
+        sys.exit(result.returncode)
+
     use_gui = not args.no_gui
 
     if not args.no_create_environment:
         run_setup_script(CREATE_C_DRIVE_SCRIPT, "Creating C Drive Environment")
-    if not args.no_demos:
+    if not args.no_examples:
         run_setup_script(COMPILE_EXAMPLES_SCRIPT, "Compiling Examples")
     create_environment_folders()
 
@@ -12961,7 +12975,7 @@ def main():
     if use_gui and PYGAME_AVAILABLE:
         log.header("Starting Pygame GUI")
         gui = PseudoWindowsGUI(1024, 768)
-        gui.show_demos = not args.no_demos
+        gui.show_examples = not args.no_examples
         if gui.start():
             log.success("Pygame GUI window opened!")
         else:

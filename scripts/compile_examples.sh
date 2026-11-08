@@ -16,8 +16,8 @@
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-# Demo programs live in C:\Windows\Demos of the emulated C drive
-OUT_DIR=c_drive/Windows/Demos
+# Example programs live in C:\Windows\Examples of the emulated C drive
+OUT_DIR=c_drive/Windows/Examples
 mkdir -p "$OUT_DIR" || exit 1
 
 CFLAGS="-Wall -Wextra -Wno-unused-parameter"
@@ -27,27 +27,27 @@ for src in examples/*.c; do
     name=$(basename "$src" .c)
 
     case "$name" in
-        console_demo)
+        console_example)
             # Console application - uses AllocConsole, kernel32 only
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -mwindows
             ;;
-        file_demo)
+        file_example)
             # Console application - sandboxed file I/O (kernel32 + user32 + msvcrt)
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -mconsole
             ;;
-        sound_demo)
+        sound_example)
             # Console application - Beep / MessageBeep / PlaySound (winmm)
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -lwinmm -mconsole
             ;;
-        sysinfo_demo)
+        sysinfo_example)
             # Console application - system information APIs
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -ladvapi32 -mconsole
             ;;
-        crt_demo)
+        crt_example)
             # Console application - C runtime (msvcrt) coverage tests
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -mconsole

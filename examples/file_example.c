@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-File I/O demo - exercises the emulator's sandboxed file support.
+File I/O example - exercises the emulator's sandboxed file support.
 
 Everything happens inside the emulated C: drive (the host c_drive/ folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
@@ -118,36 +118,36 @@ int main(void)
     /* Environment folders (created by the emulator at startup) */
     if (GetTempPathA(sizeof(dir), dir))  /* "C:\\Windows\\Temp\\" */
     {
-        wsprintfA(path, "%sfile_demo.tmp", dir);
+        wsprintfA(path, "%sfile_example.tmp", dir);
         WriteFileIn(hOut, path, "Temporary data\n");
     }
     if (GetWindowsDirectoryA(dir, sizeof(dir)))  /* "C:\\Windows" */
     {
-        wsprintfA(path, "%s\\file_demo.ini", dir);
-        WriteFileIn(hOut, path, "[file_demo]\nenabled=1\n");
+        wsprintfA(path, "%s\\file_example.ini", dir);
+        WriteFileIn(hOut, path, "[file_example]\nenabled=1\n");
     }
 
     /* New nested directories: Win32 CreateDirectoryA and CRT _mkdir */
-    CreateDirectoryA("C:\\FileDemo", NULL);
-    CreateDirectoryA("C:\\FileDemo\\Data", NULL);
-    WriteFileIn(hOut, "C:\\FileDemo\\readme.txt", "File demo directory\n");
-    WriteFileIn(hOut, "C:\\FileDemo\\Data\\data.txt", "1 2 3\n");
+    CreateDirectoryA("C:\\FileExample", NULL);
+    CreateDirectoryA("C:\\FileExample\\Data", NULL);
+    WriteFileIn(hOut, "C:\\FileExample\\readme.txt", "File example directory\n");
+    WriteFileIn(hOut, "C:\\FileExample\\Data\\data.txt", "1 2 3\n");
 
-    _mkdir("C:\\FileDemo\\Logs");
-    fp = fopen("C:\\FileDemo\\Logs\\log.txt", "w");
+    _mkdir("C:\\FileExample\\Logs");
+    fp = fopen("C:\\FileExample\\Logs\\log.txt", "w");
     if (fp)
     {
         fprintf(fp, "log entry %d\n", 1);
         fclose(fp);
-        WriteString(hOut, "(Dir) 'C:\\FileDemo\\Logs\\log.txt' has been written!\n");
+        WriteString(hOut, "(Dir) 'C:\\FileExample\\Logs\\log.txt' has been written!\n");
     }
 
-    fp = fopen("C:\\FileDemo\\Data\\data.txt", "r");
+    fp = fopen("C:\\FileExample\\Data\\data.txt", "r");
     if (fp)
     {
         if (fgets(buffer, sizeof(buffer), fp))
         {
-            WriteString(hOut, "(Dir) 'C:\\FileDemo\\Data\\data.txt' has been read!\n");
+            WriteString(hOut, "(Dir) 'C:\\FileExample\\Data\\data.txt' has been read!\n");
             WriteString(hOut, buffer);
         }
         fclose(fp);

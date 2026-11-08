@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-Console demo - covers the emulator's console features in one program:
+Console example - covers the emulator's console features in one program:
 AllocConsole, GetStdHandle, WriteConsoleA, WriteFile, ReadConsoleA
 (with ReadFile fallback), lstr* string functions and ExitProcess.
 */

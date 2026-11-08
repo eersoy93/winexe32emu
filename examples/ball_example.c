@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-Ball demo - a small paddle-and-ball game showing the emulator's game-loop
+Ball example - a small paddle-and-ball game showing the emulator's game-loop
 features: a PeekMessageA-based real-time main loop, GetAsyncKeyState polling
 (left/right arrows move the paddle), double buffering with
 CreateCompatibleDC / CreateCompatibleBitmap / BitBlt, and Sleep-paced frames.
@@ -26,7 +26,7 @@ ball trail, a glowing highlighted ball, a rounded paddle and a HUD bar.
 
 #include <windows.h>
 
-static const char* CLASS_NAME = "BallDemoClass";
+static const char* CLASS_NAME = "BallExampleClass";
 
 #define BALL_SIZE     24
 #define PADDLE_W      96
@@ -271,7 +271,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     HWND hwnd = CreateWindowExA(
-        0, CLASS_NAME, "Ball Demo",
+        0, CLASS_NAME, "Ball Example",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         480, 360,

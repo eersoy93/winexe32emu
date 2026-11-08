@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-Scroll demo - SCROLLBAR controls, StretchBlt and GetPixel in one program:
+Scroll example - SCROLLBAR controls, StretchBlt and GetPixel in one program:
 a small scene is drawn into a memory DC and StretchBlt-scaled into the
 window. The horizontal scrollbar zooms the scene (50%..250%), the
 vertical scrollbar pans it up and down. WM_HSCROLL/WM_VSCROLL handle
@@ -26,7 +26,7 @@ for the status line.
 
 #include <windows.h>
 
-static const char* CLASS_NAME = "ScrollDemoClass";
+static const char* CLASS_NAME = "ScrollExampleClass";
 
 // Control identifiers
 #define IDC_VSCROLL 101
@@ -299,7 +299,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     // WS_CLIPCHILDREN keeps the zoomed scene from painting over the scrollbars
-    hwnd = CreateWindowExA(0, CLASS_NAME, "Scroll Demo",
+    hwnd = CreateWindowExA(0, CLASS_NAME, "Scroll Example",
                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                            120, 80, 560, 420,
                            NULL, NULL, hInstance, NULL);

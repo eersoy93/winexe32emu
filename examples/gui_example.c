@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-GUI demo - a single, sectioned tour of the emulator's window & control APIs:
+GUI example - a single, sectioned tour of the emulator's window & control APIs:
 
   - Menu bar with dropdowns and a separator (CreateMenu / CreatePopupMenu /
     AppendMenuA / SetMenu / DrawMenuBar) plus WM_COMMAND from menu items.
@@ -38,7 +38,7 @@ Press ESC to quit.
 #include <ctype.h>
 #include <limits.h>
 
-static const char* CLASS_NAME = "GUIDemoClass";
+static const char* CLASS_NAME = "GUIExampleClass";
 
 /* ---- Control identifiers (grouped by section) ---- */
 #define IDC_NAME_EDIT   101
@@ -536,7 +536,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 case IDM_FILE_EXIT:   DestroyWindow(hwnd);   break;
                 case IDM_HELP_ABOUT:
                     MessageBoxA(hwnd,
-                        "winexe32emu - GUI Demo",
+                        "winexe32emu - GUI Example",
                         "About", MB_OK | MB_ICONINFORMATION);
                     break;
 
@@ -609,7 +609,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     HWND hwnd = CreateWindowExA(
-        0, CLASS_NAME, "GUI Demo",
+        0, CLASS_NAME, "GUI Example",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         480, 430,

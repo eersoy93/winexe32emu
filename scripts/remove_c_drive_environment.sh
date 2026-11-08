@@ -43,12 +43,10 @@ if [ "$1" = "--all" ]; then
 fi
 
 # Compiled examples
-for src in examples/*.c; do
-    rm -f "${C_DRIVE}/Windows/Demos/$(basename "$src" .c).exe"
-done
+sh scripts/remove_examples.sh >/dev/null || exit 1
 
 # Deepest folders first; rmdir only removes empty ones
-for dir in Windows/Demos Windows/Temp Windows/System32 Windows ""; do
+for dir in Windows/Temp Windows/System32 Windows ""; do
     rmdir "${C_DRIVE}/${dir}" 2>/dev/null
 done
 

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-Paint demo - a tiny paint program that exercises the emulator's mouse
+Paint example - a tiny paint program that exercises the emulator's mouse
 and utility APIs: WM_MOUSEMOVE with MK_LBUTTON dragging, mouse capture
 (SetCapture/ReleaseCapture), RECT helpers (SetRect, PtInRect,
 InflateRect), FrameRect/PatBlt fills, GetLocalTime clock display and
@@ -29,7 +29,7 @@ pen color (the "?" slot picks a random color), right-click clears.
 #include <stdlib.h>
 #include <time.h>
 
-static const char* CLASS_NAME = "PaintDemoClass";
+static const char* CLASS_NAME = "PaintExampleClass";
 
 // Palette layout
 #define PALETTE_COUNT  8
@@ -358,7 +358,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    hwnd = CreateWindowExA(0, CLASS_NAME, "Paint Demo",
+    hwnd = CreateWindowExA(0, CLASS_NAME, "Paint Example",
                            WS_OVERLAPPEDWINDOW,
                            140, 90, 520, 420,
                            NULL, NULL, hInstance, NULL);

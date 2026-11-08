@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-GDI demo - a small "graphics gallery" that shows off the emulator's drawing
+GDI example - a small "graphics gallery" that shows off the emulator's drawing
 features in a composed layout:
 
   - CreateFontA at several sizes with bold / italic / underline styles, and a
@@ -30,7 +30,7 @@ Press ESC to quit.
 
 #include <windows.h>
 
-static const char* CLASS_NAME = "GdiDemoClass";
+static const char* CLASS_NAME = "GdiExampleClass";
 
 #define CARD_W 152
 #define CARD_H 150
@@ -326,7 +326,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     HWND hwnd = CreateWindowExA(
-        0, CLASS_NAME, "GDI Demo",
+        0, CLASS_NAME, "GDI Example",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         700, 480,
