@@ -30,8 +30,8 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
 - `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Examples/`
 - `scripts/remove_examples.sh` - Script to remove the compiled examples
-- `scripts/test_examples.sh` - Script to compile the examples and run each one in the emulator without the GUI (exit code: number of failed examples)
 - `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders
+- `scripts/test_examples.sh` - Script to compile the examples and run each one in the emulator without the GUI (exit code: number of failed examples)
 - `winexe32emu.py` - The main script
 
 ## Features
