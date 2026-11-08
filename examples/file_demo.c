@@ -20,16 +20,39 @@ File I/O demo - exercises the emulator's sandboxed file support.
 Everything happens inside the emulated C: drive (the host c_drive/ folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
   2. msvcrt fopen/fwrite/fgets round-trip.
-  3. A sandbox-escape attempt ("..\\escape.txt") that must be refused.
+  3. Files inside directories: the environment folders created at startup
+     (C:\\Windows\\Temp, C:\\Windows) and new nested directories.
+  4. A sandbox-escape attempt ("..\\escape.txt") that must be refused.
 */
 
 #include <windows.h>
 #include <stdio.h>
+#include <direct.h>
 
 static void WriteString(HANDLE hOut, const char *text)
 {
     DWORD written = 0;
     WriteFile(hOut, text, (DWORD)lstrlenA(text), &written, NULL);
+}
+
+/* Write a small text file with the Win32 API and report the result */
+static void WriteFileIn(HANDLE hOut, const char *path, const char *text)
+{
+    char line[MAX_PATH + 64];
+    DWORD written = 0;
+    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        WriteFile(hFile, text, (DWORD)lstrlenA(text), &written, NULL);
+        CloseHandle(hFile);
+        wsprintfA(line, "(Dir) '%s' has been written!\n", path);
+    }
+    else
+    {
+        wsprintfA(line, "(Dir) '%s' couldn't be created!\n", path);
+    }
+    WriteString(hOut, line);
 }
 
 int main(void)
@@ -88,7 +111,48 @@ int main(void)
         fclose(fp);
     }
 
-    /* ---- 3. Sandbox escape must be refused ---- */
+    /* ---- 3. Files inside directories ---- */
+    char dir[MAX_PATH], path[MAX_PATH];
+
+    /* Environment folders (created by the emulator at startup) */
+    if (GetTempPathA(sizeof(dir), dir))  /* "C:\\Windows\\Temp\\" */
+    {
+        wsprintfA(path, "%sfile_demo.tmp", dir);
+        WriteFileIn(hOut, path, "Temporary data\n");
+    }
+    if (GetWindowsDirectoryA(dir, sizeof(dir)))  /* "C:\\Windows" */
+    {
+        wsprintfA(path, "%s\\file_demo.ini", dir);
+        WriteFileIn(hOut, path, "[file_demo]\nenabled=1\n");
+    }
+
+    /* New nested directories: Win32 CreateDirectoryA and CRT _mkdir */
+    CreateDirectoryA("C:\\FileDemo", NULL);
+    CreateDirectoryA("C:\\FileDemo\\Data", NULL);
+    WriteFileIn(hOut, "C:\\FileDemo\\readme.txt", "File demo directory\n");
+    WriteFileIn(hOut, "C:\\FileDemo\\Data\\data.txt", "1 2 3\n");
+
+    _mkdir("C:\\FileDemo\\Logs");
+    fp = fopen("C:\\FileDemo\\Logs\\log.txt", "w");
+    if (fp)
+    {
+        fprintf(fp, "log entry %d\n", 1);
+        fclose(fp);
+        WriteString(hOut, "(Dir) 'C:\\FileDemo\\Logs\\log.txt' has been written!\n");
+    }
+
+    fp = fopen("C:\\FileDemo\\Data\\data.txt", "r");
+    if (fp)
+    {
+        if (fgets(buffer, sizeof(buffer), fp))
+        {
+            WriteString(hOut, "(Dir) 'C:\\FileDemo\\Data\\data.txt' has been read!\n");
+            WriteString(hOut, buffer);
+        }
+        fclose(fp);
+    }
+
+    /* ---- 4. Sandbox escape must be refused ---- */
     hFile = CreateFileA("..\\escape.txt", GENERIC_WRITE, 0, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
