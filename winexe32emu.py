@@ -1120,6 +1120,8 @@ class WinAPIHandler:
 
         # GDI object/DC state (all touched only on the emulation thread)
         self.gdi_objects = {}  # handle -> {'type': 'pen'|'brush', 'color': (r,g,b), 'width': int}
+        self._bits_cache = {}  # (width, height, bpp, bits) -> RGB of CreateBitmap
+        self._dib_cache = {}   # GetDIBits request + display list -> (bits, data refs)
         self.dc_map = {}       # hdc -> hwnd the DC draws into
         self.dc_state = {}     # hdc -> {'pen','brush','pos','text_color','bk_mode','bk_color'}
         self._stock_objects = {}  # GetStockObject index -> handle
@@ -7425,7 +7427,10 @@ class WinAPIHandler:
         now = time.time()
         for (hwnd, timer_id), timer in self.timers.items():
             if now >= timer['next_fire'] and matches(hwnd, self.WM_TIMER):
-                timer['next_fire'] = now + timer['elapse']
+                # Keep the period on its grid so polling delays don't slow the timer
+                timer['next_fire'] += timer['elapse']
+                if timer['next_fire'] <= now:
+                    timer['next_fire'] = now + timer['elapse']
                 return (hwnd, timer_id, timer['callback'])
         return None
 
@@ -9012,6 +9017,15 @@ class WinAPIHandler:
         log.debug(f"LoadBitmapA({name!r}) -> 0x{handle:x} ({width}x{height})")
         return handle
 
+    BITS_CACHE_SIZE = 8
+    DIB_CACHE_SIZE = 64        # Entries of at most DIB_CACHE_MAX_BYTES each
+    DIB_CACHE_MAX_BYTES = 65536
+
+    # b'0'/b'1' bit characters -> black/white channel bytes
+    _BIT_TO_GRAY = bytes.maketrans(b'01', b'\x00\xff')
+    # Palette index bytes -> hex digit characters (for 4 bpp packing)
+    _INDEX_TO_HEX = bytes.maketrans(bytes(range(16)), b'0123456789abcdef')
+
     def CreateBitmap(self, args):
         """CreateBitmap emulation - monochrome (1 bpp) or 24/32 bpp bits"""
         width, height = self._read_signed_args(args, 0, 2)
@@ -9026,17 +9040,35 @@ class WinAPIHandler:
                 bits = bytes(self.emu.uc.mem_read(lpBits, stride * height))
             except UcError:
                 return 0
-            rows = []
-            for r in range(height):
-                line = bits[r * stride:(r + 1) * stride]
-                if bpp == 1:
-                    rows.append(b''.join(b'\xff\xff\xff' if line[i >> 3] & (0x80 >> (i & 7))
-                                         else b'\x00\x00\x00' for i in range(width)))
-                else:
-                    step = bpp // 8
-                    rows.append(b''.join(bytes((line[i * step + 2], line[i * step + 1],
-                                                line[i * step])) for i in range(width)))
-            rgb = b''.join(rows)
+            # Shared picture for equal bits, so GetDIBits' cache can recognize it
+            key = (width, height, bpp, bits)
+            rgb = self._bits_cache.get(key)
+            if rgb is not None:
+                handle = self._new_bitmap(width, height, 1 if bpp == 1 else 32, rgb)
+                log.debug(f"CreateBitmap({width}, {height}, {bpp} bpp) -> 0x{handle:x}")
+                return handle
+            out = bytearray(width * height * 3)
+            if bpp == 1:
+                digits = format(int.from_bytes(bits, 'big'), f'0{len(bits) * 8}b')
+                if stride * 8 != width:
+                    digits = ''.join(digits[r * stride * 8:r * stride * 8 + width]
+                                     for r in range(height))
+                gray = digits.encode().translate(self._BIT_TO_GRAY)
+                out[0::3] = out[1::3] = out[2::3] = gray
+            else:
+                row = width * 3
+                step = bpp // 8
+                end = width * step
+                for r in range(height):
+                    line = bits[r * stride:(r + 1) * stride]
+                    base = r * row
+                    out[base:base + row:3] = line[2:end:step]
+                    out[base + 1:base + row:3] = line[1:end:step]
+                    out[base + 2:base + row:3] = line[0:end:step]
+            rgb = bytes(out)
+            if len(self._bits_cache) >= self.BITS_CACHE_SIZE:
+                del self._bits_cache[next(iter(self._bits_cache))]
+            self._bits_cache[key] = rgb
         handle = self._new_bitmap(width, height, 1 if bpp == 1 else 32, rgb)
         log.debug(f"CreateBitmap({width}, {height}, {bpp} bpp) -> 0x{handle:x}")
         return handle
@@ -9293,17 +9325,37 @@ class WinAPIHandler:
         state['stretch_mode'] = args[1]
         return previous
 
+    def _bitmap_shapes(self, hbm, bmp):
+        """Display list of a bitmap; when selected, the DC has the live drawing"""
+        for state in self.dc_state.values():
+            if state.get('memory') and state.get('bitmap') == hbm:
+                return state['shapes']
+        return bmp['shapes']
+
+    @staticmethod
+    def _shapes_key(shapes):
+        """(hashable key, image data objects) of a display list. Image data is
+        keyed by identity, so the caller must keep the data objects alive."""
+        parts, refs = [], []
+        for shape in shapes:
+            items = []
+            for name, value in shape.items():
+                if name == '_surface':
+                    continue
+                if name == 'data':
+                    refs.append(value)
+                    value = id(value)
+                items.append((name, value))
+            parts.append(repr(items))
+        return '\n'.join(parts), refs
+
     def _bitmap_rgb(self, hbm):
         """Top-down RGB pixels of a bitmap object, rendered from its display list"""
         bmp = self.gdi_objects.get(hbm)
         if not bmp or bmp['type'] != 'bitmap':
             return None
         width, height = bmp['width'], bmp['height']
-        shapes = bmp['shapes']
-        for state in self.dc_state.values():
-            if state.get('memory') and state.get('bitmap') == hbm:
-                shapes = state['shapes']  # Selected: the DC has the live drawing
-                break
+        shapes = self._bitmap_shapes(hbm, bmp)
         if (len(shapes) == 1 and shapes[0]['type'] == 'image' and shapes[0]['pos'] == (0, 0)
                 and shapes[0]['dim'] == shapes[0]['size'] == (width, height)
                 and shapes[0].get('rop') == self.SRCCOPY):
@@ -9341,9 +9393,6 @@ class WinAPIHandler:
         if bpp not in (1, 4, 8, 24, 32):
             log.warning(f"GetDIBits: {bpp} bpp output is not supported")
             return 0
-        rgb = self._bitmap_rgb(hbm)
-        if rgb is None:
-            return 0
         stride = ((width * bpp + 31) // 32) * 4
         step = bpp // 8
         bottom_up = req_height >= 0
@@ -9368,30 +9417,67 @@ class WinAPIHandler:
                 table = b''.join(bytes((b, g, r, 0)) for r, g, b in palette)
             self._mem_write(lpbmi + hdr_size, table)
             self._mem_write(lpbmi + 32, struct.pack('<I', len(palette)))  # biClrUsed
-            nearest = {}
 
-            def index_of(color):
-                index = nearest.get(color)
-                if index is None:
+        # Programs often re-read the same picture (e.g. text drawn into a bitmap)
+        shapes_key, refs = self._shapes_key(self._bitmap_shapes(hbm, bmp))
+        key = (width, height, bmp.get('bpp'), bpp, bottom_up, start, lines,
+               tuple(map(tuple, palette)) if palette else None, shapes_key)
+        cached = self._dib_cache.get(key)
+        if cached is not None:
+            return lines if self._mem_write(lpvBits, cached[0]) else 0
+        rgb = self._bitmap_rgb(hbm)
+        if rgb is None:
+            return 0
+        if palette is not None:
+            class Nearest(dict):
+                def __missing__(cache, color):
                     index = min(range(len(palette)), key=lambda i: sum(
                         (a - b) ** 2 for a, b in zip(palette[i], color)))
-                    nearest[color] = index
-                return index
+                    cache[color] = index
+                    return index
+            index_of = Nearest().__getitem__
+            reds = rgb[0::3]
+            if reds == rgb[1::3] == rgb[2::3]:
+                # Gray image (e.g. monochrome bitmaps): map the levels with one table
+                gray = bytearray(256)
+                for level in set(reds):
+                    gray[level] = index_of((level, level, level))
+                indices = reds.translate(gray)
+            else:
+                indices = bytes(map(index_of, zip(reds, rgb[1::3], rgb[2::3])))
+            row_bytes = (width * bpp + 7) // 8
+
+            def pack(row_indices, nbytes):
+                if bpp == 8:
+                    return row_indices
+                digits = row_indices.translate(self._INDEX_TO_HEX).ljust(
+                    nbytes * 8 // bpp, b'0')
+                if bpp == 1:
+                    return int(digits, 2).to_bytes(nbytes, 'big')
+                return bytes.fromhex(digits.decode())
+
+            packed = None
+            if width * bpp % 8 == 0:
+                packed = pack(indices, row_bytes * height)
         for i in range(lines):
             scan = start + i  # Scan lines count from the bottom of a bottom-up DIB
             src_row = height - 1 - scan if bottom_up else scan
-            line = rgb[src_row * width * 3:(src_row + 1) * width * 3]
             base = i * stride
             if palette is not None:
-                per_byte = 8 // bpp
-                for x in range(width):
-                    index = index_of(bytes(line[x * 3:x * 3 + 3]))
-                    shift = 8 - bpp * (x % per_byte + 1)
-                    out[base + x // per_byte] |= index << shift
+                if packed is not None:
+                    row = packed[src_row * row_bytes:(src_row + 1) * row_bytes]
+                else:
+                    row = pack(indices[src_row * width:(src_row + 1) * width], row_bytes)
+                out[base:base + row_bytes] = row
                 continue
+            line = rgb[src_row * width * 3:(src_row + 1) * width * 3]
             out[base + 2:base + width * step:step] = line[0::3]
             out[base + 1:base + width * step:step] = line[1::3]
             out[base:base + width * step:step] = line[2::3]
+        if len(out) <= self.DIB_CACHE_MAX_BYTES:
+            if len(self._dib_cache) >= self.DIB_CACHE_SIZE:
+                del self._dib_cache[next(iter(self._dib_cache))]
+            self._dib_cache[key] = (bytes(out), refs)
         return lines if self._mem_write(lpvBits, out) else 0
 
     def CreateDCA(self, args):
