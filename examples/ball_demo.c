@@ -22,7 +22,6 @@ CreateCompatibleDC / CreateCompatibleBitmap / BitBlt, and Sleep-paced frames.
 
 The rendering is dressed up with a vertical gradient background, a fading
 ball trail, a glowing highlighted ball, a rounded paddle and a HUD bar.
-Run with -n 0 (unlimited instructions).
 */
 
 #include <windows.h>

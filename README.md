@@ -15,7 +15,7 @@ pip install -r requirements.txt
 Put EXE files in the c_drive/ folder (the emulated `C:\`) or compile the examples with `./create_c_drive_environment.sh`; the demo EXEs are placed in `c_drive/Windows/Demos/`, which the program sees as `C:\Windows\Demos`. After that, run:
 
 ```bash
-python3 winexe32emu.py gdi_demo.exe
+python3 winexe32emu.py
 ```
 
 A bare EXE name is searched in `C:\` first and then in `C:\Windows\Demos`; a Windows path inside the emulated drive (e.g. `"C:\Windows\Demos\gdi_demo.exe"`) works too.

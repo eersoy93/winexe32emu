@@ -12059,7 +12059,7 @@ class CPUEmulator:
         self.stop_emulation = False
         self.instruction_count = 0
         self.block_insn_counts = {}  # (address, size) -> instructions in block
-        self.max_instructions = 100000  # Maximum instruction limit
+        self.max_instructions = 0  # Maximum instruction limit (0 = unlimited)
         
         # Memory management
         self.heap_current = self.HEAP_BASE
@@ -12867,10 +12867,9 @@ def main():
                         help="PE file to run: a name in C:\\ or C:\\Windows\\Demos, or a "
                              "Windows path inside c_drive/; optional with the GUI, "
                              "programs can also be started from the Start menu")
-    parser.add_argument("-n", "--max-instructions", type=int, default=None,
+    parser.add_argument("-n", "--max-instructions", type=int, default=0,
                         help="Maximum instructions to execute "
-                             "(default: 5000000 with GUI, 100000 without; "
-                             "0 = unlimited, recommended for games)")
+                             "(default: 0 = unlimited)")
     parser.add_argument("-m", "--memory", type=int, default=128,
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
@@ -12909,10 +12908,7 @@ def main():
         log.error(f"File not found in emulation C drive: {args.exe}")
         sys.exit(1)
 
-    if args.max_instructions is not None:
-        max_instr = args.max_instructions
-    else:
-        max_instr = 5_000_000 if use_gui else 100000
+    max_instr = args.max_instructions
     heap_size_mib = args.memory
     # The heap must end below the callback/API stub/stack regions
     max_heap_mib = (CPUEmulator.CALLBACK_RETURN_ADDR - CPUEmulator.HEAP_BASE) // (1024 * 1024)
