@@ -34,11 +34,24 @@ from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
 
 # Version info
-WINEXE32EMU_VERSION = "0.0.21"
+WINEXE32EMU_VERSION = "0.1.0"
 
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
+
+# Environment variables seen by the emulated program. The folders they name
+# are created inside c_drive/ at startup.
+DEFAULT_ENVIRONMENT = {
+    'PATH': 'C:\\Windows\\System32;C:\\Windows',
+    'TEMP': 'C:\\Windows\\Temp',
+    'TMP': 'C:\\Windows\\Temp',
+    'WINDIR': 'C:\\Windows',
+    'SYSTEMROOT': 'C:\\Windows',
+    'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
+}
+# Variables whose value is a file path; only its parent folder is created
+ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 
 # Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
 # default because MinGW emits string literals as UTF-8; set via --codepage
@@ -471,6 +484,81 @@ class _ScanSource:
         return self._la if self._la not in (None, -1) else None
 
 
+def resolve_c_drive_path(filename):
+    """Map a Windows-style filename into the c_drive/ sandbox.
+
+    The emulated program may only ever touch files inside c_drive/.
+    Any path that would escape that directory (via "..", an absolute
+    path, or a drive letter pointing elsewhere) is rejected and this
+    returns None. On success it returns the absolute host path, which is
+    guaranteed to live under C_DRIVE_PATH.
+    """
+    if not filename:
+        return None
+
+    # Make sure the sandbox root exists so real I/O can happen.
+    try:
+        os.makedirs(C_DRIVE_PATH, exist_ok=True)
+    except OSError as e:
+        log.error(f"Cannot create c_drive/ sandbox: {e}")
+        return None
+
+    # Normalise Windows path syntax to a relative POSIX-ish path.
+    name = filename.replace('\\', '/')
+
+    # Strip a drive-letter prefix ("C:/...", "c:foo"). Everything is
+    # treated as living on the emulated C: drive regardless of letter.
+    if len(name) >= 2 and name[1] == ':':
+        name = name[2:]
+
+    # Drop UNC / leading-slash roots so they are taken relative to the
+    # sandbox instead of the host filesystem root.
+    name = name.lstrip('/')
+
+    if not name:
+        return None
+
+    # Resolve against the sandbox root and confirm containment. Using
+    # realpath collapses any "..", symlinks, etc. before the check so a
+    # crafted name cannot climb out of c_drive/.
+    root = os.path.realpath(C_DRIVE_PATH)
+    candidate = os.path.realpath(os.path.join(root, name))
+
+    if candidate != root and not candidate.startswith(root + os.sep):
+        log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
+        return None
+
+    return candidate
+
+
+def environment_folders(environment):
+    """Windows folders named by environment variables (deduplicated)."""
+    folders = []
+    for name, value in environment.items():
+        for entry in value.split(';'):
+            entry = entry.strip()
+            if len(entry) < 2 or entry[1] != ':':
+                continue  # only absolute drive paths name folders
+            if name.upper() in ENVIRONMENT_FILE_VARIABLES:
+                entry = entry.replace('/', '\\').rsplit('\\', 1)[0]
+            if entry.lower() not in (f.lower() for f in folders):
+                folders.append(entry)
+    return folders
+
+
+def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
+    """Create the folders named by the environment (C:\\Windows, ...) in c_drive/."""
+    for folder in environment_folders(environment):
+        path = resolve_c_drive_path(folder)
+        if path is None:
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            log.debug(f"Environment folder ready: {folder} -> {path}")
+        except OSError as e:
+            log.warning(f"Cannot create environment folder {folder}: {e}")
+
+
 class WinAPIHandler:
     """Windows API emulation"""
 
@@ -700,14 +788,7 @@ class WinAPIHandler:
 
         # Process environment (GetEnvironmentVariable, getenv, _putenv);
         # keys are upper-case since Windows names are case-insensitive
-        self.environment = {
-            'PATH': 'C:\\Windows\\System32;C:\\Windows',
-            'TEMP': 'C:\\Windows\\Temp',
-            'TMP': 'C:\\Windows\\Temp',
-            'WINDIR': 'C:\\Windows',
-            'SYSTEMROOT': 'C:\\Windows',
-            'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
-        }
+        self.environment = dict(DEFAULT_ENVIRONMENT)
 
         # Additional CRT state (strtok, getenv strings, signals, time buffers)
         self.next_fd = 3  # CRT file descriptors handed out by fopen
@@ -946,50 +1027,9 @@ class WinAPIHandler:
     # ==================== SANDBOXED FILE SYSTEM ====================
 
     def resolve_c_drive_path(self, filename):
-        """Map a Windows-style filename into the c_drive/ sandbox.
-
-        The emulated program may only ever touch files inside c_drive/.
-        Any path that would escape that directory (via "..", an absolute
-        path, or a drive letter pointing elsewhere) is rejected and this
-        returns None. On success it returns the absolute host path, which is
-        guaranteed to live under C_DRIVE_PATH.
-        """
-        if not filename:
-            return None
-
-        # Make sure the sandbox root exists so real I/O can happen.
-        try:
-            os.makedirs(C_DRIVE_PATH, exist_ok=True)
-        except OSError as e:
-            log.error(f"Cannot create c_drive/ sandbox: {e}")
-            return None
-
-        # Normalise Windows path syntax to a relative POSIX-ish path.
-        name = filename.replace('\\', '/')
-
-        # Strip a drive-letter prefix ("C:/...", "c:foo"). Everything is
-        # treated as living on the emulated C: drive regardless of letter.
-        if len(name) >= 2 and name[1] == ':':
-            name = name[2:]
-
-        # Drop UNC / leading-slash roots so they are taken relative to the
-        # sandbox instead of the host filesystem root.
-        name = name.lstrip('/')
-
-        if not name:
-            return None
-
-        # Resolve against the sandbox root and confirm containment. Using
-        # realpath collapses any "..", symlinks, etc. before the check so a
-        # crafted name cannot climb out of c_drive/.
-        root = os.path.realpath(C_DRIVE_PATH)
-        candidate = os.path.realpath(os.path.join(root, name))
-
-        if candidate != root and not candidate.startswith(root + os.sep):
-            log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
-            return None
-
-        return candidate
+        """Map a Windows-style filename into the c_drive/ sandbox (see
+        the module-level resolve_c_drive_path)."""
+        return resolve_c_drive_path(filename)
 
     def _c_mode_to_python(self, mode):
         """Translate a C fopen()/CreateFile mode string to a Python one.
@@ -11917,7 +11957,7 @@ def main():
     """Main function"""
     print(f"{Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════════╗")
     print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
-    print(f"{Fore.CYAN}{Style.BRIGHT}║          Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}             ║")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{f'Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION}':^58}║")
     print(f"{Fore.CYAN}{Style.BRIGHT}║                                                          ║")
     print(f"{Fore.CYAN}{Style.BRIGHT}╚══════════════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
@@ -11963,6 +12003,8 @@ def main():
         sys.exit(1)
 
     use_gui = not args.no_gui
+
+    create_environment_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
         log.error("An EXE name is required when the GUI is not available")
