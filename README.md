@@ -12,21 +12,13 @@ pip install -r requirements.txt
 
 ## Usage
 
-Put EXE files in the c_drive/ folder (the emulated `C:\`). At startup the emulator runs `./create_c_drive_environment.sh`, which creates the c_drive/ folders and compiles the examples into `c_drive/Windows/Demos/` (seen by the program as `C:\Windows\Demos`); use `--no-setup` to skip it. Then run:
+Put EXE files in the c_drive/ folder (the emulated `C:\`). Then run:
 
 ```bash
 python3 winexe32emu.py
 ```
 
-A bare EXE name is searched in `C:\` first and then in `C:\Windows\Demos`; a Windows path inside the emulated drive (e.g. `"C:\Windows\Demos\gdi_demo.exe"`) works too.
-
-Use `-h` parameter for command-line help. For programs using a legacy ANSI code page (e.g. Turkish text), add `--codepage cp1254` (default: `utf-8`).
-
-Use `-v` to see every API call and other debug output, or `-q` to see only the program output, warnings and errors.
-
-With the GUI, the EXE name is optional: the Start menu on the fake desktop lists the EXE files in `C:\`, and the demos in `C:\Windows\Demos` under its own *Demos* submenu. Each selected program starts next to the ones already running.
-
-Like on Windows, only console (`SUBSYSTEM_CONSOLE`) programs start with a console window; GUI programs get one only if they call `AllocConsole`. Every program has its own console, which stays open after the program ends; closing it while the program runs ends the program.
+Use `-h` parameter for command-line help.
 
 The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
@@ -35,7 +27,9 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
 - `c_drive/Windows/Demos/` - Compiled example EXEs (`C:\Windows\Demos`)
 - `examples/` - Example C source codes
-- `create_cdrive_environment.sh` - Script to compile examples into `c_drive/Windows/Demos/`
+- `create_c_drive_environment.sh` - Script to create the `c_drive/` folders
+- `compile_examples.sh` - Script to compile examples into `c_drive/Windows/Demos/`
+- `remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders (`--all` deletes the whole `c_drive/` after confirmation)
 - `winexe32emu.py` - The main script
 
 ## Features
@@ -44,11 +38,11 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt)
-- Fake C drive support
+- Fake C drive environment esupport
 
 ## Versioning
 
-- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc.
+- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc. Every bigger changes version is bumped to 0.1.0, 0.2.0 etc.
 
 ## Disclaimer
 

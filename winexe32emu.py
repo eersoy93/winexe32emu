@@ -573,21 +573,22 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
 
-# Prepares c_drive/ (folders and the compiled demos); run at startup
-C_DRIVE_SETUP_SCRIPT = os.path.join(SCRIPT_DIR, "create_c_drive_environment.sh")
+# Startup scripts: c_drive/ folders, and the demos compiled into C:\Windows\Demos
+CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "create_c_drive_environment.sh")
+COMPILE_EXAMPLES_SCRIPT = os.path.join(SCRIPT_DIR, "compile_examples.sh")
 
 
-def run_c_drive_setup():
-    """Run create_c_drive_environment.sh; failures are reported, not fatal."""
-    if not os.path.isfile(C_DRIVE_SETUP_SCRIPT):
-        log.warning(f"C drive setup script not found: {C_DRIVE_SETUP_SCRIPT}")
+def run_setup_script(script, title):
+    """Run a startup shell script; failures are reported, not fatal."""
+    if not os.path.isfile(script):
+        log.warning(f"Script not found: {script}")
         return
-    log.header("Preparing C Drive")
+    log.header(title)
     try:
-        result = subprocess.run(['sh', C_DRIVE_SETUP_SCRIPT], cwd=SCRIPT_DIR,
+        result = subprocess.run(['sh', script], cwd=SCRIPT_DIR,
                                 capture_output=True, text=True, timeout=600)
     except (OSError, subprocess.TimeoutExpired) as e:
-        log.warning(f"C drive setup failed: {e}")
+        log.warning(f"{os.path.basename(script)} failed: {e}")
         return
     for line in (result.stdout + result.stderr).splitlines():
         if line.startswith('OK:'):
@@ -9910,6 +9911,7 @@ class PseudoWindowsGUI:
         self.start_menu_rows = []
         self.start_menu_demos = []
         self.start_submenu_open = False
+        self.show_demos = True  # False with --no-demos: no Demos submenu
         self.launcher = None
 
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
@@ -10107,7 +10109,7 @@ class PseudoWindowsGUI:
     def _fill_start_menu(self):
         """Read the Start menu rows: C:\\ programs, then the Demos submenu"""
         programs = list_programs()
-        self.start_menu_demos = programs.get(DEMOS_FOLDER, [])
+        self.start_menu_demos = programs.get(DEMOS_FOLDER, []) if self.show_demos else []
         rows = [('program', path) for path in programs.get('C:\\', [])]
         if self.start_menu_demos:
             if rows:
@@ -12901,9 +12903,12 @@ def main():
     parser.add_argument("--codepage", default="utf-8",
                         help="ANSI code page for 'A' APIs and CRT strings "
                              "(default: utf-8; e.g. cp1254, cp1252)")
-    parser.add_argument("--no-setup", action="store_true",
-                        help="Don't run create_c_drive_environment.sh at startup "
-                             "(c_drive/ folders and compiling the demos)")
+    parser.add_argument("--no-demos", action="store_true",
+                        help="Don't compile the examples (compile_examples.sh) and "
+                             "don't show the Demos submenu in the Start menu")
+    parser.add_argument("--no-create-environment", "--no_create_environment",
+                        action="store_true",
+                        help="Don't run create_c_drive_environment.sh at startup")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true",
                            help="Show debug output (every API call, disassembly)")
@@ -12926,8 +12931,10 @@ def main():
 
     use_gui = not args.no_gui
 
-    if not args.no_setup:
-        run_c_drive_setup()
+    if not args.no_create_environment:
+        run_setup_script(CREATE_C_DRIVE_SCRIPT, "Creating C Drive Environment")
+    if not args.no_demos:
+        run_setup_script(COMPILE_EXAMPLES_SCRIPT, "Compiling Examples")
     create_environment_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
@@ -12954,6 +12961,7 @@ def main():
     if use_gui and PYGAME_AVAILABLE:
         log.header("Starting Pygame GUI")
         gui = PseudoWindowsGUI(1024, 768)
+        gui.show_demos = not args.no_demos
         if gui.start():
             log.success("Pygame GUI window opened!")
         else:
