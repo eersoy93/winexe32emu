@@ -52,6 +52,11 @@ for src in examples/*.c; do
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -mconsole
             ;;
+        api_example)
+            # Console application - kernel32/user32/gdi32/advapi32 API tests
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
+                -lkernel32 -luser32 -lgdi32 -ladvapi32 -mconsole
+            ;;
         *)
             # Default: GUI application
             i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \

@@ -52,6 +52,7 @@ run_example() {
 
 # Console examples check their own results
 run_example crt_example "== 0 failure(s) =="
+run_example api_example "== 0 failure(s) =="
 run_example file_example "was blocked! Good!"
 run_example sysinfo_example "Escape attempt (copy)   : 0, error 5"
 run_example console_example "Hello, Tester!" "Tester"

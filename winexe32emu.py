@@ -837,6 +837,13 @@ class WinAPIHandler:
         'GlobalMemoryStatus': 1, 'QueryPerformanceFrequency': 1,
         'GetTickCount64': 0, 'GetACP': 0, 'GetOEMCP': 0,
         'SetConsoleTitleA': 1, 'SetConsoleTitleW': 1,
+        'FindFirstFileA': 2, 'FindFirstFileW': 2, 'FindNextFileA': 2,
+        'FindNextFileW': 2, 'FindClose': 1, 'SetCurrentDirectoryA': 1,
+        'SetCurrentDirectoryW': 1, 'GetFullPathNameA': 4, 'GetTempFileNameA': 4,
+        'FlushFileBuffers': 1, 'SetEndOfFile': 1, 'lstrcpyW': 2, 'lstrcatW': 2,
+        'lstrcmpW': 2, 'lstrcmpiW': 2, 'SetEnvironmentVariableA': 2,
+        'SetEnvironmentVariableW': 2, 'GetEnvironmentVariableW': 3,
+        'GetPrivateProfileStringA': 6, 'WritePrivateProfileStringA': 4,
         # user32
         'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
         'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
@@ -872,7 +879,11 @@ class WinAPIHandler:
         'GetSysColor': 1, 'GetSysColorBrush': 1, 'GetDesktopWindow': 0,
         'GetForegroundWindow': 0, 'GetActiveWindow': 0, 'GetDoubleClickTime': 0,
         'CharUpperA': 1, 'CharLowerA': 1, 'IsCharAlphaA': 1,
-        'IsCharAlphaNumericA': 1,
+        'IsCharAlphaNumericA': 1, 'CharUpperW': 1, 'CharLowerW': 1,
+        'CharNextA': 1, 'CharPrevA': 2, 'IsCharUpperA': 1, 'IsCharLowerA': 1,
+        'wvsprintfA': 3, 'FindWindowA': 2, 'GetClassNameA': 3,
+        'GetWindowTextLengthA': 1, 'BringWindowToTop': 1,
+        'SetForegroundWindow': 1, 'AdjustWindowRect': 3,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
         'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
@@ -883,12 +894,15 @@ class WinAPIHandler:
         'PatBlt': 6, 'CreateFontA': 14, 'CreateFontIndirectA': 1,
         'GetTextExtentPoint32A': 4, 'CreateCompatibleDC': 1,
         'CreateCompatibleBitmap': 3, 'DeleteDC': 1, 'BitBlt': 9,
-        'StretchBlt': 11,
+        'StretchBlt': 11, 'SetTextAlign': 2, 'GetTextColor': 1, 'GetBkColor': 1,
+        'CreatePenIndirect': 1, 'CreateBrushIndirect': 1, 'GetTextMetricsA': 2,
+        'SetROP2': 2,
         # advapi32
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6,
         'RegQueryValueExW': 6, 'RegCloseKey': 1, 'RegSetValueExA': 6,
         'RegSetValueExW': 6, 'RegCreateKeyExA': 9, 'RegCreateKeyExW': 9,
-        'GetUserNameA': 2, 'GetUserNameW': 2,
+        'GetUserNameA': 2, 'GetUserNameW': 2, 'RegDeleteValueA': 2,
+        'RegDeleteKeyA': 2, 'RegEnumKeyExA': 8, 'RegEnumValueA': 8,
         # winmm
         'timeGetTime': 0, 'timeBeginPeriod': 1, 'timeEndPeriod': 1,
         'PlaySoundA': 3, 'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2,
@@ -1038,6 +1052,14 @@ class WinAPIHandler:
         # Process environment (GetEnvironmentVariable, getenv, _putenv);
         # keys are upper-case since Windows names are case-insensitive
         self.environment = dict(DEFAULT_ENVIRONMENT)
+
+        # Current directory (SetCurrentDirectory); relative paths resolve against it
+        self.current_directory = "C:\\"
+
+        # In-memory registry: predefined HKEY -> key node, open HKEY -> key node
+        self.registry_roots = {}
+        self.registry_handles = {}
+        self._init_registry()
 
         # Additional CRT state (strtok, getenv strings, signals, time buffers)
         self.next_fd = 3  # CRT file descriptors handed out by fopen
@@ -1319,9 +1341,48 @@ class WinAPIHandler:
     # ==================== SANDBOXED FILE SYSTEM ====================
 
     def resolve_c_drive_path(self, filename):
-        """Map a Windows-style filename into the c_drive/ sandbox (see
-        the module-level resolve_c_drive_path)."""
-        return resolve_c_drive_path(filename)
+        """Map a Windows-style filename into the c_drive/ sandbox (see the
+        module-level resolve_c_drive_path); relative names are taken
+        relative to the current directory."""
+        full = self.full_windows_path(filename)
+        if full is None:
+            if filename:
+                log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
+            return None
+        if full == "C:\\":
+            os.makedirs(C_DRIVE_PATH, exist_ok=True)
+            return os.path.realpath(C_DRIVE_PATH)
+        return resolve_c_drive_path(full)
+
+    def full_windows_path(self, filename, clamp=False):
+        """Absolute, normalized "C:\\..." form of filename.
+
+        A ".." above the root returns None, or stays at the root with clamp
+        (like GetFullPathName). Every drive letter is the emulated C: drive.
+        """
+        if not filename:
+            return None
+        name = filename.replace('/', '\\')
+        if len(name) >= 2 and name[1] == ':':
+            name = name[2:]
+        if not name.startswith('\\'):
+            # "name" and "C:name" are relative to the current directory
+            name = self.current_directory[2:] + '\\' + name
+        parts = []
+        for part in name.split('\\'):
+            if part in ('', '.'):
+                continue
+            if part == '..':
+                if not parts and not clamp:
+                    return None
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(part)
+        result = "C:\\" + '\\'.join(parts)
+        if parts and filename.endswith(('\\', '/')) and clamp:
+            result += '\\'
+        return result
 
     def _c_mode_to_python(self, mode):
         """Translate a C fopen()/CreateFile mode string to a Python one.
@@ -2145,16 +2206,20 @@ class WinAPIHandler:
         log.debug(f"GetWindowsDirectoryW() -> \"{win_dir}\"")
         return len(win_dir)
 
-    def lstrcpyA(self, args):
-        """lstrcpyA emulation"""
+    def lstrcpyA(self, args, wide=False):
+        """lstrcpyA/W emulation"""
         lpString1 = args[0]
         lpString2 = args[1]
         
-        src = self.read_cstring(lpString2)
-        self.emu.uc.mem_write(lpString1, src + b'\x00')
+        units = self._read_units(lpString2, wide)
+        self._write_units(lpString1, units, wide)
         
-        log.debug(f"lstrcpyA(0x{lpString1:08x}, {src[:32]!r})")
+        log.debug(f"lstrcpy{'W' if wide else 'A'}(0x{lpString1:08x}, "
+                  f"\"{self._units_text(units[:32], wide)}\")")
         return lpString1
+
+    def lstrcpyW(self, args):
+        return self.lstrcpyA(args, wide=True)
     
     def lstrcpynA(self, args):
         """lstrcpynA emulation"""
@@ -2170,54 +2235,44 @@ class WinAPIHandler:
         log.debug(f"lstrcpynA(0x{lpString1:08x}, {src[:32]!r}, {iMaxLength})")
         return lpString1
     
-    def lstrcatA(self, args):
-        """lstrcatA emulation"""
+    def lstrcatA(self, args, wide=False):
+        """lstrcatA/W emulation"""
         lpString1 = args[0]
         lpString2 = args[1]
         
-        dst = self.read_cstring(lpString1)
-        src = self.read_cstring(lpString2)
+        dst = self._read_units(lpString1, wide)
+        src = self._read_units(lpString2, wide)
+        self._write_units(lpString1 + len(dst) * (2 if wide else 1), src, wide)
         
-        self.emu.uc.mem_write(lpString1 + len(dst), src + b'\x00')
-        
-        log.debug(f"lstrcatA() -> {(dst + src)[:32]!r}")
+        log.debug(f"lstrcat{'W' if wide else 'A'}() -> "
+                  f"\"{self._units_text((dst + src)[:32], wide)}\"")
         return lpString1
+
+    def lstrcatW(self, args):
+        return self.lstrcatA(args, wide=True)
     
-    def lstrcmpA(self, args):
-        """lstrcmpA emulation"""
-        lpString1 = args[0]
-        lpString2 = args[1]
+    def lstrcmpA(self, args, wide=False, ignore_case=False):
+        """lstrcmpA/W and lstrcmpiA/W emulation"""
+        s1 = self._read_text(args[0], wide)
+        s2 = self._read_text(args[1], wide)
+        if ignore_case:
+            s1, s2 = s1.lower(), s2.lower()
         
-        s1 = self.read_string(lpString1)
-        s2 = self.read_string(lpString2)
+        result = (s1 > s2) - (s1 < s2)
         
-        if s1 < s2:
-            result = -1
-        elif s1 > s2:
-            result = 1
-        else:
-            result = 0
-        
-        log.debug(f"lstrcmpA(\"{s1[:16]}\", \"{s2[:16]}\") -> {result}")
+        log.debug(f"lstrcmp{'i' if ignore_case else ''}{'W' if wide else 'A'}"
+                  f"(\"{s1[:16]}\", \"{s2[:16]}\") -> {result}")
         return result & 0xFFFFFFFF
+
+    def lstrcmpW(self, args):
+        return self.lstrcmpA(args, wide=True)
     
     def lstrcmpiA(self, args):
         """lstrcmpiA emulation (case-insensitive)"""
-        lpString1 = args[0]
-        lpString2 = args[1]
-        
-        s1 = self.read_string(lpString1).lower()
-        s2 = self.read_string(lpString2).lower()
-        
-        if s1 < s2:
-            result = -1
-        elif s1 > s2:
-            result = 1
-        else:
-            result = 0
-        
-        log.debug(f"lstrcmpiA(\"{s1[:16]}\", \"{s2[:16]}\") -> {result}")
-        return result & 0xFFFFFFFF
+        return self.lstrcmpA(args, ignore_case=True)
+
+    def lstrcmpiW(self, args):
+        return self.lstrcmpA(args, wide=True, ignore_case=True)
     
     def GlobalAlloc(self, args):
         """GlobalAlloc emulation"""
@@ -2582,17 +2637,247 @@ class WinAPIHandler:
         return self.MoveFileA(args, wide=True)
 
     def GetCurrentDirectoryA(self, args, wide=False):
-        """GetCurrentDirectoryA/W emulation - the current directory is C:\\"""
+        """GetCurrentDirectoryA/W emulation"""
         nBufferLength, lpBuffer = args[0], args[1]
-        cwd = "C:\\"
+        cwd = self.current_directory
         log.debug(f"GetCurrentDirectory() -> \"{cwd}\"")
-        if not lpBuffer or nBufferLength <= len(cwd):
-            return len(cwd) + 1  # required size including the terminator
+        size = len(self._text_units(cwd, wide))
+        if not lpBuffer or nBufferLength <= size:
+            return size + 1  # required size including the terminator
         self._write_text(lpBuffer, cwd, wide)
-        return len(cwd)
+        return size
 
     def GetCurrentDirectoryW(self, args):
         return self.GetCurrentDirectoryA(args, wide=True)
+
+    def SetCurrentDirectoryA(self, args, wide=False):
+        """SetCurrentDirectoryA/W emulation (the directory must exist in c_drive/)"""
+        name = self._read_text(args[0], wide)
+        log.debug(f"SetCurrentDirectory(\"{name}\")")
+        full = self.full_windows_path(name)
+        path = self.resolve_c_drive_path(name)
+        if full is None or path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if not os.path.isdir(path):
+            self._last_error = 2 if not os.path.exists(path) else 267  # ERROR_DIRECTORY
+            return 0
+        self.current_directory = full
+        return 1
+
+    def SetCurrentDirectoryW(self, args):
+        return self.SetCurrentDirectoryA(args, wide=True)
+
+    def GetFullPathNameA(self, args):
+        """GetFullPathNameA emulation - resolves against the current directory"""
+        name = self.read_string(args[0])
+        nBufferLength, lpBuffer, lpFilePart = args[1], args[2], args[3]
+        full = self.full_windows_path(name, clamp=True)
+        log.debug(f"GetFullPathNameA(\"{name}\") -> \"{full}\"")
+        if full is None:
+            self._last_error = 123  # ERROR_INVALID_NAME
+            return 0
+        data = full.encode(ANSI_CODEPAGE, errors='replace')
+        if not lpBuffer or nBufferLength <= len(data):
+            return len(data) + 1
+        self.emu.uc.mem_write(lpBuffer, data + b'\x00')
+        if lpFilePart:
+            # Last component, or NULL when the path ends with a separator
+            sep = data.rfind(b'\\')
+            part = lpBuffer + sep + 1 if sep + 1 < len(data) else 0
+            self.emu.uc.mem_write(lpFilePart, struct.pack('<I', part))
+        return len(data)
+
+    def GetTempFileNameA(self, args):
+        """GetTempFileNameA emulation - <path>\\<pre><hex>.TMP (created if uUnique is 0)"""
+        path_name = self.read_string(args[0])
+        prefix = self.read_string(args[1])[:3]
+        uUnique = args[2] & 0xFFFF
+        lpTempFileName = args[3]
+        log.debug(f"GetTempFileNameA(\"{path_name}\", \"{prefix}\", {uUnique})")
+
+        directory = self.resolve_c_drive_path(path_name)
+        if directory is None or not os.path.isdir(directory):
+            self._last_error = 267  # ERROR_DIRECTORY
+            return 0
+        base = path_name.rstrip('\\/') + '\\' + prefix
+
+        if uUnique:
+            name = f"{base}{uUnique:X}.TMP"
+        else:
+            # Probe numbers from the tick count until an unused name is found
+            start = (int(time.time() * 1000) & 0xFFFF) or 1
+            for i in range(0xFFFF):
+                uUnique = (start + i - 1) % 0xFFFF + 1
+                name = f"{base}{uUnique:X}.TMP"
+                path = self.resolve_c_drive_path(name)
+                if path is None:
+                    break
+                try:
+                    with open(path, 'xb'):
+                        pass
+                    break
+                except FileExistsError:
+                    continue
+                except OSError:
+                    path = None
+                    break
+            else:
+                path = None
+            if path is None:
+                self._last_error = 80  # ERROR_FILE_EXISTS
+                return 0
+
+        data = name.encode(ANSI_CODEPAGE, errors='replace')
+        if len(data) >= 260:  # MAX_PATH
+            self._last_error = 206  # ERROR_FILENAME_EXCED_RANGE
+            return 0
+        self.emu.uc.mem_write(lpTempFileName, data + b'\x00')
+        return uUnique
+
+    def _file_handle_fp(self, hFile):
+        """Python file object of a CreateFile handle, or None (sets ERROR_INVALID_HANDLE)"""
+        info = self.handles.get(hFile)
+        if info and info.get('fp'):
+            return info['fp']
+        self._last_error = 6  # ERROR_INVALID_HANDLE
+        return None
+
+    def FlushFileBuffers(self, args):
+        """FlushFileBuffers emulation"""
+        fp = self._file_handle_fp(args[0])
+        if fp is None:
+            return 0
+        try:
+            fp.flush()
+        except OSError:
+            self._last_error = 5
+            return 0
+        return 1
+
+    def SetEndOfFile(self, args):
+        """SetEndOfFile emulation - truncate or extend the file at the file pointer"""
+        fp = self._file_handle_fp(args[0])
+        if fp is None:
+            return 0
+        try:
+            fp.truncate(fp.tell())
+        except (OSError, io.UnsupportedOperation):
+            self._last_error = 5  # ERROR_ACCESS_DENIED (opened read-only)
+            return 0
+        return 1
+
+    # ---------- FindFirstFile / FindNextFile ----------
+
+    @staticmethod
+    def _wildcard_regex(pattern):
+        """Compile a Windows wildcard (* and ?) into a case-insensitive regex"""
+        if pattern == '*.*':
+            pattern = '*'  # Matches names without an extension too
+        regex = ''.join('.*' if c == '*' else '.' if c == '?' else re.escape(c)
+                        for c in pattern)
+        return re.compile(regex + r'\Z', re.IGNORECASE | re.DOTALL)
+
+    @staticmethod
+    def _filetime(timestamp):
+        """FILETIME (100 ns units since 1601) of a Unix timestamp"""
+        return int((timestamp + 11644473600) * 10000000)
+
+    def _find_entry(self, path, name):
+        """(name, attributes, size, mtime) of one directory entry"""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if os.path.isdir(path):
+            return (name, 0x10, 0, st.st_mtime)  # FILE_ATTRIBUTE_DIRECTORY
+        return (name, 0x80, st.st_size, st.st_mtime)  # FILE_ATTRIBUTE_NORMAL
+
+    def _write_find_data(self, address, entry, wide):
+        """Fill a WIN32_FIND_DATAA/W structure"""
+        name, attributes, size, mtime = entry
+        ft = self._filetime(mtime)
+        header = struct.pack('<I3QIIII', attributes, ft, ft, ft,
+                             size >> 32, size & 0xFFFFFFFF, 0, 0)
+        name_size, alt_size = (520, 28) if wide else (260, 14)
+        if wide:
+            raw = name.encode('utf-16-le')[:name_size - 2]
+        else:
+            raw = name.encode(ANSI_CODEPAGE, errors='replace')[:name_size - 1]
+        names = raw.ljust(name_size, b'\x00') + b'\x00' * alt_size
+        self.emu.uc.mem_write(address, header + names)
+
+    def FindFirstFileA(self, args, wide=False):
+        """FindFirstFileA/W emulation - lists a c_drive/ directory"""
+        INVALID_HANDLE_VALUE = 0xFFFFFFFF
+        spec = self._read_text(args[0], wide)
+        lpFindFileData = args[1]
+        log.debug(f"FindFirstFile{'W' if wide else 'A'}(\"{spec}\")")
+
+        full = self.full_windows_path(spec)
+        if full is None or full == "C:\\":
+            self._last_error = 5 if full is None else 2
+            return INVALID_HANDLE_VALUE
+        folder, _, pattern = full.rpartition('\\')
+        folder_path = self.resolve_c_drive_path(folder + '\\')
+        if folder_path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return INVALID_HANDLE_VALUE
+        if not os.path.isdir(folder_path):
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return INVALID_HANDLE_VALUE
+
+        regex = self._wildcard_regex(pattern)
+        try:
+            names = sorted(os.listdir(folder_path), key=str.lower)
+        except OSError:
+            self._last_error = 5
+            return INVALID_HANDLE_VALUE
+        if folder != "C:":
+            names = ['.', '..'] + names  # Every directory but the root has them
+        entries = []
+        for name in names:
+            if regex.match(name):
+                entry = self._find_entry(os.path.join(folder_path, name), name)
+                if entry:
+                    entries.append(entry)
+        if not entries:
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return INVALID_HANDLE_VALUE
+
+        self._write_find_data(lpFindFileData, entries[0], wide)
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'find', 'entries': entries, 'index': 1}
+        self._last_error = 0
+        return handle
+
+    def FindFirstFileW(self, args):
+        return self.FindFirstFileA(args, wide=True)
+
+    def FindNextFileA(self, args, wide=False):
+        """FindNextFileA/W emulation"""
+        info = self.handles.get(args[0])
+        if not info or info.get('type') != 'find':
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        if info['index'] >= len(info['entries']):
+            self._last_error = 18  # ERROR_NO_MORE_FILES
+            return 0
+        self._write_find_data(args[1], info['entries'][info['index']], wide)
+        info['index'] += 1
+        return 1
+
+    def FindNextFileW(self, args):
+        return self.FindNextFileA(args, wide=True)
+
+    def FindClose(self, args):
+        """FindClose emulation"""
+        info = self.handles.get(args[0])
+        if not info or info.get('type') != 'find':
+            self._last_error = 6
+            return 0
+        del self.handles[args[0]]
+        return 1
 
     def _write_text(self, address, text, wide):
         """Write a NUL-terminated ANSI or UTF-16 string"""
@@ -2790,22 +3075,196 @@ class WinAPIHandler:
         log.debug(f"ReadConsoleA: {data!r} ({len(data)} bytes)")
         return 1
 
-    def GetEnvironmentVariableA(self, args):
-        """GetEnvironmentVariableA emulation"""
+    def GetEnvironmentVariableA(self, args, wide=False):
+        """GetEnvironmentVariableA/W emulation"""
         lpName = args[0]
         lpBuffer = args[1]
         nSize = args[2]
         
-        name = self.read_string(lpName)
-        log.debug(f"GetEnvironmentVariableA(\"{name}\")")
+        name = self._read_text(lpName, wide)
+        log.debug(f"GetEnvironmentVariable{'W' if wide else 'A'}(\"{name}\")")
         
-        # Simple environment variables
-        value = self.environment.get(name.upper(), '')
-        if value and lpBuffer != 0 and len(value) < nSize:
-            self.emu.uc.mem_write(lpBuffer, value.encode(ANSI_CODEPAGE, errors='replace') + b'\x00')
-            return len(value)
-        
-        return 0  # Not found
+        value = self.environment.get(name.upper())
+        if value is None:
+            self._last_error = 203  # ERROR_ENVVAR_NOT_FOUND
+            return 0
+        units = self._text_units(value, wide)
+        if not lpBuffer or nSize <= len(units):
+            return len(units) + 1  # required size including the terminator
+        self._write_units(lpBuffer, units, wide)
+        return len(units)
+
+    def GetEnvironmentVariableW(self, args):
+        return self.GetEnvironmentVariableA(args, wide=True)
+
+    def SetEnvironmentVariableA(self, args, wide=False):
+        """SetEnvironmentVariableA/W emulation (NULL value removes the variable)"""
+        name = self._read_text(args[0], wide)
+        value = self._read_text(args[1], wide) if args[1] else None
+        log.debug(f"SetEnvironmentVariable{'W' if wide else 'A'}(\"{name}\", {value!r})")
+        if not name or '=' in name:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if value is None:
+            if self.environment.pop(name.upper(), None) is None:
+                self._last_error = 203  # ERROR_ENVVAR_NOT_FOUND
+                return 0
+        else:
+            self.environment[name.upper()] = value
+        return 1
+
+    def SetEnvironmentVariableW(self, args):
+        return self.SetEnvironmentVariableA(args, wide=True)
+
+    # ---------- INI files (GetPrivateProfileString / WritePrivateProfileString) ----------
+
+    def _profile_path(self, filename):
+        """Host path of an INI file; a bare name lives in the Windows directory"""
+        if '\\' not in filename and '/' not in filename:
+            filename = "C:\\Windows\\" + filename
+        return self.resolve_c_drive_path(filename)
+
+    @staticmethod
+    def _ini_section_name(line):
+        """Section name of a "[name]" line, else None"""
+        line = line.strip()
+        if line.startswith('[') and ']' in line:
+            return line[1:line.index(']')].strip()
+        return None
+
+    @staticmethod
+    def _ini_key_value(line):
+        """(key, value) of a "key=value" line, else None"""
+        if line.lstrip().startswith(';') or '=' not in line:
+            return None
+        key, _, value = line.partition('=')
+        return key.strip(), value.strip()
+
+    def _ini_read_lines(self, path):
+        try:
+            with open(path, 'rb') as fp:
+                return fp.read().decode(ANSI_CODEPAGE, errors='replace').splitlines()
+        except OSError:
+            return None
+
+    def _ini_section_range(self, lines, section):
+        """(header index, end index) of a section (case-insensitive), or None"""
+        start = None
+        for i, line in enumerate(lines):
+            name = self._ini_section_name(line)
+            if name is None:
+                continue
+            if start is not None:
+                return (start, i)
+            if name.lower() == section.lower():
+                start = i
+        return None if start is None else (start, len(lines))
+
+    def GetPrivateProfileStringA(self, args):
+        """GetPrivateProfileStringA emulation (INI files inside c_drive/)"""
+        lpAppName, lpKeyName, lpDefault = args[0], args[1], args[2]
+        lpReturnedString, nSize, lpFileName = args[3], args[4], args[5]
+        section = self.read_string(lpAppName) if lpAppName else None
+        key = self.read_string(lpKeyName) if lpKeyName else None
+        default = self.read_string(lpDefault).rstrip(' ') if lpDefault else ''
+        filename = self.read_string(lpFileName)
+        log.debug(f"GetPrivateProfileStringA({section!r}, {key!r}, {default!r}, \"{filename}\")")
+
+        if not lpReturnedString or nSize == 0:
+            return 0
+        path = self._profile_path(filename)
+        lines = (self._ini_read_lines(path) if path else None) or []
+
+        if section is None or key is None:
+            # Name lists: every name NUL-terminated, the list ends with an extra NUL
+            if section is None:
+                names = [n for n in map(self._ini_section_name, lines) if n is not None]
+            else:
+                bounds = self._ini_section_range(lines, section)
+                names = []
+                if bounds:
+                    for line in lines[bounds[0] + 1:bounds[1]]:
+                        pair = self._ini_key_value(line)
+                        if pair:
+                            names.append(pair[0])
+            data = b''.join(n.encode(ANSI_CODEPAGE, errors='replace') + b'\x00' for n in names)
+            if len(data) + 1 > nSize:
+                # Truncated: the last name still ends with two NULs
+                data = data[:max(0, nSize - 2)]
+                self.emu.uc.mem_write(lpReturnedString, (data + b'\x00\x00')[:nSize])
+                return len(data)
+            self.emu.uc.mem_write(lpReturnedString, data + b'\x00')
+            return len(data)
+
+        value = None
+        bounds = self._ini_section_range(lines, section)
+        if bounds:
+            for line in lines[bounds[0] + 1:bounds[1]]:
+                pair = self._ini_key_value(line)
+                if pair and pair[0].lower() == key.lower():
+                    value = pair[1]
+                    break
+        if value is None:
+            value = default
+        elif len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+
+        data = value.encode(ANSI_CODEPAGE, errors='replace')[:nSize - 1]
+        self.emu.uc.mem_write(lpReturnedString, data + b'\x00')
+        return len(data)
+
+    def WritePrivateProfileStringA(self, args):
+        """WritePrivateProfileStringA emulation (NULL key deletes the section,
+        NULL string deletes the key)"""
+        lpAppName, lpKeyName, lpString, lpFileName = args[0], args[1], args[2], args[3]
+        if not lpAppName:
+            return 0  # Only flushes the (nonexistent) cache
+        section = self.read_string(lpAppName)
+        key = self.read_string(lpKeyName) if lpKeyName else None
+        value = self.read_string(lpString) if lpString else None
+        filename = self.read_string(lpFileName)
+        log.debug(f"WritePrivateProfileStringA({section!r}, {key!r}, {value!r}, \"{filename}\")")
+
+        path = self._profile_path(filename)
+        if path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        lines = self._ini_read_lines(path) or []
+        bounds = self._ini_section_range(lines, section)
+
+        if key is None:
+            if bounds:
+                del lines[bounds[0]:bounds[1]]
+        elif bounds:
+            index = None
+            for i in range(bounds[0] + 1, bounds[1]):
+                pair = self._ini_key_value(lines[i])
+                if pair and pair[0].lower() == key.lower():
+                    index = i
+                    break
+            if value is None:
+                if index is not None:
+                    del lines[index]
+            elif index is not None:
+                lines[index] = f"{key}={value}"
+            else:
+                # Append after the section's last non-blank line
+                end = bounds[1]
+                while end > bounds[0] + 1 and not lines[end - 1].strip():
+                    end -= 1
+                lines.insert(end, f"{key}={value}")
+        elif value is not None:
+            lines += [f"[{section}]", f"{key}={value}"]
+
+        try:
+            with open(path, 'wb') as fp:
+                fp.write(''.join(line + '\r\n' for line in lines)
+                         .encode(ANSI_CODEPAGE, errors='replace'))
+        except OSError as e:
+            log.error(f"WritePrivateProfileStringA(\"{filename}\") failed: {e}")
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        return 1
     
     def ExpandEnvironmentStringsA(self, args):
         """ExpandEnvironmentStringsA emulation"""
@@ -3758,6 +4217,111 @@ class WinAPIHandler:
         """GetDoubleClickTime emulation - Windows default (500 ms)"""
         return 500
 
+    # Window class names Windows reports for the built-in control classes
+    CONTROL_CLASS_NAMES = {'BUTTON': 'Button', 'CHECKBOX': 'Button', 'EDIT': 'Edit',
+                           'STATIC': 'Static', 'LISTBOX': 'ListBox',
+                           'COMBOBOX': 'ComboBox', 'SCROLLBAR': 'ScrollBar'}
+
+    def _window_class_name(self, hwnd):
+        """Class name of a window or control, or None for an invalid handle"""
+        if not self.gui:
+            return None
+        if hwnd in self.gui.windows:
+            if hwnd in self.gui.consoles:
+                return "ConsoleWindowClass"
+            return getattr(self.gui.windows[hwnd], 'class_name', None) or "#32770"
+        if hwnd in self.gui.controls:
+            name = self.gui.controls[hwnd].class_name
+            return self.CONTROL_CLASS_NAMES.get(name, name)
+        return None
+
+    def FindWindowA(self, args):
+        """FindWindowA emulation - top-level windows by class and/or title"""
+        lpClassName, lpWindowName = args[0], args[1]
+        if lpClassName and lpClassName < 0x10000:
+            class_name = self.atoms.get(lpClassName)
+            if class_name is None:
+                return 0
+        else:
+            class_name = self.read_string(lpClassName) if lpClassName else None
+        title = self.read_string(lpWindowName) if lpWindowName else None
+        log.debug(f"FindWindowA({class_name!r}, {title!r})")
+        if not self.gui:
+            return 0
+        with self.gui.lock:
+            # Topmost first, then hidden windows
+            order = list(reversed(self.gui.z_order))
+            order += [h for h in self.gui.windows if h not in order]
+            for hwnd in order:
+                win = self.gui.windows.get(hwnd)
+                if win is None:
+                    continue
+                if class_name is not None and \
+                        (self._window_class_name(hwnd) or '').lower() != class_name.lower():
+                    continue
+                if title is not None and win.title.lower() != title.lower():
+                    continue
+                return hwnd
+        self._last_error = 2  # ERROR_FILE_NOT_FOUND
+        return 0
+
+    def GetClassNameA(self, args):
+        """GetClassNameA emulation"""
+        hWnd, lpClassName, nMaxCount = args[0], args[1], args[2]
+        name = self._window_class_name(hWnd)
+        log.debug(f"GetClassNameA(0x{hWnd:x}) -> {name!r}")
+        if name is None:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        if not lpClassName or nMaxCount == 0 or nMaxCount >= 0x80000000:
+            return 0
+        data = name.encode(ANSI_CODEPAGE, errors='replace')[:nMaxCount - 1]
+        self.emu.uc.mem_write(lpClassName, data + b'\x00')
+        return len(data)
+
+    def GetWindowTextLengthA(self, args):
+        """GetWindowTextLengthA emulation - length in ANSI bytes"""
+        text = self.gui.get_window_text(args[0]) if self.gui else ""
+        return len(text.encode(ANSI_CODEPAGE, errors='replace'))
+
+    def BringWindowToTop(self, args):
+        """BringWindowToTop emulation - raise and activate a top-level window"""
+        hWnd = args[0]
+        log.debug(f"BringWindowToTop(0x{hWnd:x})")
+        if not self.gui:
+            return 0
+        with self.gui.lock:
+            if hWnd not in self.gui.windows:
+                self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+                return 0
+            if hWnd in self.gui.z_order:
+                self.gui.z_order.remove(hWnd)
+                self.gui.z_order.append(hWnd)
+            if self.gui.windows[hWnd].visible:
+                self.gui.active_window = hWnd
+        return 1
+
+    def SetForegroundWindow(self, args):
+        """SetForegroundWindow emulation"""
+        return self.BringWindowToTop(args)
+
+    def AdjustWindowRect(self, args):
+        """AdjustWindowRect emulation - client rect -> window rect.
+
+        Uses the fake desktop's frame (every window has a border and a
+        title bar), so it matches GetClientRect for the created window.
+        """
+        lpRect, bMenu = args[0], args[2]
+        rect = self._read_rect(lpRect) if lpRect else None
+        if rect is None:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        left, top, right, bottom = rect
+        border = PseudoWindowsGUI.BORDER
+        caption = PseudoWindowsGUI.TITLE_BAR_H + (PseudoWindowsGUI.MENU_H if bMenu else 0)
+        return 1 if self._write_rect(lpRect, left - border, top - border - caption,
+                                     right + border, bottom + border) else 0
+
     def _ansi_char(self, value):
         """Decode one ANSI code unit; None if it is not a character on its own"""
         try:
@@ -3765,21 +4329,97 @@ class WinAPIHandler:
         except UnicodeDecodeError:
             return None
 
-    def _char_case_common(self, lpsz, upper):
-        """CharUpperA/CharLowerA: a single char (HIWORD 0) or an in-place string"""
+    def _char_case_common(self, lpsz, upper, wide=False):
+        """CharUpper/CharLower A/W: a single char (HIWORD 0) or an in-place string"""
         convert = str.upper if upper else str.lower
         if lpsz < 0x10000:
+            if wide:
+                converted = convert(chr(lpsz))
+                return ord(converted) if len(converted) == 1 and ord(converted) < 0x10000 else lpsz
             ch = self._ansi_char(lpsz)
             if ch is None:
                 return lpsz
             converted = convert(ch).encode(ANSI_CODEPAGE, errors='replace')
             return converted[0] if len(converted) == 1 else lpsz
+        if wide:
+            units = self._read_units(lpsz, True)
+            text = self._units_text(units, True)
+            data = self._text_units(convert(text), True)
+            if len(data) == len(units):
+                self._write_units(lpsz, data, True, terminate=False)
+            return lpsz
         raw = self.read_cstring(lpsz)
         text = raw.decode(ANSI_CODEPAGE, errors='surrogateescape')
         data = convert(text).encode(ANSI_CODEPAGE, errors='surrogateescape')
         if len(data) == len(raw):  # never change the buffer length in place
             self.emu.uc.mem_write(lpsz, data)
         return lpsz
+
+    def CharUpperA(self, args):
+        """CharUpperA emulation"""
+        return self._char_case_common(args[0], True)
+
+    def CharLowerA(self, args):
+        """CharLowerA emulation"""
+        return self._char_case_common(args[0], False)
+
+    def CharUpperW(self, args):
+        """CharUpperW emulation"""
+        return self._char_case_common(args[0], True, wide=True)
+
+    def CharLowerW(self, args):
+        """CharLowerW emulation"""
+        return self._char_case_common(args[0], False, wide=True)
+
+    def _ansi_char_length(self, address):
+        """Bytes of the ANSI character at address (0 at the terminator).
+
+        Only UTF-8 has multi-byte characters among the supported code pages.
+        """
+        try:
+            data = bytes(self.emu.uc.mem_read(address, 1))
+        except UcError:
+            return 0
+        if data == b'\x00':
+            return 0
+        if ANSI_CODEPAGE.replace('_', '-') != 'utf-8':
+            return 1
+        lead = data[0]
+        size = 2 if 0xC2 <= lead <= 0xDF else 3 if 0xE0 <= lead <= 0xEF else \
+            4 if 0xF0 <= lead <= 0xF4 else 1
+        if size > 1:
+            try:
+                data = bytes(self.emu.uc.mem_read(address, size))
+                data.decode('utf-8')
+            except (UcError, UnicodeDecodeError):
+                return 1
+        return size
+
+    def CharNextA(self, args):
+        """CharNextA emulation - stays on the terminator"""
+        lpsz = args[0]
+        return lpsz + self._ansi_char_length(lpsz) if lpsz else 0
+
+    def CharPrevA(self, args):
+        """CharPrevA emulation - never moves before lpszStart"""
+        start, current = args[0], args[1]
+        if current <= start:
+            return start
+        # Step back over UTF-8 continuation bytes to the character that ends at current
+        for back in range(min(4, current - start), 1, -1):
+            if self._ansi_char_length(current - back) == back:
+                return current - back
+        return current - 1
+
+    def IsCharUpperA(self, args):
+        """IsCharUpperA emulation"""
+        ch = self._ansi_char(args[0])
+        return 1 if ch and ch.isupper() else 0
+
+    def IsCharLowerA(self, args):
+        """IsCharLowerA emulation"""
+        ch = self._ansi_char(args[0])
+        return 1 if ch and ch.islower() else 0
 
     def CharUpperA(self, args):
         """CharUpperA emulation"""
@@ -4658,7 +5298,7 @@ class WinAPIHandler:
         log.debug(f"TextOutA(0x{hdc:x}, {x}, {y}, \"{text}\")")
 
         if self.gui:
-            self._add_text(hdc, text, x, y)
+            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
 
         return 1
     
@@ -4677,7 +5317,7 @@ class WinAPIHandler:
         log.debug(f"TextOutW(0x{hdc:x}, {x}, {y}, \"{text}\")")
 
         if self.gui:
-            self._add_text(hdc, text, x, y)
+            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
 
         return 1
     
@@ -4773,9 +5413,12 @@ class WinAPIHandler:
         color = args[1]
         log.debug(f"SetBkColor(0x{hdc:x}, 0x{color:06x})")
         state = self.dc_state.get(hdc)
+        prev = 0xFFFFFF
         if state:
+            r, g, b = state['bk_color']
+            prev = r | (g << 8) | (b << 16)
             state['bk_color'] = self._colorref_to_rgb(color)
-        return 0xFFFFFF  # Previous color
+        return prev  # Previous color
 
     def SetBkMode(self, args):
         """SetBkMode emulation"""
@@ -4788,6 +5431,96 @@ class WinAPIHandler:
             prev = state['bk_mode']
             state['bk_mode'] = mode
         return prev  # Previous mode
+
+    CLR_INVALID = 0xFFFFFFFF
+    GDI_ERROR = 0xFFFFFFFF
+
+    def _dc_colorref(self, hdc, key):
+        """A DC color as COLORREF, or CLR_INVALID for an unknown DC"""
+        state = self.dc_state.get(hdc)
+        if not state:
+            return self.CLR_INVALID
+        r, g, b = state[key]
+        return r | (g << 8) | (b << 16)
+
+    def GetTextColor(self, args):
+        """GetTextColor emulation"""
+        return self._dc_colorref(args[0], 'text_color')
+
+    def GetBkColor(self, args):
+        """GetBkColor emulation"""
+        return self._dc_colorref(args[0], 'bk_color')
+
+    # SetTextAlign flags
+    TA_UPDATECP = 0x01
+    TA_RIGHT = 0x02
+    TA_CENTER = 0x06
+    TA_BOTTOM = 0x08
+    TA_BASELINE = 0x18
+
+    def SetTextAlign(self, args):
+        """SetTextAlign emulation - honoured by TextOut (TA_UPDATECP is ignored)"""
+        hdc, align = args[0], args[1]
+        log.debug(f"SetTextAlign(0x{hdc:x}, 0x{align:x})")
+        state = self.dc_state.get(hdc)
+        if not state:
+            return self.GDI_ERROR
+        prev = state.get('text_align', 0)  # TA_LEFT | TA_TOP
+        state['text_align'] = align
+        return prev
+
+    def _aligned_text_pos(self, hdc, text, x, y):
+        """Top-left position of TextOut text for the DC's text alignment"""
+        align = self.dc_state.get(hdc, {}).get('text_align', 0)
+        if not align & ~self.TA_UPDATECP:
+            return x, y
+        width, height = self._text_extent(hdc, text)
+        if align & self.TA_CENTER == self.TA_CENTER:
+            x -= width // 2
+        elif align & self.TA_RIGHT:
+            x -= width
+        if align & self.TA_BASELINE == self.TA_BASELINE:
+            y -= self._text_ascent(height)
+        elif align & self.TA_BOTTOM:
+            y -= height
+        return x, y
+
+    @staticmethod
+    def _text_ascent(height):
+        return (height * 4 + 2) // 5
+
+    def GetTextMetricsA(self, args):
+        """GetTextMetricsA emulation - metrics of the estimated GUI font"""
+        hdc, lptm = args[0], args[1]
+        if hdc not in self.dc_state or not lptm:
+            return 0
+        font = self._dc_font(hdc) or {}
+        ave_width, height = self._text_extent(hdc, 'x')
+        ascent = self._text_ascent(height)
+        data = struct.pack('<11i9B',
+                           height, ascent, height - ascent,
+                           0,                       # tmInternalLeading
+                           0,                       # tmExternalLeading
+                           ave_width, ave_width * 2,
+                           700 if font.get('bold') else 400,
+                           0, 96, 96,               # overhang, digitized aspect
+                           0x20, 0xFF, 0x1F, 0x20,  # first/last/default/break char
+                           1 if font.get('italic') else 0,
+                           1 if font.get('underline') else 0,
+                           0,                       # tmStruckOut
+                           0x22,                    # VARIABLE_PITCH | FF_SWISS
+                           0)                       # ANSI_CHARSET
+        return 1 if self._mem_write(lptm, data + b'\x00' * 3) else 0
+
+    def SetROP2(self, args):
+        """SetROP2 emulation - the mix mode is stored, drawing always copies the pen"""
+        hdc, rop2 = args[0], args[1]
+        state = self.dc_state.get(hdc)
+        if not state or not 1 <= rop2 <= 16:
+            return 0
+        prev = state.get('rop2', 13)  # R2_COPYPEN
+        state['rop2'] = rop2
+        return prev
 
     # ==================== GDI DRAWING APIs ====================
 
@@ -4818,6 +5551,26 @@ class WinAPIHandler:
         }
         log.debug(f"CreateSolidBrush(0x{colorref:06x}) -> 0x{handle:x}")
         return handle
+
+    def CreatePenIndirect(self, args):
+        """CreatePenIndirect emulation (LOGPEN: style, POINT width, color)"""
+        try:
+            style, width, _, color = struct.unpack('<IiiI', self.emu.uc.mem_read(args[0], 16))
+        except UcError:
+            return 0
+        return self.CreatePen([style, max(0, width), color])
+
+    def CreateBrushIndirect(self, args):
+        """CreateBrushIndirect emulation (LOGBRUSH: style, color, hatch)"""
+        try:
+            style, color, hatch = struct.unpack('<III', self.emu.uc.mem_read(args[0], 12))
+        except UcError:
+            return 0
+        if style == 1:  # BS_NULL / BS_HOLLOW
+            return self.GetStockObject([5])  # NULL_BRUSH
+        if style == 2:  # BS_HATCHED
+            return self.CreateHatchBrush([hatch, color])
+        return self.CreateSolidBrush([color])
 
     def GetStockObject(self, args):
         """GetStockObject emulation"""
@@ -5308,16 +6061,17 @@ class WinAPIHandler:
         if c > 0 and len(text) > c:
             text = text[:c]
 
-        # Rough estimate; the GUI font is close to 8x16 per character
-        width, height = len(text) * 8, 16
-        font = self._dc_font(hdc)
-        if font:
-            height = font['height']
-            width = int(len(text) * height * 0.55)
-
+        width, height = self._text_extent(hdc, text)
         if lpSize:
             self.emu.uc.mem_write(lpSize, struct.pack("<ii", width, height))
         return 1
+
+    def _text_extent(self, hdc, text):
+        """Rough (width, height) of text; the GUI font is close to 8x16 per character"""
+        font = self._dc_font(hdc)
+        if font:
+            return int(len(text) * font['height'] * 0.55), font['height']
+        return len(text) * 8, 16
 
     # ==================== MEMORY DC / DOUBLE BUFFERING ====================
 
@@ -5570,116 +6324,244 @@ class WinAPIHandler:
         hMenu = args[0]
         return 1 if self.menus.pop(hMenu, None) is not None else 0
 
-    # ADVAPI32.DLL APIs
-    def RegOpenKeyExA(self, args):
-        """RegOpenKeyExA emulation"""
-        hKey = args[0]
-        lpSubKey = args[1]
-        ulOptions = args[2]
-        samDesired = args[3]
-        phkResult = args[4]
-        
-        subkey = self.read_string(lpSubKey) if lpSubKey else ""
-        log.debug(f"RegOpenKeyExA(0x{hKey:x}, \"{subkey}\")")
-        
-        # Return fake handle
-        fake_handle = self.get_next_handle()
-        if phkResult:
-            self.emu.uc.mem_write(phkResult, struct.pack('<I', fake_handle))
-        
-        return 2  # ERROR_FILE_NOT_FOUND - key not found
-    
+    # ADVAPI32.DLL APIs - in-memory registry (per process, not persisted)
+
+    # Predefined keys (HKEY_CLASSES_ROOT ... HKEY_CURRENT_CONFIG)
+    REGISTRY_ROOTS = {0x80000000: 'HKEY_CLASSES_ROOT', 0x80000001: 'HKEY_CURRENT_USER',
+                      0x80000002: 'HKEY_LOCAL_MACHINE', 0x80000003: 'HKEY_USERS',
+                      0x80000005: 'HKEY_CURRENT_CONFIG'}
+    REG_STRING_TYPES = (1, 2, 7)  # REG_SZ, REG_EXPAND_SZ, REG_MULTI_SZ
+
+    ERROR_SUCCESS = 0
+    ERROR_FILE_NOT_FOUND = 2
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_HANDLE = 6
+    ERROR_INVALID_PARAMETER = 87
+    ERROR_MORE_DATA = 234
+    ERROR_NO_MORE_ITEMS = 259
+    ERROR_KEY_DELETED = 1018
+
+    @staticmethod
+    def _new_registry_key(name):
+        return {'name': name, 'keys': {}, 'values': {}, 'deleted': False,
+                'time': int((time.time() + 11644473600) * 10000000)}
+
+    def _init_registry(self):
+        for hkey, name in self.REGISTRY_ROOTS.items():
+            self.registry_roots[hkey] = self._new_registry_key(name)
+        for hkey, name in ((0x80000001, 'Software'), (0x80000002, 'SOFTWARE')):
+            self.registry_roots[hkey]['keys'][name.lower()] = self._new_registry_key(name)
+
+    def _registry_key(self, hkey):
+        """(key node, error code) of an open or predefined HKEY"""
+        node = self.registry_roots.get(hkey) or self.registry_handles.get(hkey)
+        if node is None:
+            return None, self.ERROR_INVALID_HANDLE
+        if node['deleted']:
+            return None, self.ERROR_KEY_DELETED
+        return node, self.ERROR_SUCCESS
+
+    @staticmethod
+    def _registry_path(subkey):
+        return [part for part in subkey.split('\\') if part]
+
+    def _registry_open_common(self, hKey, subkey, phkResult, create, lpdwDisposition=0):
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        disposition = 2  # REG_OPENED_EXISTING_KEY
+        for part in self._registry_path(subkey):
+            child = node['keys'].get(part.lower())
+            if child is None:
+                if not create:
+                    return self.ERROR_FILE_NOT_FOUND
+                child = self._new_registry_key(part)
+                node['keys'][part.lower()] = child
+                disposition = 1  # REG_CREATED_NEW_KEY
+            node = child
+        if not phkResult:
+            return self.ERROR_INVALID_PARAMETER
+        handle = self.get_next_handle()
+        self.registry_handles[handle] = node
+        self.emu.uc.mem_write(phkResult, struct.pack('<I', handle))
+        if lpdwDisposition:
+            self.emu.uc.mem_write(lpdwDisposition, struct.pack('<I', disposition))
+        return self.ERROR_SUCCESS
+
+    def RegOpenKeyExA(self, args, wide=False):
+        """RegOpenKeyExA/W emulation"""
+        hKey, lpSubKey, phkResult = args[0], args[1], args[4]
+        subkey = self._read_text(lpSubKey, wide) if lpSubKey else ""
+        result = self._registry_open_common(hKey, subkey, phkResult, create=False)
+        log.debug(f"RegOpenKeyEx{'W' if wide else 'A'}(0x{hKey:x}, \"{subkey}\") -> {result}")
+        return result
+
     def RegOpenKeyExW(self, args):
-        """RegOpenKeyExW emulation"""
-        hKey = args[0]
-        lpSubKey = args[1]
-        ulOptions = args[2]
-        samDesired = args[3]
-        phkResult = args[4]
-        
-        subkey = self.read_wide_string(lpSubKey) if lpSubKey else ""
-        log.debug(f"RegOpenKeyExW(0x{hKey:x}, \"{subkey}\")")
-        
-        fake_handle = self.get_next_handle()
-        if phkResult:
-            self.emu.uc.mem_write(phkResult, struct.pack('<I', fake_handle))
-        
-        return 2  # ERROR_FILE_NOT_FOUND
-    
-    def RegQueryValueExA(self, args):
-        """RegQueryValueExA emulation"""
-        hKey = args[0]
-        lpValueName = args[1]
-        lpReserved = args[2]
-        lpType = args[3]
-        lpData = args[4]
-        lpcbData = args[5]
-        
-        value_name = self.read_string(lpValueName) if lpValueName else ""
-        log.debug(f"RegQueryValueExA(0x{hKey:x}, \"{value_name}\")")
-        
-        return 2  # ERROR_FILE_NOT_FOUND
-    
-    def RegQueryValueExW(self, args):
-        """RegQueryValueExW emulation"""
-        hKey = args[0]
-        lpValueName = args[1]
-        lpReserved = args[2]
-        lpType = args[3]
-        lpData = args[4]
-        lpcbData = args[5]
-        
-        value_name = self.read_wide_string(lpValueName) if lpValueName else ""
-        log.debug(f"RegQueryValueExW(0x{hKey:x}, \"{value_name}\")")
-        
-        return 2  # ERROR_FILE_NOT_FOUND
-    
+        return self.RegOpenKeyExA(args, wide=True)
+
+    def RegCreateKeyExA(self, args, wide=False):
+        """RegCreateKeyExA/W emulation"""
+        hKey, lpSubKey, phkResult, lpdwDisposition = args[0], args[1], args[7], args[8]
+        subkey = self._read_text(lpSubKey, wide) if lpSubKey else ""
+        result = self._registry_open_common(hKey, subkey, phkResult, True, lpdwDisposition)
+        log.debug(f"RegCreateKeyEx{'W' if wide else 'A'}(0x{hKey:x}, \"{subkey}\") -> {result}")
+        return result
+
+    def RegCreateKeyExW(self, args):
+        return self.RegCreateKeyExA(args, wide=True)
+
     def RegCloseKey(self, args):
         """RegCloseKey emulation"""
         hKey = args[0]
         log.debug(f"RegCloseKey(0x{hKey:x})")
-        return 0  # ERROR_SUCCESS
-    
-    def RegSetValueExA(self, args):
-        """RegSetValueExA emulation"""
-        log.debug("RegSetValueExA()")
-        return 0  # ERROR_SUCCESS
-    
+        if hKey in self.registry_roots or self.registry_handles.pop(hKey, None) is not None:
+            return self.ERROR_SUCCESS
+        return self.ERROR_INVALID_HANDLE
+
+    def RegSetValueExA(self, args, wide=False):
+        """RegSetValueExA/W emulation"""
+        hKey, lpValueName, dwType, lpData, cbData = args[0], args[1], args[3], args[4], args[5]
+        name = self._read_text(lpValueName, wide) if lpValueName else ""
+        log.debug(f"RegSetValueEx{'W' if wide else 'A'}(0x{hKey:x}, \"{name}\", type={dwType})")
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        try:
+            data = bytes(self.emu.uc.mem_read(lpData, cbData)) if cbData else b''
+        except UcError:
+            return self.ERROR_INVALID_PARAMETER
+        if dwType in self.REG_STRING_TYPES:
+            # Strings are kept as text so the A and W APIs can both read them
+            data = data.decode('utf-16-le' if wide else ANSI_CODEPAGE, errors='replace')
+        node['values'][name.lower()] = {'name': name, 'type': dwType, 'data': data}
+        node['time'] = int((time.time() + 11644473600) * 10000000)
+        return self.ERROR_SUCCESS
+
     def RegSetValueExW(self, args):
-        """RegSetValueExW emulation"""
-        log.debug("RegSetValueExW()")
-        return 0  # ERROR_SUCCESS
-    
-    def RegCreateKeyExA(self, args):
-        """RegCreateKeyExA emulation"""
+        return self.RegSetValueExA(args, wide=True)
+
+    def _registry_value_bytes(self, value, wide):
+        data = value['data']
+        if isinstance(data, str):
+            return data.encode('utf-16-le') if wide else \
+                data.encode(ANSI_CODEPAGE, errors='replace')
+        return data
+
+    def _registry_store_data(self, value, wide, lpType, lpData, lpcbData):
+        """Copy a value's type and data out (RegQueryValueEx/RegEnumValue)"""
+        data = self._registry_value_bytes(value, wide)
+        if lpType:
+            self.emu.uc.mem_write(lpType, struct.pack('<I', value['type']))
+        if not lpcbData:
+            return self.ERROR_INVALID_PARAMETER if lpData else self.ERROR_SUCCESS
+        size = self._read_u32(lpcbData)
+        self.emu.uc.mem_write(lpcbData, struct.pack('<I', len(data)))
+        if lpData:
+            if size < len(data):
+                return self.ERROR_MORE_DATA
+            self.emu.uc.mem_write(lpData, data)
+        return self.ERROR_SUCCESS
+
+    def RegQueryValueExA(self, args, wide=False):
+        """RegQueryValueExA/W emulation"""
+        hKey, lpValueName = args[0], args[1]
+        lpType, lpData, lpcbData = args[3], args[4], args[5]
+        name = self._read_text(lpValueName, wide) if lpValueName else ""
+        node, error = self._registry_key(hKey)
+        if node is not None:
+            value = node['values'].get(name.lower())
+            error = self.ERROR_FILE_NOT_FOUND if value is None else \
+                self._registry_store_data(value, wide, lpType, lpData, lpcbData)
+        log.debug(f"RegQueryValueEx{'W' if wide else 'A'}(0x{hKey:x}, \"{name}\") -> {error}")
+        return error
+
+    def RegQueryValueExW(self, args):
+        return self.RegQueryValueExA(args, wide=True)
+
+    def RegDeleteValueA(self, args):
+        """RegDeleteValueA emulation"""
         hKey = args[0]
-        lpSubKey = args[1]
-        
-        subkey = self.read_string(lpSubKey) if lpSubKey else ""
-        log.debug(f"RegCreateKeyExA(0x{hKey:x}, \"{subkey}\")")
-        
-        # Write handle to phkResult
-        phkResult = args[7]
-        if phkResult:
-            fake_handle = self.get_next_handle()
-            self.emu.uc.mem_write(phkResult, struct.pack('<I', fake_handle))
-        
-        return 0  # ERROR_SUCCESS
-    
-    def RegCreateKeyExW(self, args):
-        """RegCreateKeyExW emulation"""
+        name = self.read_string(args[1]) if args[1] else ""
+        log.debug(f"RegDeleteValueA(0x{hKey:x}, \"{name}\")")
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        if node['values'].pop(name.lower(), None) is None:
+            return self.ERROR_FILE_NOT_FOUND
+        return self.ERROR_SUCCESS
+
+    def RegDeleteKeyA(self, args):
+        """RegDeleteKeyA emulation - the key must have no subkeys"""
         hKey = args[0]
-        lpSubKey = args[1]
-        
-        subkey = self.read_wide_string(lpSubKey) if lpSubKey else ""
-        log.debug(f"RegCreateKeyExW(0x{hKey:x}, \"{subkey}\")")
-        
-        phkResult = args[7]
-        if phkResult:
-            fake_handle = self.get_next_handle()
-            self.emu.uc.mem_write(phkResult, struct.pack('<I', fake_handle))
-        
-        return 0  # ERROR_SUCCESS
+        subkey = self.read_string(args[1]) if args[1] else ""
+        log.debug(f"RegDeleteKeyA(0x{hKey:x}, \"{subkey}\")")
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        path = self._registry_path(subkey)
+        if not path:
+            return self.ERROR_ACCESS_DENIED
+        for part in path[:-1]:
+            node = node['keys'].get(part.lower())
+            if node is None:
+                return self.ERROR_FILE_NOT_FOUND
+        target = node['keys'].get(path[-1].lower())
+        if target is None:
+            return self.ERROR_FILE_NOT_FOUND
+        if target['keys']:
+            return self.ERROR_ACCESS_DENIED
+        del node['keys'][path[-1].lower()]
+        target['deleted'] = True  # Open handles to it now fail
+        return self.ERROR_SUCCESS
+
+    def _registry_store_name(self, name, lpName, lpcchName):
+        """Copy an ANSI key/value name; *lpcchName is in/out (chars)"""
+        data = name.encode(ANSI_CODEPAGE, errors='replace')
+        if not lpName or not lpcchName:
+            return self.ERROR_INVALID_PARAMETER
+        if self._read_u32(lpcchName) <= len(data):
+            return self.ERROR_MORE_DATA
+        self.emu.uc.mem_write(lpName, data + b'\x00')
+        self.emu.uc.mem_write(lpcchName, struct.pack('<I', len(data)))
+        return self.ERROR_SUCCESS
+
+    def RegEnumKeyExA(self, args):
+        """RegEnumKeyExA emulation - subkeys in alphabetical order"""
+        hKey, dwIndex, lpName, lpcchName = args[0], args[1], args[2], args[3]
+        lpClass, lpcchClass, lpftLastWriteTime = args[5], args[6], args[7]
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        keys = sorted(node['keys'].values(), key=lambda k: k['name'].lower())
+        if dwIndex >= len(keys):
+            return self.ERROR_NO_MORE_ITEMS
+        key = keys[dwIndex]
+        error = self._registry_store_name(key['name'], lpName, lpcchName)
+        if error:
+            return error
+        if lpClass:
+            self.emu.uc.mem_write(lpClass, b'\x00')
+        if lpcchClass:
+            self.emu.uc.mem_write(lpcchClass, struct.pack('<I', 0))
+        if lpftLastWriteTime:
+            self.emu.uc.mem_write(lpftLastWriteTime, struct.pack('<Q', key['time']))
+        return self.ERROR_SUCCESS
+
+    def RegEnumValueA(self, args):
+        """RegEnumValueA emulation - values in creation order"""
+        hKey, dwIndex, lpValueName, lpcchValueName = args[0], args[1], args[2], args[3]
+        lpType, lpData, lpcbData = args[5], args[6], args[7]
+        node, error = self._registry_key(hKey)
+        if node is None:
+            return error
+        values = list(node['values'].values())
+        if dwIndex >= len(values):
+            return self.ERROR_NO_MORE_ITEMS
+        value = values[dwIndex]
+        error = self._registry_store_name(value['name'], lpValueName, lpcchValueName)
+        if error:
+            return error
+        return self._registry_store_data(value, False, lpType, lpData, lpcbData)
     
     # OLE32.DLL APIs
     def OleInitialize(self, args):
@@ -6282,11 +7164,11 @@ class WinAPIHandler:
             return False
         return conv.isupper() != wide_fmt
 
-    def wsprintfA(self, args):
+    def wsprintfA(self, args, varargs=None):
         """wsprintfA emulation (user32, cdecl varargs)"""
         buf = args[0]
         fmt = self.read_string(args[1])
-        text = self._format_string(fmt, args[2:])
+        text = self._format_string(fmt, args[2:] if varargs is None else varargs)
         data = text.encode(ANSI_CODEPAGE, errors='replace')[:1023]
         log.debug(f"wsprintfA(0x{buf:08x}, \"{fmt}\") -> \"{text}\"")
         try:
@@ -6294,6 +7176,10 @@ class WinAPIHandler:
         except UcError:
             pass
         return len(data)
+
+    def wvsprintfA(self, args):
+        """wvsprintfA emulation (stdcall, arguments in a va_list)"""
+        return self.wsprintfA(args, self._va_args(args[2]))
 
     def sprintf(self, args):
         """sprintf emulation"""
@@ -8376,9 +9262,9 @@ class WinAPIHandler:
         return self._sandbox_op(args[0], os.rmdir)
 
     def _getcwd(self, args):
-        """_getcwd emulation - the emulated current directory is C:\\"""
+        """_getcwd emulation - the emulated current directory"""
         buf, size = args[0], args[1]
-        units = self._text_units("C:\\", False)
+        units = self._text_units(self.current_directory, False)
         if not buf:
             return self._alloc_units(units, False)
         if size < len(units) + 1:
@@ -9099,22 +9985,12 @@ class WinAPIHandler:
         return 0
 
     def _fullpath(self, args):
-        """_fullpath emulation - resolve against the emulated C:\\ directory"""
-        rel = self.read_string(args[1]).replace('/', '\\')
-        if len(rel) >= 2 and rel[1] == ':':
-            drive, rel = rel[:2].upper(), rel[2:]
-        else:
-            drive = 'C:'
-        parts = []
-        for part in rel.split('\\'):
-            if part in ('', '.'):
-                continue
-            if part == '..':
-                if parts:
-                    parts.pop()
-            else:
-                parts.append(part)
-        units = self._text_units(drive + '\\' + '\\'.join(parts), False)
+        """_fullpath emulation - resolve against the current directory"""
+        full = self.full_windows_path(self.read_string(args[1]), clamp=True)
+        if full is None:
+            self._store_errno(self.EINVAL)
+            return 0
+        units = self._text_units(full.rstrip('\\') if len(full) > 3 else full, False)
         if not args[0]:
             return self._alloc_units(units, False)
         if len(units) >= args[2]:
