@@ -39,6 +39,7 @@ The emulator exits with the program's exit code (1 if the emulated program crash
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, msvcrt)
+- Folders named by the emulated environment variables (`C:\Windows`, `C:\Windows\System32`, `C:\Windows\Temp`) are created inside `c_drive/` at startup
 - Broad C runtime support (msvcrt, crtdll, msvcr*, ucrtbase / api-ms-win-crt-*): printf/scanf families (narrow, wide, secure and UCRT `__stdio_common_*`), string and wide string functions, number conversions, math (including x87 `_CI*` and `_ftol` helpers), time, environment, sandboxed file system calls, signals and setjmp/longjmp (see `examples/crt_demo.c`)
 
 ## Versioning
