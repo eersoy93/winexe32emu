@@ -73,7 +73,7 @@ int main(void)
     }
     else
     {
-        WriteString(hOut, "(Win32) 'hello.txt' couldn't be created!'\n");
+        WriteString(hOut, "(Win32) 'hello.txt' couldn't be created!\n");
     }
 
     hFile = CreateFileA("hello.txt", GENERIC_READ, 0, NULL,
@@ -94,8 +94,9 @@ int main(void)
     FILE *fp = fopen("notes.txt", "w");
     if (fp)
     {
+        const char *more = "more bytes written\n";
         fputs("line written with fputs\n", fp);
-        fwrite("more bytes written\n", 1, 11, fp);
+        fwrite(more, 1, (size_t)lstrlenA(more), fp);
         fclose(fp);
         WriteString(hOut, "(CRT) 'notes.txt' has been written!\n");
     }

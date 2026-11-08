@@ -50,6 +50,7 @@ static int g_pan_pos = 0;    // 0..100 -> vertical pan in pixels
 static void DrawScene(HDC hdc)
 {
     HBRUSH brush;
+    HBRUSH old_brush;
     HPEN pen;
     HPEN old_pen;
     POINT roof[3];
@@ -69,22 +70,25 @@ static void DrawScene(HDC hdc)
 
     // Sun
     brush = CreateSolidBrush(RGB(255, 220, 0));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Ellipse(hdc, SCENE_W - 60, 10, SCENE_W - 15, 55);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
 
     // Clouds
     brush = CreateSolidBrush(RGB(255, 255, 255));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Ellipse(hdc, 20, 20, 60, 40);
     Ellipse(hdc, 40, 14, 82, 38);
     Ellipse(hdc, 62, 22, 98, 42);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
 
     // House body
     brush = CreateSolidBrush(RGB(220, 120, 60));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Rectangle(hdc, 40, 70, 120, 130);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
 
     // Roof
@@ -92,20 +96,23 @@ static void DrawScene(HDC hdc)
     roof[1].x = 80;  roof[1].y = 35;
     roof[2].x = 130; roof[2].y = 70;
     brush = CreateSolidBrush(RGB(160, 40, 40));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Polygon(hdc, roof, 3);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
 
     // Door
     brush = CreateSolidBrush(RGB(90, 60, 30));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Rectangle(hdc, 70, 95, 90, 130);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
 
     // Window with a cross frame
     brush = CreateSolidBrush(RGB(180, 220, 255));
-    SelectObject(hdc, brush);
+    old_brush = (HBRUSH)SelectObject(hdc, brush);
     Rectangle(hdc, 96, 82, 114, 102);
+    SelectObject(hdc, old_brush);
     DeleteObject(brush);
     pen = CreatePen(PS_SOLID, 1, RGB(80, 60, 30));
     old_pen = (HPEN)SelectObject(hdc, pen);
@@ -177,9 +184,17 @@ static void OnPaint(HWND hwnd)
         DeleteObject(strip);
     }
 
-    wsprintfA(status, "zoom %d%%  |  pan %d px  |  pixel(%d,%d) = RGB(%d,%d,%d)",
-              zoom, g_pan_pos, probe_x, probe_y,
-              (int)GetRValue(probe), (int)GetGValue(probe), (int)GetBValue(probe));
+    if (probe == CLR_INVALID)
+    {
+        wsprintfA(status, "zoom %d%%  |  pan %d px  |  pixel(%d,%d) is off-screen",
+                  zoom, g_pan_pos, probe_x, probe_y);
+    }
+    else
+    {
+        wsprintfA(status, "zoom %d%%  |  pan %d px  |  pixel(%d,%d) = RGB(%d,%d,%d)",
+                  zoom, g_pan_pos, probe_x, probe_y,
+                  (int)GetRValue(probe), (int)GetGValue(probe), (int)GetBValue(probe));
+    }
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(40, 40, 40));
     TextOutA(hdc, 8, 362, status, lstrlenA(status));
@@ -220,19 +235,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg)
     {
         case WM_CREATE:
+        {
+            HINSTANCE inst = ((LPCREATESTRUCT)lParam)->hInstance;
             g_vscroll = CreateWindowExA(0, "SCROLLBAR", "",
                                         WS_CHILD | WS_VISIBLE | SBS_VERT,
                                         526, 8, 16, 340,
-                                        hwnd, (HMENU)IDC_VSCROLL, NULL, NULL);
+                                        hwnd, (HMENU)IDC_VSCROLL, inst, NULL);
             g_hscroll = CreateWindowExA(0, "SCROLLBAR", "",
                                         WS_CHILD | WS_VISIBLE | SBS_HORZ,
                                         8, 336, 510, 16,
-                                        hwnd, (HMENU)IDC_HSCROLL, NULL, NULL);
+                                        hwnd, (HMENU)IDC_HSCROLL, inst, NULL);
             SetScrollRange(g_vscroll, SB_CTL, 0, 100, FALSE);
             SetScrollRange(g_hscroll, SB_CTL, 0, 100, FALSE);
             SetScrollPos(g_vscroll, SB_CTL, g_pan_pos, FALSE);
             SetScrollPos(g_hscroll, SB_CTL, g_zoom_pos, FALSE);
             return 0;
+        }
 
         case WM_VSCROLL:
             if ((HWND)lParam == g_vscroll)
@@ -273,10 +291,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
-    RegisterClassA(&wc);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (!RegisterClassA(&wc))
+    {
+        return 1;
+    }
 
+    // WS_CLIPCHILDREN keeps the zoomed scene from painting over the scrollbars
     hwnd = CreateWindowExA(0, CLASS_NAME, "Scroll Demo",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                            120, 80, 560, 420,
                            NULL, NULL, hInstance, NULL);
     if (hwnd == NULL)

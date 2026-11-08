@@ -48,6 +48,12 @@ static int g_tx[TRAIL_LEN], g_ty[TRAIL_LEN];
 static int g_thead = 0;
 static int g_tcount = 0;
 
+/* Pre-rendered gradient background, rebuilt only when the size changes */
+static HDC g_bgdc = NULL;
+static HBITMAP g_bgbmp = NULL;
+static HBITMAP g_bgold = NULL;
+static int g_bgw = 0, g_bgh = 0;
+
 static void ResetBall(int client_w)
 {
     g_ball_x = (client_w - BALL_SIZE) / 2;
@@ -101,6 +107,33 @@ static void FillEllipse(HDC hdc, int cx, int cy, int radius, COLORREF color)
     DeleteObject(br);
 }
 
+static void FreeBackground(void)
+{
+    if (g_bgdc)
+    {
+        SelectObject(g_bgdc, g_bgold);
+        DeleteObject(g_bgbmp);
+        DeleteDC(g_bgdc);
+        g_bgdc = NULL;
+    }
+}
+
+static void EnsureBackground(HDC hdc, int cw, int ch)
+{
+    if (g_bgdc && g_bgw == cw && g_bgh == ch)
+    {
+        return;
+    }
+    FreeBackground();
+    g_bgdc = CreateCompatibleDC(hdc);
+    g_bgbmp = CreateCompatibleBitmap(hdc, cw, ch);
+    g_bgold = (HBITMAP)SelectObject(g_bgdc, g_bgbmp);
+    /* Deep blue at the top, lighter towards the floor */
+    GradientV(g_bgdc, 0, 0, cw, ch, RGB(8, 14, 44), RGB(26, 60, 120));
+    g_bgw = cw;
+    g_bgh = ch;
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
@@ -134,7 +167,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 }
 
 /* Draw one frame into the memory DC, then blit it to the window */
-static void RenderFrame(HWND hwnd, HDC hdc, int cw, int ch)
+static void RenderFrame(HDC hdc, int cw, int ch)
 {
     char buffer[80];
     int i;
@@ -153,8 +186,8 @@ static void RenderFrame(HWND hwnd, HDC hdc, int cw, int ch)
 
     SetBkMode(memdc, TRANSPARENT);
 
-    /* Background gradient (deep blue at the top, lighter towards the floor) */
-    GradientV(memdc, 0, 0, cw, ch, RGB(8, 14, 44), RGB(26, 60, 120));
+    EnsureBackground(hdc, cw, ch);
+    BitBlt(memdc, 0, 0, cw, ch, g_bgdc, 0, 0, SRCCOPY);
 
     /* Fading ball trail: oldest and smallest first, newest on top */
     for (i = g_tcount - 1; i >= 1; i--)
@@ -280,6 +313,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             break;
         }
 
+        /* The window is resizable: follow the current client size */
+        GetClientRect(hwnd, &client);
+        if (client.right != cw || client.bottom != ch)
+        {
+            cw = client.right;
+            ch = client.bottom;
+            if (g_ball_x > cw - BALL_SIZE || g_ball_y > ch - BALL_SIZE)
+            {
+                ResetBall(cw);
+            }
+        }
+
+        /* Too small (e.g. minimized) to play: just idle */
+        if (cw < PADDLE_W || ch < HUD_H + PADDLE_MARGIN + BALL_SIZE * 2)
+        {
+            Sleep(16);
+            continue;
+        }
+
         /* Poll the keyboard (game-style input) */
         if (GetAsyncKeyState(VK_LEFT) & 0x8000)
         {
@@ -334,11 +386,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
         /* Render the frame with double buffering */
         HDC hdc = GetDC(hwnd);
-        RenderFrame(hwnd, hdc, cw, ch);
+        RenderFrame(hdc, cw, ch);
         ReleaseDC(hwnd, hdc);
 
         Sleep(16); /* ~60 FPS */
     }
 
+    FreeBackground();
     return 0;
 }

@@ -36,6 +36,7 @@ Press ESC to quit.
 #include <windows.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <limits.h>
 
 static const char* CLASS_NAME = "GUIDemoClass";
 
@@ -138,6 +139,7 @@ static void DoCompute(HWND hwnd, char op)
     BOOL okA = FALSE, okB = FALSE;
     int a = (int)GetDlgItemInt(hwnd, IDC_A_EDIT, &okA, TRUE);
     int b = (int)GetDlgItemInt(hwnd, IDC_B_EDIT, &okB, TRUE);
+    long long r = 0;
     char status[192];
 
     if (!okA || !okB)
@@ -148,9 +150,9 @@ static void DoCompute(HWND hwnd, char op)
 
     switch (op)
     {
-        case '+': SetDlgItemInt(hwnd, IDC_RESULT, a + b, TRUE); break;
-        case '-': SetDlgItemInt(hwnd, IDC_RESULT, a - b, TRUE); break;
-        case 'x': SetDlgItemInt(hwnd, IDC_RESULT, a * b, TRUE); break;
+        case '+': r = (long long)a + b; break;
+        case '-': r = (long long)a - b; break;
+        case 'x': r = (long long)a * b; break;
         case '/':
             if (b == 0)
             {
@@ -158,9 +160,17 @@ static void DoCompute(HWND hwnd, char op)
                 SetStatus(hwnd, "Division by zero!");
                 return;
             }
-            SetDlgItemInt(hwnd, IDC_RESULT, a / b, TRUE);
+            r = (long long)a / b;
             break;
     }
+
+    if (r < INT_MIN || r > INT_MAX)
+    {
+        SetDlgItemTextA(hwnd, IDC_RESULT, "overflow");
+        SetStatus(hwnd, "Result does not fit in 32 bits!");
+        return;
+    }
+    SetDlgItemInt(hwnd, IDC_RESULT, (int)r, TRUE);
 
     wsprintfA(status, "Computed %d %c %d", a, (op == 'x' ? '*' : op), b);
     SetStatus(hwnd, status);
@@ -178,7 +188,7 @@ static int cmp_int(const void* a, const void* b)
 static void DoSort(HWND hwnd)
 {
     char raw[256];
-    char out[256];
+    char out[64 * 13 + 1];  /* 64 x ", -2147483648" */
     int  numbers[64];
     int  count = 0;
     char* p;
@@ -568,13 +578,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
-        case WM_KEYDOWN:
-            if (wParam == VK_ESCAPE)
-            {
-                PostQuitMessage(0);
-            }
-            return 0;
-
         case WM_DESTROY:
             KillTimer(hwnd, IDT_CLOCK);
             PostQuitMessage(0);
@@ -624,6 +627,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     MSG msg = {0};
     while (GetMessageA(&msg, NULL, 0, 0) > 0)
     {
+        /* Child controls get the keyboard focus, so catch ESC here */
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE)
+        {
+            DestroyWindow(hwnd);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }

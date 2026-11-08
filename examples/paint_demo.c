@@ -46,6 +46,8 @@ static const char* CLASS_NAME = "PaintDemoClass";
 // Stored line segments of the drawing
 #define MAX_SEGMENTS   4096
 
+#define IDT_CLOCK      1
+
 static COLORREF g_palette[PALETTE_COUNT - 1] =
 {
     RGB(0, 0, 0),       // Black
@@ -94,11 +96,11 @@ static COLORREF RandomColor(void)
     return RGB(rand() % 256, rand() % 256, rand() % 256);
 }
 
-static void AddSegment(int x1, int y1, int x2, int y2)
+static BOOL AddSegment(int x1, int y1, int x2, int y2)
 {
     if (g_segments >= MAX_SEGMENTS)
     {
-        return;
+        return FALSE;
     }
     g_segx1[g_segments] = x1;
     g_segy1[g_segments] = y1;
@@ -106,6 +108,29 @@ static void AddSegment(int x1, int y1, int x2, int y2)
     g_segy2[g_segments] = y2;
     g_segcolor[g_segments] = g_color;
     g_segments++;
+    return TRUE;
+}
+
+static void DrawSegment(HDC hdc, int i)
+{
+    HPEN pen = CreatePen(PS_SOLID, 2, g_segcolor[i]);
+    HPEN old_pen = (HPEN)SelectObject(hdc, pen);
+    MoveToEx(hdc, g_segx1[i], g_segy1[i], NULL);
+    LineTo(hdc, g_segx2[i], g_segy2[i]);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen);
+}
+
+// Repaint only the status bar (clock and stroke count)
+static void InvalidateStatus(HWND hwnd)
+{
+    RECT canvas;
+    RECT client;
+    RECT rc;
+    CanvasRect(hwnd, &canvas);
+    GetClientRect(hwnd, &client);
+    SetRect(&rc, 0, canvas.bottom + 2, client.right, client.bottom);
+    InvalidateRect(hwnd, &rc, FALSE);
 }
 
 static void OnPaint(HWND hwnd)
@@ -192,12 +217,7 @@ static void OnPaint(HWND hwnd)
     // The drawing itself
     for (i = 0; i < g_segments; i++)
     {
-        HPEN pen = CreatePen(PS_SOLID, 2, g_segcolor[i]);
-        HPEN old_pen = (HPEN)SelectObject(hdc, pen);
-        MoveToEx(hdc, g_segx1[i], g_segy1[i], NULL);
-        LineTo(hdc, g_segx2[i], g_segy2[i]);
-        SelectObject(hdc, old_pen);
-        DeleteObject(pen);
+        DrawSegment(hdc, i);
     }
 
     // Status bar: clock, stroke count and usage hint
@@ -255,10 +275,13 @@ static void OnMouseMove(HWND hwnd, WPARAM wParam, int x, int y)
 
     // Only draw while the cursor stays on the canvas
     CanvasRect(hwnd, &rc);
-    if (PtInRect(&rc, (POINT){ x, y }))
+    if (PtInRect(&rc, (POINT){ x, y }) &&
+        AddSegment(g_lastx, g_lasty, x, y))
     {
-        AddSegment(g_lastx, g_lasty, x, y);
-        InvalidateRect(hwnd, NULL, FALSE);
+        // Draw just the new segment instead of repainting everything
+        HDC hdc = GetDC(hwnd);
+        DrawSegment(hdc, g_segments - 1);
+        ReleaseDC(hwnd, hdc);
     }
     g_lastx = x;
     g_lasty = y;
@@ -268,6 +291,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg)
     {
+        case WM_CREATE:
+            SetTimer(hwnd, IDT_CLOCK, 1000, NULL);
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == IDT_CLOCK)
+            {
+                InvalidateStatus(hwnd);
+            }
+            return 0;
+
         case WM_PAINT:
             OnPaint(hwnd);
             return 0;
@@ -285,6 +319,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             {
                 g_drawing = FALSE;
                 ReleaseCapture();
+                InvalidateStatus(hwnd);
             }
             return 0;
 
@@ -294,6 +329,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_DESTROY:
+            KillTimer(hwnd, IDT_CLOCK);
             PostQuitMessage(0);
             return 0;
     }
@@ -315,10 +351,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
-    RegisterClassA(&wc);
+    wc.hCursor = LoadCursor(NULL, IDC_CROSS);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (!RegisterClassA(&wc))
+    {
+        return 1;
+    }
 
     hwnd = CreateWindowExA(0, CLASS_NAME, "Paint Demo",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           WS_OVERLAPPEDWINDOW,
                            140, 90, 520, 420,
                            NULL, NULL, hInstance, NULL);
     if (hwnd == NULL)

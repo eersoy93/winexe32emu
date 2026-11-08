@@ -126,7 +126,9 @@ static void test_strings(void)
     check(strcmp(strerror(ENOENT), "No such file or directory") == 0, "strerror");
     check(_stricmp("HeLLo", "hello") == 0 && _strcmpi("a", "B") < 0, "_stricmp/_strcmpi");
     check(strnlen("abcdef", 3) == 3, "strnlen");
-    check(strcpy_s(buf, 4, "toolong") != 0 && buf[0] == '\0', "strcpy_s overflow");
+    /* _TRUNCATE avoids the invalid parameter handler that terminates on real msvcrt */
+    check(strncpy_s(buf, 4, "toolong", _TRUNCATE) == STRUNCATE && strcmp(buf, "too") == 0,
+          "strncpy_s truncation");
 
     wcscpy(wbuf, L"Hello");
     wcscat(wbuf, L" World");
@@ -234,18 +236,26 @@ static void test_environment_and_files(void)
 static void test_control_flow(void)
 {
     volatile int stage = 0;
-    int result;
+    volatile int result = 0;
 
     signal(SIGINT, on_signal);
     raise(SIGINT);
     check(signal_seen == SIGINT, "signal/raise");
 
-    result = setjmp(jump_target);
-    if (result == 0)
+    /* setjmp may only appear in a controlling expression like this one */
+    switch (setjmp(jump_target))
     {
-        stage = 1;
-        jump_back(5);
-        stage = 99;  /* never reached */
+        case 0:
+            stage = 1;
+            jump_back(5);
+            stage = 99;  /* never reached */
+            break;
+        case 5:
+            result = 5;
+            break;
+        default:
+            result = -1;
+            break;
     }
     check(result == 5 && stage == 1, "setjmp/longjmp");
 }

@@ -19,6 +19,11 @@ System information demo - exercises kernel32/user32/advapi32 query APIs
 and the wide/copy/move file APIs of the sandboxed C: drive.
 */
 
+/* GetTickCount64 needs Vista+ declarations on older MinGW headers */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <windows.h>
 #include <stdio.h>
 
@@ -90,8 +95,15 @@ int main(void)
         HANDLE h = CreateFileA("C:\\Windows\\Temp\\SysInfo\\a.txt", GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         DWORD written;
-        WriteFile(h, "data", 4, &written, NULL);
-        CloseHandle(h);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            WriteFile(h, "data", 4, &written, NULL);
+            CloseHandle(h);
+        }
+        else
+        {
+            printf("  CreateFileA a.txt       : failed, error %lu\n", GetLastError());
+        }
     }
     printf("  CopyFileA a->b          : %d\n",
            CopyFileA("C:\\Windows\\Temp\\SysInfo\\a.txt", "C:\\Windows\\Temp\\SysInfo\\b.txt", FALSE));

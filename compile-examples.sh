@@ -17,6 +17,8 @@
 OUT_DIR=c_drive/Windows/Demos
 mkdir -p "$OUT_DIR"
 
+CFLAGS="-Wall -Wextra -Wno-unused-parameter"
+
 # Compile each example with appropriate flags
 for src in examples/*.c; do
     name=$(basename "$src" .c)
@@ -24,32 +26,32 @@ for src in examples/*.c; do
     case "$name" in
         console_demo)
             # Console application - uses AllocConsole, kernel32 only
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -mwindows
             ;;
         file_demo)
             # Console application - sandboxed file I/O (kernel32 + user32 + msvcrt)
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -mconsole
             ;;
         sound_demo)
             # Console application - Beep / MessageBeep / PlaySound (winmm)
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -lwinmm -mconsole
             ;;
         sysinfo_demo)
             # Console application - system information APIs
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -ladvapi32 -mconsole
             ;;
         crt_demo)
             # Console application - C runtime (msvcrt) coverage tests
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -mconsole
             ;;
         *)
             # Default: GUI application
-            i686-w64-mingw32-gcc -o "${OUT_DIR}/${name}.exe" "$src" \
+            i686-w64-mingw32-gcc $CFLAGS -o "${OUT_DIR}/${name}.exe" "$src" \
                 -lkernel32 -luser32 -lgdi32 -mwindows
             ;;
     esac
