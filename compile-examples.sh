@@ -26,9 +26,9 @@ for src in examples/*.c; do
                 -lkernel32 -mwindows
             ;;
         file_demo)
-            # Console application - sandboxed file I/O (kernel32 + msvcrt)
+            # Console application - sandboxed file I/O (kernel32 + user32 + msvcrt)
             i686-w64-mingw32-gcc -o "c_drive/${name}.exe" "$src" \
-                -lkernel32 -mconsole
+                -lkernel32 -luser32 -mconsole
             ;;
         crt_demo)
             # Console application - C runtime (msvcrt) coverage tests

@@ -596,6 +596,7 @@ class WinAPIHandler:
         'LocalAlloc': 2, 'LocalFree': 1, 'CloseHandle': 1, 'Sleep': 1,
         'GetFileAttributesA': 1, 'CreateFileA': 7, 'CreateFileW': 7,
         'GetFileSize': 2, 'SetFilePointer': 4, 'DeleteFileA': 1,
+        'CreateDirectoryA': 2, 'RemoveDirectoryA': 1,
         'ReadFile': 5, 'ReadConsoleA': 5, 'GetEnvironmentVariableA': 3,
         'ExpandEnvironmentStringsA': 3, 'InitializeCriticalSection': 1,
         'InitializeCriticalSectionAndSpinCount': 2, 'EnterCriticalSection': 1,
@@ -2169,6 +2170,41 @@ class WinAPIHandler:
         except OSError as e:
             log.error(f"DeleteFileA(\"{filename}\") failed: {e}")
             self._last_error = 5
+            return 0
+
+    def CreateDirectoryA(self, args):
+        """CreateDirectoryA emulation (sandboxed)"""
+        dirname = self.read_string(args[0])
+        log.debug(f"CreateDirectoryA(\"{dirname}\")")
+        path = self.resolve_c_drive_path(dirname)
+        if path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        try:
+            os.mkdir(path)
+            return 1
+        except FileExistsError:
+            self._last_error = 183  # ERROR_ALREADY_EXISTS
+        except FileNotFoundError:
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+        except OSError as e:
+            log.error(f"CreateDirectoryA(\"{dirname}\") failed: {e}")
+            self._last_error = 5
+        return 0
+
+    def RemoveDirectoryA(self, args):
+        """RemoveDirectoryA emulation (sandboxed, directory must be empty)"""
+        dirname = self.read_string(args[0])
+        log.debug(f"RemoveDirectoryA(\"{dirname}\")")
+        path = self.resolve_c_drive_path(dirname)
+        if path is None or not os.path.isdir(path):
+            self._last_error = 3 if path else 5
+            return 0
+        try:
+            os.rmdir(path)
+            return 1
+        except OSError:
+            self._last_error = 145  # ERROR_DIR_NOT_EMPTY
             return 0
 
     def ReadFile(self, args):
