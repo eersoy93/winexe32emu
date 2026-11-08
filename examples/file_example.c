@@ -21,8 +21,9 @@ Everything happens inside the emulated C: drive (the host c_drive/ folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
   2. msvcrt fopen/fwrite/fgets round-trip.
   3. Files inside directories: the environment folders created at startup
-     (C:\\Windows\\Temp, C:\\Windows) and new nested directories.
-  4. A sandbox-escape attempt ("..\\escape.txt") that must be refused.
+     (C:\\Windows\\Temp, C:\\Windows) and new nested directories in the
+     example's own folder (the current directory).
+  4. A sandbox-escape attempt ("C:\\..\\escape.txt") that must be refused.
 */
 
 #include <windows.h>
@@ -128,39 +129,39 @@ int main(void)
     }
 
     /* New nested directories: Win32 CreateDirectoryA and CRT _mkdir */
-    CreateDirectoryA("C:\\FileExample", NULL);
-    CreateDirectoryA("C:\\FileExample\\Data", NULL);
-    WriteFileIn(hOut, "C:\\FileExample\\readme.txt", "File example directory\n");
-    WriteFileIn(hOut, "C:\\FileExample\\Data\\data.txt", "1 2 3\n");
+    CreateDirectoryA("FileExample", NULL);
+    CreateDirectoryA("FileExample\\Data", NULL);
+    WriteFileIn(hOut, "FileExample\\readme.txt", "File example directory\n");
+    WriteFileIn(hOut, "FileExample\\Data\\data.txt", "1 2 3\n");
 
-    _mkdir("C:\\FileExample\\Logs");
-    fp = fopen("C:\\FileExample\\Logs\\log.txt", "w");
+    _mkdir("FileExample\\Logs");
+    fp = fopen("FileExample\\Logs\\log.txt", "w");
     if (fp)
     {
         fprintf(fp, "log entry %d\n", 1);
         fclose(fp);
-        WriteString(hOut, "(Dir) 'C:\\FileExample\\Logs\\log.txt' has been written!\n");
+        WriteString(hOut, "(Dir) 'FileExample\\Logs\\log.txt' has been written!\n");
     }
 
-    fp = fopen("C:\\FileExample\\Data\\data.txt", "r");
+    fp = fopen("FileExample\\Data\\data.txt", "r");
     if (fp)
     {
         if (fgets(buffer, sizeof(buffer), fp))
         {
-            WriteString(hOut, "(Dir) 'C:\\FileExample\\Data\\data.txt' has been read!\n");
+            WriteString(hOut, "(Dir) 'FileExample\\Data\\data.txt' has been read!\n");
             WriteString(hOut, buffer);
         }
         fclose(fp);
     }
 
     /* ---- 4. Sandbox escape must be refused ---- */
-    hFile = CreateFileA("..\\escape.txt", GENERIC_WRITE, 0, NULL,
+    hFile = CreateFileA("C:\\..\\escape.txt", GENERIC_WRITE, 0, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
-        WriteString(hOut, "Sandbox escape via '..\\escape.txt' was blocked! Good!\n");
+        WriteString(hOut, "Sandbox escape via 'C:\\..\\escape.txt' was blocked! Good!\n");
     else
     {
-        WriteString(hOut, "Sandbox escape via '..\\escape.txt' succeeded! Bad!\n");
+        WriteString(hOut, "Sandbox escape via 'C:\\..\\escape.txt' succeeded! Bad!\n");
         CloseHandle(hFile);
     }
 

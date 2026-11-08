@@ -16,15 +16,20 @@
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-# Example programs live in C:\Windows\Examples of the emulated C drive
-OUT_DIR=c_drive/Windows/Examples
-mkdir -p "$OUT_DIR" || exit 1
+# Example programs live in their own folders in C:\Windows\Examples of the
+# emulated C drive (C:\Windows\Examples\gui_example\gui_example.exe)
+EXAMPLES_DIR=c_drive/Windows/Examples
+mkdir -p "$EXAMPLES_DIR" || exit 1
 
 CFLAGS="-Wall -Wextra -Wno-unused-parameter"
 
 # Compile each example with appropriate flags
 for src in examples/*.c; do
     name=$(basename "$src" .c)
+    OUT_DIR="${EXAMPLES_DIR}/${name}"
+    mkdir -p "$OUT_DIR" || exit 1
+    # Left over from the old layout (all EXEs directly in C:\Windows\Examples)
+    rm -f "${EXAMPLES_DIR}/${name}.exe"
 
     case "$name" in
         console_example)

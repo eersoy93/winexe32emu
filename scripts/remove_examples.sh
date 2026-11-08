@@ -14,7 +14,8 @@
 # limitations under the License.
 
 # Undoes compile_examples.sh: deletes the compiled example EXEs. Other files
-# in C:\Windows\Examples are kept (the folder stays if any remain).
+# in C:\Windows\Examples and the example folders are kept (folders stay if
+# any remain).
 
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
@@ -22,7 +23,9 @@ cd "$(dirname "$0")/.." || exit 1
 OUT_DIR=c_drive/Windows/Examples
 
 for src in examples/*.c; do
-    rm -f "${OUT_DIR}/$(basename "$src" .c).exe" || exit 1
+    name=$(basename "$src" .c)
+    rm -f "${OUT_DIR}/${name}/${name}.exe" "${OUT_DIR}/${name}.exe" || exit 1
+    rmdir "${OUT_DIR}/${name}" 2>/dev/null
 done
 rmdir "$OUT_DIR" 2>/dev/null
 

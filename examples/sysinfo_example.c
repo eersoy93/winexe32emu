@@ -117,7 +117,7 @@ int main(void)
            DeleteFileW(L"C:\\Windows\\Temp\\SysInfo\\a.txt"),
            DeleteFileW(L"C:\\Windows\\Temp\\SysInfo\\c.txt"));
     printf("  RemoveDirectoryW        : %d\n", RemoveDirectoryW(L"C:\\Windows\\Temp\\SysInfo"));
-    ok = CopyFileA("C:\\Windows\\win.ini", "..\\escape.txt", FALSE);
+    ok = CopyFileA("C:\\Windows\\win.ini", "C:\\..\\escape.txt", FALSE);
     printf("  Escape attempt (copy)   : %d, error %lu\n", ok, GetLastError());
 
     printf("\nDone!\n");

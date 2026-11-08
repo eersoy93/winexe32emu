@@ -655,12 +655,33 @@ def _program_folder_host_path(folder):
     return resolve_c_drive_path(folder)
 
 
+def _folder_programs(directory):
+    """Names of the EXE files directly inside a host directory, sorted."""
+    try:
+        return sorted((f for f in os.listdir(directory)
+                       if f.lower().endswith('.exe')
+                       and os.path.isfile(os.path.join(directory, f))),
+                      key=str.lower)
+    except (OSError, TypeError):
+        return []
+
+
+def _program_subfolders(directory):
+    """Names of the folders directly inside a host directory, sorted."""
+    try:
+        return sorted((d for d in os.listdir(directory)
+                       if os.path.isdir(os.path.join(directory, d))), key=str.lower)
+    except (OSError, TypeError):
+        return []
+
+
 def find_program(name):
     """Host path of the EXE to run, or None if it does not exist.
 
-    A Windows path (C:\\Windows\\Examples\\gdi_example.exe, Windows\\Examples\\...)
+    A Windows path (C:\\Windows\\Examples\\gdi_example\\gdi_example.exe, ...)
     is resolved inside c_drive/; a bare file name is searched in
-    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Examples).
+    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Examples) and in their
+    subfolders (each example lives in its own folder).
     """
     if not name:
         return None
@@ -668,27 +689,29 @@ def find_program(name):
         path = resolve_c_drive_path(name)
         return path if path and os.path.isfile(path) else None
     for folder in PROGRAM_FOLDERS:
-        path = resolve_c_drive_path(folder.rstrip('\\') + '\\' + name)
-        if path and os.path.isfile(path):
-            return path
+        directory = _program_folder_host_path(folder)
+        if not directory:
+            continue
+        for sub in [''] + _program_subfolders(directory):
+            path = os.path.join(directory, sub, name)
+            if os.path.isfile(path):
+                return path
     return None
 
 
 def list_programs():
-    """Windows paths of the EXE files in each PROGRAM_FOLDERS entry
-    (for the Start menu): {folder: [paths]}."""
+    """Windows paths of the EXE files in each PROGRAM_FOLDERS entry and its
+    subfolders (for the Start menu): {folder: [paths]}."""
     programs = {}
     for folder in PROGRAM_FOLDERS:
         directory = _program_folder_host_path(folder)
-        try:
-            names = sorted((f for f in os.listdir(directory)
-                            if f.lower().endswith('.exe')
-                            and os.path.isfile(os.path.join(directory, f))),
-                           key=str.lower)
-        except (OSError, TypeError):
-            names = []
         prefix = folder.rstrip('\\') + '\\'
-        programs[folder] = [prefix + f for f in names]
+        paths = [prefix + f for f in _folder_programs(directory)]
+        if directory:
+            for sub in _program_subfolders(directory):
+                paths += [f"{prefix}{sub}\\{f}"
+                          for f in _folder_programs(os.path.join(directory, sub))]
+        programs[folder] = sorted(paths, key=lambda p: p.rsplit('\\', 1)[-1].lower())
     return programs
 
 
@@ -1088,8 +1111,10 @@ class WinAPIHandler:
         # keys are upper-case since Windows names are case-insensitive
         self.environment = dict(DEFAULT_ENVIRONMENT)
 
-        # Current directory (SetCurrentDirectory); relative paths resolve against it
-        self.current_directory = "C:\\"
+        # Current directory (SetCurrentDirectory); relative paths resolve against it.
+        # Programs start in their EXE's folder, like when launched from Explorer.
+        exe_dir = self.windows_exe_path().rsplit('\\', 1)[0]
+        self.current_directory = exe_dir if len(exe_dir) > 2 else "C:\\"
 
         # (type, name) -> (RVA, size) of the EXE's resources, built on first use
         self._resource_index = None

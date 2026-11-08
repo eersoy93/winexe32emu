@@ -25,7 +25,6 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 ## Folder Structure
 
 - `c_drive/` - Put your EXE files here (emulation path, `C:\`)
-- `c_drive/Windows/Examples/` - Compiled example EXEs (`C:\Windows\Examples`)
 - `examples/` - Example C source codes
 - `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Examples/`
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders

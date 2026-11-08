@@ -206,12 +206,13 @@ static void test_environment_and_files(void)
     FILE *fp;
     int value = 0;
     char word[16] = "";
-    char cwd[64];
+    char cwd[_MAX_PATH];
 
     check(getenv("WINDIR") != NULL && strcmp(getenv("WINDIR"), "C:\\Windows") == 0, "getenv");
     check(_putenv("CRT_EXAMPLE=yes") == 0 && strcmp(getenv("CRT_EXAMPLE"), "yes") == 0, "_putenv");
     check(getenv("NO_SUCH_VARIABLE") == NULL, "getenv missing");
-    check(_getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "C:\\") == 0, "_getcwd");
+    check(_getcwd(cwd, sizeof(cwd)) != NULL &&
+          strcmp(cwd, "C:\\Windows\\Examples\\crt_example") == 0, "_getcwd (EXE folder)");
 
     fp = fopen("crt_example.txt", "w");
     if (fp)
