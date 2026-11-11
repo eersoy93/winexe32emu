@@ -20,9 +20,9 @@ File I/O test - exercises the emulator's sandboxed file support.
 Everything happens inside the emulated C: drive (the host c_drive/ folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
   2. msvcrt fopen/fwrite/fgets round-trip.
-  3. Files inside directories: the environment folders created at startup
-     (C:\\Windows\\Temp, C:\\Windows) and new nested directories in the
-     test's own folder (the current directory).
+  3. Files inside directories: the environment folder created at startup
+     (C:\\Windows\\Temp) and new nested directories in the test's own
+     folder (the current directory).
   4. A sandbox-escape attempt ("C:\\..\\escape.txt") that must be refused.
 */
 
@@ -116,15 +116,12 @@ int main(void)
     /* ---- 3. Files inside directories ---- */
     char dir[MAX_PATH], path[MAX_PATH];
 
-    /* Environment folders (created by the emulator at startup) */
+    /* Environment folder (created by the emulator at startup) */
     if (GetTempPathA(sizeof(dir), dir))  /* "C:\\Windows\\Temp\\" */
     {
         wsprintfA(path, "%sfile_test.tmp", dir);
         WriteFileIn(hOut, path, "Temporary data\n");
-    }
-    if (GetWindowsDirectoryA(dir, sizeof(dir)))  /* "C:\\Windows" */
-    {
-        wsprintfA(path, "%s\\file_test.ini", dir);
+        wsprintfA(path, "%sfile_test.ini", dir);
         WriteFileIn(hOut, path, "[file_test]\nenabled=1\n");
     }
 

@@ -55,7 +55,7 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt, shell32, ole32, comctl32, comdlg32)
-- Fake C drive environment esupport
+- Fake C drive environment support
 
 ## Versioning
 

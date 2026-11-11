@@ -17,9 +17,11 @@
 cd "$(dirname "$0")/.." || exit 1
 
 # Emulated C drive and the folders the default environment names
-# (WINDIR/SYSTEMROOT, PATH, TEMP/TMP, PROGRAMFILES)
+# (WINDIR/SYSTEMROOT, PATH, TEMP/TMP, PROGRAMFILES, USERPROFILE, APPDATA,
+# LOCALAPPDATA, PUBLIC, PROGRAMDATA); user files are in Users/, not in Windows/
 C_DRIVE=c_drive
-for dir in Windows Windows/System32 Windows/Temp "Program Files"; do
+for dir in Windows Windows/System32 Windows/Temp "Program Files" \
+           Users/User/AppData/Roaming Users/User/AppData/Local Users/Public ProgramData; do
     mkdir -p "${C_DRIVE}/${dir}" || exit 1
 done
 echo "OK: ${C_DRIVE}/ directory tree"

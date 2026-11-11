@@ -50,6 +50,17 @@ WINEXE32EMU_VERSION = "0.2.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
 
+# User account of the emulated programs and the Windows Vista+ folder layout:
+# per-user files in the profile under C:\Users, shared ones in C:\Users\Public
+# and C:\ProgramData (C:\Windows holds only the system)
+USER_NAME = "User"
+USERS_FOLDER = 'C:\\Users'
+USER_PROFILE_FOLDER = USERS_FOLDER + '\\' + USER_NAME
+USER_APPDATA_FOLDER = USER_PROFILE_FOLDER + '\\AppData\\Roaming'
+USER_LOCAL_APPDATA_FOLDER = USER_PROFILE_FOLDER + '\\AppData\\Local'
+PUBLIC_FOLDER = USERS_FOLDER + '\\Public'
+PROGRAM_DATA_FOLDER = 'C:\\ProgramData'
+
 # Environment variables seen by the emulated program. The folders they name
 # are created inside c_drive/ at startup.
 PROGRAM_FILES_FOLDER = 'C:\\Program Files'
@@ -61,6 +72,15 @@ DEFAULT_ENVIRONMENT = {
     'SYSTEMROOT': 'C:\\Windows',
     'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
     'PROGRAMFILES': PROGRAM_FILES_FOLDER,
+    'USERNAME': USER_NAME,
+    'USERPROFILE': USER_PROFILE_FOLDER,
+    'HOMEDRIVE': 'C:',
+    'HOMEPATH': USER_PROFILE_FOLDER[2:],
+    'APPDATA': USER_APPDATA_FOLDER,
+    'LOCALAPPDATA': USER_LOCAL_APPDATA_FOLDER,
+    'PUBLIC': PUBLIC_FOLDER,
+    'ALLUSERSPROFILE': PROGRAM_DATA_FOLDER,
+    'PROGRAMDATA': PROGRAM_DATA_FOLDER,
 }
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
@@ -612,8 +632,8 @@ def environment_folders(environment):
     for name, value in environment.items():
         for entry in value.split(';'):
             entry = entry.strip()
-            if len(entry) < 2 or entry[1] != ':':
-                continue  # only absolute drive paths name folders
+            if len(entry) < 3 or entry[1] != ':':
+                continue  # only absolute drive paths name folders (not "C:" alone)
             if name.upper() in ENVIRONMENT_FILE_VARIABLES:
                 entry = entry.replace('/', '\\').rsplit('\\', 1)[0]
             if entry.lower() not in (f.lower() for f in folders):
@@ -4046,7 +4066,7 @@ class WinAPIHandler:
         return 1
 
     COMPUTER_NAME = "WINEXE32EMU"
-    USER_NAME = "User"
+    USER_NAME = USER_NAME
 
     def GetComputerNameA(self, args, wide=False):
         """GetComputerNameA/W emulation"""
@@ -5835,41 +5855,49 @@ class WinAPIHandler:
 
     # ---------- Shell folders (shell32) ----------
 
-    # CSIDL -> folder; the per-user and "All Users" folders are in C:\Windows
-    # like on Windows 9x
+    # CSIDL -> folder, laid out like Windows Vista and later: the user's
+    # folders are in the profile (C:\Users\<user>), the shared ones in
+    # C:\Users\Public and C:\ProgramData
     SHELL_FOLDERS = {
-        0x00: 'C:\\Windows\\Desktop',                         # CSIDL_DESKTOP
-        0x02: 'C:\\Windows\\Start Menu\\Programs',            # CSIDL_PROGRAMS
-        0x05: 'C:\\My Documents',                             # CSIDL_PERSONAL
-        0x06: 'C:\\Windows\\Favorites',                       # CSIDL_FAVORITES
-        0x07: 'C:\\Windows\\Start Menu\\Programs\\StartUp',   # CSIDL_STARTUP
-        0x08: 'C:\\Windows\\Recent',                          # CSIDL_RECENT
-        0x09: 'C:\\Windows\\SendTo',                          # CSIDL_SENDTO
-        0x0B: 'C:\\Windows\\Start Menu',                      # CSIDL_STARTMENU
-        0x10: 'C:\\Windows\\Desktop',                         # CSIDL_DESKTOPDIRECTORY
-        0x14: 'C:\\Windows\\Fonts',                           # CSIDL_FONTS
-        0x15: 'C:\\Windows\\ShellNew',                        # CSIDL_TEMPLATES
-        0x16: 'C:\\Windows\\All Users\\Start Menu',           # CSIDL_COMMON_STARTMENU
-        0x17: 'C:\\Windows\\All Users\\Start Menu\\Programs',  # CSIDL_COMMON_PROGRAMS
-        0x18: 'C:\\Windows\\All Users\\Start Menu\\Programs\\StartUp',  # CSIDL_COMMON_STARTUP
-        0x19: 'C:\\Windows\\All Users\\Desktop',  # CSIDL_COMMON_DESKTOPDIRECTORY
-        0x1A: 'C:\\Windows\\Application Data',                # CSIDL_APPDATA
-        0x1C: 'C:\\Windows\\Local Settings\\Application Data',  # CSIDL_LOCAL_APPDATA
-        0x1F: 'C:\\Windows\\All Users\\Favorites',            # CSIDL_COMMON_FAVORITES
-        0x20: 'C:\\Windows\\Temporary Internet Files',        # CSIDL_INTERNET_CACHE
-        0x21: 'C:\\Windows\\Cookies',                         # CSIDL_COOKIES
-        0x22: 'C:\\Windows\\History',                         # CSIDL_HISTORY
-        0x23: 'C:\\Windows\\All Users\\Application Data',     # CSIDL_COMMON_APPDATA
-        0x24: 'C:\\Windows',                                  # CSIDL_WINDOWS
-        0x25: 'C:\\Windows\\System32',                        # CSIDL_SYSTEM
-        0x26: PROGRAM_FILES_FOLDER,                           # CSIDL_PROGRAM_FILES
-        0x27: 'C:\\My Documents\\My Pictures',                # CSIDL_MYPICTURES
-        0x28: 'C:\\Windows',                                  # CSIDL_PROFILE
-        0x29: 'C:\\Windows\\System32',                        # CSIDL_SYSTEMX86
-        0x2A: PROGRAM_FILES_FOLDER,                           # CSIDL_PROGRAM_FILESX86
-        0x2B: PROGRAM_FILES_FOLDER + '\\Common Files',        # CSIDL_PROGRAM_FILES_COMMON
-        0x2D: 'C:\\Windows\\All Users\\Templates',            # CSIDL_COMMON_TEMPLATES
-        0x2E: 'C:\\Windows\\All Users\\Documents',            # CSIDL_COMMON_DOCUMENTS
+        0x00: USER_PROFILE_FOLDER + '\\Desktop',                     # CSIDL_DESKTOP
+        0x02: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs',  # CSIDL_PROGRAMS
+        0x05: USER_PROFILE_FOLDER + '\\Documents',                   # CSIDL_PERSONAL
+        0x06: USER_PROFILE_FOLDER + '\\Favorites',                   # CSIDL_FAVORITES
+        0x07: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Startup',
+        0x08: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Recent',  # CSIDL_RECENT
+        0x09: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\SendTo',  # CSIDL_SENDTO
+        0x0B: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Start Menu',  # CSIDL_STARTMENU
+        0x0D: USER_PROFILE_FOLDER + '\\Music',                       # CSIDL_MYMUSIC
+        0x0E: USER_PROFILE_FOLDER + '\\Videos',                      # CSIDL_MYVIDEO
+        0x10: USER_PROFILE_FOLDER + '\\Desktop',                     # CSIDL_DESKTOPDIRECTORY
+        0x14: 'C:\\Windows\\Fonts',                                  # CSIDL_FONTS
+        0x15: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Templates',  # CSIDL_TEMPLATES
+        0x16: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Start Menu',  # CSIDL_COMMON_STARTMENU
+        0x17: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs',
+        0x18: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Startup',
+        0x19: PUBLIC_FOLDER + '\\Desktop',             # CSIDL_COMMON_DESKTOPDIRECTORY
+        0x1A: USER_APPDATA_FOLDER,                                    # CSIDL_APPDATA
+        0x1C: USER_LOCAL_APPDATA_FOLDER,                              # CSIDL_LOCAL_APPDATA
+        0x1F: USER_PROFILE_FOLDER + '\\Favorites',                   # CSIDL_COMMON_FAVORITES
+        0x20: USER_LOCAL_APPDATA_FOLDER + '\\Microsoft\\Windows\\INetCache',  # CSIDL_INTERNET_CACHE
+        0x21: USER_LOCAL_APPDATA_FOLDER + '\\Microsoft\\Windows\\INetCookies',  # CSIDL_COOKIES
+        0x22: USER_LOCAL_APPDATA_FOLDER + '\\Microsoft\\Windows\\History',  # CSIDL_HISTORY
+        0x23: PROGRAM_DATA_FOLDER,                                    # CSIDL_COMMON_APPDATA
+        0x24: 'C:\\Windows',                                          # CSIDL_WINDOWS
+        0x25: 'C:\\Windows\\System32',                                # CSIDL_SYSTEM
+        0x26: PROGRAM_FILES_FOLDER,                                   # CSIDL_PROGRAM_FILES
+        0x27: USER_PROFILE_FOLDER + '\\Pictures',                    # CSIDL_MYPICTURES
+        0x28: USER_PROFILE_FOLDER,                                    # CSIDL_PROFILE
+        0x29: 'C:\\Windows\\System32',                                # CSIDL_SYSTEMX86
+        0x2A: PROGRAM_FILES_FOLDER,                                   # CSIDL_PROGRAM_FILESX86
+        0x2B: PROGRAM_FILES_FOLDER + '\\Common Files',               # CSIDL_PROGRAM_FILES_COMMON
+        0x2D: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Templates',  # CSIDL_COMMON_TEMPLATES
+        0x2E: PUBLIC_FOLDER + '\\Documents',                         # CSIDL_COMMON_DOCUMENTS
+        0x2F: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools',
+        0x30: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools',
+        0x35: PUBLIC_FOLDER + '\\Music',                             # CSIDL_COMMON_MUSIC
+        0x36: PUBLIC_FOLDER + '\\Pictures',                          # CSIDL_COMMON_PICTURES
+        0x37: PUBLIC_FOLDER + '\\Videos',                            # CSIDL_COMMON_VIDEO
     }
 
     def _shell_folder(self, csidl):

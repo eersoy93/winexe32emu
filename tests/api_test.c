@@ -378,7 +378,11 @@ static void test_shell(void)
     check(SHGetFolderPathA(NULL, CSIDL_PROGRAM_FILES, NULL, 0, buf) == S_OK &&
           strcmp(buf, "C:\\Program Files") == 0, "SHGetFolderPathA (Program Files)");
     check(SHGetFolderPathA(NULL, CSIDL_PROGRAMS, NULL, 0, buf) == S_OK &&
-          GetFileAttributesA(buf) & FILE_ATTRIBUTE_DIRECTORY, "SHGetFolderPathA (Programs exists)");
+          strncmp(buf, "C:\\Users\\User\\", 14) == 0 &&
+          GetFileAttributesA(buf) & FILE_ATTRIBUTE_DIRECTORY,
+          "SHGetFolderPathA (Programs exists in the user profile)");
+    check(GetEnvironmentVariableA("APPDATA", buf, sizeof(buf)) &&
+          strcmp(buf, "C:\\Users\\User\\AppData\\Roaming") == 0, "APPDATA is in C:\\Users");
 
     CoInitialize(NULL);
     hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkA,

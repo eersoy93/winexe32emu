@@ -50,8 +50,12 @@ done
 sh scripts/remove_tests.sh >/dev/null || exit 1
 
 # Deepest folders first; rmdir only removes empty ones
-for dir in Windows/Temp Windows/System32 "Windows/Start Menu/Programs" "Windows/Start Menu" \
-           Windows "Program Files" ""; do
+START_MENU="Users/User/AppData/Roaming/Microsoft/Windows/Start Menu"
+for dir in Windows/Temp Windows/System32 Windows "Program Files" \
+           "${START_MENU}/Programs" "${START_MENU}" Users/User/AppData/Roaming/Microsoft/Windows \
+           Users/User/AppData/Roaming/Microsoft Users/User/AppData/Roaming \
+           Users/User/AppData/Local Users/User/AppData Users/User Users/Public Users \
+           ProgramData ""; do
     rmdir "${C_DRIVE}/${dir}" 2>/dev/null
 done
 
