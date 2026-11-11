@@ -8086,12 +8086,16 @@ class WinAPIHandler:
         
         draw_x = x
         draw_y = y
-        
-        # Calculate centering (approximate)
+        text_w, text_h = self._text_extent(hdc, text)
+
         if format_flags & DT_CENTER:
-            draw_x = x + (width - len(text) * 8) // 2  # 8 pixel estimated character width
+            draw_x = x + (width - text_w) // 2
+        elif format_flags & 0x02:  # DT_RIGHT
+            draw_x = x + width - text_w
         if format_flags & DT_VCENTER:
-            draw_y = y + (height - 16) // 2  # 16 pixel estimated height
+            draw_y = y + (height - text_h) // 2
+        elif format_flags & 0x08:  # DT_BOTTOM
+            draw_y = y + height - text_h
         
         if self.gui:
             state = self.dc_state.get(hdc, {})
@@ -8809,6 +8813,7 @@ class WinAPIHandler:
         self.gdi_objects[handle] = {
             'type': 'font',
             'height': abs(height) or 13,
+            'cell': height >= 0,  # Negative: character (em) height, else cell height
             'bold': weight >= 600,
             'italic': bool(italic),
             'underline': bool(underline),
@@ -8833,6 +8838,7 @@ class WinAPIHandler:
         self.gdi_objects[handle] = {
             'type': 'font',
             'height': abs(height) or 13,
+            'cell': height >= 0,  # Negative: character (em) height, else cell height
             'bold': weight >= 600,
             'italic': bool(italic),
             'underline': bool(underline),
@@ -8856,8 +8862,16 @@ class WinAPIHandler:
         return 1
 
     def _text_extent(self, hdc, text):
-        """Rough (width, height) of text; the GUI font is close to 8x16 per character"""
+        """(width, height) of text in the DC's font, measured with the font the
+        GUI draws it with; without the GUI the font is close to 8x16 per character"""
         font = self._dc_font(hdc)
+        if self.gui and self.gui.font is not None:
+            with self.gui.lock:
+                render_font = self.gui._get_render_font(font)
+                width = render_font.size(text)[0]
+                if font and not font.get('cell', True):
+                    return width, render_font.get_height()
+            return width, font['height'] if font else 16
         if font:
             return int(len(text) * font['height'] * 0.55), font['height']
         return len(text) * 8, 16
@@ -14982,19 +14996,33 @@ class PseudoWindowsGUI:
         shape['_surface'] = (key, surface)
         return surface
 
+    # Free fonts with the metrics of the common Windows fonts
+    METRIC_FONTS = {'arial': 'liberationsans', 'helvetica': 'liberationsans',
+                    'times new roman': 'liberationserif', 'times': 'liberationserif',
+                    'courier new': 'liberationmono', 'courier': 'liberationmono'}
+
     def _get_render_font(self, font_dict):
-        """Pygame font for a GDI font dict (cached); None -> default GUI font."""
+        """Pygame font for a GDI font dict (cached); None -> default GUI font.
+        A positive GDI height is the cell height (ascent + descent), a negative
+        one the character height, which is the pygame size."""
         if not font_dict:
             return self.font
-        # GDI height is in pixels; pygame SysFont sizes are close to points
-        size = max(8, int(font_dict.get('height', 13) * 0.75))
+        height = font_dict.get('height', 13)
+        cell = font_dict.get('cell', True)
         face = (font_dict.get('face') or 'arial').lower()
         bold = font_dict.get('bold', False)
         italic = font_dict.get('italic', False)
-        key = (face, size, bold, italic)
+        key = (face, height, cell, bold, italic)
         if key not in self._font_cache:
-            self._font_cache[key] = pygame.font.SysFont(f"{face},arial", size,
-                                                        bold=bold, italic=italic)
+            # The face itself if installed, else a free font with its metrics
+            installed = face.replace(' ', '') in pygame.font.get_fonts()
+            alias = self.METRIC_FONTS.get(face, 'liberationsans')
+            names = f"{face},{alias},arial" if installed else f"{alias},{face},arial"
+            font = pygame.font.SysFont(names, height, bold=bold, italic=italic)
+            if cell and font.get_height() > height:
+                size = max(6, round(height * height / font.get_height()))
+                font = pygame.font.SysFont(names, size, bold=bold, italic=italic)
+            self._font_cache[key] = font
         return self._font_cache[key]
 
     def _draw_menu_bar(self, window):
