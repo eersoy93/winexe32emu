@@ -44,7 +44,7 @@ from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
 
 # Version info
-WINEXE32EMU_VERSION = "0.1.0"
+WINEXE32EMU_VERSION = "0.1.5"
 
 # Default EXE directory (c_drive/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
