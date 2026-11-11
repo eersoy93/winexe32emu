@@ -14412,12 +14412,13 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
-        # Start menu: open flag, rows (C:\ programs, then an Examples submenu
-        # listing C:\Windows\Examples), and the callback that runs one (set by main)
+        # Start menu: open flag, rows (Programs: C:\ programs and an Examples
+        # submenu listing C:\Windows\Examples; Exit), and the callback that runs
+        # a program (set by main)
         self.start_menu_open = False
         self.start_menu_rows = []
-        self.start_menu_examples = []
-        self.start_submenu_open = False
+        self.start_open_path = []  # Row index of the open submenu at each level
+        self.start_icon_paths = {}  # Windows path -> host path of the menu's programs
         self.show_examples = True  # False with --no-examples: no Examples submenu
         self.launcher = None
 
@@ -14849,47 +14850,71 @@ class PseudoWindowsGUI:
         return pygame.Rect(2, self.height - 28, 60, 26)
 
     def _fill_start_menu(self):
-        """Read the Start menu rows: C:\\ programs, then the Examples submenu"""
+        """Build the Start menu: Programs (C:\\ programs and the Examples
+        submenu listing C:\\Windows\\Examples) and Exit.
+        Rows are ('program', label, path), ('submenu', label, rows),
+        ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
         programs = list_programs()
-        self.start_menu_examples = (programs.get(EXAMPLES_FOLDER, [])
-                                    if self.show_examples else [])
-        rows = [('program', path) for path in programs.get('C:\\', [])]
-        if self.start_menu_examples:
+        rows = [('program', self._program_label(path), path)
+                for path in programs.get('C:\\', [])]
+        examples = programs.get(EXAMPLES_FOLDER, []) if self.show_examples else []
+        if examples:
             if rows:
-                rows.append(('separator', None))
-            rows.append(('examples', None))
-        self.start_menu_rows = rows or [('empty', None)]
-        self.start_submenu_open = False
+                rows.append(('separator', None, None))
+            rows.append(('submenu', "Examples",
+                         [('program', self._program_label(path), path) for path in examples]))
+        self.start_icon_paths = {path: resolve_c_drive_path(path)
+                                 for path in programs.get('C:\\', []) + examples}
+        self.start_menu_rows = [
+            ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
+            ('separator', None, None),
+            ('exit', "Exit", None),
+        ]
+        self.start_open_path = []
 
-    def _start_menu_rects(self):
-        """Start menu rect and one rect per row"""
-        heights = [self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
-                   for kind, _ in self.start_menu_rows]
-        menu_h = sum(heights) + 6
-        menu = pygame.Rect(0, self.height - 30 - menu_h, self.START_MENU_W, menu_h)
+    def _menu_row_rects(self, menu, rows, strip=False):
+        """Row rects inside a menu panel rect (right of the blue strip if strip)"""
         rects = []
         y = menu.y + 3
-        for h in heights:
-            rects.append(pygame.Rect(menu.x + self.START_STRIP_W + 2, y,
-                                     menu.width - self.START_STRIP_W - 5, h))
+        left = menu.x + (self.START_STRIP_W + 2 if strip else 3)
+        for kind, _, _ in rows:
+            h = self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
+            rects.append(pygame.Rect(left, y, menu.right - 3 - left, h))
             y += h
-        return menu, rects
+        return rects
 
-    def _start_submenu_rects(self, examples_rect):
-        """Examples submenu rect (right of its row) and its item rects"""
-        count = len(self.start_menu_examples)
-        sub_h = count * self.START_ITEM_H + 6
-        top = max(0, min(examples_rect.y - 3, self.height - 30 - sub_h))
-        sub = pygame.Rect(examples_rect.right + 2, top, self.START_MENU_W, sub_h)
-        rects = [pygame.Rect(sub.x + 3, sub.y + 3 + i * self.START_ITEM_H,
-                             sub.width - 6, self.START_ITEM_H)
-                 for i in range(count)]
-        return sub, rects
+    def _start_menu_levels(self):
+        """[(menu rect, rows, row rects)] of the Start menu and its open submenus"""
+        rows = self.start_menu_rows
+        height = sum(self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
+                     for kind, _, _ in rows) + 6
+        menu = pygame.Rect(0, self.height - self.TASKBAR_H - height, self.START_MENU_W, height)
+        levels = [(menu, rows, self._menu_row_rects(menu, rows, strip=True))]
+        for index in self.start_open_path:
+            menu, rows, rects = levels[-1]
+            if not (0 <= index < len(rows)) or rows[index][0] != 'submenu':
+                break
+            parent_row = rects[index]
+            sub_rows = rows[index][2]
+            height = sum(self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
+                         for kind, _, _ in sub_rows) + 6
+            width = max([self.START_MENU_W] + [self.font.size(label)[0] + 60
+                                               for kind, label, _ in sub_rows if label])
+            top = max(0, min(parent_row.y - 3, self.height - self.TASKBAR_H - height))
+            sub = pygame.Rect(menu.right - 2, top, width, height)
+            levels.append((sub, sub_rows, self._menu_row_rects(sub, sub_rows)))
+        return levels
 
-    def _examples_row_rect(self, rects):
-        for (kind, _), rect in zip(self.start_menu_rows, rects):
-            if kind == 'examples':
-                return rect
+    def _start_menu_hit(self, pos):
+        """(level, row index or None) of the topmost Start menu panel under pos, or None"""
+        levels = self._start_menu_levels()
+        for level in range(len(levels) - 1, -1, -1):
+            menu, rows, rects = levels[level]
+            if menu.collidepoint(pos):
+                for i, rect in enumerate(rects):
+                    if rect.collidepoint(pos) and rows[i][0] != 'separator':
+                        return level, i
+                return level, None
         return None
 
     def _draw_menu_panel(self, rect):
@@ -14902,63 +14927,97 @@ class PseudoWindowsGUI:
         pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
                          (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1))
 
-    def _draw_menu_row(self, rect, label, highlighted):
+    def _draw_menu_row(self, rect, label, highlighted, icon=None):
+        """Menu row: an optional 16x16 icon, then the label"""
         if highlighted:
             pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
         color = self.COLOR_TITLE_TEXT if highlighted else self.COLOR_TEXT
+        if icon is not None:
+            self.screen.blit(icon, (rect.x + 4, rect.y + (rect.height - icon.get_height()) // 2))
+        text_x = rect.x + (8 + self.CAPTION_ICON_SIZE + 4 if icon is not None else 6)
         text = self.font.render(label, True, color)
-        self.screen.blit(text, (rect.x + 6, rect.y + (rect.height - text.get_height()) // 2))
+        self.screen.blit(text, (text_x, rect.y + (rect.height - text.get_height()) // 2))
         return color
+
+    def _folder_icon(self):
+        """16x16 yellow folder icon of the Start menu's submenus (cached)"""
+        icon = self.exe_icon_cache.get(('folder', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            pygame.draw.rect(icon, (255, 255, 128), pygame.Rect(1, 2, 6, 3))
+            pygame.draw.rect(icon, (128, 128, 0), pygame.Rect(1, 2, 6, 3), 1)
+            body = pygame.Rect(1, 4, 14, 10)
+            pygame.draw.rect(icon, (255, 255, 128), body)
+            pygame.draw.rect(icon, (128, 128, 0), body, 1)
+            self.exe_icon_cache[('folder', 16)] = icon
+        return icon
+
+    def _exit_icon(self):
+        """16x16 Exit icon: an open door with a green arrow leaving it (cached)"""
+        icon = self.exe_icon_cache.get(('exit', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            frame = pygame.Rect(1, 1, 9, 14)
+            pygame.draw.rect(icon, (64, 64, 64), frame)
+            # The door is swung open towards the viewer
+            pygame.draw.polygon(icon, (160, 96, 32), [(2, 2), (7, 3), (7, 15), (2, 14)])
+            pygame.draw.polygon(icon, (96, 48, 0), [(2, 2), (7, 3), (7, 15), (2, 14)], 1)
+            icon.set_at((6, 9), (255, 220, 0))  # Knob
+            green, dark = (0, 192, 0), (0, 96, 0)
+            arrow = [(8, 7), (11, 7), (11, 4), (15, 8), (11, 12), (11, 9), (8, 9)]
+            pygame.draw.polygon(icon, green, arrow)
+            pygame.draw.polygon(icon, dark, arrow, 1)
+            self.exe_icon_cache[('exit', 16)] = icon
+        return icon
 
     @staticmethod
     def _program_label(path):
         return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
 
     def _draw_start_menu(self):
-        """Draw the Start menu: C:\\ programs and an Examples submenu (C:\\Windows\\Examples)"""
+        """Draw the Start menu and its open submenus"""
         if not self.start_menu_open:
             return
-        menu, rects = self._start_menu_rects()
-        self._draw_menu_panel(menu)
-        strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3, menu.height - 6)
-        pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
-
         mouse_pos = pygame.mouse.get_pos()
-        examples_rect = self._examples_row_rect(rects)
-        sub, sub_rects = (self._start_submenu_rects(examples_rect) if examples_rect
-                          else (None, []))
+        # Hovering a row opens its submenu and closes the deeper ones
+        hit = self._start_menu_hit(mouse_pos)
+        if hit and hit[1] is not None:
+            level, index = hit
+            rows = self._start_menu_levels()[level][1]
+            self.start_open_path = self.start_open_path[:level] + (
+                [index] if rows[index][0] == 'submenu' else [])
 
-        # Hovering a row opens the Examples submenu or closes it
-        if not (sub and self.start_submenu_open and sub.collidepoint(mouse_pos)):
-            for (kind, _), rect in zip(self.start_menu_rows, rects):
-                if rect.collidepoint(mouse_pos) and kind != 'separator':
-                    self.start_submenu_open = (kind == 'examples')
-
-        for (kind, path), rect in zip(self.start_menu_rows, rects):
-            if kind == 'separator':
-                y = rect.centery
-                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                                 (rect.x + 2, y - 1), (rect.right - 2, y - 1))
-                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
-                                 (rect.x + 2, y), (rect.right - 2, y))
-            elif kind == 'empty':
-                text = self.font.render("(no programs found)", True, (128, 128, 128))
-                self.screen.blit(text, (rect.x + 6, rect.y + 3))
-            elif kind == 'examples':
-                color = self._draw_menu_row(rect, "Examples", self.start_submenu_open)
-                # Submenu arrow
-                ax, ay = rect.right - 12, rect.centery
-                pygame.draw.polygon(self.screen, color,
-                                    [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
-            else:
-                self._draw_menu_row(rect, self._program_label(path),
-                                    rect.collidepoint(mouse_pos))
-
-        if sub and self.start_submenu_open:
-            self._draw_menu_panel(sub)
-            for path, rect in zip(self.start_menu_examples, sub_rects):
-                self._draw_menu_row(rect, self._program_label(path),
-                                    rect.collidepoint(mouse_pos))
+        for level, (menu, rows, rects) in enumerate(self._start_menu_levels()):
+            self._draw_menu_panel(menu)
+            if level == 0:
+                strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3,
+                                    menu.height - 6)
+                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
+            open_index = (self.start_open_path[level]
+                          if level < len(self.start_open_path) else None)
+            for i, ((kind, label, data), rect) in enumerate(zip(rows, rects)):
+                if kind == 'separator':
+                    y = rect.centery
+                    pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                                     (rect.x + 2, y - 1), (rect.right - 2, y - 1))
+                    pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                                     (rect.x + 2, y), (rect.right - 2, y))
+                elif kind == 'empty':
+                    text = self.font.render(label, True, (128, 128, 128))
+                    self.screen.blit(text, (rect.x + 6, rect.y + 3))
+                elif kind == 'submenu':
+                    color = self._draw_menu_row(rect, label, i == open_index,
+                                                icon=self._folder_icon())
+                    ax, ay = rect.right - 12, rect.centery
+                    pygame.draw.polygon(self.screen, color,
+                                        [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
+                elif kind == 'program':
+                    icon = self._exe_icon(self.start_icon_paths.get(data),
+                                          self.CAPTION_ICON_SIZE)[0]
+                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
+                elif kind == 'exit':
+                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos),
+                                        icon=self._exit_icon())
 
     def _handle_start_menu_click(self, pos, button):
         """Start button toggles the menu; returns True if the click was consumed"""
@@ -14975,26 +15034,23 @@ class PseudoWindowsGUI:
         if not self.start_menu_open:
             return False
 
-        menu, rects = self._start_menu_rects()
-        examples_rect = self._examples_row_rect(rects)
-        if examples_rect and self.start_submenu_open:
-            sub, sub_rects = self._start_submenu_rects(examples_rect)
-            if sub.collidepoint(pos):
-                for path, rect in zip(self.start_menu_examples, sub_rects):
-                    if button == 1 and rect.collidepoint(pos) and self.launcher:
-                        self.start_menu_open = False
-                        self.launcher(path)
-                return True
-        if examples_rect and examples_rect.collidepoint(pos):
-            self.start_submenu_open = True
-            return True
-
-        self.start_menu_open = False
-        if not menu.collidepoint(pos):
+        hit = self._start_menu_hit(pos)
+        if hit is None:
+            self.start_menu_open = False  # A click outside closes the menu
             return False
-        for (kind, path), rect in zip(self.start_menu_rows, rects):
-            if kind == 'program' and button == 1 and rect.collidepoint(pos) and self.launcher:
-                self.launcher(path)
+        level, index = hit
+        if index is None or button != 1:
+            return True
+        kind, _, data = self._start_menu_levels()[level][1][index]
+        if kind == 'submenu':
+            self.start_open_path = self.start_open_path[:level] + [index]
+        elif kind == 'program':
+            self.start_menu_open = False
+            if self.launcher:
+                self.launcher(data)
+        elif kind == 'exit':
+            self.start_menu_open = False
+            self.running = False  # Like closing the emulator's window
         return True
 
     @gui_locked
@@ -16098,7 +16154,7 @@ class PseudoWindowsGUI:
         self.width, self.height = width, height
         self.pending_mode = (width, height)
         self.start_menu_open = False
-        self.start_submenu_open = False
+        self.start_open_path = []
         self.desktop_menu = None
         for win in self.windows.values():
             if win.maximized and win.parent is None:
