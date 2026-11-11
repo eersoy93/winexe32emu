@@ -4371,7 +4371,15 @@ class WinAPIHandler:
             show = nCmdShow in [1, 3, 5, 6, 7, 8, 9, 10]
             self.gui.show_window(hWnd, show)
             win = self.gui.windows.get(hWnd)
-            if show and win is not None and win.size_state is None:
+            if win is not None and win.parent is None and nCmdShow in (3, 9):
+                with self.gui.lock:
+                    if nCmdShow == 3 and not win.maximized:  # SW_SHOWMAXIMIZED
+                        win.minimized = False
+                        win.maximize(self.gui.width, self.gui.height, 30)
+                    elif nCmdShow == 9:  # SW_RESTORE
+                        win.restore()
+                self._send_size(hWnd)
+            elif show and win is not None and win.size_state is None:
                 self._send_size(hWnd)
         
         return 1
@@ -4658,10 +4666,25 @@ class WinAPIHandler:
         
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
-            if not (uFlags & 0x0002):  # SWP_NOMOVE
-                win.x, win.y = X, Y
-            if not (uFlags & 0x0001):  # SWP_NOSIZE
-                win.width, win.height = cx, cy
+            X, Y, cx, cy = self._read_signed_args(args, 2, 4)
+            with self.gui.lock:
+                if not (uFlags & 0x0002):  # SWP_NOMOVE
+                    win.x, win.y = X, Y
+                if not (uFlags & 0x0001):  # SWP_NOSIZE
+                    win.width, win.height = cx, cy
+                if (not uFlags & 0x0004 and win.parent is None  # SWP_NOZORDER
+                        and hWnd in self.gui.z_order):
+                    after = hWndInsertAfter if hWndInsertAfter < 0x80000000 else hWndInsertAfter - 0x100000000
+                    if after in (0, -1):  # HWND_TOP, HWND_TOPMOST
+                        self.gui.z_order.remove(hWnd)
+                        self.gui.z_order.append(hWnd)
+                    elif after == 1:  # HWND_BOTTOM
+                        self.gui.z_order.remove(hWnd)
+                        self.gui.z_order.insert(0, hWnd)
+                if uFlags & 0x0040:  # SWP_SHOWWINDOW
+                    self.gui.show_window(hWnd, True)
+                elif uFlags & 0x0080:  # SWP_HIDEWINDOW
+                    self.gui.show_window(hWnd, False)
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
@@ -4826,10 +4849,20 @@ class WinAPIHandler:
                 store[nIndex] = new_value
             return old & 0xFFFFFFFF
         if nIndex == GWL_STYLE:
-            old = win.style if win else store.get(nIndex, 0)
+            if win is None:
+                old = store.get(nIndex, 0)
+            else:
+                # WS_MINIMIZE / WS_MAXIMIZE reflect the window state
+                old = (win.style | (0x20000000 if win.minimized else 0)
+                       | (0x01000000 if win.maximized else 0))
             if set_value:
                 if win:
                     win.style = new_value
+                    # Dropping WS_MINIMIZE / WS_MAXIMIZE leaves that state
+                    if not new_value & 0x20000000:
+                        win.minimized = False
+                    if not new_value & 0x01000000:
+                        win.maximized = False
                 store[nIndex] = new_value
             return old & 0xFFFFFFFF
         if nIndex in (GWL_EXSTYLE, GWL_USERDATA):
@@ -5486,16 +5519,27 @@ class WinAPIHandler:
 
     DISPLAY_MODES = [(640, 480), (800, 600), (1024, 768), (1280, 1024)]
 
+    def _desktop_size(self):
+        """Display mode of the fake desktop at startup (the registry mode)"""
+        if self.gui:
+            return self.gui.desktop_width, self.gui.desktop_height
+        return self._screen_size()
+
     def _display_modes(self):
-        width, height = self._screen_size()
-        return [(w, h, bpp) for w, h in self.DISPLAY_MODES if w <= width and h <= height
-                for bpp in (8, 16, 32)]
+        width, height = self._desktop_size()
+        sizes = [(w, h) for w, h in self.DISPLAY_MODES if w <= width and h <= height]
+        if (width, height) not in sizes:
+            sizes.append((width, height))
+        return [(w, h, bpp) for w, h in sizes for bpp in (8, 16, 32)]
 
     def EnumDisplaySettingsA(self, args):
-        """EnumDisplaySettingsA emulation - the current mode and smaller standard ones"""
+        """EnumDisplaySettingsA emulation - the startup mode and smaller standard ones"""
         mode_num, lpDevMode = args[1], args[2]
-        if mode_num >= 0xFFFFFFFE:  # ENUM_CURRENT_SETTINGS, ENUM_REGISTRY_SETTINGS
+        if mode_num == 0xFFFFFFFF:  # ENUM_CURRENT_SETTINGS
             width, height = self._screen_size()
+            mode = (width, height, 32)
+        elif mode_num == 0xFFFFFFFE:  # ENUM_REGISTRY_SETTINGS
+            width, height = self._desktop_size()
             mode = (width, height, 32)
         else:
             modes = self._display_modes()
@@ -5511,11 +5555,16 @@ class WinAPIHandler:
             return 0
         return 1
 
+    WM_DISPLAYCHANGE = 0x007E
+
     def ChangeDisplaySettingsA(self, args):
-        """ChangeDisplaySettingsA emulation - modes that fit the fake desktop are
-        accepted (the desktop itself does not change)"""
-        lpDevMode = args[0]
+        """ChangeDisplaySettingsA emulation - an enumerated mode changes the fake
+        desktop resolution (the color depth stays 32 bpp); NULL restores the
+        startup mode"""
+        lpDevMode, dwFlags = args[0], args[1]
         if not lpDevMode:
+            if not dwFlags & 0x2:  # CDS_TEST
+                self._set_display_mode(*self._desktop_size(), owner=None)
             return 0  # DISP_CHANGE_SUCCESSFUL (back to the registry mode)
         try:
             fields = struct.unpack('<I', self.emu.uc.mem_read(lpDevMode + 40, 4))[0]
@@ -5523,11 +5572,30 @@ class WinAPIHandler:
         except UcError:
             return 0xFFFFFFFB  # DISP_CHANGE_BADPARAM
         screen_w, screen_h = self._screen_size()
+        width = width if fields & 0x80000 else screen_w    # DM_PELSWIDTH
+        height = height if fields & 0x100000 else screen_h  # DM_PELSHEIGHT
+        sizes = {(w, h) for w, h, _ in self._display_modes()}
         if ((fields & 0x40000 and bpp not in (1, 4, 8, 15, 16, 24, 32)) or
-                (fields & 0x80000 and width > screen_w) or
-                (fields & 0x100000 and height > screen_h)):
+                (width, height) not in sizes):
             return 0xFFFFFFFE  # DISP_CHANGE_BADMODE
+        if not dwFlags & 0x2:  # CDS_TEST only checks the mode
+            # CDS_FULLSCREEN modes end with the program
+            owner = self if dwFlags & 0x4 else None
+            self._set_display_mode(width, height, owner)
         return 0
+
+    def _set_display_mode(self, width, height, owner):
+        """Resize the fake desktop and tell the top-level windows (WM_DISPLAYCHANGE)"""
+        if not self.gui:
+            return
+        changed = (width, height) != self._screen_size()
+        self.gui.set_display_mode(width, height, owner)
+        if not changed:
+            return
+        lparam = ((height & 0xFFFF) << 16) | (width & 0xFFFF)
+        for hwnd, win in list(self.gui.windows.items()):
+            if win.parent is None and win.owner is self and self._find_wndproc_for_hwnd(hwnd):
+                self.post_window_message(hwnd, self.WM_DISPLAYCHANGE, 32, lparam)
 
     # ---------- Dialog boxes ----------
 
@@ -5594,7 +5662,7 @@ class WinAPIHandler:
         size = template['font'][1] if template['font'] else 8
         bx, by = 1.5 * size / 8, 1.625 * size / 8
         client_w, client_h = round(template['cx'] * bx), round(template['cy'] * by)
-        border, caption = PseudoWindowsGUI.BORDER, PseudoWindowsGUI.TITLE_BAR_H
+        border, caption = PseudoWindowsGUI.frame_size(template['style'], dialog=True)
         width, height = client_w + 2 * border, client_h + 2 * border + caption
         owner_win = self.gui.windows.get(owner)
         screen_w, screen_h = self._screen_size()
@@ -6155,17 +6223,18 @@ class WinAPIHandler:
     def AdjustWindowRect(self, args):
         """AdjustWindowRect emulation - client rect -> window rect.
 
-        Uses the fake desktop's frame (every window has a border and a
-        title bar), so it matches GetClientRect for the created window.
+        Uses the fake desktop's frame for the style (overlapped and WS_CAPTION
+        windows have a border and a title bar), so it matches GetClientRect for
+        the created window.
         """
-        lpRect, bMenu = args[0], args[2]
+        lpRect, dwStyle, bMenu = args[0], args[1], args[2]
         rect = self._read_rect(lpRect) if lpRect else None
         if rect is None:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         left, top, right, bottom = rect
-        border = PseudoWindowsGUI.BORDER
-        caption = PseudoWindowsGUI.TITLE_BAR_H + (PseudoWindowsGUI.MENU_H if bMenu else 0)
+        border, caption = PseudoWindowsGUI.frame_size(dwStyle)
+        caption += PseudoWindowsGUI.MENU_H if bMenu else 0
         return 1 if self._write_rect(lpRect, left - border, top - border - caption,
                                      right + border, bottom + border) else 0
 
@@ -14156,9 +14225,23 @@ class PseudoWindowsGUI:
     MENU_H = 20  # Menu bar height (only when the window has a menu)
     LISTBOX_ITEM_H = 18  # Row height in LISTBOX and COMBOBOX dropdowns
 
+    # Window styles deciding the frame of a top-level window
+    WS_POPUP = 0x80000000
+    WS_CAPTION = 0x00C00000
+    WS_BORDER = 0x00800000
+    WS_DLGFRAME = 0x00400000
+    WS_THICKFRAME = 0x00040000
+    DS_MODALFRAME = 0x80
+
     def __init__(self, width=1024, height=768):
         self.width = width
         self.height = height
+        # Display mode set at startup (the registry mode); ChangeDisplaySettings
+        # changes width/height, the GUI thread then resizes the screen
+        self.desktop_width = width
+        self.desktop_height = height
+        self.pending_mode = None
+        self.display_mode_owner = None  # Process that changed the display mode
         self.screen = None
         self.running = False
         self.clock = None
@@ -14282,6 +14365,10 @@ class PseudoWindowsGUI:
         while self.running:
             # Window state is shared with the emulation thread
             with self.lock:
+                if self.pending_mode is not None:
+                    # Display surfaces belong to this thread (ChangeDisplaySettings)
+                    self.screen = pygame.display.set_mode(self.pending_mode, pygame.SCALED)
+                    self.pending_mode = None
                 self._process_frame()
                 self._post_size_changes()
                 self._post_activation_changes()
@@ -14505,6 +14592,8 @@ class PseudoWindowsGUI:
 
     def _handle_start_menu_click(self, pos, button):
         """Start button toggles the menu; returns True if the click was consumed"""
+        if self._fullscreen_window() is not None:
+            return False  # A full-screen window covers the taskbar
         if self._start_button_rect().collidepoint(pos):
             self.start_menu_open = not self.start_menu_open
             if self.start_menu_open:
@@ -14547,6 +14636,9 @@ class PseudoWindowsGUI:
         """A program ended: close its windows; its console stays to show the output"""
         if process in self.processes:
             self.processes.remove(process)
+        if self.display_mode_owner is process:
+            # Like Windows, a CDS_FULLSCREEN mode ends with its program
+            self.set_display_mode(self.desktop_width, self.desktop_height)
         for hwnd, win in list(self.windows.items()):
             if win.owner is not process:
                 continue
@@ -14700,29 +14792,61 @@ class PseudoWindowsGUI:
             return
         
         is_active = (window.hwnd == self.active_window)
-        
-        # Window shadow
-        shadow_rect = pygame.Rect(window.x + 3, window.y + 3, window.width, window.height)
-        pygame.draw.rect(self.screen, (64, 64, 64), shadow_rect)
-        
-        # Window frame
-        frame_rect = pygame.Rect(window.x, window.y, window.width, window.height)
-        pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, frame_rect)
-        pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame_rect, 1)
-        
-        # 3D edge effect
-        pygame.draw.line(self.screen, (255, 255, 255), 
-                        (window.x, window.y), (window.x + window.width - 1, window.y))
-        pygame.draw.line(self.screen, (255, 255, 255), 
-                        (window.x, window.y), (window.x, window.y + window.height - 1))
-        pygame.draw.line(self.screen, (64, 64, 64), 
-                        (window.x + window.width - 1, window.y), 
-                        (window.x + window.width - 1, window.y + window.height - 1))
-        pygame.draw.line(self.screen, (64, 64, 64), 
-                        (window.x, window.y + window.height - 1), 
-                        (window.x + window.width - 1, window.y + window.height - 1))
-        
-        # Title bar
+        border, caption = self.window_frame(window)
+
+        if border:
+            # Window shadow
+            shadow_rect = pygame.Rect(window.x + 3, window.y + 3, window.width, window.height)
+            pygame.draw.rect(self.screen, (64, 64, 64), shadow_rect)
+
+            # Window frame
+            frame_rect = pygame.Rect(window.x, window.y, window.width, window.height)
+            pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, frame_rect)
+            pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame_rect, 1)
+
+        if border > 1:
+            # 3D edge effect
+            pygame.draw.line(self.screen, (255, 255, 255),
+                            (window.x, window.y), (window.x + window.width - 1, window.y))
+            pygame.draw.line(self.screen, (255, 255, 255),
+                            (window.x, window.y), (window.x, window.y + window.height - 1))
+            pygame.draw.line(self.screen, (64, 64, 64),
+                            (window.x + window.width - 1, window.y),
+                            (window.x + window.width - 1, window.y + window.height - 1))
+            pygame.draw.line(self.screen, (64, 64, 64),
+                            (window.x, window.y + window.height - 1),
+                            (window.x + window.width - 1, window.y + window.height - 1))
+
+        if caption:
+            self._draw_title_bar(window, is_active)
+
+        # Menu bar (between title bar and client area)
+        if window.menu:
+            self._draw_menu_bar(window)
+
+        # Content area
+        client_x, client_y = self.client_origin(window)
+        client_w, client_h = self.client_size(window)
+        content_rect = pygame.Rect(client_x, client_y, client_w, client_h)
+        pygame.draw.rect(self.screen, window.bg_color, content_rect)
+
+        # Clip client-area drawing to the window (GDI shapes may overflow)
+        self.screen.set_clip(content_rect)
+
+        # Render GDI shapes and texts (Rectangle, Ellipse, TextOut, ...)
+        for shape in window.drawn_shapes:
+            self._draw_shape(shape, client_x, client_y)
+
+        # Draw controls
+        for control in window.controls:
+            self._draw_control(control, client_x, client_y)
+
+        self._draw_child_windows(window)
+
+        self.screen.set_clip(None)
+
+    def _draw_title_bar(self, window, is_active):
+        """Draw a window's caption: title and the caption buttons"""
         title_color = self.COLOR_TITLE_BAR if is_active else self.COLOR_TITLE_BAR_INACTIVE
         title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
         pygame.draw.rect(self.screen, title_color, title_rect)
@@ -14756,31 +14880,6 @@ class PseudoWindowsGUI:
             # Minimize butonu
             min_rect = pygame.Rect(window.x + window.width - btn_size * 3 - 9, btn_y, btn_size, btn_size)
             self._draw_window_button(min_rect, "─", "min")
-        
-        # Menu bar (between title bar and client area)
-        if window.menu:
-            self._draw_menu_bar(window)
-
-        # Content area
-        client_x, client_y = self.client_origin(window)
-        client_w, client_h = self.client_size(window)
-        content_rect = pygame.Rect(client_x, client_y, client_w, client_h)
-        pygame.draw.rect(self.screen, window.bg_color, content_rect)
-
-        # Clip client-area drawing to the window (GDI shapes may overflow)
-        self.screen.set_clip(content_rect)
-
-        # Render GDI shapes and texts (Rectangle, Ellipse, TextOut, ...)
-        for shape in window.drawn_shapes:
-            self._draw_shape(shape, client_x, client_y)
-
-        # Draw controls
-        for control in window.controls:
-            self._draw_control(control, client_x, client_y)
-
-        self._draw_child_windows(window)
-
-        self.screen.set_clip(None)
 
     def _draw_shape(self, shape, ox, oy, target=None):
         """Render one GDI display list entry at client origin (ox, oy) on target
@@ -15387,6 +15486,8 @@ class PseudoWindowsGUI:
         """
         if win.maximized or win.minimized or win.is_dialog:
             return None
+        if win.parent is None and not self.window_frame(win)[0]:
+            return None  # No frame to grab
 
         m = self.RESIZE_BORDER
 
@@ -15501,20 +15602,67 @@ class PseudoWindowsGUI:
             px, py = self.client_origin(self.windows[win.parent])
             border = self._child_border(win)
             return (px + win.x + border, py + win.y + border)
-        top = win.y + self.BORDER + self.TITLE_BAR_H
+        border, caption = self.window_frame(win)
+        top = win.y + border + caption
         if win.menu:
             top += self.MENU_H
-        return (win.x + self.BORDER, top)
+        return (win.x + border, top)
 
     def client_size(self, win):
         """Client area size (width, height) of a window."""
         if win.parent in self.windows:
             border = self._child_border(win)
             return (max(0, win.width - 2 * border), max(0, win.height - 2 * border))
-        height = win.height - 2 * self.BORDER - self.TITLE_BAR_H
+        border, caption = self.window_frame(win)
+        height = win.height - 2 * border - caption
         if win.menu:
             height -= self.MENU_H
-        return (win.width - 2 * self.BORDER, max(0, height))
+        return (max(0, win.width - 2 * border), max(0, height))
+
+    @classmethod
+    def frame_size(cls, style, dialog=False):
+        """(border, caption height) of a top-level window with this style.
+        Overlapped windows always have a caption; pop-ups only with WS_CAPTION."""
+        if not style & cls.WS_POPUP or style & cls.WS_CAPTION == cls.WS_CAPTION:
+            return cls.BORDER, cls.TITLE_BAR_H
+        if style & (cls.WS_DLGFRAME | cls.WS_THICKFRAME) or (dialog and
+                                                             style & cls.DS_MODALFRAME):
+            return cls.BORDER, 0
+        if style & cls.WS_BORDER:
+            return 1, 0
+        return 0, 0
+
+    def window_frame(self, win):
+        """(border, caption height) of a top-level window"""
+        return self.frame_size(win.style, win.is_dialog)
+
+    def _fullscreen_window(self):
+        """The topmost visible window if it covers the whole screen, else None"""
+        for hwnd in reversed(self.z_order):
+            win = self.windows.get(hwnd)
+            if win is None or not win.visible or win.minimized:
+                continue
+            if (win.x <= 0 and win.y <= 0 and win.x + win.width >= self.width
+                    and win.y + win.height >= self.height):
+                return hwnd
+            return None
+        return None
+
+    @gui_locked
+    def set_display_mode(self, width, height, owner=None):
+        """Change the fake desktop resolution (ChangeDisplaySettings); the GUI
+        thread resizes the screen on its next frame"""
+        self.display_mode_owner = owner
+        if (width, height) == (self.width, self.height):
+            return
+        self.width, self.height = width, height
+        self.pending_mode = (width, height)
+        self.start_menu_open = False
+        self.start_submenu_open = False
+        for win in self.windows.values():
+            if win.maximized and win.parent is None:
+                win.x, win.y, win.width, win.height = 0, 0, width, height - 30
+        log.info(f"Display mode changed to {width}x{height}")
 
     @staticmethod
     def _child_border(win):
@@ -15721,9 +15869,10 @@ class PseudoWindowsGUI:
         """Screen rect of a window's menu bar strip (or None)."""
         if not win.menu:
             return None
-        return pygame.Rect(win.x + self.BORDER,
-                           win.y + self.BORDER + 22,
-                           win.width - 2 * self.BORDER,
+        border, caption = self.window_frame(win)
+        return pygame.Rect(win.x + border,
+                           win.y + border + max(0, caption - 3),
+                           win.width - 2 * border,
                            self.MENU_H)
 
     def _menu_item_rects(self, win):
@@ -16100,9 +16249,9 @@ class PseudoWindowsGUI:
         if self.open_combo and self._handle_combo_click(pos, button):
             return
 
-        # Click on taskbar windows
+        # Click on taskbar windows (a full-screen window covers the taskbar)
         taskbar_y = self.height - 30
-        if y >= taskbar_y:
+        if y >= taskbar_y and self._fullscreen_window() is None:
             # System tray area (right side) - ignore click
             tray_width = 80
             if x >= self.width - tray_width:
@@ -16156,6 +16305,7 @@ class PseudoWindowsGUI:
                     self.active_window = hwnd
                     self.z_order.remove(hwnd)
                     self.z_order.append(hwnd)
+                    border, caption = self.window_frame(win)
                     
                     # Title bar buttons (right to left: close, max, min)
                     btn_size = 16
@@ -16164,12 +16314,13 @@ class PseudoWindowsGUI:
                     
                     # Close butonu (X)
                     close_x = win.x + win.width - btn_size - 5
-                    if close_x <= x <= close_x + btn_size and btn_y_start <= y <= btn_y_end:
+                    if (caption and close_x <= x <= close_x + btn_size
+                            and btn_y_start <= y <= btn_y_end):
                         self._close_window(hwnd)
                         return
                     
                     # Minimize and maximize buttons if not a dialog
-                    if not win.is_dialog:
+                    if caption and not win.is_dialog:
                         # Maximize butonu (□)
                         max_x = win.x + win.width - btn_size * 2 - 7
                         if max_x <= x <= max_x + btn_size and btn_y_start <= y <= btn_y_end:
@@ -16198,7 +16349,8 @@ class PseudoWindowsGUI:
                             return
 
                     # Title bar click (start dragging) - if not maximized
-                    if win.y + 3 <= y <= win.y + 25 and not win.maximized:
+                    if (caption and win.y + border <= y <= win.y + caption
+                            and not win.maximized):
                         self.dragging_window = hwnd
                         self.drag_offset_x = x - win.x
                         self.drag_offset_y = y - win.y
