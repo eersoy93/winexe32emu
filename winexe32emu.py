@@ -38,6 +38,7 @@ import datetime
 import unicodedata
 import fnmatch
 import ntpath
+import warnings
 import wave
 from functools import cmp_to_key, wraps
 from colorama import init, Fore, Style
@@ -4685,6 +4686,9 @@ class WinAPIHandler:
                     self.gui.show_window(hWnd, True)
                 elif uFlags & 0x0080:  # SWP_HIDEWINDOW
                     self.gui.show_window(hWnd, False)
+                if (not uFlags & 0x0010 and win.parent is None  # SWP_NOACTIVATE
+                        and win.visible and not win.minimized):
+                    self.gui.active_window = hWnd
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
@@ -4922,21 +4926,29 @@ class WinAPIHandler:
         return 0
 
     def SetFocus(self, args):
-        """SetFocus emulation - give keyboard focus to a control"""
+        """SetFocus emulation - give keyboard focus to a control, or to a
+        top-level window, which is activated then"""
         hWnd = args[0]
         log.debug(f"SetFocus(0x{hWnd:x})")
         prev = 0
         if self.gui:
-            prev = self.gui.focused_control or 0
+            prev = self.GetFocus([])
             if hWnd in self.gui.controls:
                 self.gui.focused_control = hWnd
             else:
                 self.gui.focused_control = None
+                win = self.gui.windows.get(hWnd)
+                if win is not None and win.parent is None and win.visible:
+                    self.BringWindowToTop([hWnd])
         return prev
 
     def GetFocus(self, args):
-        """GetFocus emulation"""
-        return (self.gui.focused_control or 0) if self.gui else 0
+        """GetFocus emulation - the focused control, else the active window
+        (0 if the focus belongs to another program)"""
+        if not self.gui:
+            return 0
+        hwnd = self.gui.focused_control or self.gui.active_window or 0
+        return hwnd if hwnd and self.gui.window_owner(hwnd) is self else 0
 
     def GetAsyncKeyState(self, args):
         """GetAsyncKeyState emulation - poll key state (game loops)"""
@@ -14359,6 +14371,8 @@ class PseudoWindowsGUI:
     
     def _gui_loop(self):
         """Main GUI loop"""
+        # A click that focuses the emulator's window is also passed to the program
+        os.environ.setdefault('SDL_MOUSE_FOCUS_CLICKTHROUGH', '1')
         pygame.init()
         pygame.display.set_caption(
             f"Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION} - Fake Desktop")
@@ -14383,6 +14397,7 @@ class PseudoWindowsGUI:
                     # Display surfaces belong to this thread (ChangeDisplaySettings)
                     self.screen = pygame.display.set_mode(self.pending_mode, pygame.SCALED)
                     self.pending_mode = None
+                    self._focus_host_window()
                 self._process_frame()
                 self._post_size_changes()
                 self._post_activation_changes()
@@ -14391,6 +14406,17 @@ class PseudoWindowsGUI:
             self.clock.tick(60)
         
         pygame.quit()
+
+    @staticmethod
+    def _focus_host_window():
+        """Give the emulator's own window the input focus again (a display mode
+        change resizes it), so the first click already reaches the program"""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', DeprecationWarning)
+                pygame.Window.from_display_module().focus()
+        except (AttributeError, pygame.error):
+            pass  # pygame without the Window API
 
     def _process_frame(self):
         """Handle pending input events and redraw the screen"""
