@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Undoes create_c_drive_environment.sh and compile_tests.sh. Other files
+# Undoes create_c_drive_environment.sh, compile_apps.sh and compile_tests.sh. Other files
 # in c_drive/ are kept (folders holding them stay); --all deletes the whole
 # c_drive/ after a confirmation.
 
@@ -42,7 +42,11 @@ if [ "$1" = "--all" ]; then
     exit 0
 fi
 
-# Compiled tests
+# Compiled apps and tests
+for dir in apps/*/; do
+    [ -d "$dir" ] || continue
+    rm -f "${C_DRIVE}/Windows/$(basename "$dir").exe" || exit 1
+done
 sh scripts/remove_tests.sh >/dev/null || exit 1
 
 # Deepest folders first; rmdir only removes empty ones

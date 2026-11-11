@@ -38,7 +38,7 @@ run_test() {
     expected=$2
     input=$3
     output=$(printf '%s\n' "$input" | timeout "$TIMEOUT" "$PYTHON" winexe32emu.py \
-        --no-gui --no-create-environment -q "${name}.exe" 2>&1)
+        --no-gui --no-create-environment --no-apps -q "${name}.exe" 2>&1)
     code=$?
     if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -qF -- "$expected"; then
         echo "PASS: ${name}"

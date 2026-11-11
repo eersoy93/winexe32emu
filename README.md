@@ -10,6 +10,8 @@
 pip install -r requirements.txt
 ```
 
+Also you should install a building toolchain for apps and tests.
+
 ## Usage
 
 Put EXE files in the c_drive/ folder (the emulated `C:\`). Then run:
@@ -19,6 +21,12 @@ python3 winexe32emu.py
 ```
 
 Use `-h` parameter for command-line help.
+
+The apps in `apps/` are compiled into `c_drive/Windows/` at every start (skip it with `--no-apps`; needs `i686-w64-mingw32-gcc`). The file manager (`C:\Windows\filemanager.exe`) browses the emulated C drive, shows the size and date of the selected entry and runs EXE files. Open it from the Start menu, the desktop or the command line:
+
+```bash
+python3 winexe32emu.py filemanager.exe
+```
 
 Test programs are only compiled and run with the `--tests` parameter (needs `i686-w64-mingw32-gcc`). It compiles them into `c_drive/Windows/Tests/`, runs each one without the GUI and exits with the number of failed tests:
 
@@ -30,10 +38,12 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 
 ## Folder Structure
 
-- `c_drive/` - Put your EXE files here (emulation path, `C:\`); only the EXE files directly in it are shown on the desktop
+- `apps/` - App C source codes, one folder per app (`apps/filemanager/` - File manager)
+- `c_drive/` - Put your EXE files here (emulation path, `C:\`); only the file manager and the EXE files directly in it are shown on the desktop
+- `scripts/compile_apps.sh` - Script to compile the apps into `c_drive/Windows/` (run at every start)
 - `scripts/compile_tests.sh` - Script to compile the test programs into `c_drive/Windows/Tests/`
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
-- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled test programs and the empty `c_drive/` folders
+- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled apps, the compiled test programs and the empty `c_drive/` folders
 - `scripts/remove_tests.sh` - Script to remove the compiled test programs
 - `scripts/run_tests.sh` - Script to compile the test programs and run each one in the emulator without the GUI (exit code: number of failed tests)
 - `tests/` - Test program C source codes

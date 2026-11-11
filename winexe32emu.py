@@ -63,6 +63,9 @@ DEFAULT_ENVIRONMENT = {
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 
+# File manager app compiled from apps/filemanager/ at every start (compile_apps.sh)
+FILE_MANAGER_PATH = 'C:\\Windows\\filemanager.exe'
+
 # Emulated folder holding the test programs compiled with --tests (c_drive/Windows/Tests/)
 TESTS_FOLDER = 'C:\\Windows\\Tests'
 
@@ -629,9 +632,10 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
 
-# Scripts: c_drive/ folders at startup, and the test programs (--tests: compiled
+# Scripts: c_drive/ folders and the apps (apps/ into C:\Windows) at startup, and the test programs (--tests: compiled
 # into C:\Windows\Tests and run without the GUI)
 CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "create_c_drive_environment.sh")
+COMPILE_APPS_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "compile_apps.sh")
 RUN_TESTS_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "run_tests.sh")
 REMOVE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "remove_c_drive_environment.sh")
 
@@ -1137,6 +1141,7 @@ class WinAPIHandler:
 
     # Control notification codes (high word of WM_COMMAND wParam)
     LBN_SELCHANGE = 1
+    LBN_DBLCLK = 2
     CBN_SELCHANGE = 1
 
     # Button control messages
@@ -4395,6 +4400,9 @@ class WinAPIHandler:
                     color = self._brush_color(wndclass['background'])
                     if color is not None:
                         self.gui.windows[hwnd].bg_color = color
+                # Top-level windows get their menu bar from hMenu (like SetMenu)
+                if not dwStyle & self.WS_CHILD and hMenu in self.menus:
+                    self.gui.windows[hwnd].menu = self._build_menu_tree(hMenu)
 
             # Real Windows sends WM_CREATE to the WndProc synchronously, before
             # CreateWindowEx returns. Apps often create their child controls here.
@@ -7544,6 +7552,7 @@ class WinAPIHandler:
         if Msg == self.LB_RESETCONTENT:
             control.items = []
             control.sel_index = -1
+            control.top_index = 0
             return 0
         if Msg == self.LB_GETCOUNT:
             return len(items)
@@ -7555,6 +7564,13 @@ class WinAPIHandler:
                 return self.LB_ERR
             if wParam < len(items):
                 control.sel_index = wParam
+                # Scroll the selected item into view
+                if control.class_name == "LISTBOX":
+                    rows = max(1, (control.height - 2) // self.gui.LISTBOX_ITEM_H)
+                    if wParam < control.top_index:
+                        control.top_index = wParam
+                    elif wParam >= control.top_index + rows:
+                        control.top_index = wParam - rows + 1
                 return wParam
             return self.LB_ERR
         if Msg == self.LB_GETTEXT:
@@ -9855,22 +9871,35 @@ class WinAPIHandler:
         log.debug(f"AppendMenuA(0x{hMenu:x}, flags=0x{uFlags:x}, id=0x{uIDNewItem:x}, '{text}')")
         return 1
 
+    @staticmethod
+    def _menu_label(text):
+        """(label, shortcut) of a menu item text: "&Open\\tEnter" -> ("Open", "Enter");
+        "&" marks the mnemonic and "&&" is a literal "&"""
+        if not isinstance(text, str):
+            return '', ''
+        label, _, shortcut = text.partition('\t')
+        label = '&'.join(part.replace('&', '') for part in label.split('&&'))
+        return label, shortcut
+
     def _build_menu_tree(self, hmenu):
         """Convert menu handles into the plain structure the GUI renders"""
         tree = []
         for item in self.menus.get(hmenu, []):
+            label, _ = self._menu_label(item['text'])
             if item['flags'] & self.MF_POPUP:
                 subitems = []
                 for sub in self.menus.get(item['submenu'], []):
                     if sub['flags'] & self.MF_SEPARATOR:
                         subitems.append({'separator': True})
                     else:
-                        subitems.append({'text': sub['text'], 'id': sub['id']})
-                tree.append({'text': item['text'], 'id': 0, 'items': subitems})
+                        sub_label, shortcut = self._menu_label(sub['text'])
+                        subitems.append({'text': sub_label, 'shortcut': shortcut,
+                                         'id': sub['id']})
+                tree.append({'text': label, 'id': 0, 'items': subitems})
             elif item['flags'] & self.MF_SEPARATOR:
                 continue  # Separators make no sense at the top level
             else:
-                tree.append({'text': item['text'], 'id': item['id'], 'items': None})
+                tree.append({'text': label, 'id': item['id'], 'items': None})
         return tree
 
     def SetMenu(self, args):
@@ -14678,9 +14707,11 @@ class PseudoWindowsGUI:
     DOUBLE_CLICK_MS = 500
 
     def _refresh_desktop_icons(self):
-        """Read the desktop icons: only the programs directly in C:\\"""
-        self.desktop_icons = ['C:\\' + f
-                              for f in _folder_programs(_program_folder_host_path('C:\\'))]
+        """Read the desktop icons: the file manager (if compiled) and only the
+        programs directly in C:\\"""
+        self.desktop_icons = [FILE_MANAGER_PATH] if self._file_manager_available() else []
+        self.desktop_icons += ['C:\\' + f
+                               for f in _folder_programs(_program_folder_host_path('C:\\'))]
         self.desktop_icon_paths = {path: resolve_c_drive_path(path)
                                    for path in self.desktop_icons}
         self.selected_icon = None
@@ -14848,16 +14879,26 @@ class PseudoWindowsGUI:
     def _start_button_rect(self):
         return pygame.Rect(2, self.height - 28, 60, 26)
 
+    @staticmethod
+    def _file_manager_available():
+        path = resolve_c_drive_path(FILE_MANAGER_PATH)
+        return bool(path) and os.path.isfile(path)
+
     def _fill_start_menu(self):
-        """Build the Start menu: Programs (C:\\ programs) and Exit.
+        """Build the Start menu: File Manager (if compiled), Programs (C:\\
+        programs) and Exit.
         Rows are ('program', label, path), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
-        programs = list_programs()
-        rows = [('program', self._program_label(path), path)
-                for path in programs.get('C:\\', [])]
-        self.start_icon_paths = {path: resolve_c_drive_path(path)
-                                 for path in programs.get('C:\\', [])}
-        self.start_menu_rows = [
+        paths = [path for path in list_programs().get('C:\\', [])
+                 if path.lower() != FILE_MANAGER_PATH.lower()]
+        rows = [('program', self._program_label(path), path) for path in paths]
+        top = []
+        if self._file_manager_available():
+            top = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH),
+                   ('separator', None, None)]
+            paths.append(FILE_MANAGER_PATH)
+        self.start_icon_paths = {path: resolve_c_drive_path(path) for path in paths}
+        self.start_menu_rows = top + [
             ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
             ('separator', None, None),
             ('exit', "Exit", None),
@@ -14964,6 +15005,8 @@ class PseudoWindowsGUI:
 
     @staticmethod
     def _program_label(path):
+        if path.lower() == FILE_MANAGER_PATH.lower():
+            return "File Manager"
         return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
 
     def _draw_start_menu(self):
@@ -15535,6 +15578,10 @@ class PseudoWindowsGUI:
             color = self.COLOR_TITLE_TEXT if hovered else self.COLOR_TEXT
             text = self.font.render(sub['text'], True, color)
             self.screen.blit(text, (rect.x + 16, rect.y + (rect.height - text.get_height()) // 2))
+            if sub.get('shortcut'):
+                text = self.font.render(sub['shortcut'], True, color)
+                self.screen.blit(text, (rect.right - 12 - text.get_width(),
+                                        rect.y + (rect.height - text.get_height()) // 2))
     
     def _combo_dropdown_rects(self, control):
         """Dropdown rect and item rects of an open combobox (screen coords)."""
@@ -16422,7 +16469,9 @@ class PseudoWindowsGUI:
         width = 100
         for sub in items:
             if sub.get('text'):
-                width = max(width, self.font.size(sub['text'])[0] + 32)
+                shortcut_w = (self.font.size(sub['shortcut'])[0] + 24
+                              if sub.get('shortcut') else 0)
+                width = max(width, self.font.size(sub['text'])[0] + 32 + shortcut_w)
 
         item_h = 20
         sep_h = 7
@@ -16936,6 +16985,9 @@ class PseudoWindowsGUI:
                                     if self.winapi:
                                         self._post_control_command(
                                             win, control, self.winapi.LBN_SELCHANGE)
+                                        if self._double_click(('listbox', control.hwnd, index)):
+                                            self._post_control_command(
+                                                win, control, self.winapi.LBN_DBLCLK)
                             return
                         elif control.class_name == "COMBOBOX":
                             if button == 1:
@@ -17127,10 +17179,12 @@ class PseudoWindowsGUI:
             pass
     
     def _show_messagebox(self, caption, text, msg_type):
-        """Show MessageBox"""
-        # Create MessageBox window
-        width = max(300, len(text) * 8 + 50)
-        height = 120
+        """Show MessageBox; each line of text gets its own row"""
+        lines = text.replace('\r\n', '\n').split('\n')
+        line_h = 18
+        text_w = max(self.font.size(line)[0] for line in lines)
+        width = min(max(300, text_w + 50), self.width - 20)
+        height = 90 + len(lines) * line_h
         x = (self.width - width) // 2
         y = (self.height - height) // 2
         
@@ -17139,8 +17193,10 @@ class PseudoWindowsGUI:
         win.is_dialog = True  # Show only close button
         
         # Text
-        text_ctrl = FakeControl(self.get_next_hwnd(), "STATIC", text, 20, 20, width - 40, 30)
-        win.controls.append(text_ctrl)
+        for i, line in enumerate(lines):
+            if line:
+                win.controls.append(FakeControl(self.get_next_hwnd(), "STATIC", line,
+                                                20, 20 + i * line_h, width - 40, line_h))
         
         # OK button
         ok_btn = FakeControl(self.get_next_hwnd(), "BUTTON", "OK", (width - 80) // 2, height - 60, 80, 25)
@@ -18298,6 +18354,9 @@ def main():
     parser.add_argument("--clean", action="store_true",
                         help="Only delete c_drive/ (scripts/remove_c_drive_environment.sh "
                              "--all, asks for confirmation) and exit")
+    parser.add_argument("--no-apps", action="store_true",
+                        help="Don't compile the apps in apps/ (compile_apps.sh) into "
+                             "C:\\Windows, like the file manager (filemanager.exe)")
     parser.add_argument("--tests", action="store_true",
                         help="Only compile the test programs into C:\\Windows\\Tests, run "
                              "each one without the GUI (scripts/run_tests.sh) and exit "
@@ -18368,6 +18427,8 @@ def main():
 
     if not args.no_create_environment:
         run_setup_script(CREATE_C_DRIVE_SCRIPT, "Creating C Drive Environment")
+    if not args.no_apps:
+        run_setup_script(COMPILE_APPS_SCRIPT, "Compiling Apps")
     create_environment_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
