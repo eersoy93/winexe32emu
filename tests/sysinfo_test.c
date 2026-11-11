@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-System information example - exercises kernel32/user32/advapi32 query APIs
+System information test - exercises kernel32/user32/advapi32 query APIs
 and the wide/copy/move file APIs of the sandboxed C: drive.
 */
 
@@ -38,7 +38,7 @@ int main(void)
     BOOL ok;
 
     SetConsoleTitleA("System Information");
-    printf("=== System information example ===\n\n");
+    printf("=== System information test ===\n\n");
 
     size = sizeof(name);
     if (GetComputerNameA(name, &size))

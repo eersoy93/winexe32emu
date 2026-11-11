@@ -20,17 +20,23 @@ python3 winexe32emu.py
 
 Use `-h` parameter for command-line help.
 
+Test programs are only compiled and run with the `--tests` parameter (needs `i686-w64-mingw32-gcc`). It compiles them into `c_drive/Windows/Tests/`, runs each one without the GUI and exits with the number of failed tests:
+
+```bash
+python3 winexe32emu.py --tests
+```
+
 The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
 
-- `c_drive/` - Put your EXE files here (emulation path, `C:\`)
-- `examples/` - Example C source codes
-- `scripts/compile_examples.sh` - Script to compile examples into `c_drive/Windows/Examples/`
+- `c_drive/` - Put your EXE files here (emulation path, `C:\`); only the EXE files directly in it are shown on the desktop
+- `scripts/compile_tests.sh` - Script to compile the test programs into `c_drive/Windows/Tests/`
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
-- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled examples and the empty `c_drive/` folders
-- `scripts/remove_examples.sh` - Script to remove the compiled examples
-- `scripts/test_examples.sh` - Script to compile the examples and run each one in the emulator without the GUI (exit code: number of failed examples)
+- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled test programs and the empty `c_drive/` folders
+- `scripts/remove_tests.sh` - Script to remove the compiled test programs
+- `scripts/run_tests.sh` - Script to compile the test programs and run each one in the emulator without the GUI (exit code: number of failed tests)
+- `tests/` - Test program C source codes
 - `winexe32emu.py` - The main script
 
 ## Features

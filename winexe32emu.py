@@ -63,12 +63,12 @@ DEFAULT_ENVIRONMENT = {
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 
-# Emulated folder holding the example programs (c_drive/Windows/Examples/)
-EXAMPLES_FOLDER = 'C:\\Windows\\Examples'
+# Emulated folder holding the test programs compiled with --tests (c_drive/Windows/Tests/)
+TESTS_FOLDER = 'C:\\Windows\\Tests'
 
-# Folders searched for a bare EXE name (command line) and listed in the
-# Start menu, in this order
-PROGRAM_FOLDERS = ('C:\\', EXAMPLES_FOLDER)
+# Folders searched for a bare EXE name (command line), in this order; the
+# Start menu lists only the C:\\ programs
+PROGRAM_FOLDERS = ('C:\\', TESTS_FOLDER)
 
 # Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
 # default because MinGW emits string literals as UTF-8; set via --codepage
@@ -617,9 +617,8 @@ def environment_folders(environment):
 
 
 def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
-    """Create the folders named by the environment (C:\\Windows, ...) and the
-    examples folder (C:\\Windows\\Examples) in c_drive/."""
-    for folder in environment_folders(environment) + [EXAMPLES_FOLDER]:
+    """Create the folders named by the environment (C:\\Windows, ...) in c_drive/."""
+    for folder in environment_folders(environment):
         path = resolve_c_drive_path(folder)
         if path is None:
             continue
@@ -630,9 +629,10 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
 
-# Startup scripts: c_drive/ folders, and the examples compiled into C:\Windows\Examples
+# Scripts: c_drive/ folders at startup, and the test programs (--tests: compiled
+# into C:\Windows\Tests and run without the GUI)
 CREATE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "create_c_drive_environment.sh")
-COMPILE_EXAMPLES_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "compile_examples.sh")
+RUN_TESTS_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "run_tests.sh")
 REMOVE_C_DRIVE_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "remove_c_drive_environment.sh")
 
 
@@ -685,10 +685,10 @@ def _program_subfolders(directory):
 def find_program(name):
     """Host path of the EXE to run, or None if it does not exist.
 
-    A Windows path (C:\\Windows\\Examples\\gdi_example\\gdi_example.exe, ...)
+    A Windows path (C:\\Windows\\Tests\\api_test\\api_test.exe, ...)
     is resolved inside c_drive/; a bare file name is searched in
-    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Examples) and in their
-    subfolders (each example lives in its own folder).
+    PROGRAM_FOLDERS (C:\\ first, then C:\\Windows\\Tests) and in their
+    subfolders (each test program lives in its own folder).
     """
     if not name:
         return None
@@ -14412,14 +14412,12 @@ class PseudoWindowsGUI:
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
 
-        # Start menu: open flag, rows (Programs: C:\ programs and an Examples
-        # submenu listing C:\Windows\Examples; Exit), and the callback that runs
+        # Start menu: open flag, rows (Programs: C:\ programs; Exit), and the callback that runs
         # a program (set by main)
         self.start_menu_open = False
         self.start_menu_rows = []
         self.start_open_path = []  # Row index of the open submenu at each level
         self.start_icon_paths = {}  # Windows path -> host path of the menu's programs
-        self.show_examples = True  # False with --no-examples: no Examples submenu
         self.launcher = None
 
         # Desktop icons (Windows paths of the C:\ programs) and the selected one
@@ -14680,8 +14678,9 @@ class PseudoWindowsGUI:
     DOUBLE_CLICK_MS = 500
 
     def _refresh_desktop_icons(self):
-        """Read the desktop icons: the programs in C:\\ and its subfolders"""
-        self.desktop_icons = list_programs().get('C:\\', [])
+        """Read the desktop icons: only the programs directly in C:\\"""
+        self.desktop_icons = ['C:\\' + f
+                              for f in _folder_programs(_program_folder_host_path('C:\\'))]
         self.desktop_icon_paths = {path: resolve_c_drive_path(path)
                                    for path in self.desktop_icons}
         self.selected_icon = None
@@ -14850,21 +14849,14 @@ class PseudoWindowsGUI:
         return pygame.Rect(2, self.height - 28, 60, 26)
 
     def _fill_start_menu(self):
-        """Build the Start menu: Programs (C:\\ programs and the Examples
-        submenu listing C:\\Windows\\Examples) and Exit.
+        """Build the Start menu: Programs (C:\\ programs) and Exit.
         Rows are ('program', label, path), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
         programs = list_programs()
         rows = [('program', self._program_label(path), path)
                 for path in programs.get('C:\\', [])]
-        examples = programs.get(EXAMPLES_FOLDER, []) if self.show_examples else []
-        if examples:
-            if rows:
-                rows.append(('separator', None, None))
-            rows.append(('submenu', "Examples",
-                         [('program', self._program_label(path), path) for path in examples]))
         self.start_icon_paths = {path: resolve_c_drive_path(path)
-                                 for path in programs.get('C:\\', []) + examples}
+                                 for path in programs.get('C:\\', [])}
         self.start_menu_rows = [
             ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
             ('separator', None, None),
@@ -18286,11 +18278,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Examples/ "
-               "(C:\\Windows\\Examples).\nExample: python3 winexe32emu.py gdi_example.exe"
+        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Tests/ "
+               "(C:\\Windows\\Tests).\nExample: python3 winexe32emu.py api_test.exe"
     )
     parser.add_argument("exe", nargs="?",
-                        help="PE file to run: a name in C:\\ or C:\\Windows\\Examples, or a "
+                        help="PE file to run: a name in C:\\ or C:\\Windows\\Tests, or a "
                              "Windows path inside c_drive/; optional with the GUI, "
                              "programs can also be started from the Start menu")
     parser.add_argument("-n", "--max-instructions", type=int, default=0,
@@ -18306,9 +18298,10 @@ def main():
     parser.add_argument("--clean", action="store_true",
                         help="Only delete c_drive/ (scripts/remove_c_drive_environment.sh "
                              "--all, asks for confirmation) and exit")
-    parser.add_argument("--no-examples", action="store_true",
-                        help="Don't compile the examples (compile_examples.sh) and "
-                             "don't show the Examples submenu in the Start menu")
+    parser.add_argument("--tests", action="store_true",
+                        help="Only compile the test programs into C:\\Windows\\Tests, run "
+                             "each one without the GUI (scripts/run_tests.sh) and exit "
+                             "(exit code: number of failed tests)")
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
                         help="Don't run create_c_drive_environment.sh at startup")
@@ -18361,12 +18354,20 @@ def main():
             sys.exit(1)
         sys.exit(result.returncode)
 
+    if args.tests:
+        log.header("Compiling and Running Tests")
+        try:
+            result = subprocess.run(['sh', RUN_TESTS_SCRIPT], cwd=SCRIPT_DIR,
+                                    env=dict(os.environ, PYTHON=sys.executable))
+        except OSError as e:
+            log.error(f"Cannot run {RUN_TESTS_SCRIPT}: {e}")
+            sys.exit(1)
+        sys.exit(result.returncode)
+
     use_gui = not args.no_gui
 
     if not args.no_create_environment:
         run_setup_script(CREATE_C_DRIVE_SCRIPT, "Creating C Drive Environment")
-    if not args.no_examples:
-        run_setup_script(COMPILE_EXAMPLES_SCRIPT, "Compiling Examples")
     create_environment_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
@@ -18393,7 +18394,6 @@ def main():
     if use_gui and PYGAME_AVAILABLE:
         log.header("Starting Pygame GUI")
         gui = PseudoWindowsGUI(1024, 768)
-        gui.show_examples = not args.no_examples
         if gui.start():
             log.success("Pygame GUI window opened!")
         else:

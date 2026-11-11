@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-API example - exercises kernel32 directory search, current directory,
+API test - exercises kernel32 directory search, current directory,
 INI file, string and environment APIs, user32 character and window APIs,
 gdi32 DC attribute APIs and the advapi32 registry.
 Every check prints PASS or FAIL; the exit code is the failure count.
@@ -148,14 +148,14 @@ static void test_strings(void)
 
 static void test_profile(void)
 {
-    const char *ini = "api_example.ini";  /* In the Windows directory */
+    const char *ini = "api_test.ini";  /* In the Windows directory */
     char buf[64];
 
     printf("\n--- kernel32: INI files ---\n");
     check(WritePrivateProfileStringA("General", "Name", "Tester", ini), "WritePrivateProfileStringA");
     WritePrivateProfileStringA("General", "Count", "42", ini);
     WritePrivateProfileStringA("Other", "Key", "\"quoted\"", ini);
-    check(GetFileAttributesA("C:\\Windows\\api_example.ini") != INVALID_FILE_ATTRIBUTES,
+    check(GetFileAttributesA("C:\\Windows\\api_test.ini") != INVALID_FILE_ATTRIBUTES,
           "INI file is in C:\\Windows");
 
     GetPrivateProfileStringA("general", "NAME", "none", buf, sizeof(buf), ini);
@@ -173,7 +173,7 @@ static void test_profile(void)
     WritePrivateProfileStringA("Other", NULL, NULL, ini);
     GetPrivateProfileStringA("Other", "Key", "gone", buf, sizeof(buf), ini);
     check(strcmp(buf, "gone") == 0, "WritePrivateProfileStringA deletes a section");
-    DeleteFileA("C:\\Windows\\api_example.ini");
+    DeleteFileA("C:\\Windows\\api_test.ini");
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -216,20 +216,20 @@ static void test_user32(void)
     memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleA(NULL);
-    wc.lpszClassName = "ApiExampleClass";
+    wc.lpszClassName = "ApiTestClass";
     RegisterClassA(&wc);
-    hwnd = CreateWindowExA(0, "ApiExampleClass", "API Example", WS_OVERLAPPEDWINDOW,
+    hwnd = CreateWindowExA(0, "ApiTestClass", "API Test", WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT, 300, 200, NULL, NULL, wc.hInstance, NULL);
     if (!IsWindow(hwnd)) {
         printf("SKIP: window checks (no GUI)\n");
         return;
     }
-    check(FindWindowA("ApiExampleClass", NULL) == hwnd, "FindWindowA (class)");
-    check(FindWindowA(NULL, "API Example") == hwnd, "FindWindowA (title)");
+    check(FindWindowA("ApiTestClass", NULL) == hwnd, "FindWindowA (class)");
+    check(FindWindowA(NULL, "API Test") == hwnd, "FindWindowA (title)");
     check(FindWindowA("NoSuchClass", NULL) == NULL, "FindWindowA (no match)");
-    check(GetClassNameA(hwnd, buf, sizeof(buf)) == 15 && strcmp(buf, "ApiExampleClass") == 0,
+    check(GetClassNameA(hwnd, buf, sizeof(buf)) == 12 && strcmp(buf, "ApiTestClass") == 0,
           "GetClassNameA");
-    check(GetWindowTextLengthA(hwnd) == 11, "GetWindowTextLengthA");
+    check(GetWindowTextLengthA(hwnd) == 8, "GetWindowTextLengthA");
     ShowWindow(hwnd, SW_SHOW);
     check(BringWindowToTop(hwnd), "BringWindowToTop");
     check(SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd, "SetForegroundWindow");
@@ -280,7 +280,7 @@ static void test_registry(void)
     LONG rc;
 
     printf("\n--- advapi32: registry ---\n");
-    rc = RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\WinExe32Emu\\ApiExample", 0, NULL, 0,
+    rc = RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\WinExe32Emu\\ApiTest", 0, NULL, 0,
                          KEY_ALL_ACCESS, NULL, &hk, &disp);
     check(rc == ERROR_SUCCESS && disp == REG_CREATED_NEW_KEY, "RegCreateKeyExA (new key)");
     RegSetValueExA(hk, "Name", 0, REG_SZ, (const BYTE *)"Tester", 7);
@@ -336,7 +336,7 @@ static void test_registry(void)
     RegDeleteKeyA(hk, "Child1");
     RegDeleteKeyA(hk, "Child2");
     RegCloseKey(hk);
-    check(RegDeleteKeyA(HKEY_CURRENT_USER, "Software\\WinExe32Emu\\ApiExample") == ERROR_SUCCESS &&
+    check(RegDeleteKeyA(HKEY_CURRENT_USER, "Software\\WinExe32Emu\\ApiTest") == ERROR_SUCCESS &&
           RegDeleteKeyA(HKEY_CURRENT_USER, "Software\\WinExe32Emu") == ERROR_SUCCESS,
           "RegDeleteKeyA");
     check(RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\WinExe32Emu", 0, KEY_READ, &hk) ==
@@ -345,7 +345,7 @@ static void test_registry(void)
 
 int main(void)
 {
-    printf("=== API example ===\n");
+    printf("=== API test ===\n");
     test_files();
     test_strings();
     test_profile();

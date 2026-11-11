@@ -15,14 +15,14 @@ limitations under the License.
 */
 
 /*
-File I/O example - exercises the emulator's sandboxed file support.
+File I/O test - exercises the emulator's sandboxed file support.
 
 Everything happens inside the emulated C: drive (the host c_drive/ folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
   2. msvcrt fopen/fwrite/fgets round-trip.
   3. Files inside directories: the environment folders created at startup
      (C:\\Windows\\Temp, C:\\Windows) and new nested directories in the
-     example's own folder (the current directory).
+     test's own folder (the current directory).
   4. A sandbox-escape attempt ("C:\\..\\escape.txt") that must be refused.
 */
 
@@ -119,36 +119,36 @@ int main(void)
     /* Environment folders (created by the emulator at startup) */
     if (GetTempPathA(sizeof(dir), dir))  /* "C:\\Windows\\Temp\\" */
     {
-        wsprintfA(path, "%sfile_example.tmp", dir);
+        wsprintfA(path, "%sfile_test.tmp", dir);
         WriteFileIn(hOut, path, "Temporary data\n");
     }
     if (GetWindowsDirectoryA(dir, sizeof(dir)))  /* "C:\\Windows" */
     {
-        wsprintfA(path, "%s\\file_example.ini", dir);
-        WriteFileIn(hOut, path, "[file_example]\nenabled=1\n");
+        wsprintfA(path, "%s\\file_test.ini", dir);
+        WriteFileIn(hOut, path, "[file_test]\nenabled=1\n");
     }
 
     /* New nested directories: Win32 CreateDirectoryA and CRT _mkdir */
-    CreateDirectoryA("FileExample", NULL);
-    CreateDirectoryA("FileExample\\Data", NULL);
-    WriteFileIn(hOut, "FileExample\\readme.txt", "File example directory\n");
-    WriteFileIn(hOut, "FileExample\\Data\\data.txt", "1 2 3\n");
+    CreateDirectoryA("FileTest", NULL);
+    CreateDirectoryA("FileTest\\Data", NULL);
+    WriteFileIn(hOut, "FileTest\\readme.txt", "File test directory\n");
+    WriteFileIn(hOut, "FileTest\\Data\\data.txt", "1 2 3\n");
 
-    _mkdir("FileExample\\Logs");
-    fp = fopen("FileExample\\Logs\\log.txt", "w");
+    _mkdir("FileTest\\Logs");
+    fp = fopen("FileTest\\Logs\\log.txt", "w");
     if (fp)
     {
         fprintf(fp, "log entry %d\n", 1);
         fclose(fp);
-        WriteString(hOut, "(Dir) 'FileExample\\Logs\\log.txt' has been written!\n");
+        WriteString(hOut, "(Dir) 'FileTest\\Logs\\log.txt' has been written!\n");
     }
 
-    fp = fopen("FileExample\\Data\\data.txt", "r");
+    fp = fopen("FileTest\\Data\\data.txt", "r");
     if (fp)
     {
         if (fgets(buffer, sizeof(buffer), fp))
         {
-            WriteString(hOut, "(Dir) 'FileExample\\Data\\data.txt' has been read!\n");
+            WriteString(hOut, "(Dir) 'FileTest\\Data\\data.txt' has been read!\n");
             WriteString(hOut, buffer);
         }
         fclose(fp);

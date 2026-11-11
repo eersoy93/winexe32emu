@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-Sound example - exercises the emulator's audio output.
+Sound test - exercises the emulator's audio output.
 
   1. Beep: a short melody (each call blocks for its duration).
   2. MessageBeep: the system sound types.
@@ -62,11 +62,11 @@ int main(void)
     static const UINT beeps[] = { MB_OK, MB_ICONHAND, MB_ICONQUESTION,
                                   MB_ICONEXCLAMATION, MB_ICONASTERISK, 0xFFFFFFFF };
     static BYTE wav[44 + WAV_RATE * WAV_MS / 1000];
-    const char *path = "C:\\Windows\\Temp\\sound_example.wav";
+    const char *path = "C:\\Windows\\Temp\\sound_test.wav";
     DWORD size, start, written, i;
     HANDLE hFile;
 
-    printf("=== Sound example ===\n\n");
+    printf("=== Sound test ===\n\n");
 
     printf("1. Beep: C major scale\n");
     start = timeGetTime();

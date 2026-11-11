@@ -17,9 +17,9 @@
 cd "$(dirname "$0")/.." || exit 1
 
 # Emulated C drive and the folders the default environment names
-# (WINDIR/SYSTEMROOT, PATH, TEMP/TMP); examples live in C:\Windows\Examples
+# (WINDIR/SYSTEMROOT, PATH, TEMP/TMP)
 C_DRIVE=c_drive
-for dir in Windows Windows/System32 Windows/Temp Windows/Examples; do
+for dir in Windows Windows/System32 Windows/Temp; do
     mkdir -p "${C_DRIVE}/${dir}" || exit 1
 done
 echo "OK: ${C_DRIVE}/ directory tree"

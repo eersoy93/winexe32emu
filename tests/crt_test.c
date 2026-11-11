@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-C runtime example - exercises the emulator's msvcrt support:
+C runtime test - exercises the emulator's msvcrt support:
 formatted I/O, strings, wide strings, number conversion, math,
 time, environment, file system, signals and setjmp/longjmp.
 Every check prints PASS or FAIL; the exit code is the failure count.
@@ -209,27 +209,27 @@ static void test_environment_and_files(void)
     char cwd[_MAX_PATH];
 
     check(getenv("WINDIR") != NULL && strcmp(getenv("WINDIR"), "C:\\Windows") == 0, "getenv");
-    check(_putenv("CRT_EXAMPLE=yes") == 0 && strcmp(getenv("CRT_EXAMPLE"), "yes") == 0, "_putenv");
+    check(_putenv("CRT_TEST=yes") == 0 && strcmp(getenv("CRT_TEST"), "yes") == 0, "_putenv");
     check(getenv("NO_SUCH_VARIABLE") == NULL, "getenv missing");
     check(_getcwd(cwd, sizeof(cwd)) != NULL &&
-          strcmp(cwd, "C:\\Windows\\Examples\\crt_example") == 0, "_getcwd (EXE folder)");
+          strcmp(cwd, "C:\\Windows\\Tests\\crt_test") == 0, "_getcwd (EXE folder)");
 
-    fp = fopen("crt_example.txt", "w");
+    fp = fopen("crt_test.txt", "w");
     if (fp)
     {
         fprintf(fp, "%d %s\n", 2026, "scan");
         fclose(fp);
     }
-    fp = fopen("crt_example.txt", "r");
+    fp = fopen("crt_test.txt", "r");
     check(fp != NULL && fscanf(fp, "%d %15s", &value, word) == 2 &&
           value == 2026 && strcmp(word, "scan") == 0, "fprintf/fscanf");
     if (fp)
         fclose(fp);
 
-    remove("crt_example_renamed.txt");
-    check(rename("crt_example.txt", "crt_example_renamed.txt") == 0, "rename");
-    check(_access("crt_example_renamed.txt", 0) == 0, "_access");
-    check(remove("crt_example_renamed.txt") == 0 && _access("crt_example_renamed.txt", 0) == -1, "remove");
+    remove("crt_test_renamed.txt");
+    check(rename("crt_test.txt", "crt_test_renamed.txt") == 0, "rename");
+    check(_access("crt_test_renamed.txt", 0) == 0, "_access");
+    check(remove("crt_test_renamed.txt") == 0 && _access("crt_test_renamed.txt", 0) == -1, "remove");
     errno = 0;
     check(fopen("missing_file.txt", "r") == NULL && errno == ENOENT, "fopen errno");
 }
@@ -263,7 +263,7 @@ static void test_control_flow(void)
 
 int main(void)
 {
-    puts("== CRT example ==");
+    puts("== CRT test ==");
     test_formatting();
     test_scanning();
     test_strings();

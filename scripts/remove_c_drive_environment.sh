@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Undoes create_c_drive_environment.sh and compile_examples.sh. Other files
+# Undoes create_c_drive_environment.sh and compile_tests.sh. Other files
 # in c_drive/ are kept (folders holding them stay); --all deletes the whole
 # c_drive/ after a confirmation.
 
@@ -42,8 +42,8 @@ if [ "$1" = "--all" ]; then
     exit 0
 fi
 
-# Compiled examples
-sh scripts/remove_examples.sh >/dev/null || exit 1
+# Compiled tests
+sh scripts/remove_tests.sh >/dev/null || exit 1
 
 # Deepest folders first; rmdir only removes empty ones
 for dir in Windows/Temp Windows/System32 Windows ""; do

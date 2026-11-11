@@ -13,20 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Undoes compile_examples.sh: deletes the compiled example EXEs. Other files
-# in C:\Windows\Examples and the example folders are kept (folders stay if
-# any remain).
+# Undoes compile_tests.sh: deletes the compiled test EXEs. Other files in
+# C:\Windows\Tests and the test folders are kept (folders stay if any remain).
 
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-OUT_DIR=c_drive/Windows/Examples
+OUT_DIR=c_drive/Windows/Tests
 
-for src in examples/*.c; do
+for src in tests/*.c; do
     name=$(basename "$src" .c)
-    rm -f "${OUT_DIR}/${name}/${name}.exe" "${OUT_DIR}/${name}.exe" || exit 1
+    rm -f "${OUT_DIR}/${name}/${name}.exe" || exit 1
     rmdir "${OUT_DIR}/${name}" 2>/dev/null
 done
 rmdir "$OUT_DIR" 2>/dev/null
 
-echo "OK: compiled examples removed"
+echo "OK: compiled tests removed"
