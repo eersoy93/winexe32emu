@@ -1015,6 +1015,11 @@ class WinAPIHandler:
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     WM_CHAR = 0x0102
+    WM_SYSKEYDOWN = 0x0104
+    WM_SYSKEYUP = 0x0105
+    WM_SYSCHAR = 0x0106
+    WM_SYSCOMMAND = 0x0112
+    SC_CLOSE = 0xF060
     WM_COMMAND = 0x0111
     WM_DRAWITEM = 0x002B
     WM_TIMER = 0x0113
@@ -7791,6 +7796,11 @@ class WinAPIHandler:
         # Default WM_CLOSE handling: destroy the window (like real Windows)
         if Msg == self.WM_CLOSE:
             self.DestroyWindow([hWnd])
+        # Alt+F4 -> SC_CLOSE -> WM_CLOSE (posted: no nested WndProc calls here)
+        elif Msg == self.WM_SYSKEYDOWN and wParam == 0x73 and lParam & 0x20000000:  # VK_F4
+            self.post_window_message(hWnd, self.WM_SYSCOMMAND, self.SC_CLOSE, 0)
+        elif Msg == self.WM_SYSCOMMAND and wParam & 0xFFF0 == self.SC_CLOSE:
+            self.post_window_message(hWnd, self.WM_CLOSE, 0, 0)
 
         return 0
 
@@ -14313,6 +14323,11 @@ class PseudoWindowsGUI:
 
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
         self.key_states = {}
+        # Left Alt held (WM_SYSKEY* messages) and whether another key was pressed
+        # with it; the right Alt is AltGr (Ctrl+Alt), which types characters
+        self.alt_down = False
+        self.alt_combo = False
+        self.alt_f4_seen = False  # F4 arrived as a key while Alt was held
 
         # Last mouse position for GetCursorPos (GUI thread writes)
         self.mouse_pos = (0, 0)
@@ -14433,7 +14448,13 @@ class PseudoWindowsGUI:
         # Process Pygame events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                self.running = False
+                if self.alt_down and not self.key_states.get(0x11):
+                    # The host's window manager took Alt+F4 for the emulator's
+                    # window: it is meant for the fake desktop's active window
+                    if not self.alt_f4_seen:
+                        self._alt_f4()
+                else:
+                    self.running = False
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_mouse_click(event.pos, event.button)
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -14473,12 +14494,20 @@ class PseudoWindowsGUI:
                 vk = self._pygame_key_to_vk(event)
                 if vk is not None:
                     self.key_states[vk] = True
+                if event.key == pygame.K_LALT:
+                    self.alt_down, self.alt_combo, self.alt_f4_seen = True, False, False
+                elif self.alt_down:
+                    self.alt_combo = True  # Alt+key: releasing Alt is a plain WM_KEYUP
+                    if event.key == pygame.K_F4:
+                        self.alt_f4_seen = True
                 self._handle_key_press(event)
             elif event.type == pygame.KEYUP:
                 vk = self._pygame_key_to_vk(event)
                 if vk is not None:
                     self.key_states[vk] = False
-                    self._forward_key_up(vk)
+                    self._forward_key_up(vk, event)
+                if event.key == pygame.K_LALT:
+                    self.alt_down = False
         
         # MessageBox check
         self._check_messagebox()
@@ -16602,13 +16631,43 @@ class PseudoWindowsGUI:
         }
         return special.get(key)
 
-    def _forward_key_up(self, vk):
-        """Forward a key release (WM_KEYUP) to the active application window."""
+    def _alt_f4(self):
+        """Alt+F4 that reached the emulator only as a host window close request:
+        send it to the active program window, or close an emulator window"""
+        self.alt_combo = True
+        hwnd = self.active_window
+        if not hwnd or hwnd not in self.windows:
+            return
+        if self._is_app_window(hwnd):
+            self.winapi.post_window_message(hwnd, self.winapi.WM_SYSKEYDOWN, 0x73, 0x20000001)
+            self.winapi.post_window_message(hwnd, self.winapi.WM_SYSKEYUP, 0x73, 0xE0000001)
+        else:
+            self._close_window(hwnd)
+
+    def _is_sys_key(self, vk):
+        """Is this keystroke a system key (WM_SYSKEY*): F10 or with the left Alt,
+        but not with Ctrl (Ctrl+Alt is AltGr)"""
+        if self.key_states.get(0x11):
+            return False
+        return vk == 0x79 or self.alt_down  # VK_F10
+
+    def _forward_key_up(self, vk, event=None):
+        """Forward a key release (WM_KEYUP / WM_SYSKEYUP) to the active application window."""
         if not self.winapi:
             return
         hwnd = self.active_window
-        if hwnd and self._is_app_window(hwnd):
-            self.winapi.post_window_message(hwnd, self.winapi.WM_KEYUP, vk, 1)
+        if not hwnd or not self._is_app_window(hwnd):
+            return
+        lparam = 0xC0000001  # Previous key state and transition state bits
+        if event is not None and event.key == pygame.K_LALT:
+            # Alt alone is a system key; after Alt+key its release is a plain key-up
+            sys_key = not self.alt_combo and not self.key_states.get(0x11)
+        else:
+            sys_key = self._is_sys_key(vk)
+        if sys_key and self.alt_down:
+            lparam |= 0x20000000  # Context code: Alt is down
+        message = self.winapi.WM_SYSKEYUP if sys_key else self.winapi.WM_KEYUP
+        self.winapi.post_window_message(hwnd, message, vk, lparam)
 
     def _forward_key_to_window(self, event):
         """Forward a keystroke to the active application window's WndProc."""
@@ -16618,14 +16677,26 @@ class PseudoWindowsGUI:
         if not hwnd or not self._is_app_window(hwnd):
             return
         vk = self._pygame_key_to_vk(event)
+        sys_key = self._is_sys_key(vk)
+        lparam = 0x20000001 if sys_key and self.alt_down else 1  # Context code: Alt is down
         if vk is not None:
-            self.winapi.post_window_message(hwnd, self.winapi.WM_KEYDOWN, vk, 1)
-        # Synthesize WM_CHAR for printable input (TranslateMessage behavior)
+            message = self.winapi.WM_SYSKEYDOWN if sys_key else self.winapi.WM_KEYDOWN
+            self.winapi.post_window_message(hwnd, message, vk, lparam)
+        # Synthesize WM_CHAR / WM_SYSCHAR for printable input (TranslateMessage behavior)
         if event.unicode and len(event.unicode) == 1 and event.unicode.isprintable():
-            self.winapi.post_window_message(hwnd, self.winapi.WM_CHAR, ord(event.unicode), 1)
+            message = self.winapi.WM_SYSCHAR if sys_key else self.winapi.WM_CHAR
+            self.winapi.post_window_message(hwnd, message, ord(event.unicode), lparam)
 
     def _handle_key_press(self, event):
         """Handle keyboard key press"""
+        # Alt+F4 goes to the active window even from a console or an edit control
+        if event.key == pygame.K_F4 and self.alt_down and self._is_sys_key(0x73):
+            if self.active_window in self.windows and not self._is_app_window(self.active_window):
+                self._close_window(self.active_window)  # Emulator window
+            else:
+                self._forward_key_to_window(event)
+            return
+
         # The active console window takes the line its program is waiting for
         console = self.consoles.get(self.active_window)
         if console is not None and console.input_active:
