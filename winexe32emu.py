@@ -722,6 +722,105 @@ def list_programs():
     return programs
 
 
+def _icon_image_rgba(data):
+    """(width, height, RGBA bytes) of an RT_ICON image (a DIB with the AND mask
+    under it, or PNG), or None if it can't be decoded"""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        if not PYGAME_AVAILABLE:
+            return None
+        try:
+            surface = pygame.image.load(io.BytesIO(data), 'icon.png')
+        except pygame.error:
+            return None
+        return (*surface.get_size(), pygame.image.tobytes(surface, 'RGBA'))
+    if len(data) < 40:
+        return None
+    hdr_size, width, double_height, _, bpp, compression = struct.unpack_from('<IiiHHI', data)
+    height = abs(double_height) // 2
+    if width <= 0 or height <= 0 or compression != 0:
+        return None
+    # The header's height covers the image and the mask: decode only the image
+    header = bytearray(data)
+    struct.pack_into('<i', header, 8, height)
+    decoded = WinAPIHandler._decode_dib(bytes(header))
+    if decoded is None:
+        return None
+    rgb = decoded[2]
+    colors = 0
+    if bpp <= 8:
+        colors = struct.unpack_from('<I', data, 32)[0] or (1 << bpp)
+    xor_offset = hdr_size + 4 * colors
+    xor_stride = ((width * bpp + 31) // 32) * 4
+    and_offset = xor_offset + xor_stride * height
+    and_stride = ((width + 31) // 32) * 4
+
+    alpha = bytearray(width * height)
+    if bpp == 32:
+        for r in range(height):
+            start = xor_offset + (height - 1 - r) * xor_stride
+            alpha[r * width:(r + 1) * width] = data[start + 3:start + width * 4:4]
+    if not any(alpha):
+        # No alpha channel: the AND mask tells the transparent pixels (bit set)
+        if len(data) < and_offset + and_stride * height:
+            alpha = bytearray(b'\xff' * (width * height))
+        else:
+            for r in range(height):
+                line = data[and_offset + (height - 1 - r) * and_stride:]
+                for c in range(width):
+                    if not (line[c >> 3] >> (7 - (c & 7))) & 1:
+                        alpha[r * width + c] = 255
+    rgba = bytearray(width * height * 4)
+    for c in range(3):
+        rgba[c::4] = rgb[c::3]
+    rgba[3::4] = alpha
+    return width, height, bytes(rgba)
+
+
+def read_exe_icon(host_path, size=32):
+    """(width, height, RGBA bytes) of the EXE's main icon (its first icon group),
+    the image closest to size x size with the most colors; None if it has none"""
+    try:
+        pe = pefile.PE(host_path, fast_load=True)
+    except (pefile.PEFormatError, OSError):
+        return None
+    try:
+        pe.parse_data_directories(directories=[
+            pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+        root = getattr(pe, 'DIRECTORY_ENTRY_RESOURCE', None)
+        entries = {entry.id: entry for entry in (root.entries if root else [])}
+        if 14 not in entries or 3 not in entries:  # RT_GROUP_ICON, RT_ICON
+            return None
+
+        def first_language_data(name_entry):
+            languages = getattr(name_entry, 'directory', None)
+            if not languages or not languages.entries:
+                return None
+            struct_ = languages.entries[0].data.struct
+            return pe.get_data(struct_.OffsetToData, struct_.Size)
+
+        group = first_language_data(entries[14].directory.entries[0])
+        if not group or len(group) < 6:
+            return None
+        count = struct.unpack_from('<H', group, 4)[0]
+        images = []
+        for i in range(count):
+            if len(group) < 6 + 14 * (i + 1):
+                break
+            w, _, _, _, _, bits, _, icon_id = struct.unpack_from('<BBBBHHIH', group, 6 + 14 * i)
+            images.append((abs((w or 256) - size), -bits, icon_id))
+        icons = {entry.id: entry for entry in entries[3].directory.entries}
+        for _, _, icon_id in sorted(images):
+            data = first_language_data(icons[icon_id]) if icon_id in icons else None
+            decoded = _icon_image_rgba(data) if data else None
+            if decoded:
+                return decoded
+        return None
+    except (pefile.PEFormatError, AttributeError, IndexError, struct.error):
+        return None
+    finally:
+        pe.close()
+
+
 class SoundPlayer:
     """Audio output for Beep, MessageBeep and PlaySound (pygame.mixer).
 
@@ -14079,6 +14178,7 @@ class FakeWindow:
     def __init__(self, hwnd, title, x, y, width, height, style=0):
         self.hwnd = hwnd
         self.title = title
+        self.icon_path = None  # Host path of the EXE whose icon the title bar shows
         self.x = x
         self.y = y
         self.width = width
@@ -14321,6 +14421,23 @@ class PseudoWindowsGUI:
         self.show_examples = True  # False with --no-examples: no Examples submenu
         self.launcher = None
 
+        # Desktop icons (Windows paths of the C:\ programs) and the selected one
+        self.desktop_icons = []
+        self.desktop_icon_paths = {}  # Windows path -> host path
+        # (host EXE path, size) -> (normal, selected) icon surfaces
+        self.exe_icon_cache = {}
+        self.selected_icon = None
+        # Desktop right-click menu: (rect, [(label, action) or None], row rects) or None
+        self.desktop_menu = None
+
+        # Left clicks (ticks, pos, target) for double-click detection
+        self.last_click = (0, (0, 0), None)
+        self.prev_click = (0, (0, 0), None)
+
+        # When the mouse started hovering the clock (date tooltip), or None
+        self.tray_hover_since = None
+        self._checker_cache = {}  # Pressed taskbar button face per size
+
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
         self.key_states = {}
         # Left Alt held (WM_SYSKEY* messages) and whether another key was pressed
@@ -14409,8 +14526,11 @@ class PseudoWindowsGUI:
         pygame.font.init()
         self.font = pygame.font.SysFont('arial', 14)
         self.font_small = pygame.font.SysFont('arial', 11)
+        self.font_small_bold = pygame.font.SysFont('arial', 11, bold=True)
         self.font_bold = pygame.font.SysFont('arial', 14, bold=True)
         self.font_console = pygame.font.SysFont('consolas,courier,monospace', 12)
+
+        self._refresh_desktop_icons()
         
         self.running = True
         self.ready.set()
@@ -14526,6 +14646,7 @@ class PseudoWindowsGUI:
         """Draw screen"""
         # Desktop background
         self.screen.fill(self.COLOR_DESKTOP)
+        self._draw_desktop_icons()
         
         # Taskbar
         self._draw_taskbar()
@@ -14544,8 +14665,178 @@ class PseudoWindowsGUI:
         # Open combobox dropdown is drawn over all windows too
         self._draw_open_combo()
 
-        # Start menu is the topmost layer
+        # Desktop right-click menu, the Start menu and the clock tooltip are the topmost layers
+        self._draw_desktop_menu()
         self._draw_start_menu()
+        self._draw_clock_tooltip()
+
+    # ==================== DESKTOP ICONS ====================
+
+    ICON_CELL_W = 76
+    ICON_CELL_H = 72
+    ICON_MARGIN = 6
+    ICON_SIZE = 32
+    DOUBLE_CLICK_MS = 500
+
+    def _refresh_desktop_icons(self):
+        """Read the desktop icons: the programs in C:\\ and its subfolders"""
+        self.desktop_icons = list_programs().get('C:\\', [])
+        self.desktop_icon_paths = {path: resolve_c_drive_path(path)
+                                   for path in self.desktop_icons}
+        self.selected_icon = None
+        self.exe_icon_cache.clear()  # Programs may have been replaced
+
+    def _default_exe_icon(self, size):
+        """Default program icon (a small window with a title bar) of size x size"""
+        shadow = max(1, size // 16)
+        surface = pygame.Surface((size, size), pygame.SRCALPHA)
+        body = pygame.Rect(0, size * 3 // 32, size - shadow, size * 25 // 32)
+        pygame.draw.rect(surface, (64, 64, 64), body.move(shadow, shadow))
+        pygame.draw.rect(surface, self.COLOR_EDIT_BG, body)
+        pygame.draw.rect(surface, self.COLOR_TITLE_BAR,
+                         pygame.Rect(body.x, body.y, body.width, max(3, size * 6 // 32)))
+        pygame.draw.rect(surface, self.COLOR_TEXT, body, 1)
+        return surface
+
+    def _exe_icon(self, host_path, size):
+        """(normal, selected) size x size surfaces of an EXE's own icon, or of
+        the default program icon if it has none (cached)"""
+        key = (host_path, size)
+        images = self.exe_icon_cache.get(key)
+        if images is not None:
+            return images
+        icon = read_exe_icon(host_path, size) if host_path else None
+        if icon is None:
+            image = self._default_exe_icon(size)
+        else:
+            width, height, rgba = icon
+            image = pygame.image.frombuffer(rgba, (width, height), 'RGBA').copy()
+            if (width, height) != (size, size):
+                image = pygame.transform.smoothscale(image, (size, size))
+        # Selected icons are tinted with the selection color (alpha kept)
+        selected = image.copy()
+        selected.fill((96, 96, 200, 255), special_flags=pygame.BLEND_RGBA_MULT)
+        self.exe_icon_cache[key] = (image, selected)
+        return image, selected
+
+    def _desktop_icon_rects(self):
+        """One cell rect per desktop icon, in columns from the top left"""
+        rows = max(1, (self.height - self.TASKBAR_H - self.ICON_MARGIN) // self.ICON_CELL_H)
+        return [pygame.Rect(self.ICON_MARGIN + (i // rows) * self.ICON_CELL_W,
+                            self.ICON_MARGIN + (i % rows) * self.ICON_CELL_H,
+                            self.ICON_CELL_W, self.ICON_CELL_H)
+                for i in range(len(self.desktop_icons))]
+
+    def _desktop_icon_at(self, pos):
+        """Index of the desktop icon under pos, or None"""
+        for i, rect in enumerate(self._desktop_icon_rects()):
+            if rect.collidepoint(pos):
+                return i
+        return None
+
+    def _fit_text(self, font, text, max_width):
+        """text cut with '...' to fit max_width pixels"""
+        if font.size(text)[0] <= max_width:
+            return text
+        while text and font.size(text + "...")[0] > max_width:
+            text = text[:-1]
+        return text + "..." if text else ""
+
+    def _draw_desktop_icons(self):
+        """Draw the desktop icons with their labels under them"""
+        for i, (path, rect) in enumerate(zip(self.desktop_icons, self._desktop_icon_rects())):
+            selected = (i == self.selected_icon)
+            normal, tinted = self._exe_icon(self.desktop_icon_paths.get(path), self.ICON_SIZE)
+            self.screen.blit(tinted if selected else normal,
+                             (rect.centerx - self.ICON_SIZE // 2, rect.y + 4))
+            label = self._fit_text(self.font_small, self._program_label(path), rect.width - 6)
+            text = self.font_small.render(label, True, self.COLOR_TITLE_TEXT)
+            text_rect = text.get_rect(midtop=(rect.centerx, rect.y + self.ICON_SIZE + 10))
+            if selected:
+                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, text_rect.inflate(4, 2))
+            else:
+                shadow = self.font_small.render(label, True, self.COLOR_TEXT)
+                self.screen.blit(shadow, text_rect.move(1, 1))
+            self.screen.blit(text, text_rect)
+
+    def _double_click(self, target):
+        """Record the target of the current left click; True if it is the
+        second click of a double click on the same target"""
+        now, pos, _ = self.last_click
+        last_time, last_pos, last_target = self.prev_click
+        if (target == last_target and now - last_time <= self.DOUBLE_CLICK_MS
+                and abs(pos[0] - last_pos[0]) <= 4 and abs(pos[1] - last_pos[1]) <= 4):
+            self.last_click = (0, pos, None)  # A third click starts over
+            return True
+        self.last_click = (now, pos, target)
+        return False
+
+    def _launch_icon(self, index):
+        if self.launcher and 0 <= index < len(self.desktop_icons):
+            self.launcher(self.desktop_icons[index])
+
+    def _handle_desktop_click(self, pos, button):
+        """Click on the desktop background: select / run icons, right-click menu"""
+        index = self._desktop_icon_at(pos)
+        if button == 1:
+            self.selected_icon = index
+            if index is not None and self._double_click(('icon', index)):
+                self._launch_icon(index)
+        elif button == 3:
+            self.selected_icon = index
+            if index is not None:
+                items = [("Open", lambda: self._launch_icon(index))]
+            else:
+                items = [("Refresh", self._refresh_desktop_icons), None,
+                         ("Properties", self._show_display_properties)]
+            self._open_desktop_menu(pos, items)
+
+    def _show_display_properties(self):
+        self._show_messagebox(
+            "Display Properties",
+            f"Screen area: {self.width} by {self.height} pixels, Colors: True Color (32 bit)", 0)
+
+    def _open_desktop_menu(self, pos, items):
+        """Open the right-click menu at pos, kept inside the screen"""
+        width = max(120, max(self.font.size(item[0])[0] for item in items if item) + 30)
+        heights = [self.START_SEP_H if item is None else self.START_ITEM_H for item in items]
+        menu = pygame.Rect(pos[0], pos[1], width, sum(heights) + 6)
+        menu.right = min(menu.right, self.width)
+        menu.bottom = min(menu.bottom, self.height - self.TASKBAR_H)
+        menu.x, menu.y = max(0, menu.x), max(0, menu.y)
+        rects, y = [], menu.y + 3
+        for h in heights:
+            rects.append(pygame.Rect(menu.x + 3, y, menu.width - 6, h))
+            y += h
+        self.desktop_menu = (menu, items, rects)
+        self.start_menu_open = False
+
+    def _draw_desktop_menu(self):
+        if not self.desktop_menu:
+            return
+        menu, items, rects = self.desktop_menu
+        self._draw_menu_panel(menu)
+        mouse_pos = pygame.mouse.get_pos()
+        for item, rect in zip(items, rects):
+            if item is None:
+                y = rect.centery
+                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
+                                 (rect.x + 2, y - 1), (rect.right - 2, y - 1))
+                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                                 (rect.x + 2, y), (rect.right - 2, y))
+            else:
+                self._draw_menu_row(rect, item[0], rect.collidepoint(mouse_pos))
+
+    def _handle_desktop_menu_click(self, pos, button):
+        """Any click closes the right-click menu; True if it was inside the menu"""
+        menu, items, rects = self.desktop_menu
+        self.desktop_menu = None
+        if not menu.collidepoint(pos):
+            return False
+        for item, rect in zip(items, rects):
+            if item and button in (1, 3) and rect.collidepoint(pos):
+                item[1]()
+        return True
 
     # ==================== START MENU ====================
 
@@ -14678,6 +14969,7 @@ class PseudoWindowsGUI:
             if self.start_menu_open:
                 self.open_menu = None
                 self.open_combo = None
+                self.desktop_menu = None
                 self._fill_start_menu()
             return True
         if not self.start_menu_open:
@@ -14761,109 +15053,155 @@ class PseudoWindowsGUI:
         if self.resizing_window == hwnd:
             self.resizing_window = None
     
+    TASKBAR_H = 30
+    TASK_BTN_MAX_W = 160
+    TASK_BTN_MIN_W = 40
+    TOOLTIP_DELAY_MS = 500
+    COLOR_TOOLTIP = (255, 255, 225)
+
+    def _tray_rect(self):
+        """Sunken system tray area holding the clock (right side of the taskbar)"""
+        width = max(60, self.font_small.size("88:88")[0] + 24)
+        return pygame.Rect(self.width - width - 2, self.height - self.TASKBAR_H + 3,
+                           width, self.TASKBAR_H - 6)
+
+    def _taskbar_buttons(self):
+        """[(hwnd, window, rect)] of the taskbar buttons: top-level windows
+        (not dialogs) in creation order, so the buttons keep their places"""
+        top_level = set(self.z_order)
+        windows = [(hwnd, win) for hwnd, win in self.windows.items()
+                   if hwnd in top_level and win.visible and not win.is_dialog]
+        if not windows:
+            return []
+        left = self._start_button_rect().right + 6
+        available = self._tray_rect().x - 6 - left
+        btn_width = max(self.TASK_BTN_MIN_W,
+                        min(self.TASK_BTN_MAX_W, available // len(windows) - 4))
+        buttons = []
+        for i, (hwnd, win) in enumerate(windows):
+            rect = pygame.Rect(left + i * (btn_width + 4), self.height - self.TASKBAR_H + 3,
+                               btn_width, self.TASKBAR_H - 6)
+            if rect.right > left + available:
+                break  # No room left for more buttons
+            buttons.append((hwnd, win, rect))
+        return buttons
+
     def _draw_taskbar(self):
         """Draw taskbar"""
-        taskbar_height = 30
-        taskbar_rect = pygame.Rect(0, self.height - taskbar_height, self.width, taskbar_height)
-        
-        # Taskbar background
-        pygame.draw.rect(self.screen, self.COLOR_TASKBAR, taskbar_rect)
-        pygame.draw.line(self.screen, (255, 255, 255), (0, self.height - taskbar_height), 
-                        (self.width, self.height - taskbar_height))
-        
-        # Start button
+        top = self.height - self.TASKBAR_H
+        pygame.draw.rect(self.screen, self.COLOR_TASKBAR,
+                         pygame.Rect(0, top, self.width, self.TASKBAR_H))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (0, top), (self.width, top))
+
         self._draw_button_3d(self._start_button_rect(), "Start",
-                             pressed=self.start_menu_open)
-        
-        # System tray area (right side)
-        tray_width = 80
-        tray_rect = pygame.Rect(self.width - tray_width, self.height - taskbar_height + 2, 
-                               tray_width - 4, taskbar_height - 4)
-        # Sunken effect for tray
-        pygame.draw.rect(self.screen, (192, 192, 192), tray_rect)
-        pygame.draw.line(self.screen, (128, 128, 128), 
-                        (tray_rect.x, tray_rect.y), (tray_rect.x + tray_rect.width, tray_rect.y))
-        pygame.draw.line(self.screen, (128, 128, 128), 
-                        (tray_rect.x, tray_rect.y), (tray_rect.x, tray_rect.y + tray_rect.height))
-        pygame.draw.line(self.screen, (255, 255, 255), 
-                        (tray_rect.x + tray_rect.width, tray_rect.y), 
-                        (tray_rect.x + tray_rect.width, tray_rect.y + tray_rect.height))
-        pygame.draw.line(self.screen, (255, 255, 255), 
-                        (tray_rect.x, tray_rect.y + tray_rect.height), 
-                        (tray_rect.x + tray_rect.width, tray_rect.y + tray_rect.height))
-        
-        # Saat
-        current_time = time.strftime("%H:%M")
-        time_text = self.font_small.render(current_time, True, self.COLOR_TEXT)
-        self.screen.blit(time_text, (self.width - 45, self.height - taskbar_height + 8))
-        
-        # Open windows (excluding dialogs)
-        x_offset = 70
-        max_btn_width = 140
-        
-        # First count visible windows (excluding dialogs)
-        visible_windows = [(hwnd, self.windows[hwnd]) for hwnd in self.z_order 
-                          if hwnd in self.windows and self.windows[hwnd].visible 
-                          and not self.windows[hwnd].is_dialog]
-        
-        # Adjust button width
-        available_width = self.width - tray_width - 80  # Leave room for Start button and tray
-        if visible_windows:
-            btn_width = min(max_btn_width, available_width // len(visible_windows) - 5)
-            btn_width = max(60, btn_width)  # Minimum 60px
-        else:
-            btn_width = max_btn_width
-        
-        for hwnd, win in visible_windows:
-            btn_rect = pygame.Rect(x_offset, self.height - taskbar_height + 2, btn_width, taskbar_height - 4)
-            
+                             pressed=self.start_menu_open, bold=True)
+
+        # System tray with the clock (sunken)
+        tray = self._tray_rect()
+        pygame.draw.rect(self.screen, self.COLOR_TASKBAR, tray)
+        pygame.draw.line(self.screen, (128, 128, 128), tray.topleft, (tray.right - 1, tray.top))
+        pygame.draw.line(self.screen, (128, 128, 128), tray.topleft, (tray.left, tray.bottom - 1))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                         (tray.right - 1, tray.top), (tray.right - 1, tray.bottom - 1))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                         (tray.left, tray.bottom - 1), (tray.right - 1, tray.bottom - 1))
+        time_text = self.font_small.render(time.strftime("%H:%M"), True, self.COLOR_TEXT)
+        self.screen.blit(time_text, time_text.get_rect(center=tray.center))
+
+        for hwnd, win, rect in self._taskbar_buttons():
             is_active = (hwnd == self.active_window) and not win.minimized
-            is_minimized = win.minimized
-            
-            # Minimized windows should not appear pressed
-            # Active window should appear pressed
-            self._draw_taskbar_button(btn_rect, win.title, is_active, is_minimized)
-            
-            x_offset += btn_width + 5
-    
-    def _draw_taskbar_button(self, rect, title, is_active, is_minimized):
-        """Draw taskbar button"""
-        # Background
+            self._draw_taskbar_button(rect, win, is_active)
+
+    def _draw_taskbar_button(self, rect, win, is_active):
+        """Draw a taskbar button with the program icon and the window title; the
+        active window's one is pressed with bold text"""
         if is_active:
-            # Active: pressed appearance
-            pygame.draw.rect(self.screen, (192, 192, 192), rect)
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y), (rect.x + rect.width - 1, rect.y))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x + rect.width - 1, rect.y), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x, rect.y + rect.height - 1), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
+            # Classic checkered face of a pressed taskbar button
+            self.screen.blit(self._checker_surface(rect.size), rect.topleft)
+            light, dark = self.COLOR_BUTTON_BORDER_DARK, self.COLOR_BUTTON_BORDER_LIGHT
         else:
-            # Normal: raised appearance
             pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x, rect.y), (rect.x + rect.width - 1, rect.y))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x + rect.width - 1, rect.y), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y + rect.height - 1), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
-        
-        # Text
-        max_chars = (rect.width - 10) // 7  # Approximate character count
-        display_title = title[:max_chars] if len(title) > max_chars else title
-        text_color = self.COLOR_TEXT
-        text_surface = self.font_small.render(display_title, True, text_color)
-        text_x = rect.x + 5
-        text_y = rect.y + (rect.height - text_surface.get_height()) // 2
-        self.screen.blit(text_surface, (text_x, text_y))
+            light, dark = self.COLOR_BUTTON_BORDER_LIGHT, self.COLOR_BUTTON_BORDER_DARK
+        pygame.draw.line(self.screen, light, rect.topleft, (rect.right - 1, rect.top))
+        pygame.draw.line(self.screen, light, rect.topleft, (rect.left, rect.bottom - 1))
+        pygame.draw.line(self.screen, dark, (rect.right - 1, rect.top), (rect.right - 1, rect.bottom - 1))
+        pygame.draw.line(self.screen, dark, (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1))
+
+        offset = 1 if is_active else 0
+        size = self.CAPTION_ICON_SIZE
+        text_x = rect.x + 5 + offset
+        if rect.width >= size + 14:
+            icon = self._exe_icon(win.icon_path, size)[0]
+            self.screen.blit(icon, (text_x, rect.y + (rect.height - size) // 2 + offset))
+            text_x += size + 4
+        font = self.font_small_bold if is_active else self.font_small
+        label = self._fit_text(font, win.title, rect.right - 5 - text_x)
+        text_surface = font.render(label, True, self.COLOR_TEXT)
+        self.screen.blit(text_surface, (text_x,
+                                        rect.y + (rect.height - text_surface.get_height()) // 2 + offset))
+
+    def _checker_surface(self, size):
+        """White / gray checkered surface of this size (cached)"""
+        cache = self._checker_cache
+        surface = cache.get(size)
+        if surface is None:
+            surface = pygame.Surface(size)
+            surface.fill(self.COLOR_BUTTON_BORDER_LIGHT)
+            for y in range(size[1]):
+                for x in range(y & 1, size[0], 2):
+                    surface.set_at((x, y), self.COLOR_TASKBAR)
+            cache.clear()  # Only the current button width is needed
+            cache[size] = surface
+        return surface
+
+    def _draw_clock_tooltip(self):
+        """Date tooltip after hovering the clock for a moment"""
+        if self._fullscreen_window() is not None or self.start_menu_open or self.desktop_menu:
+            self.tray_hover_since = None
+            return
+        if not self._tray_rect().collidepoint(pygame.mouse.get_pos()):
+            self.tray_hover_since = None
+            return
+        now = pygame.time.get_ticks()
+        if self.tray_hover_since is None:
+            self.tray_hover_since = now
+        if now - self.tray_hover_since < self.TOOLTIP_DELAY_MS:
+            return
+        text = self.font_small.render(time.strftime("%A, %B %d, %Y"), True, self.COLOR_TEXT)
+        tip = pygame.Rect(0, 0, text.get_width() + 8, text.get_height() + 4)
+        tip.bottomright = (self.width - 2, self.height - self.TASKBAR_H - 2)
+        tip.x = max(0, tip.x)
+        pygame.draw.rect(self.screen, self.COLOR_TOOLTIP, tip)
+        pygame.draw.rect(self.screen, self.COLOR_TEXT, tip, 1)
+        self.screen.blit(text, (tip.x + 4, tip.y + 2))
+
+    def _handle_taskbar_click(self, pos, button):
+        """Taskbar button click: restore a minimized window, minimize the active
+        one, or bring another one to the front"""
+        if button != 1:
+            return
+        for hwnd, win, rect in self._taskbar_buttons():
+            if not rect.collidepoint(pos):
+                continue
+            if win.minimized:
+                win.restore()
+            elif hwnd == self.active_window:
+                win.minimize()
+                self._activate_next_window(skip_dialogs=True)
+                return
+            self.active_window = hwnd
+            self.z_order.remove(hwnd)
+            self.z_order.append(hwnd)
+            return
+
+    def _activate_next_window(self, skip_dialogs=False):
+        """Activate the topmost visible, not minimized window (after a minimize)"""
+        for h in reversed(self.z_order):
+            win = self.windows.get(h)
+            if (win and win.visible and not win.minimized
+                    and not (skip_dialogs and win.is_dialog)):
+                self.active_window = h
+                return
     
     def _draw_window(self, window):
         """Draw window"""
@@ -14930,16 +15268,13 @@ class PseudoWindowsGUI:
         title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
         pygame.draw.rect(self.screen, title_color, title_rect)
         
-        # Title text, cut with "..." before the caption buttons
+        # Program icon (not on dialogs), then the title cut with "..." before the caption buttons
+        text_x = self._draw_caption_icon(window)
         buttons_w = 18 * (1 if window.is_dialog else 3) + 5
-        max_title_w = window.width - 8 - buttons_w - 6
-        title = window.title
-        if self.font_bold.size(title)[0] > max_title_w:
-            while title and self.font_bold.size(title + "...")[0] > max_title_w:
-                title = title[:-1]
-            title += "..."
+        max_title_w = window.x + window.width - buttons_w - 8 - text_x
+        title = self._fit_text(self.font_bold, window.title, max_title_w)
         title_text = self.font_bold.render(title, True, self.COLOR_TITLE_TEXT)
-        self.screen.blit(title_text, (window.x + 8, window.y + 6))
+        self.screen.blit(title_text, (text_x, window.y + 6))
         
         # Window buttons (Minimize, Maximize, Close)
         btn_size = 16
@@ -14959,6 +15294,17 @@ class PseudoWindowsGUI:
             # Minimize butonu
             min_rect = pygame.Rect(window.x + window.width - btn_size * 3 - 9, btn_y, btn_size, btn_size)
             self._draw_window_button(min_rect, "─", "min")
+
+    CAPTION_ICON_SIZE = 16
+
+    def _draw_caption_icon(self, window):
+        """Draw the small program icon at the left of a title bar (dialogs have
+        none); returns the x where the title text starts"""
+        if window.is_dialog:
+            return window.x + 8
+        icon = self._exe_icon(window.icon_path, self.CAPTION_ICON_SIZE)[0]
+        self.screen.blit(icon, (window.x + 6, window.y + 3 + (22 - self.CAPTION_ICON_SIZE) // 2))
+        return window.x + 8 + self.CAPTION_ICON_SIZE + 2
 
     def _draw_shape(self, shape, ox, oy, target=None):
         """Render one GDI display list entry at client origin (ox, oy) on target
@@ -15462,7 +15808,7 @@ class PseudoWindowsGUI:
             pygame.draw.rect(self.screen, self.COLOR_BUTTON, label)
             self.screen.blit(text, (label.x + 2, label.y))
 
-    def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None):
+    def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None, bold=False):
         """Draw 3D-style button.
 
         When ``arrow`` is one of 'up'/'down'/'left'/'right', a filled triangle
@@ -15495,7 +15841,8 @@ class PseudoWindowsGUI:
             return
 
         # Text
-        font = self.font_small if small else self.font
+        font = (self.font_small_bold if bold else self.font_small) if small else (
+            self.font_bold if bold else self.font)
         text_surface = font.render(text, True, self.COLOR_TEXT)
         text_rect = text_surface.get_rect(center=rect.center)
         self.screen.blit(text_surface, text_rect)
@@ -15752,6 +16099,7 @@ class PseudoWindowsGUI:
         self.pending_mode = (width, height)
         self.start_menu_open = False
         self.start_submenu_open = False
+        self.desktop_menu = None
         for win in self.windows.values():
             if win.maximized and win.parent is None:
                 win.x, win.y, win.width, win.height = 0, 0, width, height - 30
@@ -16364,6 +16712,13 @@ class PseudoWindowsGUI:
     def _handle_mouse_click(self, pos, button):
         """Handle mouse click"""
         x, y = pos
+        if button == 1:
+            self.prev_click, self.last_click = (self.last_click,
+                                                (pygame.time.get_ticks(), pos, None))
+
+        # The desktop right-click menu closes on any click
+        if self.desktop_menu and self._handle_desktop_menu_click(pos, button):
+            return
 
         # The Start menu grabs clicks first
         if self._handle_start_menu_click(pos, button):
@@ -16378,51 +16733,11 @@ class PseudoWindowsGUI:
             return
 
         # Click on taskbar windows (a full-screen window covers the taskbar)
-        taskbar_y = self.height - 30
-        if y >= taskbar_y and self._fullscreen_window() is None:
-            # System tray area (right side) - ignore click
-            tray_width = 80
-            if x >= self.width - tray_width:
-                return
-            
-            # Visible windows (excluding dialogs)
-            visible_windows = [(hwnd, self.windows[hwnd]) for hwnd in self.z_order 
-                              if hwnd in self.windows and self.windows[hwnd].visible 
-                              and not self.windows[hwnd].is_dialog]
-            
-            if not visible_windows:
-                return
-            
-            # Calculate button width
-            max_btn_width = 140
-            available_width = self.width - tray_width - 80
-            btn_width = min(max_btn_width, available_width // len(visible_windows) - 5)
-            btn_width = max(60, btn_width)
-            
-            # Which button was clicked?
-            btn_x = 70
-            for hwnd, win in visible_windows:
-                if btn_x <= x <= btn_x + btn_width:
-                    if win.minimized:
-                        # If minimized, restore
-                        win.restore()
-                    elif hwnd == self.active_window:
-                        # If already active, minimize
-                        win.minimize()
-                        # Activate next visible window
-                        for h in reversed(self.z_order):
-                            if h in self.windows and self.windows[h].visible and not self.windows[h].minimized and not self.windows[h].is_dialog:
-                                self.active_window = h
-                                break
-                        return
-                    
-                    # Make window active and bring to front
-                    self.active_window = hwnd
-                    self.z_order.remove(hwnd)
-                    self.z_order.append(hwnd)
-                    return
-                btn_x += btn_width + 5
+        if y >= self.height - self.TASKBAR_H and self._fullscreen_window() is None:
+            self._handle_taskbar_click(pos, button)
             return
+
+        self.selected_icon = None  # The desktop click below selects again
         
         # Check windows in reverse order (topmost first)
         for hwnd in reversed(self.z_order):
@@ -16459,11 +16774,7 @@ class PseudoWindowsGUI:
                         min_x = win.x + win.width - btn_size * 3 - 9
                         if min_x <= x <= min_x + btn_size and btn_y_start <= y <= btn_y_end:
                             win.minimize()
-                            # Activate next visible window
-                            for h in reversed(self.z_order):
-                                if h in self.windows and self.windows[h].visible and not self.windows[h].minimized:
-                                    self.active_window = h
-                                    break
+                            self._activate_next_window()
                             return
                     
                     # Edge/corner resizing (left button only)
@@ -16476,12 +16787,18 @@ class PseudoWindowsGUI:
                             self.resize_start_rect = (win.x, win.y, win.width, win.height)
                             return
 
-                    # Title bar click (start dragging) - if not maximized
-                    if (caption and win.y + border <= y <= win.y + caption
-                            and not win.maximized):
-                        self.dragging_window = hwnd
-                        self.drag_offset_x = x - win.x
-                        self.drag_offset_y = y - win.y
+                    # Title bar click: a double click maximizes / restores,
+                    # otherwise dragging starts (if not maximized)
+                    if caption and win.y + border <= y <= win.y + caption:
+                        if (button == 1 and not win.is_dialog
+                                and self._double_click(('title', hwnd))):
+                            self.dragging_window = None
+                            win.maximize(self.width, self.height, self.TASKBAR_H)
+                            return
+                        if not win.maximized:
+                            self.dragging_window = hwnd
+                            self.drag_offset_x = x - win.x
+                            self.drag_offset_y = y - win.y
                         return
 
                     # Menu bar click
@@ -16609,6 +16926,10 @@ class PseudoWindowsGUI:
                                 self.winapi.MK_RBUTTON, lparam)
 
                     break
+        else:
+            # No window under the mouse: the desktop gets the click
+            if self._fullscreen_window() is None:
+                self._handle_desktop_click(pos, button)
     
     def _pygame_key_to_vk(self, event):
         """Map a Pygame key to a Windows virtual-key code, or None."""
@@ -16824,6 +17145,9 @@ class PseudoWindowsGUI:
         hwnd = self.get_next_hwnd()
         window = FakeWindow(hwnd, title, x, y, width, height, style)
         window.owner = owner
+        # The title bar shows the owning program's EXE icon
+        loader = getattr(getattr(owner, 'emu', None), 'pe_loader', None)
+        window.icon_path = getattr(loader, 'filepath', None)
         self.windows[hwnd] = window
         if parent in self.windows:
             # Child windows are drawn inside their parent, not on the desktop
@@ -16959,9 +17283,12 @@ class PseudoWindowsGUI:
         title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
         pygame.draw.rect(self.screen, title_color, title_rect)
         
-        # Title text
-        title_text = self.font_bold.render(window.title[:50], True, self.COLOR_TITLE_TEXT)
-        self.screen.blit(title_text, (window.x + 8, window.y + 6))
+        # Program icon and title text
+        text_x = self._draw_caption_icon(window)
+        title = self._fit_text(self.font_bold, window.title,
+                               window.x + window.width - 18 * 3 - 13 - text_x)
+        title_text = self.font_bold.render(title, True, self.COLOR_TITLE_TEXT)
+        self.screen.blit(title_text, (text_x, window.y + 6))
         
         # Window buttons
         btn_size = 16
