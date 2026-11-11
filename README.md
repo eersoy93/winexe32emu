@@ -10,7 +10,7 @@
 pip install -r requirements.txt
 ```
 
-Also you should install a building toolchain for apps and tests.
+Also you should install a building toolchain (MinGW-w64) for apps and tests.
 
 ## Usage
 
@@ -22,7 +22,7 @@ python3 winexe32emu.py
 
 Use `-h` parameter for command-line help.
 
-The apps in `apps/` are compiled into `c_drive/Windows/` at every start (skip it with `--no-apps`; needs `i686-w64-mingw32-gcc`). The file manager (`C:\Windows\filemanager.exe`) browses the emulated C drive, shows the size and date of the selected entry and runs EXE files. Open it from the Start menu, the desktop or the command line:
+The apps in `apps/` are compiled into `c_drive/Windows/` at every start (skip it with `--no-apps`; needs `i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`). The file manager (`C:\Windows\filemanager.exe`) browses the emulated C drive, shows the size and date of the selected entry and runs EXE files. Open it from the Start menu (Programs), the desktop or the command line:
 
 ```bash
 python3 winexe32emu.py filemanager.exe

@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Compiles each app in apps/ (apps/NAME/*.c) into C:\Windows\NAME.exe of the
-# emulated C drive (C:\Windows\filemanager.exe). Exit code: number of failed apps.
+# Compiles each app in apps/ (apps/NAME/*.c, and apps/NAME/*.rc resources like
+# the icon) into C:\Windows\NAME.exe of the emulated C drive
+# (C:\Windows\filemanager.exe). Exit code: number of failed apps.
 
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
@@ -30,15 +31,27 @@ for dir in apps/*/; do
     [ -d "$dir" ] || continue
     name=$(basename "$dir")
 
+    # Resources (.rc) are compiled into objects linked with the sources
+    objects=""
+    ok=1
+    for rc in "$dir"*.rc; do
+        [ -f "$rc" ] || continue
+        obj=$(mktemp) || exit 1
+        objects="$objects $obj"
+        i686-w64-mingw32-windres -I "$dir" -O coff -o "$obj" "$rc" || ok=0
+    done
+
     # GUI applications
     # shellcheck disable=SC2086
-    if i686-w64-mingw32-gcc $CFLAGS -o "${APPS_DIR}/${name}.exe" "$dir"*.c \
-        -lkernel32 -luser32 -lgdi32 -mwindows; then
+    if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "${APPS_DIR}/${name}.exe" \
+        "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -mwindows; then
         echo "OK: ${name}.exe"
     else
         echo "ERROR: ${name}.exe compilation failed!"
         failed=$((failed + 1))
     fi
+    # shellcheck disable=SC2086
+    [ -z "$objects" ] || rm -f $objects
 done
 
 exit "$failed"

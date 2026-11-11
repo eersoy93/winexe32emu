@@ -14885,20 +14885,19 @@ class PseudoWindowsGUI:
         return bool(path) and os.path.isfile(path)
 
     def _fill_start_menu(self):
-        """Build the Start menu: File Manager (if compiled), Programs (C:\\
-        programs) and Exit.
+        """Build the Start menu: Programs (the File Manager, if compiled, in its
+        own section above the C:\\ programs) and Exit.
         Rows are ('program', label, path), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
         paths = [path for path in list_programs().get('C:\\', [])
                  if path.lower() != FILE_MANAGER_PATH.lower()]
         rows = [('program', self._program_label(path), path) for path in paths]
-        top = []
         if self._file_manager_available():
-            top = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH),
-                   ('separator', None, None)]
+            section = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH)]
+            rows = section + ([('separator', None, None)] + rows if rows else [])
             paths.append(FILE_MANAGER_PATH)
         self.start_icon_paths = {path: resolve_c_drive_path(path) for path in paths}
-        self.start_menu_rows = top + [
+        self.start_menu_rows = [
             ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
             ('separator', None, None),
             ('exit', "Exit", None),

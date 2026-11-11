@@ -449,7 +449,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconA(hInstance, MAKEINTRESOURCEA(1));
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "WinExe32EmuFileManager";
     if (!RegisterClassA(&wc))
