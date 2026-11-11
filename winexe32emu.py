@@ -4979,6 +4979,16 @@ class WinAPIHandler:
         log.debug(f"SetCursorPos({x}, {y})")
         return 1
 
+    def _client_origin_of(self, hwnd):
+        """Screen position of a window's or control's client area, or None"""
+        if not self.gui:
+            return None
+        if hwnd in self.gui.windows:
+            return self.gui.client_origin(self.gui.windows[hwnd])
+        if hwnd in self.gui.controls:
+            return self.gui.control_origin(self.gui.controls[hwnd])
+        return None
+
     def ScreenToClient(self, args):
         """ScreenToClient emulation"""
         hWnd = args[0]
@@ -4989,9 +4999,9 @@ class WinAPIHandler:
             x, y = struct.unpack("<ii", self.emu.uc.mem_read(lpPoint, 8))
         except UcError:
             return 0
-        if self.gui and hWnd in self.gui.windows:
-            ox, oy = self.gui.client_origin(self.gui.windows[hWnd])
-            x, y = x - ox, y - oy
+        origin = self._client_origin_of(hWnd)
+        if origin is not None:
+            x, y = x - origin[0], y - origin[1]
         try:
             self.emu.uc.mem_write(lpPoint, struct.pack("<ii", x, y))
         except UcError:
@@ -5008,9 +5018,9 @@ class WinAPIHandler:
             x, y = struct.unpack("<ii", self.emu.uc.mem_read(lpPoint, 8))
         except UcError:
             return 0
-        if self.gui and hWnd in self.gui.windows:
-            ox, oy = self.gui.client_origin(self.gui.windows[hWnd])
-            x, y = x + ox, y + oy
+        origin = self._client_origin_of(hWnd)
+        if origin is not None:
+            x, y = x + origin[0], y + origin[1]
         try:
             self.emu.uc.mem_write(lpPoint, struct.pack("<ii", x, y))
         except UcError:
@@ -15786,6 +15796,39 @@ class PseudoWindowsGUI:
         ox, oy = self.client_origin(win)
         return (x - ox, y - oy)
 
+    SS_NOTIFY = 0x100
+
+    def control_origin(self, control):
+        """Screen coordinates of a control's client area origin, or None"""
+        parent = self.windows.get(control.parent_hwnd)
+        if parent is None:
+            return None
+        px, py = self.client_origin(parent)
+        return (px + control.x, py + control.y)
+
+    def _notify_static_at(self, win, x, y):
+        """Visible SS_NOTIFY static control at screen point (x, y), or None.
+        Other statics are transparent to the mouse (HTTRANSPARENT)."""
+        ox, oy = self.client_origin(win)
+        for control in win.controls:
+            if (control.visible and control.class_name == 'STATIC'
+                    and control.style & self.SS_NOTIFY
+                    and ox + control.x <= x < ox + control.x + control.width
+                    and oy + control.y <= y < oy + control.y + control.height):
+                return control
+        return None
+
+    def _mouse_target(self, win, x, y):
+        """(hwnd, client x, client y) of the mouse message for screen point (x, y)
+        in an application window: an SS_NOTIFY static under it gets its own
+        messages, like in Windows; else the window itself"""
+        control = None if win.is_dialog else self._notify_static_at(win, x, y)
+        if control is not None:
+            cx, cy = self.control_origin(control)
+            return control.hwnd, x - cx, y - cy
+        cx, cy = self._client_point(win, x, y)
+        return win.hwnd, cx, cy
+
     # Upper bound for a retained display list (oldest shapes are dropped)
     MAX_SHAPES = 20000
 
@@ -16186,7 +16229,9 @@ class PseudoWindowsGUI:
 
         # Mouse capture: every move goes to the capturing window
         win = self._capture_target()
-        if win is None:
+        if win is not None:
+            target, cx, cy = win.hwnd, *self._client_point(win, x, y)
+        else:
             # Otherwise: topmost visible app window under the cursor
             for hwnd in reversed(self.z_order):
                 w = self.windows.get(hwnd)
@@ -16197,10 +16242,10 @@ class PseudoWindowsGUI:
                         return  # title bar / menu bar / chrome
                     win = w
                     break
-        if win is None:
-            return
-        cx, cy = self._client_point(win, x, y)
-        self.winapi.post_window_message(win.hwnd, self.winapi.WM_MOUSEMOVE,
+            if win is None:
+                return
+            target, cx, cy = self._mouse_target(win, x, y)
+        self.winapi.post_window_message(target, self.winapi.WM_MOUSEMOVE,
                                         wparam, self._make_lparam(cx, cy))
 
     def _forward_mouse_up(self, pos, button):
@@ -16229,12 +16274,12 @@ class PseudoWindowsGUI:
                     return
                 if y < self.client_origin(win)[1]:
                     return  # title bar / menu bar / chrome, not client area
-                cx, cy = self._client_point(win, x, y)
+                target, cx, cy = self._mouse_target(win, x, y)
                 lparam = self._make_lparam(cx, cy)
                 if button == 1:
-                    self.winapi.post_window_message(hwnd, self.winapi.WM_LBUTTONUP, 0, lparam)
+                    self.winapi.post_window_message(target, self.winapi.WM_LBUTTONUP, 0, lparam)
                 elif button == 3:
-                    self.winapi.post_window_message(hwnd, self.winapi.WM_RBUTTONUP, 0, lparam)
+                    self.winapi.post_window_message(target, self.winapi.WM_RBUTTONUP, 0, lparam)
                 return
 
     def _handle_menu_click(self, pos, button):
@@ -16435,6 +16480,23 @@ class PseudoWindowsGUI:
                         if not (ctrl_x <= x <= ctrl_x + control.width and
                                 ctrl_y <= y <= ctrl_y + ctrl_h):
                             continue
+
+                        if control.class_name == "STATIC":
+                            if not control.style & self.SS_NOTIFY:
+                                continue  # Transparent: the click goes to what is below
+                            # The static gets the click, its parent STN_CLICKED
+                            if button in (1, 3) and self._is_app_window(hwnd):
+                                if not win.is_dialog:
+                                    message, mk = ((self.winapi.WM_LBUTTONDOWN,
+                                                    self.winapi.MK_LBUTTON) if button == 1 else
+                                                   (self.winapi.WM_RBUTTONDOWN,
+                                                    self.winapi.MK_RBUTTON))
+                                    self.winapi.post_window_message(
+                                        control.hwnd, message, mk,
+                                        self._make_lparam(x - ctrl_x, y - ctrl_y))
+                                if button == 1:
+                                    self._post_control_command(win, control, 0)  # STN_CLICKED
+                            return
 
                         if control.class_name == "BUTTON":
                             if (control.style & 0xF) == 7:
