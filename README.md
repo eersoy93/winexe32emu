@@ -22,24 +22,12 @@ python3 winexe32emu.py
 
 Use `-h` parameter for command-line help.
 
-The apps in `apps/` are compiled into `c_drive/Windows/` at every start (skip it with `--no-apps`; needs `i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`). The file manager (`C:\Windows\filemanager.exe`) browses the emulated C drive, shows the size and date of the selected entry and runs EXE files. Open it from the Start menu (Programs), the desktop or the command line:
-
-```bash
-python3 winexe32emu.py filemanager.exe
-```
-
-Test programs are only compiled and run with the `--tests` parameter (needs `i686-w64-mingw32-gcc`). It compiles them into `c_drive/Windows/Tests/`, runs each one without the GUI and exits with the number of failed tests:
-
-```bash
-python3 winexe32emu.py --tests
-```
-
 The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure
 
 - `apps/` - App C source codes, one folder per app (`apps/filemanager/` - File manager)
-- `c_drive/` - Put your EXE files here (emulation path, `C:\`); only the file manager and the EXE files directly in it are shown on the desktop
+- `c_drive/` - Put your EXE files here (emulation path, `C:\`) and run them with the file manager or the command line; the desktop and the Start menu show the file manager and the shortcuts and programs of the Desktop and Start Menu folders (`C:\Users\User`, `C:\Users\Public`, `C:\ProgramData`)
 - `scripts/compile_apps.sh` - Script to compile the apps into `c_drive/Windows/` (run at every start)
 - `scripts/compile_tests.sh` - Script to compile the test programs into `c_drive/Windows/Tests/`
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders

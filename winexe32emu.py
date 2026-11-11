@@ -91,8 +91,7 @@ FILE_MANAGER_PATH = 'C:\\Windows\\filemanager.exe'
 # Emulated folder holding the test programs compiled with --tests (c_drive/Windows/Tests/)
 TESTS_FOLDER = 'C:\\Windows\\Tests'
 
-# Folders searched for a bare EXE name (command line), in this order; the
-# Start menu lists only the C:\\ programs
+# Folders searched for a bare EXE name (command line), in this order
 PROGRAM_FOLDERS = ('C:\\', TESTS_FOLDER)
 
 # Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
@@ -688,17 +687,6 @@ def _program_folder_host_path(folder):
     return resolve_c_drive_path(folder)
 
 
-def _folder_programs(directory):
-    """Names of the EXE files directly inside a host directory, sorted."""
-    try:
-        return sorted((f for f in os.listdir(directory)
-                       if f.lower().endswith('.exe')
-                       and os.path.isfile(os.path.join(directory, f))),
-                      key=str.lower)
-    except (OSError, TypeError):
-        return []
-
-
 def _program_subfolders(directory):
     """Names of the folders directly inside a host directory, sorted."""
     try:
@@ -732,20 +720,54 @@ def find_program(name):
     return None
 
 
-def list_programs():
-    """Windows paths of the EXE files in each PROGRAM_FOLDERS entry and its
-    subfolders (for the Start menu): {folder: [paths]}."""
-    programs = {}
-    for folder in PROGRAM_FOLDERS:
-        directory = _program_folder_host_path(folder)
-        prefix = folder.rstrip('\\') + '\\'
-        paths = [prefix + f for f in _folder_programs(directory)]
-        if directory:
-            for sub in _program_subfolders(directory):
-                paths += [f"{prefix}{sub}\\{f}"
-                          for f in _folder_programs(os.path.join(directory, sub))]
-        programs[folder] = sorted(paths, key=lambda p: p.rsplit('\\', 1)[-1].lower())
-    return programs
+def parse_shell_link(data):
+    """Fields of a shell link (.lnk, MS-SHLLINK) file: 'path' (local target),
+    'description', 'relative', 'workdir', 'arguments', 'icon', 'icon_index',
+    'show' and 'hotkey'; None if data is not a shell link"""
+    def cstring(offset, wide=False):
+        unit = 2 if wide else 1
+        end = offset
+        while data[end:end + unit] != b'\x00' * unit:
+            if end + unit > len(data):
+                raise IndexError("unterminated string")
+            end += unit
+        return data[offset:end].decode('utf-16-le' if wide else ANSI_CODEPAGE,
+                                       errors='replace')
+
+    try:
+        if struct.unpack_from('<I', data, 0)[0] != 0x4C:
+            return None
+        flags = struct.unpack_from('<I', data, 20)[0]
+        icon_index, show, hotkey = struct.unpack_from('<iIH', data, 56)
+        pos = 0x4C
+        if flags & 0x1:  # HasLinkTargetIDList
+            pos += 2 + struct.unpack_from('<H', data, pos)[0]
+        link = {'path': '', 'description': '', 'relative': '', 'workdir': '',
+                'arguments': '', 'icon': '', 'icon_index': icon_index, 'show': show,
+                'hotkey': hotkey}
+        if flags & 0x2:  # HasLinkInfo
+            size, header_size, info_flags = struct.unpack_from('<III', data, pos)
+            base_offset, _, suffix_offset = struct.unpack_from('<III', data, pos + 16)
+            if info_flags & 1:  # VolumeIDAndLocalBasePath
+                if header_size >= 0x24:
+                    unicode_base = struct.unpack_from('<I', data, pos + 28)[0]
+                    link['path'] = cstring(pos + unicode_base, wide=True)
+                else:
+                    link['path'] = cstring(pos + base_offset)
+                link['path'] += cstring(pos + suffix_offset)
+            pos += size
+        for flag, field in ((0x4, 'description'), (0x8, 'relative'), (0x10, 'workdir'),
+                            (0x20, 'arguments'), (0x40, 'icon')):
+            if flags & flag:
+                count = struct.unpack_from('<H', data, pos)[0]
+                unit = 2 if flags & 0x80 else 1
+                raw = data[pos + 2:pos + 2 + count * unit]
+                link[field] = raw.decode('utf-16-le' if unit == 2 else ANSI_CODEPAGE,
+                                         errors='replace')
+                pos += 2 + count * unit
+    except (struct.error, IndexError):
+        return None
+    return link
 
 
 def _icon_image_rgba(data):
@@ -11170,53 +11192,14 @@ class WinAPIHandler:
         link_info += volume + base + b'\x00'
         return header + link_info + strings + b'\x00' * 4
 
-    def _load_shell_link(self, state, data):
+    @staticmethod
+    def _load_shell_link(state, data):
         """Fill a shell link's state from .lnk file contents; False if not one"""
-        try:
-            if struct.unpack_from('<I', data, 0)[0] != 0x4C:
-                return False
-            flags = struct.unpack_from('<I', data, 20)[0]
-            icon_index, show, hotkey = struct.unpack_from('<iIH', data, 56)
-            pos = 0x4C
-            if flags & 0x1:  # HasLinkTargetIDList
-                pos += 2 + struct.unpack_from('<H', data, pos)[0]
-            path = ''
-            if flags & 0x2:  # HasLinkInfo
-                size, header_size, info_flags = struct.unpack_from('<III', data, pos)
-                base_offset, _, suffix_offset = struct.unpack_from('<III', data, pos + 16)
-
-                def cstring(offset, wide=False):
-                    unit = 2 if wide else 1
-                    end = offset
-                    while data[end:end + unit] != b'\x00' * unit:
-                        end += unit
-                    return data[offset:end].decode('utf-16-le' if wide else ANSI_CODEPAGE,
-                                                   errors='replace')
-                if info_flags & 1:  # VolumeIDAndLocalBasePath
-                    if header_size >= 0x24:
-                        unicode_base = struct.unpack_from('<I', data, pos + 28)[0]
-                        path = cstring(pos + unicode_base, wide=True)
-                    else:
-                        path = cstring(pos + base_offset)
-                    path += cstring(pos + suffix_offset)
-                pos += size
-            texts = {}
-            for flag, field in ((0x4, 'description'), (0x8, 'relative'), (0x10, 'workdir'),
-                                (0x20, 'arguments'), (0x40, 'icon')):
-                if flags & flag:
-                    count = struct.unpack_from('<H', data, pos)[0]
-                    unit = 2 if flags & 0x80 else 1
-                    raw = data[pos + 2:pos + 2 + count * unit]
-                    texts[field] = raw.decode('utf-16-le' if unit == 2 else ANSI_CODEPAGE,
-                                              errors='replace')
-                    pos += 2 + count * unit
-        except (struct.error, IndexError):
+        link = parse_shell_link(data)
+        if link is None:
             return False
-        state.update({'path': path, 'description': '', 'relative': '', 'workdir': '',
-                      'arguments': '', 'icon': ''})
-        state.update(texts)
-        state.update({'icon_index': icon_index, 'show': show, 'hotkey': hotkey,
-                      'dirty': False})
+        state.update(link)
+        state['dirty'] = False
         return True
 
     def _com_persist_file(self, method, wide, args):
@@ -15805,13 +15788,17 @@ class PseudoWindowsGUI:
     DOUBLE_CLICK_MS = 500
 
     def _refresh_desktop_icons(self):
-        """Read the desktop icons: the file manager (if compiled) and only the
-        programs directly in C:\\"""
-        self.desktop_icons = [FILE_MANAGER_PATH] if self._file_manager_available() else []
-        self.desktop_icons += ['C:\\' + f
-                               for f in _folder_programs(_program_folder_host_path('C:\\'))]
-        self.desktop_icon_paths = {path: resolve_c_drive_path(path)
-                                   for path in self.desktop_icons}
+        """Read the desktop icons, (label, path or shortcut) pairs: the file
+        manager (if compiled), then the shortcuts and programs of the user's and
+        the public Desktop folders"""
+        self.desktop_icons, self.desktop_icon_paths = [], {}
+        if self._file_manager_available():
+            self.desktop_icons.append((self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH))
+            self.desktop_icon_paths[FILE_MANAGER_PATH] = resolve_c_drive_path(FILE_MANAGER_PATH)
+        _, items = self._shortcut_entries([WinAPIHandler.SHELL_FOLDERS[0x10],   # DESKTOPDIRECTORY
+                                           WinAPIHandler.SHELL_FOLDERS[0x19]],  # COMMON_DESKTOP...
+                                          self.desktop_icon_paths)
+        self.desktop_icons += items
         self.selected_icon = None
         self.exe_icon_cache.clear()  # Programs may have been replaced
 
@@ -15873,12 +15860,13 @@ class PseudoWindowsGUI:
 
     def _draw_desktop_icons(self):
         """Draw the desktop icons with their labels under them"""
-        for i, (path, rect) in enumerate(zip(self.desktop_icons, self._desktop_icon_rects())):
+        for i, ((name, data), rect) in enumerate(zip(self.desktop_icons,
+                                                     self._desktop_icon_rects())):
             selected = (i == self.selected_icon)
-            normal, tinted = self._exe_icon(self.desktop_icon_paths.get(path), self.ICON_SIZE)
+            normal, tinted = self._exe_icon(self.desktop_icon_paths.get(data), self.ICON_SIZE)
             self.screen.blit(tinted if selected else normal,
                              (rect.centerx - self.ICON_SIZE // 2, rect.y + 4))
-            label = self._fit_text(self.font_small, self._program_label(path), rect.width - 6)
+            label = self._fit_text(self.font_small, name, rect.width - 6)
             text = self.font_small.render(label, True, self.COLOR_TITLE_TEXT)
             text_rect = text.get_rect(midtop=(rect.centerx, rect.y + self.ICON_SIZE + 10))
             if selected:
@@ -15901,8 +15889,13 @@ class PseudoWindowsGUI:
         return False
 
     def _launch_icon(self, index):
-        if self.launcher and 0 <= index < len(self.desktop_icons):
-            self.launcher(self.desktop_icons[index])
+        if not 0 <= index < len(self.desktop_icons):
+            return
+        data = self.desktop_icons[index][1]
+        if isinstance(data, tuple):
+            self._open_shortcut(data)
+        elif self.launcher:
+            self.launcher(data)
 
     def _handle_desktop_click(self, pos, button):
         """Click on the desktop background: select / run icons, right-click menu"""
@@ -15983,24 +15976,90 @@ class PseudoWindowsGUI:
         return bool(path) and os.path.isfile(path)
 
     def _fill_start_menu(self):
-        """Build the Start menu: Programs (the File Manager, if compiled, in its
-        own section above the C:\\ programs) and Exit.
-        Rows are ('program', label, path), ('submenu', label, rows),
+        """Build the Start menu: Programs (the Start Menu folders of the user and
+        of all users with their shortcuts, then the File Manager, if compiled, in
+        its own section) and Exit.
+        Rows are ('program', label, path or shortcut), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
-        paths = [path for path in list_programs().get('C:\\', [])
-                 if path.lower() != FILE_MANAGER_PATH.lower()]
-        rows = [('program', self._program_label(path), path) for path in paths]
+        self.start_icon_paths = {}
+        shortcut_rows = self._shortcut_rows([WinAPIHandler.SHELL_FOLDERS[0x02],    # CSIDL_PROGRAMS
+                                             WinAPIHandler.SHELL_FOLDERS[0x17]])  # COMMON_PROGRAMS
+        rows = []
         if self._file_manager_available():
-            section = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH)]
-            rows = section + ([('separator', None, None)] + rows if rows else [])
-            paths.append(FILE_MANAGER_PATH)
-        self.start_icon_paths = {path: resolve_c_drive_path(path) for path in paths}
+            rows = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH)]
+            self.start_icon_paths[FILE_MANAGER_PATH] = resolve_c_drive_path(FILE_MANAGER_PATH)
+        if shortcut_rows:
+            rows = shortcut_rows + ([('separator', None, None)] + rows if rows else [])
         self.start_menu_rows = [
             ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
             ('separator', None, None),
             ('exit', "Exit", None),
         ]
         self.start_open_path = []
+
+    def _shortcut_entries(self, folders, icon_paths):
+        """Merged contents of folders (Windows paths), like Windows merges the
+        user's and the all users' Start Menu or Desktop folders:
+        ({lower-case name: (name, [Windows paths])} of the subfolders,
+        sorted [(label, ('shortcut', target, arguments, working directory))]
+        of the shortcuts (.lnk) and programs). The host paths of the EXE
+        targets are added to icon_paths."""
+        subfolders, items = {}, {}
+        for folder in folders:
+            host = resolve_c_drive_path(folder)
+            if not host or not os.path.isdir(host):
+                continue
+            for name in _program_subfolders(host):
+                subfolders.setdefault(name.lower(), (name, []))[1].append(folder + '\\' + name)
+            for name in sorted(os.listdir(host), key=str.lower):
+                label, ext = os.path.splitext(name)
+                file_path = os.path.join(host, name)
+                if ext.lower() not in ('.lnk', '.exe') or not os.path.isfile(file_path):
+                    continue
+                if ext.lower() == '.exe':
+                    data = ('shortcut', folder + '\\' + name, '', '')
+                else:
+                    try:
+                        with open(file_path, 'rb') as f:
+                            link = parse_shell_link(f.read(65536))
+                    except OSError:
+                        link = None
+                    if link is None or not link['path']:
+                        continue
+                    data = ('shortcut', link['path'], link['arguments'], link['workdir'])
+                if label.lower() not in items:
+                    items[label.lower()] = (label, data)
+                    if data[1].lower().endswith('.exe'):
+                        icon_paths[data] = resolve_c_drive_path(data[1])
+        return subfolders, [item for _, item in sorted(items.items())]
+
+    def _shortcut_rows(self, folders, depth=0):
+        """Start menu rows of Start Menu folders (Windows paths): their merged
+        subfolders as submenus first, then their shortcuts and programs"""
+        subfolders, items = self._shortcut_entries(folders, self.start_icon_paths)
+        rows = []
+        if depth < 8:
+            for _, (name, paths) in sorted(subfolders.items()):
+                rows.append(('submenu', name, self._shortcut_rows(paths, depth + 1)
+                             or [('empty', "(Empty)", None)]))
+        rows += [('program', label, data) for label, data in items]
+        return rows
+
+    def _open_shortcut(self, data):
+        """Run the target of a Start menu shortcut (only programs can be run)"""
+        _, target, arguments, workdir = data
+        name = ntpath.basename(target)
+        host = resolve_c_drive_path(target) if target else None
+        if not host or not os.path.isfile(host):
+            self._show_messagebox("Problem with Shortcut",
+                                  f"The item '{name}' that this shortcut refers to has "
+                                  "been changed or moved.", 0x10)
+        elif not target.lower().endswith('.exe'):
+            self._show_messagebox(name, "This file does not have a program associated "
+                                  "with it for performing this action.", 0x10)
+        elif self.launcher:
+            command_line = f'"{target}"' + (f' {arguments}' if arguments else '')
+            self.launcher(target, command_line, workdir or ntpath.dirname(target))
 
     def _menu_row_rects(self, menu, rows, strip=False):
         """Row rects inside a menu panel rect (right of the blue strip if strip)"""
@@ -16178,7 +16237,9 @@ class PseudoWindowsGUI:
             self.start_open_path = self.start_open_path[:level] + [index]
         elif kind == 'program':
             self.start_menu_open = False
-            if self.launcher:
+            if isinstance(data, tuple):
+                self._open_shortcut(data)
+            elif self.launcher:
                 self.launcher(data)
         elif kind == 'exit':
             self.start_menu_open = False
@@ -19646,10 +19707,11 @@ def main():
     # CreateProcessA starts child programs the same way
     WinAPIHandler.process_starter = staticmethod(load_program)
 
-    def launch(name):
+    def launch(name, command_line=None, current_directory=None):
         """Start menu: run the EXE at Windows path name next to the running programs"""
         # Loading takes a while: keep it off the GUI thread
-        threading.Thread(target=load_program, args=(name,), daemon=True).start()
+        threading.Thread(target=load_program, args=(name, command_line, current_directory),
+                         daemon=True).start()
 
     if gui:
         gui.launcher = launch
