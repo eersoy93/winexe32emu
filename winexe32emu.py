@@ -52,6 +52,7 @@ C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
 
 # Environment variables seen by the emulated program. The folders they name
 # are created inside c_drive/ at startup.
+PROGRAM_FILES_FOLDER = 'C:\\Program Files'
 DEFAULT_ENVIRONMENT = {
     'PATH': 'C:\\Windows\\System32;C:\\Windows',
     'TEMP': 'C:\\Windows\\Temp',
@@ -59,6 +60,7 @@ DEFAULT_ENVIRONMENT = {
     'WINDIR': 'C:\\Windows',
     'SYSTEMROOT': 'C:\\Windows',
     'COMSPEC': 'C:\\Windows\\System32\\cmd.exe',
+    'PROGRAMFILES': PROGRAM_FILES_FOLDER,
 }
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
@@ -1016,6 +1018,8 @@ class WinAPIHandler:
         'FileTimeToSystemTime': 2, 'SystemTimeToFileTime': 2,
         'FileTimeToLocalFileTime': 2, 'GetDriveTypeA': 1,
         'SetFileAttributesA': 2, 'CompareStringA': 6, 'RaiseException': 4,
+        'SetFileAttributesW': 2, 'MoveFileExA': 3, 'MoveFileExW': 3,
+        'FormatMessageA': 7, 'FormatMessageW': 7,
         # user32
         'GetSystemMetrics': 1, 'MessageBoxA': 4, 'MessageBoxW': 4,
         'LoadCursorA': 2, 'LoadCursorW': 2, 'LoadIconA': 2, 'LoadIconW': 2,
@@ -1063,7 +1067,9 @@ class WinAPIHandler:
         'EndDialog': 2, 'RegisterWindowMessageA': 1, 'SystemParametersInfoA': 4,
         'LoadKeyboardLayoutA': 2, 'CreateCursor': 7, 'DestroyIcon': 1,
         'DestroyCursor': 1, 'IsZoomed': 1, 'ShowCursor': 1, 'DialogBoxParamA': 5,
-        'GetWindowPlacement': 2, 'SetWindowPlacement': 2,
+        'GetWindowPlacement': 2, 'SetWindowPlacement': 2, 'DialogBoxParamW': 5,
+        'CreateDialogParamA': 5, 'CreateDialogParamW': 5, 'IsDialogMessageW': 2,
+        'GetDlgItemTextW': 4, 'SetDlgItemTextW': 3, 'ExitWindowsEx': 2,
         # gdi32
         'GetDeviceCaps': 2, 'TextOutA': 5, 'TextOutW': 5, 'SetTextColor': 2,
         'SetBkColor': 2, 'SetBkMode': 2, 'CreatePen': 3, 'CreateSolidBrush': 1,
@@ -1086,6 +1092,8 @@ class WinAPIHandler:
         'RegSetValueExW': 6, 'RegCreateKeyExA': 9, 'RegCreateKeyExW': 9,
         'GetUserNameA': 2, 'GetUserNameW': 2, 'RegDeleteValueA': 2,
         'RegDeleteKeyA': 2, 'RegEnumKeyExA': 8, 'RegEnumValueA': 8,
+        'OpenProcessToken': 3, 'LookupPrivilegeValueA': 3, 'LookupPrivilegeValueW': 3,
+        'AdjustTokenPrivileges': 6,
         # winmm
         'timeGetTime': 0, 'timeBeginPeriod': 1, 'timeEndPeriod': 1,
         'PlaySoundA': 3, 'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2,
@@ -1099,11 +1107,15 @@ class WinAPIHandler:
         'acmStreamUnprepareHeader': 3,
         # ole32
         'OleInitialize': 1, 'OleUninitialize': 0, 'CoInitialize': 1,
-        'CoUninitialize': 0,
+        'CoUninitialize': 0, 'CoCreateInstance': 5, 'CoTaskMemAlloc': 1,
+        'CoTaskMemFree': 1,
         # comdlg32
         'GetOpenFileNameA': 1, 'GetSaveFileNameA': 1, 'FindTextA': 1,
         # shell32
-        'ExtractIconA': 3,
+        'ExtractIconA': 3, 'SHGetFolderPathA': 5, 'SHGetFolderPathW': 5,
+        'SHGetSpecialFolderPathA': 4, 'SHGetSpecialFolderPathW': 4,
+        'SHBrowseForFolderA': 1, 'SHBrowseForFolderW': 1,
+        'SHGetPathFromIDListA': 2, 'SHGetPathFromIDListW': 2,
         # comctl32
         'InitCommonControls': 0, 'CreateStatusWindowA': 4,
     }
@@ -1288,6 +1300,18 @@ class WinAPIHandler:
         # (type, name) -> (RVA, size) of the EXE's resources, built on first use
         self._resource_index = None
 
+        # MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT): (host src, host dst or None, flags)
+        self.pending_file_operations = []
+
+        # COM: interface name -> vtable address, object base -> state dict,
+        # COM method stub name -> argument count (including "this")
+        self._com_vtables = {}
+        self.com_objects = {}
+        self.com_arg_counts = {}
+
+        # Shell item ID lists (SHBrowseForFolder): PIDL address -> Windows path
+        self.pidls = {}
+
         # In-memory registry: predefined HKEY -> key node, open HKEY -> key node
         self.registry_roots = {}
         self.registry_handles = {}
@@ -1363,7 +1387,7 @@ class WinAPIHandler:
         dll = dll_name.lower()
         if dll.startswith(self.CDECL_DLL_PREFIXES) or func_name in self.CDECL_FUNCTIONS:
             return 0
-        argc = self.STDCALL_ARG_COUNTS.get(func_name)
+        argc = self.STDCALL_ARG_COUNTS.get(func_name, self.com_arg_counts.get(func_name))
         return None if argc is None else argc * 4
 
     # MSVCRT FILE layout: _ptr, _cnt, _base, _flag, _file, _charbuf, _bufsiz, _tmpfname
@@ -1491,6 +1515,7 @@ class WinAPIHandler:
             '_iob': self._ensure_iob,
             '_fmode': self._ensure_fmode_addr,
             '_commode': self._ensure_commode_addr,
+            '_adjust_fdiv': self._ensure_adjust_fdiv_addr,
             '_acmdln': lambda: self.api__p__acmdln([]),
             '_wcmdln': lambda: self.api__p__wcmdln([]),
             '__argc': lambda: self.api__p___argc([]),
@@ -1738,6 +1763,20 @@ class WinAPIHandler:
         self.process_exited = True
         self.emu.stop_emulation = True
         return 0
+
+    def ExitWindowsEx(self, args):
+        """ExitWindowsEx emulation - an emulated restart: the pending
+        MOVEFILE_DELAY_UNTIL_REBOOT operations are done and the calling
+        program ends (the emulator itself keeps running)"""
+        uFlags = args[0]
+        kind = {0: 'log off', 1: 'shut down', 2: 'restart', 8: 'power off'}.get(
+            uFlags & 0xB, 'shut down')
+        log.success(f"ExitWindowsEx(0x{uFlags:x}): emulated {kind}, ending the program")
+        self._run_pending_file_operations()
+        self._set_exit_code(0)
+        self.process_exited = True
+        self.emu.stop_emulation = True
+        return 1
     
     def GetCommandLineA(self, args):
         """GetCommandLineA emulation"""
@@ -2073,7 +2112,131 @@ class WinAPIHandler:
         log.debug(f"SetLastError({dwErrCode})")
         self._last_error = dwErrCode
         return 0
-    
+
+    # FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM) texts of common error codes
+    SYSTEM_ERROR_MESSAGES = {
+        0: "The operation completed successfully.",
+        1: "Incorrect function.",
+        2: "The system cannot find the file specified.",
+        3: "The system cannot find the path specified.",
+        4: "The system cannot open the file.",
+        5: "Access is denied.",
+        6: "The handle is invalid.",
+        8: "Not enough memory resources are available to process this command.",
+        14: "Not enough memory resources are available to complete this operation.",
+        15: "The system cannot find the drive specified.",
+        16: "The directory cannot be removed.",
+        18: "There are no more files.",
+        19: "The media is write protected.",
+        21: "The device is not ready.",
+        32: "The process cannot access the file because it is being used by another "
+            "process.",
+        33: "The process cannot access the file because another process has locked a "
+            "portion of the file.",
+        38: "Reached the end of the file.",
+        39: "The disk is full.",
+        50: "The request is not supported.",
+        80: "The file exists.",
+        87: "The parameter is incorrect.",
+        112: "There is not enough space on the disk.",
+        122: "The data area passed to a system call is too small.",
+        123: "The filename, directory name, or volume label syntax is incorrect.",
+        126: "The specified module could not be found.",
+        127: "The specified procedure could not be found.",
+        145: "The directory is not empty.",
+        183: "Cannot create a file when that file already exists.",
+        206: "The filename or extension is too long.",
+        259: "No more data is available.",
+        267: "The directory name is invalid.",
+        1313: "A specified privilege does not exist.",
+        1400: "Invalid window handle.",
+        1813: "The specified resource type cannot be found in the image file.",
+        1814: "The specified resource name cannot be found in the image file.",
+    }
+
+    FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x100
+    FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
+    FORMAT_MESSAGE_FROM_STRING = 0x400
+    FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
+    FORMAT_MESSAGE_ARGUMENT_ARRAY = 0x2000
+
+    def _format_message_text(self, template, flags, arguments, wide):
+        """Expand the %-sequences of a FormatMessage template"""
+        if arguments and not flags & self.FORMAT_MESSAGE_ARGUMENT_ARRAY:
+            arguments = self._read_u32(arguments)  # va_list *: the argument list
+
+        def insert(match):
+            index, spec = int(match.group(1)), match.group(2) or 's'
+            if flags & self.FORMAT_MESSAGE_IGNORE_INSERTS or not arguments:
+                return match.group(0)
+            value = self._read_u32(arguments + 4 * (index - 1))
+            conv = spec[-1]
+            if conv in 'sS':
+                return self._read_text(value, wide == (conv == 's')) if value else '(null)'
+            if conv in 'cC':
+                return chr(value & 0xFFFF)
+            if conv in 'di':
+                value = value - (1 << 32) if value & 0x80000000 else value
+            try:
+                return ('%' + re.sub(r'[lhIwL]|64|32', '', spec)) % value
+            except (TypeError, ValueError):
+                return str(value)
+
+        out, pos = [], 0
+        pattern = re.compile(r'%(?:([1-9][0-9]?)(?:!([^!]+)!)?|(.))', re.S)
+        for match in pattern.finditer(template):
+            out.append(template[pos:match.start()])
+            pos = match.end()
+            if match.group(1):
+                out.append(insert(match))
+                continue
+            char = match.group(3)
+            if char == '0':
+                return ''.join(out)
+            out.append({'n': '\r\n', 'r': '\r', 't': '\t'}.get(char, char))
+        out.append(template[pos:])
+        return ''.join(out)
+
+    def FormatMessageA(self, args, wide=False):
+        """FormatMessageA/W emulation - from a string or the system message table"""
+        dwFlags, lpSource, dwMessageId, _, lpBuffer, nSize, Arguments = args[:7]
+        if dwFlags & self.FORMAT_MESSAGE_FROM_STRING:
+            template = self._read_text(lpSource, wide)
+        elif dwFlags & self.FORMAT_MESSAGE_FROM_SYSTEM:
+            template = self.SYSTEM_ERROR_MESSAGES.get(dwMessageId)
+            if template is None:
+                log.debug(f"FormatMessage: no system message for {dwMessageId}")
+                self._last_error = 317  # ERROR_MR_MID_NOT_FOUND
+                return 0
+            template += '\r\n'
+        else:
+            self._last_error = 317  # Message tables of other modules are not emulated
+            return 0
+        text = self._format_message_text(template, dwFlags, Arguments, wide)
+        if dwFlags & 0xFF == 0xFF:  # FORMAT_MESSAGE_MAX_WIDTH_MASK: no line breaks
+            text = text.replace('\r\n', ' ').rstrip(' ')
+        units = self._text_units(text, wide)
+        log.debug(f"FormatMessage{'W' if wide else 'A'}({dwMessageId}) -> {text!r}")
+        if not lpBuffer:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if dwFlags & self.FORMAT_MESSAGE_ALLOCATE_BUFFER:
+            unit_size = 2 if wide else 1
+            buffer = self.emu.heap_alloc(max(len(units) + 1, nSize) * unit_size)
+            if not buffer:
+                self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
+                return 0
+            self._write_units(buffer, units, wide)
+            self._mem_write(lpBuffer, struct.pack('<I', buffer))
+        else:
+            if len(units) + 1 > nSize:
+                self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+                return 0
+            self._write_units(lpBuffer, units, wide)
+        return len(units)
+
+    def FormatMessageW(self, args):
+        return self.FormatMessageA(args, wide=True)
     def VirtualAlloc(self, args):
         """VirtualAlloc emulation"""
         lpAddress = args[0]
@@ -2526,9 +2689,9 @@ class WinAPIHandler:
         WinAPIHandler.volume_label = label[:11].upper()
         return 1
 
-    def SetFileAttributesA(self, args):
-        """SetFileAttributesA emulation - only the read-only flag maps to the host"""
-        filename = self.read_string(args[0])
+    def SetFileAttributesA(self, args, wide=False):
+        """SetFileAttributesA/W emulation - only the read-only flag maps to the host"""
+        filename = self._read_text(args[0], wide)
         attributes = args[1]
         path = self.resolve_c_drive_path(filename)
         if path is None or not os.path.exists(path):
@@ -2546,6 +2709,9 @@ class WinAPIHandler:
                 self._last_error = 5  # ERROR_ACCESS_DENIED
                 return 0
         return 1
+
+    def SetFileAttributesW(self, args):
+        return self.SetFileAttributesA(args, wide=True)
 
     # ---------- Time conversions ----------
 
@@ -3527,6 +3693,71 @@ class WinAPIHandler:
     def MoveFileW(self, args):
         return self.MoveFileA(args, wide=True)
 
+    MOVEFILE_REPLACE_EXISTING = 0x1
+    MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+
+    def MoveFileExA(self, args, wide=False):
+        """MoveFileExA/W emulation. MOVEFILE_DELAY_UNTIL_REBOOT operations are
+        kept until ExitWindowsEx restarts the (emulated) system."""
+        lpExisting, lpNew, flags = args[0], args[1], args[2]
+        src = self._read_text(lpExisting, wide)
+        dst = self._read_text(lpNew, wide) if lpNew else None
+        log.debug(f"MoveFileEx(\"{src}\", \"{dst}\", 0x{flags:x})")
+        src_path = self.resolve_c_drive_path(src)
+        dst_path = self.resolve_c_drive_path(dst) if dst else None
+        if src_path is None or (dst is not None and dst_path is None):
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if flags & self.MOVEFILE_DELAY_UNTIL_REBOOT:
+            self.pending_file_operations.append((src_path, dst_path, flags))
+            log.info(f"MoveFileEx: \"{src}\" -> \"{dst or '(delete)'}\" after restart")
+            return 1
+        if dst is None:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if not os.path.exists(src_path):
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return 0
+        if os.path.exists(dst_path):
+            if (not flags & self.MOVEFILE_REPLACE_EXISTING or os.path.isdir(dst_path)
+                    or os.path.isdir(src_path)):
+                self._last_error = 183  # ERROR_ALREADY_EXISTS
+                return 0
+        try:
+            if os.path.isdir(src_path):
+                os.rename(src_path, dst_path)
+            else:
+                shutil.move(src_path, dst_path)
+        except FileNotFoundError:
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        except OSError as e:
+            log.error(f"MoveFileEx(\"{src}\", \"{dst}\") failed: {e}")
+            self._last_error = 5
+            return 0
+        return 1
+
+    def MoveFileExW(self, args):
+        return self.MoveFileExA(args, wide=True)
+
+    def _run_pending_file_operations(self):
+        """Do the MOVEFILE_DELAY_UNTIL_REBOOT renames/deletions (system restart)"""
+        operations, self.pending_file_operations = self.pending_file_operations, []
+        for src_path, dst_path, flags in operations:
+            try:
+                if dst_path is None:
+                    if os.path.isdir(src_path):
+                        os.rmdir(src_path)
+                    elif os.path.exists(src_path):
+                        os.remove(src_path)
+                elif os.path.exists(src_path):
+                    if os.path.isfile(dst_path) and flags & self.MOVEFILE_REPLACE_EXISTING:
+                        os.replace(src_path, dst_path)
+                    elif not os.path.exists(dst_path):
+                        os.rename(src_path, dst_path)
+            except OSError as e:
+                log.warning(f"Pending file operation on {src_path} failed: {e}")
+
     def GetCurrentDirectoryA(self, args, wide=False):
         """GetCurrentDirectoryA/W emulation"""
         nBufferLength, lpBuffer = args[0], args[1]
@@ -3834,6 +4065,64 @@ class WinAPIHandler:
 
     def GetUserNameW(self, args):
         return self.GetUserNameA(args, wide=True)
+
+    # Privilege names -> LUIDs (LookupPrivilegeValue)
+    PRIVILEGE_LUIDS = {
+        'secreatetokenprivilege': 2, 'seassignprimarytokenprivilege': 3,
+        'selockmemoryprivilege': 4, 'seincreasequotaprivilege': 5,
+        'semachineaccountprivilege': 6, 'setcbprivilege': 7, 'sesecurityprivilege': 8,
+        'setakeownershipprivilege': 9, 'seloaddriverprivilege': 10,
+        'sesystemprofileprivilege': 11, 'sesystemtimeprivilege': 12,
+        'seprofilesingleprocessprivilege': 13, 'seincreasebasepriorityprivilege': 14,
+        'secreatepagefileprivilege': 15, 'secreatepermanentprivilege': 16,
+        'sebackupprivilege': 17, 'serestoreprivilege': 18, 'seshutdownprivilege': 19,
+        'sedebugprivilege': 20, 'seauditprivilege': 21,
+        'sesystemenvironmentprivilege': 22, 'sechangenotifyprivilege': 23,
+        'seremoteshutdownprivilege': 24, 'seundockprivilege': 25,
+    }
+
+    def OpenProcessToken(self, args):
+        """OpenProcessToken emulation - an access token of the (administrator) user"""
+        ProcessHandle, DesiredAccess, TokenHandle = args[0], args[1], args[2]
+        log.debug(f"OpenProcessToken(0x{ProcessHandle:x}, 0x{DesiredAccess:x})")
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'token', 'access': DesiredAccess}
+        if not self._mem_write(TokenHandle, struct.pack('<I', handle)):
+            del self.handles[handle]
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        return 1
+
+    def LookupPrivilegeValueA(self, args, wide=False):
+        """LookupPrivilegeValueA/W emulation - LUID of a privilege name"""
+        name = self._read_text(args[1], wide) if args[1] else ''
+        luid = self.PRIVILEGE_LUIDS.get(name.lower())
+        log.debug(f"LookupPrivilegeValue(\"{name}\") -> {luid}")
+        if luid is None:
+            self._last_error = 1313  # ERROR_NO_SUCH_PRIVILEGE
+            return 0
+        if not self._mem_write(args[2], struct.pack('<Ii', luid, 0)):
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        return 1
+
+    def LookupPrivilegeValueW(self, args):
+        return self.LookupPrivilegeValueA(args, wide=True)
+
+    def AdjustTokenPrivileges(self, args):
+        """AdjustTokenPrivileges emulation - the user holds every privilege"""
+        TokenHandle, _, _, BufferLength, PreviousState, ReturnLength = args[:6]
+        info = self.handles.get(TokenHandle)
+        if not info or info.get('type') != 'token':
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        if PreviousState and BufferLength >= 4:
+            self._mem_write(PreviousState, struct.pack('<I', 0))  # PrivilegeCount
+        if ReturnLength:
+            self._mem_write(ReturnLength, struct.pack('<I', 4))
+        # Callers check GetLastError() for ERROR_NOT_ALL_ASSIGNED
+        self._last_error = 0
+        return 1
 
     def GetSystemInfo(self, args):
         """GetSystemInfo emulation - one x86 processor, 4 KiB pages"""
@@ -4374,13 +4663,15 @@ class WinAPIHandler:
             if class_name.upper() == "MSCTLS_STATUSBAR32" and hWndParent in self.gui.windows:
                 hwnd = self._create_status_bar(hWndParent, window_name, dwStyle, hMenu)
             elif class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
-                                        "SCROLLBAR"]:
+                                        "SCROLLBAR", "MSCTLS_PROGRESS32"]:
                 # BUTTON with a checkbox or radio button style is drawn and
                 # clicked as a checkbox
                 control_class = class_name
                 if (class_name.upper() == "BUTTON" and
                         (dwStyle & 0xF) in self.CHECK_BUTTON_STYLES):
                     control_class = "CHECKBOX"
+                elif class_name.upper() == "MSCTLS_PROGRESS32":
+                    control_class = "PROGRESSBAR"
                 # For child controls hMenu carries the control ID (used by WM_COMMAND)
                 hwnd = self.gui.create_control(hWndParent, control_class, window_name,
                                                x, y, nWidth, nHeight, dwStyle,
@@ -4510,6 +4801,14 @@ class WinAPIHandler:
 
         if self.gui and hWnd in self.gui.controls:
             self.gui.destroy_control(hWnd)
+        elif self.gui and hWnd in self.dialogs:
+            dialog = self.dialogs[hWnd]
+            if not dialog.get('destroying'):
+                # WM_DESTROY reaches the dialog procedure while its controls still exist
+                dialog['destroying'] = True
+                if dialog['proc']:
+                    self.emu.call_wndproc(dialog['proc'], hWnd, self.WM_DESTROY, 0, 0)
+                self._close_dialog(hWnd)
         elif self.gui and hWnd in self.gui.windows:
             self.gui._close_window(hWnd, notify_app=False)
             # Deliver WM_DESTROY via the queue: a synchronous call here would
@@ -4844,22 +5143,28 @@ class WinAPIHandler:
         # Fallback: return dialog item ID as handle
         return 0x20000 + nIDDlgItem
 
-    def GetDlgItemTextA(self, args):
-        """GetDlgItemTextA emulation"""
+    def GetDlgItemTextA(self, args, wide=False):
+        """GetDlgItemTextA/W emulation"""
         hDlg = args[0]
         nIDDlgItem = args[1]
         lpString = args[2]
         cchMax = args[3]
         hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
-        return self.GetWindowTextA([hwnd, lpString, cchMax])
+        return self.GetWindowTextA([hwnd, lpString, cchMax], wide)
 
-    def SetDlgItemTextA(self, args):
-        """SetDlgItemTextA emulation"""
+    def GetDlgItemTextW(self, args):
+        return self.GetDlgItemTextA(args, wide=True)
+
+    def SetDlgItemTextA(self, args, wide=False):
+        """SetDlgItemTextA/W emulation"""
         hDlg = args[0]
         nIDDlgItem = args[1]
         lpString = args[2]
         hwnd = self.GetDlgItem([hDlg, nIDDlgItem])
-        return self.SetWindowTextA([hwnd, lpString])
+        return self.SetWindowTextA([hwnd, lpString], wide)
+
+    def SetDlgItemTextW(self, args):
+        return self.SetDlgItemTextA(args, wide=True)
 
     def GetDlgItemInt(self, args):
         """GetDlgItemInt emulation - read a control's text and parse an integer.
@@ -5528,6 +5833,279 @@ class WinAPIHandler:
             return count
         return self.get_next_handle() if index < count else 0
 
+    # ---------- Shell folders (shell32) ----------
+
+    # CSIDL -> folder; the per-user and "All Users" folders are in C:\Windows
+    # like on Windows 9x
+    SHELL_FOLDERS = {
+        0x00: 'C:\\Windows\\Desktop',                         # CSIDL_DESKTOP
+        0x02: 'C:\\Windows\\Start Menu\\Programs',            # CSIDL_PROGRAMS
+        0x05: 'C:\\My Documents',                             # CSIDL_PERSONAL
+        0x06: 'C:\\Windows\\Favorites',                       # CSIDL_FAVORITES
+        0x07: 'C:\\Windows\\Start Menu\\Programs\\StartUp',   # CSIDL_STARTUP
+        0x08: 'C:\\Windows\\Recent',                          # CSIDL_RECENT
+        0x09: 'C:\\Windows\\SendTo',                          # CSIDL_SENDTO
+        0x0B: 'C:\\Windows\\Start Menu',                      # CSIDL_STARTMENU
+        0x10: 'C:\\Windows\\Desktop',                         # CSIDL_DESKTOPDIRECTORY
+        0x14: 'C:\\Windows\\Fonts',                           # CSIDL_FONTS
+        0x15: 'C:\\Windows\\ShellNew',                        # CSIDL_TEMPLATES
+        0x16: 'C:\\Windows\\All Users\\Start Menu',           # CSIDL_COMMON_STARTMENU
+        0x17: 'C:\\Windows\\All Users\\Start Menu\\Programs',  # CSIDL_COMMON_PROGRAMS
+        0x18: 'C:\\Windows\\All Users\\Start Menu\\Programs\\StartUp',  # CSIDL_COMMON_STARTUP
+        0x19: 'C:\\Windows\\All Users\\Desktop',  # CSIDL_COMMON_DESKTOPDIRECTORY
+        0x1A: 'C:\\Windows\\Application Data',                # CSIDL_APPDATA
+        0x1C: 'C:\\Windows\\Local Settings\\Application Data',  # CSIDL_LOCAL_APPDATA
+        0x1F: 'C:\\Windows\\All Users\\Favorites',            # CSIDL_COMMON_FAVORITES
+        0x20: 'C:\\Windows\\Temporary Internet Files',        # CSIDL_INTERNET_CACHE
+        0x21: 'C:\\Windows\\Cookies',                         # CSIDL_COOKIES
+        0x22: 'C:\\Windows\\History',                         # CSIDL_HISTORY
+        0x23: 'C:\\Windows\\All Users\\Application Data',     # CSIDL_COMMON_APPDATA
+        0x24: 'C:\\Windows',                                  # CSIDL_WINDOWS
+        0x25: 'C:\\Windows\\System32',                        # CSIDL_SYSTEM
+        0x26: PROGRAM_FILES_FOLDER,                           # CSIDL_PROGRAM_FILES
+        0x27: 'C:\\My Documents\\My Pictures',                # CSIDL_MYPICTURES
+        0x28: 'C:\\Windows',                                  # CSIDL_PROFILE
+        0x29: 'C:\\Windows\\System32',                        # CSIDL_SYSTEMX86
+        0x2A: PROGRAM_FILES_FOLDER,                           # CSIDL_PROGRAM_FILESX86
+        0x2B: PROGRAM_FILES_FOLDER + '\\Common Files',        # CSIDL_PROGRAM_FILES_COMMON
+        0x2D: 'C:\\Windows\\All Users\\Templates',            # CSIDL_COMMON_TEMPLATES
+        0x2E: 'C:\\Windows\\All Users\\Documents',            # CSIDL_COMMON_DOCUMENTS
+    }
+
+    def _shell_folder(self, csidl):
+        """Windows path of a CSIDL special folder (created like on a real
+        installation, where they exist), or None if unknown"""
+        folder = self.SHELL_FOLDERS.get(csidl & 0xFF)
+        if folder is None:
+            return None
+        path = self.resolve_c_drive_path(folder)
+        if path is not None:
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                log.warning(f"Cannot create shell folder {folder}: {e}")
+        return folder
+
+    def SHGetFolderPathA(self, args, wide=False):
+        """SHGetFolderPathA/W emulation - HRESULT, the path has no trailing backslash"""
+        csidl, pszPath = args[1], args[4]
+        folder = self._shell_folder(csidl)
+        log.debug(f"SHGetFolderPath(0x{csidl:x}) -> {folder}")
+        if folder is None:
+            return 0x80070057  # E_INVALIDARG
+        if not pszPath or not self._write_units(pszPath, self._text_units(folder, wide)[:259],
+                                                wide):
+            return 0x80070057
+        return 0  # S_OK
+
+    def SHGetFolderPathW(self, args):
+        return self.SHGetFolderPathA(args, wide=True)
+
+    def SHGetSpecialFolderPathA(self, args, wide=False):
+        """SHGetSpecialFolderPathA/W emulation - BOOL"""
+        pszPath, csidl = args[1], args[2]
+        folder = self._shell_folder(csidl)
+        log.debug(f"SHGetSpecialFolderPath(0x{csidl:x}) -> {folder}")
+        if folder is None or not pszPath:
+            return 0
+        return 1 if self._write_units(pszPath, self._text_units(folder, wide)[:259],
+                                      wide) else 0
+
+    def SHGetSpecialFolderPathW(self, args):
+        return self.SHGetSpecialFolderPathA(args, wide=True)
+
+    def _make_pidl(self, path):
+        """Item ID list (one item holding the path) for a Windows path"""
+        data = path.encode('utf-16-le') + b'\x00\x00'
+        pidl = self.emu.heap_alloc(2 + len(data) + 2)
+        if pidl:
+            self._mem_write(pidl, struct.pack('<H', 2 + len(data)) + data + b'\x00\x00')
+            self.pidls[pidl] = path
+        return pidl
+
+    def SHGetPathFromIDListA(self, args, wide=False):
+        """SHGetPathFromIDListA/W emulation (PIDLs of SHBrowseForFolder)"""
+        pidl, pszPath = args[0], args[1]
+        path = self.pidls.get(pidl)
+        if path is None or not pszPath:
+            if pszPath:
+                self._write_units(pszPath, [], wide)
+            return 0
+        return 1 if self._write_units(pszPath, self._text_units(path, wide)[:259], wide) else 0
+
+    def SHGetPathFromIDListW(self, args):
+        return self.SHGetPathFromIDListA(args, wide=True)
+
+    def CoTaskMemAlloc(self, args):
+        """CoTaskMemAlloc emulation"""
+        return self.emu.heap_alloc(max(args[0], 1))
+
+    def CoTaskMemFree(self, args):
+        """CoTaskMemFree emulation (also frees SHBrowseForFolder PIDLs)"""
+        if args[0]:
+            self.pidls.pop(args[0], None)
+            self.emu.heap_free(args[0])
+        return 0
+
+    BFFM_INITIALIZED, BFFM_SELCHANGED = 1, 2
+    BFFM_SETSTATUSTEXTA, BFFM_ENABLEOK, BFFM_SETSELECTIONA = 0x464, 0x465, 0x466
+    BFFM_SETSELECTIONW, BFFM_SETSTATUSTEXTW, BFFM_SETOKTEXT = 0x467, 0x468, 0x469
+    BFFM_SETEXPANDED = 0x46A
+
+    def SHBrowseForFolderA(self, args, wide=False):
+        """SHBrowseForFolderA/W emulation - a modal folder browser; returns a PIDL"""
+        lpbi = args[0]
+        try:
+            (hwndOwner, pidlRoot, pszDisplayName, lpszTitle, ulFlags, lpfn,
+             lParam) = struct.unpack('<7I', self.emu.uc.mem_read(lpbi, 28))
+        except UcError:
+            return 0
+        if not self.gui or not self.gui.running:
+            return 0
+        title = self._read_text(lpszTitle, wide) if lpszTitle else ''
+        root = self.pidls.get(pidlRoot, 'C:\\').rstrip('\\') if pidlRoot else 'C:'
+        log.info(f"SHBrowseForFolder{'W' if wide else 'A'}(\"{title}\")")
+
+        ID_TITLE, ID_PATH, ID_LIST, ID_STATUS = 0x3742, 0x3743, 0x3744, 0x3745
+        template = self._dialog_template('Browse for Folder', 220, 196, [
+            self._dialog_item('STATIC', title, 7, 6, 206, 18, ID_TITLE),
+            self._dialog_item('STATIC', '', 7, 28, 206, 10, ID_PATH, 0x80),  # SS_NOPREFIX
+            self._dialog_item('LISTBOX', '', 7, 40, 206, 116, ID_LIST, 0x00A10001),
+            self._dialog_item('STATIC', '', 7, 158, 206, 10, ID_STATUS, 0x80),
+            self._dialog_item('BUTTON', 'OK', 106, 174, 50, 14, 1, 0x00010001),
+            self._dialog_item('BUTTON', 'Cancel', 163, 174, 50, 14, 2, 0x00010000)])
+        state = {'dir': root, 'result': None}
+
+        def at_root():
+            return state['dir'].rstrip('\\').lower() == root.lower()
+
+        def selected():
+            """Folder chosen now: the selected list entry or the current folder"""
+            listbox = self._dialog_control(dlg, ID_LIST)
+            if 0 <= listbox.sel_index < len(listbox.items):
+                item = listbox.items[listbox.sel_index]
+                if item != '..':
+                    return state['dir'].rstrip('\\') + '\\' + item
+            return state['dir'] if len(state['dir']) > 2 else state['dir'] + '\\'
+
+        def notify_selection():
+            path = selected()
+            self._dialog_control(dlg, ID_PATH).text = path
+            if lpfn:
+                pidl = self._make_pidl(path)
+                self.emu.call_callback(lpfn, [dlg, self.BFFM_SELCHANGED, pidl, lParam])
+                self.CoTaskMemFree([pidl])
+
+        def fill(select=None):
+            host_dir = self.resolve_c_drive_path(state['dir'] + '\\')
+            try:
+                entries = sorted((e for e in os.listdir(host_dir)
+                                  if os.path.isdir(os.path.join(host_dir, e))), key=str.lower)
+            except (OSError, TypeError):
+                entries = []
+            listbox = self._dialog_control(dlg, ID_LIST)
+            listbox.items = ([] if at_root() else ['..']) + entries
+            listbox.top_index = 0
+            listbox.sel_index = -1
+            if select is not None:
+                names = [item.lower() for item in listbox.items]
+                if select.lower() in names:
+                    listbox.sel_index = names.index(select.lower())
+                    rows = max(1, (listbox.height - 2) // self.gui.LISTBOX_ITEM_H)
+                    listbox.top_index = max(0, listbox.sel_index - rows + 1)
+            notify_selection()
+
+        def navigate(path, select=None):
+            # The trailing backslash keeps "C:" from meaning the current directory
+            full = self.full_windows_path(path.rstrip('\\') + '\\', clamp=True)
+            host = self.resolve_c_drive_path(full) if full else None
+            if host is None or not os.path.isdir(host):
+                return False
+            full = full.rstrip('\\')
+            if not full.lower().startswith(root.lower()):
+                return False
+            state['dir'] = full
+            fill(select)
+            return True
+
+        def set_selection(path):
+            """BFFM_SETSELECTION: show the nearest existing folder selected"""
+            full = self.full_windows_path(path, clamp=True)
+            while full:
+                full = full.rstrip('\\')
+                parent, name = ntpath.split(full)
+                host = self.resolve_c_drive_path(full + '\\')
+                if host is not None and os.path.isdir(host):
+                    if name and full.lower() != root.lower():
+                        navigate(parent, select=name)
+                    else:
+                        navigate(full)
+                    return 1
+                if not name:
+                    break
+                full = parent
+            return 0
+
+        def handler(message, wParam, lParam_):
+            if message == self.WM_INITDIALOG:
+                fill()
+                return 1
+            if message in (self.BFFM_SETSELECTIONA, self.BFFM_SETSELECTIONW,
+                           self.BFFM_SETEXPANDED):
+                if wParam:
+                    path = self._read_text(lParam_, message != self.BFFM_SETSELECTIONA)
+                else:
+                    path = self.pidls.get(lParam_)
+                return set_selection(path) if path else 0
+            if message in (self.BFFM_SETSTATUSTEXTA, self.BFFM_SETSTATUSTEXTW):
+                text = self._read_text(lParam_, message == self.BFFM_SETSTATUSTEXTW)
+                self._dialog_control(dlg, ID_STATUS).text = text
+                return 0
+            if message == self.BFFM_ENABLEOK:
+                self._dialog_control(dlg, 1).enabled = bool(lParam_)
+                return 0
+            if message == self.BFFM_SETOKTEXT:
+                self._dialog_control(dlg, 1).text = self.read_wide_string(lParam_)
+                return 0
+            if message == self.WM_CLOSE:
+                self.EndDialog([dlg, 0])
+            elif message == self.WM_COMMAND:
+                control_id, code = wParam & 0xFFFF, wParam >> 16
+                listbox = self._dialog_control(dlg, ID_LIST)
+                if control_id == ID_LIST and code == self.LBN_SELCHANGE:
+                    notify_selection()
+                elif control_id == ID_LIST and code == self.LBN_DBLCLK:
+                    if 0 <= listbox.sel_index < len(listbox.items):
+                        item = listbox.items[listbox.sel_index]
+                        if item == '..':
+                            parent, name = ntpath.split(state['dir'])
+                            navigate(parent, select=name)
+                        else:
+                            navigate(state['dir'] + '\\' + item)
+                elif control_id == 1:
+                    state['result'] = selected()
+                    self.EndDialog([dlg, 1])
+                elif control_id == 2:
+                    self.EndDialog([dlg, 0])
+            return 0
+
+        dlg = self._create_dialog(template, self._owner_window(hwndOwner), handler=handler)
+        # The status line is shown with BIF_STATUSTEXT, but not in the new dialog style
+        self._dialog_control(dlg, ID_STATUS).visible = ulFlags & 0x44 == 0x04
+        self._show_dialog(dlg, 0)
+        if lpfn and dlg in self.dialogs:
+            self.emu.call_callback(lpfn, [dlg, self.BFFM_INITIALIZED, 0, lParam])
+        if self._run_modal_dialog(dlg) != 1 or not state['result']:
+            return 0
+        path = state['result']
+        if pszDisplayName:
+            name = ntpath.basename(path.rstrip('\\')) or path
+            self._write_units(pszDisplayName, self._text_units(name, wide)[:259], wide)
+        return self._make_pidl(path)
+
+    def SHBrowseForFolderW(self, args):
+        return self.SHBrowseForFolderA(args, wide=True)
+
     # ---------- Keyboard ----------
 
     def GetKeyboardState(self, args):
@@ -5828,6 +6406,8 @@ class WinAPIHandler:
                 cls = 'CHECKBOX'
             elif cls.upper() == 'MSCTLS_STATUSBAR32':
                 cls = 'STATUSBAR'
+            elif cls.upper() == 'MSCTLS_PROGRESS32':
+                cls = 'PROGRESSBAR'
             chwnd = self.gui.create_control(
                 hwnd, cls, text, round(item['x'] * bx), round(item['y'] * by),
                 round(item['cx'] * bx), round(item['cy'] * by), style,
@@ -5921,9 +6501,18 @@ class WinAPIHandler:
         dlg = self._dialog_of(hwnd)
         if dlg:
             if message == self.WM_KEYDOWN and wParam in (0x0D, 0x1B):
-                # Enter: default button, Escape: Cancel
-                button = (self._dialog_button(dlg) if wParam == 0x0D
-                          else self._dialog_button(dlg, 2))
+                # Enter: focused or default push button, Escape: Cancel
+                if wParam == 0x0D:
+                    focused = self.gui.controls.get(self.gui.focused_control)
+                    if (focused is not None and focused.parent_hwnd == dlg and
+                            focused.class_name == 'BUTTON' and (focused.style & 0xF) in (0, 1)):
+                        button = focused
+                    else:
+                        button = self._dialog_button(dlg)
+                    if button is not None and not button.enabled:
+                        return 0
+                else:
+                    button = self._dialog_button(dlg, 2)
                 control_id = button.control_id if button else (1 if wParam == 0x0D else 2)
                 return self._dialog_message(dlg, self.WM_COMMAND, control_id,
                                             button.hwnd if button else 0)
@@ -5978,8 +6567,9 @@ class WinAPIHandler:
             self._close_dialog(dlg)
         return result
 
-    def _show_dialog(self, dlg, init_param):
-        """Show a new dialog, send WM_INITDIALOG and focus its first edit control"""
+    def _show_dialog(self, dlg, init_param, show=True):
+        """Send WM_INITDIALOG to a new dialog, focus its first edit control and
+        show it (a modeless one only if its template has WS_VISIBLE)"""
         win = self.gui.windows[dlg]
         edits = [c for c in win.controls if c.class_name == 'EDIT' and c.visible and c.enabled]
         first = next((c for c in win.controls
@@ -5990,23 +6580,35 @@ class WinAPIHandler:
             return
         if set_focus and edits and self.gui.focused_control not in [c.hwnd for c in edits]:
             self.gui.focused_control = edits[0].hwnd
-        self.gui.show_window(dlg, True)
+        if show:
+            self.gui.show_window(dlg, True)
 
-    def DialogBoxParamA(self, args):
-        """DialogBoxParamA emulation - modal dialog from an RT_DIALOG resource"""
-        hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam = args[:5]
-        key = self._resource_key(lpTemplateName)
+    def _load_dialog_template(self, hInstance, lpTemplateName, wide, api_name):
+        """Parsed RT_DIALOG resource of the EXE, or None (last error set)"""
+        if lpTemplateName < 0x10000:
+            key = lpTemplateName
+        else:
+            name = self._read_text(lpTemplateName, wide)
+            key = int(name[1:]) if name.startswith('#') and name[1:].isdigit() else name.upper()
         found = self._find_resource(5, key) if self._is_own_module(hInstance) else None
-        log.info(f"DialogBoxParamA({key!r})")
+        log.info(f"{api_name}({key!r})")
         if found is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
-            return 0xFFFFFFFF
+            return None
         if not self.gui or not self.gui.running:
-            return 0xFFFFFFFF
+            return None
         try:
-            template = self._parse_dialog_template(bytes(self.emu.uc.mem_read(*found)))
+            return self._parse_dialog_template(bytes(self.emu.uc.mem_read(*found)))
         except (struct.error, UcError) as e:
-            log.error(f"DialogBoxParamA: bad dialog template ({e})")
+            log.error(f"{api_name}: bad dialog template ({e})")
+            return None
+
+    def DialogBoxParamA(self, args, wide=False):
+        """DialogBoxParamA/W emulation - modal dialog from an RT_DIALOG resource"""
+        hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam = args[:5]
+        template = self._load_dialog_template(hInstance, lpTemplateName, wide,
+                                              'DialogBoxParamW' if wide else 'DialogBoxParamA')
+        if template is None:
             return 0xFFFFFFFF
         owner = hWndParent
         control = self.gui.controls.get(owner)
@@ -6015,6 +6617,47 @@ class WinAPIHandler:
         dlg = self._create_dialog(template, owner, proc=lpDialogFunc)
         self._show_dialog(dlg, dwInitParam)
         return self._run_modal_dialog(dlg)
+
+    def DialogBoxParamW(self, args):
+        return self.DialogBoxParamA(args, wide=True)
+
+    def CreateDialogParamA(self, args, wide=False):
+        """CreateDialogParamA/W emulation - modeless dialog from an RT_DIALOG
+        resource; the program's message loop drives it (IsDialogMessage)"""
+        hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam = args[:5]
+        template = self._load_dialog_template(
+            hInstance, lpTemplateName, wide,
+            'CreateDialogParamW' if wide else 'CreateDialogParamA')
+        if template is None:
+            return 0
+        dlg = self._create_dialog(template, self._owner_window(hWndParent), proc=lpDialogFunc)
+        self._show_dialog(dlg, dwInitParam, show=bool(template['style'] & self.WS_VISIBLE))
+        return dlg if dlg in self.dialogs else 0
+
+    def CreateDialogParamW(self, args):
+        return self.CreateDialogParamA(args, wide=True)
+
+    WM_NEXTDLGCTL = 0x0028
+
+    def _send_dialog_message(self, dlg, message, wParam, lParam):
+        """SendMessage to a dialog: its procedure, then the DefDlgProc defaults"""
+        result = self._dialog_message(dlg, message, wParam, lParam)
+        if message == self.WM_NEXTDLGCTL and not result and dlg in self.dialogs:
+            win = self.gui.windows.get(dlg)
+            if lParam & 0xFFFF:  # wParam is the control to focus
+                target = wParam
+            else:  # Next (wParam 0) or previous tab stop
+                stops = [c.hwnd for c in (win.controls if win else [])
+                         if c.visible and c.enabled and c.style & 0x00010000]  # WS_TABSTOP
+                if not stops:
+                    return 0
+                current = self.gui.focused_control
+                index = stops.index(current) if current in stops else -1
+                target = stops[(index + (-1 if wParam else 1)) % len(stops)]
+            control = self.gui.controls.get(target)
+            if control is not None and control.parent_hwnd == dlg:
+                self.SetFocus([target])
+        return result
 
     def EndDialog(self, args):
         """EndDialog emulation - the modal loop ends with nResult"""
@@ -6041,6 +6684,9 @@ class WinAPIHandler:
             return 0
         self._dispatch(hwnd, message, wParam, lParam)
         return 1
+
+    def IsDialogMessageW(self, args):
+        return self.IsDialogMessageA(args)
 
     # ---------- Common dialogs (comdlg32) ----------
 
@@ -7496,6 +8142,10 @@ class WinAPIHandler:
         if self.gui and hWnd in self.gui.controls:
             return self._control_message(self.gui.controls[hWnd], Msg, wParam, lParam, wide)
 
+        # Dialogs: the dialog procedure (or internal handler), then DefDlgProc
+        if self.gui and hWnd in self.dialogs:
+            return self._send_dialog_message(hWnd, Msg, wParam, lParam)
+
         # Other messages: deliver synchronously to the window's WndProc
         wndproc = self._find_wndproc_for_hwnd(hWnd)
         if wndproc:
@@ -7504,6 +8154,65 @@ class WinAPIHandler:
 
     def SendMessageW(self, args):
         return self.SendMessageA(args, wide=True)
+
+    PBM_SETRANGE, PBM_SETPOS, PBM_DELTAPOS, PBM_SETSTEP = 0x401, 0x402, 0x403, 0x404
+    PBM_STEPIT, PBM_SETRANGE32, PBM_GETRANGE, PBM_GETPOS = 0x405, 0x406, 0x407, 0x408
+    PBM_SETBARCOLOR, PBM_SETBKCOLOR = 0x409, 0x2001  # PBM_SETBKCOLOR = CCM_SETBKCOLOR
+
+    def _progress_bar_message(self, control, Msg, wParam, lParam):
+        """Progress bar (msctls_progress32) messages; None if not one of them"""
+        def signed(value):
+            return value - (1 << 32) if value & 0x80000000 else value
+
+        def set_pos(pos):
+            prev = control.scroll_pos
+            control.scroll_pos = max(control.scroll_min, min(pos, control.scroll_max))
+            return prev & 0xFFFFFFFF
+
+        def set_range(low, high):
+            prev = ((control.scroll_max & 0xFFFF) << 16) | (control.scroll_min & 0xFFFF)
+            control.scroll_min, control.scroll_max = low, high
+            control.scroll_pos = max(low, min(control.scroll_pos, high))
+            return prev
+
+        def colorref(value):
+            if value == 0xFF000000:  # CLR_DEFAULT
+                return None
+            return (value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF)
+
+        def to_colorref(color):
+            return 0xFF000000 if color is None else color[0] | color[1] << 8 | color[2] << 16
+
+        if Msg == self.PBM_SETRANGE:
+            return set_range(lParam & 0xFFFF, (lParam >> 16) & 0xFFFF)
+        if Msg == self.PBM_SETRANGE32:
+            return set_range(signed(wParam), signed(lParam))
+        if Msg == self.PBM_SETPOS:
+            return set_pos(signed(wParam))
+        if Msg == self.PBM_DELTAPOS:
+            return set_pos(control.scroll_pos + signed(wParam))
+        if Msg == self.PBM_SETSTEP:
+            prev, control.progress_step = control.progress_step, signed(wParam)
+            return prev & 0xFFFFFFFF
+        if Msg == self.PBM_STEPIT:
+            pos = control.scroll_pos + control.progress_step
+            if pos > control.scroll_max:  # Wraps around like the real control
+                pos = control.scroll_min + (pos - control.scroll_max)
+            return set_pos(pos)
+        if Msg == self.PBM_GETRANGE:
+            if lParam:
+                self._mem_write(lParam, struct.pack('<ii', control.scroll_min,
+                                                    control.scroll_max))
+            return (control.scroll_min if wParam else control.scroll_max) & 0xFFFFFFFF
+        if Msg == self.PBM_GETPOS:
+            return control.scroll_pos & 0xFFFFFFFF
+        if Msg == self.PBM_SETBARCOLOR:
+            prev, control.progress_bar_color = control.progress_bar_color, colorref(lParam)
+            return to_colorref(prev)
+        if Msg == self.PBM_SETBKCOLOR:
+            prev, control.progress_bk_color = control.progress_bk_color, colorref(lParam)
+            return to_colorref(prev)
+        return None
 
     def _control_message(self, control, Msg, wParam, lParam, wide=False):
         """Handle a message sent to a child control (emulation thread).
@@ -7515,6 +8224,10 @@ class WinAPIHandler:
 
         if control.class_name == 'STATUSBAR':
             result = self._status_bar_message(control, Msg, wParam, lParam, wide)
+            if result is not None:
+                return result
+        elif control.class_name == 'PROGRESSBAR':
+            result = self._progress_bar_message(control, Msg, wParam, lParam)
             if result is not None:
                 return result
 
@@ -9950,6 +10663,13 @@ class WinAPIHandler:
             self.registry_roots[hkey] = self._new_registry_key(name)
         for hkey, name in ((0x80000001, 'Software'), (0x80000002, 'SOFTWARE')):
             self.registry_roots[hkey]['keys'][name.lower()] = self._new_registry_key(name)
+        # Default values of a Windows installation
+        node = self.registry_roots[0x80000002]
+        for part in ('SOFTWARE', 'Microsoft', 'Windows', 'CurrentVersion'):
+            node = node['keys'].setdefault(part.lower(), self._new_registry_key(part))
+        for name, folder in (('ProgramFilesDir', PROGRAM_FILES_FOLDER),
+                             ('CommonFilesDir', PROGRAM_FILES_FOLDER + '\\Common Files')):
+            node['values'][name.lower()] = {'name': name, 'type': 1, 'data': folder + '\x00'}
 
     def _registry_key(self, hkey):
         """(key node, error code) of an open or predefined HKEY"""
@@ -10182,6 +10902,345 @@ class WinAPIHandler:
         """CoUninitialize emulation"""
         log.debug("CoUninitialize()")
         return 0
+
+    # ---------- COM objects ----------
+
+    S_OK, S_FALSE = 0, 1
+    E_NOINTERFACE, E_POINTER, E_FAIL = 0x80004002, 0x80004003, 0x80004005
+    E_INVALIDARG = 0x80070057
+    CLASS_E_NOAGGREGATION, REGDB_E_CLASSNOTREG = 0x80040110, 0x80040154
+
+    CLSID_SHELLLINK = '00021401-0000-0000-c000-000000000046'
+    IID_IUNKNOWN = '00000000-0000-0000-c000-000000000046'
+    IID_IPERSIST = '0000010c-0000-0000-c000-000000000046'
+    IID_IPERSISTFILE = '0000010b-0000-0000-c000-000000000046'
+    IID_ISHELLLINKA = '000214ee-0000-0000-c000-000000000046'
+    IID_ISHELLLINKW = '000214f9-0000-0000-c000-000000000046'
+
+    # Interface kind -> methods (name, argument count with "this") in vtable order
+    COM_INTERFACES = {
+        'shell_link': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetPath', 5),
+            ('GetIDList', 2), ('SetIDList', 2), ('GetDescription', 3), ('SetDescription', 2),
+            ('GetWorkingDirectory', 3), ('SetWorkingDirectory', 2), ('GetArguments', 3),
+            ('SetArguments', 2), ('GetHotkey', 2), ('SetHotkey', 2), ('GetShowCmd', 2),
+            ('SetShowCmd', 2), ('GetIconLocation', 4), ('SetIconLocation', 3),
+            ('SetRelativePath', 3), ('Resolve', 3), ('SetPath', 2)],
+        'persist_file': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetClassID', 2),
+            ('IsDirty', 1), ('Load', 3), ('Save', 3), ('SaveCompleted', 2),
+            ('GetCurFile', 2)],
+    }
+
+    def _read_guid(self, address):
+        """GUID in memory -> lower-case "xxxxxxxx-xxxx-..." string ('' if unreadable)"""
+        try:
+            data1, data2, data3, data4 = struct.unpack('<IHH8s', self.emu.uc.mem_read(address, 16))
+        except UcError:
+            return ''
+        return f'{data1:08x}-{data2:04x}-{data3:04x}-{data4[:2].hex()}-{data4[2:].hex()}'
+
+    @staticmethod
+    def _guid_bytes(guid):
+        parts = guid.split('-')
+        return (struct.pack('<IHH', int(parts[0], 16), int(parts[1], 16), int(parts[2], 16))
+                + bytes.fromhex(parts[3] + parts[4]))
+
+    def _com_vtable(self, interface, kind, wide=False):
+        """vtable of API stubs for an interface; method calls go to
+        self._com_<kind>(method, wide, args)"""
+        key = (interface, wide)
+        if key in self._com_vtables:
+            return self._com_vtables[key]
+        target = getattr(self, f'_com_{kind}')
+        stubs = []
+        for method, argc in self.COM_INTERFACES[kind]:
+            name = f"{interface}::{method}"
+            self._api_map[name] = (lambda m: lambda args: target(m, wide, args))(method)
+            self.com_arg_counts[name] = argc
+            stubs.append(self.emu._create_api_stub('ole32.dll', name))
+        vtable = self.emu.heap_alloc(4 * len(stubs))
+        self._mem_write(vtable, struct.pack(f'<{len(stubs)}I', *stubs))
+        self._com_vtables[key] = vtable
+        return vtable
+
+    def _com_new_object(self, interfaces, state):
+        """Allocate a COM object: one vtable pointer per interface, all sharing
+        state; returns {IID: interface pointer}"""
+        base = self.emu.heap_alloc(4 * len(interfaces))
+        state.update({'refs': 1, 'base': base, 'pointers': {}})
+        for index, (iids, vtable) in enumerate(interfaces):
+            pointer = base + 4 * index
+            self._mem_write(pointer, struct.pack('<I', vtable))
+            self.com_objects[pointer] = state
+            for iid in iids:
+                state['pointers'].setdefault(iid, pointer)
+        return state['pointers']
+
+    def _com_unknown(self, method, args):
+        """IUnknown methods shared by every emulated COM object (None: not one)"""
+        state = self.com_objects.get(args[0])
+        if state is None:
+            return 0 if method in ('AddRef', 'Release') else self.E_POINTER
+        if method == 'QueryInterface':
+            pointer = state['pointers'].get(self._read_guid(args[1]))
+            if not args[2]:
+                return self.E_POINTER
+            self._mem_write(args[2], struct.pack('<I', pointer or 0))
+            if not pointer:
+                return self.E_NOINTERFACE
+            state['refs'] += 1
+            return self.S_OK
+        if method == 'AddRef':
+            state['refs'] += 1
+            return state['refs']
+        if method == 'Release':
+            state['refs'] -= 1
+            if state['refs'] <= 0:
+                for pointer in set(state['pointers'].values()):
+                    self.com_objects.pop(pointer, None)
+                self.emu.heap_free(state['base'])
+                return 0
+            return state['refs']
+        return None
+
+    def CoCreateInstance(self, args):
+        """CoCreateInstance emulation - only the shell link object (CLSID_ShellLink)"""
+        rclsid, pUnkOuter, _, riid, ppv = args[:5]
+        clsid, iid = self._read_guid(rclsid), self._read_guid(riid)
+        log.debug(f"CoCreateInstance({{{clsid}}}, {{{iid}}})")
+        if not ppv:
+            return self.E_POINTER
+        self._mem_write(ppv, struct.pack('<I', 0))
+        if pUnkOuter:
+            return self.CLASS_E_NOAGGREGATION
+        if clsid != self.CLSID_SHELLLINK:
+            log.warning(f"CoCreateInstance: COM class {{{clsid}}} is not emulated")
+            return self.REGDB_E_CLASSNOTREG
+        pointers = self._com_new_object(
+            [((self.IID_ISHELLLINKW, self.IID_IUNKNOWN),
+              self._com_vtable('IShellLinkW', 'shell_link', wide=True)),
+             ((self.IID_ISHELLLINKA,), self._com_vtable('IShellLinkA', 'shell_link')),
+             ((self.IID_IPERSISTFILE, self.IID_IPERSIST),
+              self._com_vtable('IPersistFile', 'persist_file'))],
+            {'path': '', 'description': '', 'workdir': '', 'arguments': '',
+             'relative': '', 'icon': '', 'icon_index': 0, 'show': 1, 'hotkey': 0,
+             'file': None, 'dirty': False})
+        unknown = pointers[self.IID_IUNKNOWN]
+        result = self._com_unknown('QueryInterface', [unknown, riid, ppv])
+        self._com_unknown('Release', [unknown])
+        return result
+
+    def _com_write_text(self, address, size, text, wide):
+        """Copy text to a caller buffer of size characters (truncated)"""
+        if not address or not size:
+            return False
+        units = self._text_units(text, wide)[:size - 1]
+        return self._write_units(address, units, wide)
+
+    # Fields of the IShellLink string getters/setters
+    SHELL_LINK_TEXT_FIELDS = {'Description': 'description', 'WorkingDirectory': 'workdir',
+                              'Arguments': 'arguments'}
+
+    def _com_shell_link(self, method, wide, args):
+        """IShellLinkA/W methods"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        field = self.SHELL_LINK_TEXT_FIELDS.get(method[3:])
+        if field and method.startswith('Get'):
+            return self.S_OK if self._com_write_text(args[1], args[2], state[field],
+                                                     wide) else self.E_INVALIDARG
+        if field:
+            state[field] = self._read_text(args[1], wide) if args[1] else ''
+            state['dirty'] = True
+            return self.S_OK
+        if method == 'GetPath':
+            if not self._com_write_text(args[1], args[2], state['path'], wide):
+                return self.E_INVALIDARG
+            if args[3]:  # WIN32_FIND_DATA of the target
+                self._mem_write(args[3], bytes(592 if wide else 320))
+                path = self.resolve_c_drive_path(state['path']) if state['path'] else None
+                if path and os.path.exists(path):
+                    attributes = 0x10 if os.path.isdir(path) else 0x20
+                    self._mem_write(args[3], struct.pack('<I', attributes))
+                    self._com_write_text(args[3] + 44, 260, ntpath.basename(state['path']),
+                                         wide)
+            return self.S_OK if state['path'] else self.S_FALSE
+        if method == 'SetPath':
+            state['path'] = self._read_text(args[1], wide) if args[1] else ''
+            state['dirty'] = True
+            return self.S_OK
+        if method == 'GetIDList':
+            if not args[1]:
+                return self.E_POINTER
+            pidl = self._make_pidl(state['path']) if state['path'] else 0
+            self._mem_write(args[1], struct.pack('<I', pidl))
+            return self.S_OK if pidl else self.S_FALSE
+        if method == 'SetIDList':
+            path = self.pidls.get(args[1])
+            if path is None:
+                return self.E_INVALIDARG
+            state['path'], state['dirty'] = path, True
+            return self.S_OK
+        if method == 'GetHotkey':
+            return self.S_OK if self._mem_write(args[1], struct.pack(
+                '<H', state['hotkey'])) else self.E_POINTER
+        if method == 'SetHotkey':
+            state['hotkey'], state['dirty'] = args[1] & 0xFFFF, True
+            return self.S_OK
+        if method == 'GetShowCmd':
+            return self.S_OK if self._mem_write(args[1], struct.pack(
+                '<i', state['show'])) else self.E_POINTER
+        if method == 'SetShowCmd':
+            state['show'], state['dirty'] = args[1], True
+            return self.S_OK
+        if method == 'GetIconLocation':
+            if not self._com_write_text(args[1], args[2], state['icon'], wide):
+                return self.E_INVALIDARG
+            self._mem_write(args[3], struct.pack('<i', state['icon_index']))
+            return self.S_OK
+        if method == 'SetIconLocation':
+            state['icon'] = self._read_text(args[1], wide) if args[1] else ''
+            state['icon_index'] = struct.unpack('<i', struct.pack('<I', args[2]))[0]
+            state['dirty'] = True
+            return self.S_OK
+        if method == 'SetRelativePath':
+            state['relative'] = self._read_text(args[1], wide) if args[1] else ''
+            state['dirty'] = True
+            return self.S_OK
+        return self.S_OK  # Resolve: the target is not searched for
+
+    def _shell_link_data(self, state):
+        """Shell link (.lnk, MS-SHLLINK) file contents: header, LinkInfo with the
+        local target path, string data"""
+        flags = 0x2 | 0x80  # HasLinkInfo | IsUnicode
+        strings = b''
+        for flag, text in ((0x4, state['description']), (0x8, state['relative']),
+                           (0x10, state['workdir']), (0x20, state['arguments']),
+                           (0x40, state['icon'])):
+            if text:
+                flags |= flag
+                data = text.encode('utf-16-le')
+                strings += struct.pack('<H', len(data) // 2) + data
+        target = self.full_windows_path(state['path']) or state['path']
+        host = self.resolve_c_drive_path(target) if target else None
+        attributes, size, filetime = 0, 0, 0
+        if host and os.path.exists(host):
+            info = os.stat(host)
+            attributes = 0x10 if os.path.isdir(host) else 0x20
+            size = info.st_size & 0xFFFFFFFF if not os.path.isdir(host) else 0
+            filetime = int((info.st_mtime + 11644473600) * 10000000)
+        header = struct.pack('<I16sIIQQQIiIHHII', 0x4C, self._guid_bytes(self.CLSID_SHELLLINK),
+                             flags, attributes, filetime, filetime, filetime, size,
+                             state['icon_index'], state['show'], state['hotkey'], 0, 0, 0)
+        volume = struct.pack('<IIII', 0x11, 3, 0x1E3A5C07, 0x10) + b'\x00'  # DRIVE_FIXED
+        base = target.encode(ANSI_CODEPAGE, errors='replace') + b'\x00'
+        link_info = struct.pack('<7I', 0x1C + len(volume) + len(base) + 1, 0x1C, 1, 0x1C,
+                                0x1C + len(volume), 0, 0x1C + len(volume) + len(base))
+        link_info += volume + base + b'\x00'
+        return header + link_info + strings + b'\x00' * 4
+
+    def _load_shell_link(self, state, data):
+        """Fill a shell link's state from .lnk file contents; False if not one"""
+        try:
+            if struct.unpack_from('<I', data, 0)[0] != 0x4C:
+                return False
+            flags = struct.unpack_from('<I', data, 20)[0]
+            icon_index, show, hotkey = struct.unpack_from('<iIH', data, 56)
+            pos = 0x4C
+            if flags & 0x1:  # HasLinkTargetIDList
+                pos += 2 + struct.unpack_from('<H', data, pos)[0]
+            path = ''
+            if flags & 0x2:  # HasLinkInfo
+                size, header_size, info_flags = struct.unpack_from('<III', data, pos)
+                base_offset, _, suffix_offset = struct.unpack_from('<III', data, pos + 16)
+
+                def cstring(offset, wide=False):
+                    unit = 2 if wide else 1
+                    end = offset
+                    while data[end:end + unit] != b'\x00' * unit:
+                        end += unit
+                    return data[offset:end].decode('utf-16-le' if wide else ANSI_CODEPAGE,
+                                                   errors='replace')
+                if info_flags & 1:  # VolumeIDAndLocalBasePath
+                    if header_size >= 0x24:
+                        unicode_base = struct.unpack_from('<I', data, pos + 28)[0]
+                        path = cstring(pos + unicode_base, wide=True)
+                    else:
+                        path = cstring(pos + base_offset)
+                    path += cstring(pos + suffix_offset)
+                pos += size
+            texts = {}
+            for flag, field in ((0x4, 'description'), (0x8, 'relative'), (0x10, 'workdir'),
+                                (0x20, 'arguments'), (0x40, 'icon')):
+                if flags & flag:
+                    count = struct.unpack_from('<H', data, pos)[0]
+                    unit = 2 if flags & 0x80 else 1
+                    raw = data[pos + 2:pos + 2 + count * unit]
+                    texts[field] = raw.decode('utf-16-le' if unit == 2 else ANSI_CODEPAGE,
+                                              errors='replace')
+                    pos += 2 + count * unit
+        except (struct.error, IndexError):
+            return False
+        state.update({'path': path, 'description': '', 'relative': '', 'workdir': '',
+                      'arguments': '', 'icon': ''})
+        state.update(texts)
+        state.update({'icon_index': icon_index, 'show': show, 'hotkey': hotkey,
+                      'dirty': False})
+        return True
+
+    def _com_persist_file(self, method, wide, args):
+        """IPersistFile methods (file names are always UTF-16)"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        if method == 'GetClassID':
+            return self.S_OK if self._mem_write(args[1], self._guid_bytes(
+                self.CLSID_SHELLLINK)) else self.E_POINTER
+        if method == 'IsDirty':
+            return self.S_OK if state['dirty'] else self.S_FALSE
+        if method == 'SaveCompleted':
+            return self.S_OK
+        if method == 'GetCurFile':
+            name = state['file'] or '*.lnk'
+            address = self._alloc_units(self._text_units(name, True), True)
+            self._mem_write(args[1], struct.pack('<I', address))
+            return self.S_OK if state['file'] else self.S_FALSE
+        filename = self.read_wide_string(args[1]) if args[1] else state['file']
+        if not filename:
+            return self.E_INVALIDARG
+        path = self.resolve_c_drive_path(filename)
+        if path is None:
+            return 0x80070005  # E_ACCESSDENIED
+        if method == 'Load':
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except FileNotFoundError:
+                return 0x80070002  # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+            except OSError:
+                return 0x80070005
+            if not self._load_shell_link(state, data):
+                return self.E_FAIL
+            state['file'] = filename
+            log.debug(f"IPersistFile::Load(\"{filename}\") -> \"{state['path']}\"")
+            return self.S_OK
+        # Save
+        try:
+            with open(path, 'wb') as f:
+                f.write(self._shell_link_data(state))
+        except FileNotFoundError:
+            return 0x80070003  # HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)
+        except OSError:
+            return 0x80070005
+        log.info(f"Shell link saved: \"{filename}\" -> \"{state['path']}\"")
+        if args[2] or not state['file']:  # fRemember
+            state['file'] = filename
+        state['dirty'] = False
+        return self.S_OK
     
     # MSVCRT.DLL APIs
     def _ensure_fmode_addr(self):
@@ -10197,6 +11256,13 @@ class WinAPIHandler:
             self._commode_addr = self.emu.heap_alloc(4)
             self.emu.uc.mem_write(self._commode_addr, struct.pack('<I', 0))  # Default commit mode
         return self._commode_addr
+
+    def _ensure_adjust_fdiv_addr(self):
+        """Memory of the _adjust_fdiv variable: 0, no Pentium FDIV bug workaround"""
+        if not self._crt_static.get('_adjust_fdiv'):
+            self._crt_static['_adjust_fdiv'] = self.emu.heap_alloc(4)
+            self._mem_write(self._crt_static['_adjust_fdiv'], struct.pack('<I', 0))
+        return self._crt_static['_adjust_fdiv']
     
     def api__p__fmode(self, args):
         """__p__fmode emulation - Returns address of _fmode variable"""
@@ -14322,6 +15388,10 @@ class FakeControl:
         self.parts = [-1]
         self.part_texts = {}
         self.simple = False
+        # Progress bar (PROGRESSBAR class): range/position use scroll_min/max/pos
+        self.progress_step = 10
+        self.progress_bar_color = None  # (r, g, b) of PBM_SETBARCOLOR, None: default
+        self.progress_bk_color = None   # (r, g, b) of PBM_SETBKCOLOR, None: default
 
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
@@ -15749,25 +16819,63 @@ class PseudoWindowsGUI:
                 self.screen.set_clip(prev_clip)
             left = right
 
+    def _draw_progressbar(self, control, abs_x, abs_y):
+        """Progress bar (msctls_progress32): sunken box filled up to the position,
+        with blocks unless PBS_SMOOTH; PBS_VERTICAL fills from the bottom"""
+        rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
+        pygame.draw.rect(self.screen, control.progress_bk_color or self.COLOR_BUTTON, rect)
+        dark, light = (128, 128, 128), (255, 255, 255)
+        pygame.draw.line(self.screen, dark, rect.topleft, (rect.right - 1, rect.top))
+        pygame.draw.line(self.screen, dark, rect.topleft, (rect.left, rect.bottom - 1))
+        pygame.draw.line(self.screen, light, (rect.left, rect.bottom - 1),
+                         (rect.right - 1, rect.bottom - 1))
+        pygame.draw.line(self.screen, light, (rect.right - 1, rect.top),
+                         (rect.right - 1, rect.bottom - 1))
+        inner = rect.inflate(-4, -4)
+        span = control.scroll_max - control.scroll_min
+        if inner.width <= 0 or inner.height <= 0 or span <= 0:
+            return
+        fraction = min(1.0, max(0.0, (control.scroll_pos - control.scroll_min) / span))
+        vertical = bool(control.style & 0x4)  # PBS_VERTICAL
+        length = round((inner.height if vertical else inner.width) * fraction)
+        color = control.progress_bar_color or (0, 0, 128)
+        if control.style & 0x1:  # PBS_SMOOTH
+            blocks = [(0, length)]
+        else:
+            size = max(2, ((inner.width if vertical else inner.height) * 2) // 3)
+            blocks = [(start, min(size, length - start))
+                      for start in range(0, length, size + 2)]
+        for start, extent in blocks:
+            if vertical:
+                block = pygame.Rect(inner.left, inner.bottom - start - extent,
+                                    inner.width, extent)
+            else:
+                block = pygame.Rect(inner.left + start, inner.top, extent, inner.height)
+            pygame.draw.rect(self.screen, color, block)
+
     def _draw_control_body(self, control, abs_x, abs_y):
         if control.class_name == "STATUSBAR":
             self._draw_statusbar(control, abs_x, abs_y)
         elif control.class_name == "BUTTON":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
+            # "&x" marks the mnemonic (underlined on Windows), "&&" is a literal "&"
+            label = re.sub(r'&(.)', r'\1', control.text)
             if (control.style & 0xF) == 7:  # BS_GROUPBOX
                 self._draw_group_box(control, rect)
             elif (control.style & 0xF) == 1:  # BS_DEFPUSHBUTTON: black outer frame
-                self._draw_button_3d(rect.inflate(-2, -2), control.text)
+                self._draw_button_3d(rect.inflate(-2, -2), label,
+                                     disabled=not control.enabled)
                 pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
             else:
-                self._draw_button_3d(rect, control.text)
+                self._draw_button_3d(rect, label, disabled=not control.enabled)
             
         elif control.class_name == "STATIC":
             self._draw_static(control, pygame.Rect(abs_x, abs_y, control.width, control.height))
             
         elif control.class_name == "EDIT":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
+            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled
+                             else self.COLOR_BUTTON, rect)
             border_color = (0, 0, 128) if control.hwnd == self.focused_control else (128, 128, 128)
             pygame.draw.rect(self.screen, border_color, rect, 1)
             # Sunken effect
@@ -15782,7 +16890,8 @@ class PseudoWindowsGUI:
 
             prev_clip = self.screen.get_clip()
             self.screen.set_clip(rect)
-            text = self.font.render(text_str, True, self.COLOR_TEXT)
+            text = self.font.render(text_str, True, self.COLOR_TEXT if control.enabled
+                                    else (128, 128, 128))
             text_y = abs_y + (control.height - text.get_height()) // 2
             self.screen.blit(text, (abs_x + 4, text_y))
 
@@ -15861,13 +16970,7 @@ class PseudoWindowsGUI:
             self.screen.blit(text, (abs_x + 18, abs_y))
             
         elif control.class_name == "PROGRESSBAR":
-            rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
-            pygame.draw.rect(self.screen, (128, 128, 128), rect, 1)
-            # Progress fill (example 50%)
-            fill_width = int(control.width * 0.5)
-            fill_rect = pygame.Rect(abs_x + 1, abs_y + 1, fill_width - 2, control.height - 2)
-            pygame.draw.rect(self.screen, (0, 128, 0), fill_rect)
+            self._draw_progressbar(control, abs_x, abs_y)
 
         elif control.class_name == "SCROLLBAR":
             m = self._scrollbar_metrics(control, abs_x, abs_y)
@@ -15902,7 +17005,8 @@ class PseudoWindowsGUI:
             pygame.draw.rect(self.screen, self.COLOR_BUTTON, label)
             self.screen.blit(text, (label.x + 2, label.y))
 
-    def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None, bold=False):
+    def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None, bold=False,
+                        disabled=False):
         """Draw 3D-style button.
 
         When ``arrow`` is one of 'up'/'down'/'left'/'right', a filled triangle
@@ -15937,7 +17041,12 @@ class PseudoWindowsGUI:
         # Text
         font = (self.font_small_bold if bold else self.font_small) if small else (
             self.font_bold if bold else self.font)
-        text_surface = font.render(text, True, self.COLOR_TEXT)
+        if disabled:
+            # Embossed gray text (COLOR_GRAYTEXT with a white shadow)
+            shadow = font.render(text, True, self.COLOR_BUTTON_BORDER_LIGHT)
+            self.screen.blit(shadow, shadow.get_rect(center=(rect.centerx + 1,
+                                                            rect.centery + 1)))
+        text_surface = font.render(text, True, (128, 128, 128) if disabled else self.COLOR_TEXT)
         text_rect = text_surface.get_rect(center=rect.center)
         self.screen.blit(text_surface, text_rect)
 

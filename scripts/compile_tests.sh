@@ -49,8 +49,8 @@ for src in tests/*.c; do
             LIBS="-lkernel32 -luser32 -ladvapi32 -mconsole"
             ;;
         api_test)
-            # Console application - kernel32/user32/gdi32/advapi32 API tests
-            LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -mconsole"
+            # Console application - kernel32/user32/gdi32/advapi32/shell32/ole32 API tests
+            LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lole32 -luuid -mconsole"
             ;;
         *)
             # Default: console application - C runtime (msvcrt) and kernel32

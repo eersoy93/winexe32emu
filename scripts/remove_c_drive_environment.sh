@@ -50,7 +50,8 @@ done
 sh scripts/remove_tests.sh >/dev/null || exit 1
 
 # Deepest folders first; rmdir only removes empty ones
-for dir in Windows/Temp Windows/System32 Windows ""; do
+for dir in Windows/Temp Windows/System32 "Windows/Start Menu/Programs" "Windows/Start Menu" \
+           Windows "Program Files" ""; do
     rmdir "${C_DRIVE}/${dir}" 2>/dev/null
 done
 

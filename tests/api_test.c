@@ -17,11 +17,13 @@ limitations under the License.
 /*
 API test - exercises kernel32 directory search, current directory,
 INI file, string and environment APIs, user32 character and window APIs,
-gdi32 DC attribute APIs and the advapi32 registry.
+gdi32 DC attribute APIs, the advapi32 registry and access tokens, kernel32
+MoveFileEx/FormatMessage, shell32 special folders and ole32 shell links.
 Every check prints PASS or FAIL; the exit code is the failure count.
 */
 
 #include <windows.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -118,8 +120,17 @@ static void test_files(void)
           "SetCurrentDirectoryA to a missing folder fails");
     check(!SetCurrentDirectoryA("..\\.."), "SetCurrentDirectoryA cannot leave c_drive");
 
-    DeleteFileA("a.txt");
-    DeleteFileA(tmp);
+    check(MoveFileExA("a.txt", "b.txt", 0) &&
+          GetFileAttributesA("a.txt") == INVALID_FILE_ATTRIBUTES, "MoveFileExA (rename)");
+    check(!MoveFileExA(tmp, "b.txt", 0) && GetLastError() == ERROR_ALREADY_EXISTS,
+          "MoveFileExA refuses an existing target");
+    check(MoveFileExA(tmp, "b.txt", MOVEFILE_REPLACE_EXISTING) &&
+          GetFileAttributesA(tmp) == INVALID_FILE_ATTRIBUTES, "MoveFileExA (replace)");
+    check(MoveFileExA("b.txt", NULL, MOVEFILE_DELAY_UNTIL_REBOOT) &&
+          GetFileAttributesA("b.txt") != INVALID_FILE_ATTRIBUTES,
+          "MoveFileExA (delete after restart) keeps the file now");
+
+    DeleteFileA("b.txt");
     check(SetCurrentDirectoryW(L"C:\\"), "SetCurrentDirectoryW back to C:\\");
     check(RemoveDirectoryA("ApiTest"), "Test folder removed");
 }
@@ -343,6 +354,75 @@ static void test_registry(void)
           ERROR_FILE_NOT_FOUND, "Deleted key is gone");
 }
 
+static void test_shell(void)
+{
+    char buf[MAX_PATH], *msg = NULL;
+    DWORD_PTR inserts[2] = {3, (DWORD_PTR)"C:"};
+    IShellLinkA *link = NULL;
+    IPersistFile *file = NULL;
+    HANDLE token;
+    TOKEN_PRIVILEGES tp;
+    HRESULT hr;
+
+    printf("\n--- kernel32/shell32/ole32/advapi32: messages, folders, shell links ---\n");
+    check(FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                         FORMAT_MESSAGE_IGNORE_INSERTS, NULL, ERROR_FILE_NOT_FOUND, 0,
+                         (LPSTR)&msg, 0, NULL) > 0 && msg &&
+          strcmp(msg, "The system cannot find the file specified.\r\n") == 0,
+          "FormatMessageA (system message, allocated buffer)");
+    LocalFree(msg);
+    check(FormatMessageA(FORMAT_MESSAGE_FROM_STRING | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                         "%1!d! files in %2%%", 0, 0, buf, sizeof(buf), (va_list *)inserts) &&
+          strcmp(buf, "3 files in C:%") == 0, "FormatMessageA (string with inserts)");
+
+    check(SHGetFolderPathA(NULL, CSIDL_PROGRAM_FILES, NULL, 0, buf) == S_OK &&
+          strcmp(buf, "C:\\Program Files") == 0, "SHGetFolderPathA (Program Files)");
+    check(SHGetFolderPathA(NULL, CSIDL_PROGRAMS, NULL, 0, buf) == S_OK &&
+          GetFileAttributesA(buf) & FILE_ATTRIBUTE_DIRECTORY, "SHGetFolderPathA (Programs exists)");
+
+    CoInitialize(NULL);
+    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkA,
+                          (void **)&link);
+    check(SUCCEEDED(hr) && link, "CoCreateInstance (ShellLink)");
+    if (link) {
+        link->lpVtbl->SetPath(link, "C:\\Windows\\filemanager.exe");
+        link->lpVtbl->SetArguments(link, "/x");
+        hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&file);
+        check(SUCCEEDED(hr) && file->lpVtbl->Save(file, L"C:\\api_test.lnk", TRUE) == S_OK,
+              "IPersistFile::Save");
+        file->lpVtbl->Release(file);
+        link->lpVtbl->Release(link);
+    }
+    link = NULL;
+    CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkA,
+                     (void **)&link);
+    if (link && SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPersistFile,
+                                                        (void **)&file))) {
+        char args[16] = "";
+        check(file->lpVtbl->Load(file, L"C:\\api_test.lnk", STGM_READ) == S_OK &&
+              link->lpVtbl->GetPath(link, buf, sizeof(buf), NULL, 0) == S_OK &&
+              strcmp(buf, "C:\\Windows\\filemanager.exe") == 0 &&
+              link->lpVtbl->GetArguments(link, args, sizeof(args)) == S_OK &&
+              strcmp(args, "/x") == 0, "IPersistFile::Load reads the saved link");
+        file->lpVtbl->Release(file);
+    }
+    if (link)
+        link->lpVtbl->Release(link);
+    DeleteFileA("C:\\api_test.lnk");
+    CoUninitialize();
+
+    check(OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token),
+          "OpenProcessToken");
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    check(LookupPrivilegeValueA(NULL, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid) &&
+          tp.Privileges[0].Luid.LowPart == 19, "LookupPrivilegeValueA (SeShutdownPrivilege)");
+    SetLastError(1);
+    check(AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL) &&
+          GetLastError() == ERROR_SUCCESS, "AdjustTokenPrivileges");
+    CloseHandle(token);
+}
+
 int main(void)
 {
     printf("=== API test ===\n");
@@ -352,6 +432,7 @@ int main(void)
     test_user32();
     test_gdi32();
     test_registry();
+    test_shell();
     printf("\n== %d failure(s) ==\n", failures);
     return failures;
 }
