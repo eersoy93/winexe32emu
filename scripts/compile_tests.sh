@@ -28,6 +28,25 @@ failed=0
 # Compile each test program with appropriate flags
 for src in tests/*.c; do
     name=$(basename "$src" .c)
+
+    case "$name" in
+        *_dll)
+            # DLL of a test program (NAME_dll.c): next to NAME.exe. Its preferred
+            # base is in the emulator's heap (like 7z.dll), so it gets relocated.
+            OUT_DIR="${TESTS_DIR}/${name%_dll}"
+            mkdir -p "$OUT_DIR" || exit 1
+            # shellcheck disable=SC2086
+            if i686-w64-mingw32-gcc $CFLAGS -shared -Wl,--image-base,0x10000000 \
+                    -o "${OUT_DIR}/${name}.dll" "$src" -lkernel32; then
+                echo "OK: ${name}.dll"
+            else
+                echo "ERROR: ${name}.dll compilation failed!"
+                failed=$((failed + 1))
+            fi
+            continue
+            ;;
+    esac
+
     OUT_DIR="${TESTS_DIR}/${name}"
     mkdir -p "$OUT_DIR" || exit 1
 
@@ -48,9 +67,13 @@ for src in tests/*.c; do
             # Console application - system information APIs
             LIBS="-lkernel32 -luser32 -ladvapi32 -mconsole"
             ;;
+        thread_test)
+            # Console application - threads, synchronization, file mappings, DLL loading
+            LIBS="-lkernel32 -mconsole"
+            ;;
         api_test)
-            # Console application - kernel32/user32/gdi32/advapi32/shell32/ole32 API tests
-            LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lole32 -luuid -mconsole"
+            # Console application - kernel32/user32/gdi32/advapi32/shell32/ole32/oleaut32 API tests
+            LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid -mconsole"
             ;;
         *)
             # Default: console application - C runtime (msvcrt) and kernel32

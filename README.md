@@ -27,14 +27,14 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 ## Folder Structure
 
 - `apps/` - App C source codes, one folder per app (`apps/filemanager/` - File manager)
-- `c_drive/` - Put your EXE files here (emulation path, `C:\`) and run them with the file manager or the command line; the desktop and the Start menu show the file manager and the shortcuts and programs of the Desktop and Start Menu folders (`C:\Users\User`, `C:\Users\Public`, `C:\ProgramData`)
+- `c_drive/` - Put your EXE files here (emulation path, `C:\`) and run them with the file manager or the command line.
 - `scripts/compile_apps.sh` - Script to compile the apps into `c_drive/Windows/` (run at every start)
 - `scripts/compile_tests.sh` - Script to compile the test programs into `c_drive/Windows/Tests/`
 - `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
 - `scripts/remove_c_drive_environment.sh` - Script to remove the compiled apps, the compiled test programs and the empty `c_drive/` folders
 - `scripts/remove_tests.sh` - Script to remove the compiled test programs
 - `scripts/run_tests.sh` - Script to compile the test programs and run each one in the emulator without the GUI (exit code: number of failed tests)
-- `tests/` - Test program C source codes
+- `tests/` - Test program C source codes (`NAME_dll.c` is compiled into a DLL next to `NAME.exe`)
 - `winexe32emu.py` - The main script
 
 ## Features
@@ -42,7 +42,8 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - PE file loading and analysis
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
-- Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt, shell32, ole32, comctl32, comdlg32)
+- Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt, shell32, ole32, oleaut32, comctl32, comdlg32)
+- Loading the programs' own DLLs (relocation, imports, exports, `DllMain`)
 - Fake C drive environment support
 
 ## Versioning

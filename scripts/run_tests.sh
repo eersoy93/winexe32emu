@@ -56,6 +56,7 @@ run_test file_test "was blocked! Good!"
 run_test sysinfo_test "Escape attempt (copy)   : 0, error 5"
 run_test console_test "Hello, Tester!" "Tester"
 run_test sound_test "Done!"
+run_test thread_test "== 0 failure(s) =="
 
 echo "== ${passed} passed, ${failed} failed =="
 exit "$failed"

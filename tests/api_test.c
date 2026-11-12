@@ -18,7 +18,8 @@ limitations under the License.
 API test - exercises kernel32 directory search, current directory,
 INI file, string and environment APIs, user32 character and window APIs,
 gdi32 DC attribute APIs, the advapi32 registry and access tokens, kernel32
-MoveFileEx/FormatMessage, shell32 special folders and ole32 shell links.
+MoveFileEx/FormatMessage, shell32 special folders, ole32 shell links,
+oleaut32 BSTR/VARIANT and kernel32 DOS date/time conversions.
 Every check prints PASS or FAIL; the exit code is the failure count.
 */
 
@@ -445,6 +446,39 @@ static void test_shell(void)
     CloseHandle(token);
 }
 
+static void test_oleaut(void)
+{
+    BSTR text = SysAllocString(L"7-Zip");
+    BSTR part = SysAllocStringLen(L"abcdef", 3);
+    VARIANT a, b;
+    FILETIME ft, back;
+    WORD dos_date, dos_time;
+    SYSTEMTIME st = {2024, 2, 0, 29, 13, 45, 30, 0};
+
+    check(text && SysStringLen(text) == 5 && SysStringByteLen(text) == 10 &&
+          lstrcmpW(text, L"7-Zip") == 0, "SysAllocString / SysStringLen");
+    check(part && SysStringLen(part) == 3 && lstrcmpW(part, L"abc") == 0, "SysAllocStringLen");
+    VariantInit(&a);
+    VariantInit(&b);
+    a.vt = VT_BSTR;
+    a.bstrVal = text;
+    check(VariantCopy(&b, &a) == S_OK && b.vt == VT_BSTR && b.bstrVal != text &&
+          lstrcmpW(b.bstrVal, L"7-Zip") == 0, "VariantCopy duplicates a BSTR");
+    check(VariantClear(&b) == S_OK && b.vt == VT_EMPTY, "VariantClear");
+    VariantClear(&a);
+    SysFreeString(part);
+
+    SystemTimeToFileTime(&st, &ft);
+    check(FileTimeToDosDateTime(&ft, &dos_date, &dos_time) &&
+          dos_date == (((2024 - 1980) << 9) | (2 << 5) | 29) &&
+          dos_time == ((13 << 11) | (45 << 5) | 15), "FileTimeToDosDateTime");
+    check(DosDateTimeToFileTime(dos_date, dos_time, &back) && CompareFileTime(&ft, &back) == 0,
+          "DosDateTimeToFileTime / CompareFileTime");
+    back.dwLowDateTime += 1;
+    check(CompareFileTime(&ft, &back) == -1 && CompareFileTime(&back, &ft) == 1,
+          "CompareFileTime order");
+}
+
 int main(void)
 {
     printf("=== API test ===\n");
@@ -455,6 +489,7 @@ int main(void)
     test_gdi32();
     test_registry();
     test_shell();
+    test_oleaut();
     printf("\n== %d failure(s) ==\n", failures);
     return failures;
 }
