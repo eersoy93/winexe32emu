@@ -824,6 +824,131 @@ def _icon_image_rgba(data):
     return width, height, bytes(rgba)
 
 
+# Built-in standard cursors (IDC_*) of the fake desktop, drawn like the classic
+# Windows ones: 'X' black, 'O' white, '.' transparent
+_ARROW_CURSOR = (
+    "X...........", "XX..........", "XOX.........", "XOOX........", "XOOOX.......",
+    "XOOOOX......", "XOOOOOX.....", "XOOOOOOX....", "XOOOOOOOX...", "XOOOOOOOOX..",
+    "XOOOOOOOOOX.", "XOOOOOOXXXXX", "XOOOXOOX....", "XOOXXOOX....", "XOX..XOOX...",
+    "XX...XOOX...", "X.....XOOX..", "......XOOX..", ".......XX...")
+_HOURGLASS = (
+    "XXXXXXXXXXXXX", "XOOOOOOOOOOOX", "XXXXXXXXXXXXX", ".XOOOOOOOOOX.", ".XOOOOOOOOOX.",
+    ".XOXOXOXOXOX.", ".XOOXOXOXOOX.", "..XOOXOXOOX..", "...XOOXOOX...", "....XOOOX....",
+    ".....XOX.....", ".....XOX.....", "....XOOOX....", "...XOOXOOX...", "..XOOOOOOOX..",
+    ".XOOOOXOOOOX.", ".XOOOXOXOOOX.", ".XOOXOXOXOOX.", ".XOXOXOXOXOX.", "XXXXXXXXXXXXX",
+    "XOOOOOOOOOOOX", "XXXXXXXXXXXXX")
+_SMALL_HOURGLASS = (
+    "XXXXXXX", "XOOOOOX", ".XOXOX.", "..XOX..", "..XOX..", ".XOOOX.", "XOXOXOX", "XXXXXXX")
+_QUESTION_MARK = (
+    ".XXXXX.", "XOOOOOX", "XOXXXOX", "XXX.XOX", "..XXOOX", "..XOOX.", "..XOX..",
+    "..XXX..", "..XOX..", "..XXX..")
+_IBEAM_CURSOR = (
+    "OOOO.OOOO", "OXXXOXXXO", "OOOOXOOOO") + ("...OXO...",) * 11 + (
+    "OOOOXOOOO", "OXXXOXXXO", "OOOO.OOOO")
+_HAND_CURSOR = (
+    ".....XX.........", "....XOOX........", "....XOOX........", "....XOOX........",
+    "....XOOX........", "....XOOXXX......", "....XOOXOOXXX...", "....XOOXOOXOOXX.",
+    ".XX.XOOXOOXOOXOX", "XOOXXOOOOOOOOXOX", "XOOOXOOOOOOOOOOX", ".XOOXOOOOOOOOOOX",
+    "..XOOOOOOOOOOOOX", "..XOOOOOOOOOOOX.", "...XOOOOOOOOOOX.", "...XOOOOOOOOOX..",
+    "....XOOOOOOOOX..", "....XOOOOOOOOX..", "....XXXXXXXXXX..")
+_UPARROW_CURSOR = (
+    ".....X.....", "....XOX....", "...XOOOX...", "..XOOOOOX..", ".XOOOOOOOX.",
+    "XOOOOOOOOOX", "XXXXOOOXXXX") + ("...XOOOX...",) * 10 + ("...XXXXX...",)
+
+
+def _cursor_core_art(core, width, height, outline='X', fill='O'):
+    """Art rows of a shape: core pixels in fill, their 8 neighbors in outline"""
+    grid = [['.'] * width for _ in range(height)]
+    for x, y in core:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if 0 <= x + dx < width and 0 <= y + dy < height:
+                    grid[y + dy][x + dx] = outline
+    for x, y in core:
+        grid[y][x] = fill
+    return tuple(''.join(row) for row in grid)
+
+
+def _size_ns_core(cx, top, length, head=5):
+    """Core of a vertical double-headed arrow centered on column cx"""
+    core = set()
+    for i in range(head):  # Arrowheads
+        for x in range(cx - i, cx + i + 1):
+            core.add((x, top + i))
+            core.add((x, top + length - 1 - i))
+    core.update((cx, y) for y in range(top, top + length))
+    return core
+
+
+def _overlay_art(*layers):
+    """Art of layers [(rows, (x, y))] drawn in order; '.' lets lower ones show"""
+    width = max(x + len(rows[0]) for rows, (x, y) in layers)
+    height = max(y + len(rows) for rows, (x, y) in layers)
+    grid = [['.'] * width for _ in range(height)]
+    for rows, (ox, oy) in layers:
+        for y, row in enumerate(rows):
+            for x, char in enumerate(row):
+                if char != '.':
+                    grid[oy + y][ox + x] = char
+    return tuple(''.join(row) for row in grid)
+
+
+def _standard_cursor_art():
+    """IDC_* -> (art rows, hotspot)"""
+    ns = _size_ns_core(5, 1, 19)
+    nwse = ({(x, y) for x in range(1, 7) for y in range(1, 7) if x + y <= 7} |
+            {(x, y) for x in range(9, 15) for y in range(9, 15) if x + y >= 23} |
+            {(i, i) for i in range(1, 15)})
+    cross = ({(x, 9) for x in range(1, 18)} | {(9, y) for y in range(1, 18)})
+    no_core = set()
+    for y in range(20):
+        for x in range(20):
+            dist = math.hypot(x - 9.5, y - 9.5)
+            if 6.0 <= dist <= 8.6 or (dist < 8.6 and abs(x - y) <= 1):
+                no_core.add((x, y))
+    size_all = (_size_ns_core(11, 1, 21, head=4) |
+                {(y, x) for x, y in _size_ns_core(11, 1, 21, head=4)})
+    arts = {
+        32512: (_ARROW_CURSOR, (0, 0)),                                        # IDC_ARROW
+        32513: (_IBEAM_CURSOR, (4, 8)),                                        # IDC_IBEAM
+        32514: (_HOURGLASS, (6, 11)),                                          # IDC_WAIT
+        32515: (_cursor_core_art(cross, 19, 19, 'O', 'X'), (9, 9)),            # IDC_CROSS
+        32516: (_UPARROW_CURSOR, (5, 0)),                                      # IDC_UPARROW
+        32642: (_cursor_core_art(nwse, 16, 16), (8, 8)),                       # IDC_SIZENWSE
+        32643: (_cursor_core_art({(15 - x, y) for x, y in nwse}, 16, 16), (7, 8)),
+        32644: (_cursor_core_art({(y, x) for x, y in ns}, 21, 11), (10, 5)),  # IDC_SIZEWE
+        32645: (_cursor_core_art(ns, 11, 21), (5, 10)),                       # IDC_SIZENS
+        32646: (_cursor_core_art(size_all, 23, 23), (11, 11)),                # IDC_SIZEALL
+        32648: (_cursor_core_art(no_core, 20, 20, 'O', 'X'), (10, 10)),       # IDC_NO
+        32649: (_HAND_CURSOR, (5, 0)),                                         # IDC_HAND
+        32650: (_overlay_art((_ARROW_CURSOR, (0, 0)), (_SMALL_HOURGLASS, (11, 11))),
+                (0, 0)),                                                       # IDC_APPSTARTING
+        32651: (_overlay_art((_ARROW_CURSOR, (0, 0)), (_QUESTION_MARK, (12, 9))),
+                (0, 0)),                                                       # IDC_HELP
+    }
+    arts[32640] = arts[32646]  # IDC_SIZE
+    arts[32641] = arts[32512]  # IDC_ICON
+    return arts
+
+
+_standard_cursors = {}
+
+
+def standard_cursor_image(cursor_id):
+    """Cursor dict ({'hotspot', 'size', 'rgba'}) of a built-in standard cursor
+    (the arrow for unknown IDC_* values)"""
+    image = _standard_cursors.get(cursor_id)
+    if image is None:
+        arts = _standard_cursor_art()
+        rows, hotspot = arts.get(cursor_id, arts[32512])
+        width, height = len(rows[0]), len(rows)
+        colors = {'X': b'\x00\x00\x00\xff', 'O': b'\xff\xff\xff\xff', '.': b'\x00\x00\x00\x00'}
+        rgba = b''.join(colors[char] for row in rows for char in row.ljust(width, '.'))
+        image = {'hotspot': hotspot, 'size': (width, height), 'rgba': rgba}
+        _standard_cursors[cursor_id] = image
+    return image
+
+
 def read_exe_icon(host_path, size=32):
     """(width, height, RGBA bytes) of the EXE's main icon (its first icon group),
     the image closest to size x size with the most colors; None if it has none"""
@@ -17474,14 +17599,10 @@ class PseudoWindowsGUI:
 
         win.x, win.y, win.width, win.height = new_x, new_y, new_w, new_h
 
-    RESIZE_CURSORS = {"left": "SIZEWE", "right": "SIZEWE", "top": "SIZENS",
-                      "bottom": "SIZENS", "topleft": "SIZENWSE", "bottomright": "SIZENWSE",
-                      "topright": "SIZENESW", "bottomleft": "SIZENESW"}
-
-    # Standard cursors (IDC_*) -> pygame system cursor names
-    SYSTEM_CURSORS = {32513: "IBEAM", 32514: "WAIT", 32515: "CROSSHAIR", 32642: "SIZENWSE",
-                      32643: "SIZENESW", 32644: "SIZEWE", 32645: "SIZENS", 32646: "SIZEALL",
-                      32640: "SIZEALL", 32648: "NO", 32649: "HAND", 32650: "WAITARROW"}
+    # Window edge -> standard cursor (IDC_SIZEWE, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZENESW)
+    RESIZE_CURSORS = {"left": 32644, "right": 32644, "top": 32645, "bottom": 32645,
+                      "topleft": 32642, "bottomright": 32642, "topright": 32643,
+                      "bottomleft": 32643}
 
     def _program_cursor(self, pos):
         """Cursor a program shows at pos: (True, cursor dict or None if hidden),
@@ -17507,7 +17628,8 @@ class PseudoWindowsGUI:
     def _update_mouse_cursor(self):
         """Show the cursor of the mouse position (every frame): a resize arrow
         on window edges, the program's cursor (SetCursor, class cursor,
-        ShowCursor) over its client area, else the arrow"""
+        ShowCursor) over its client area, else the arrow. Standard cursors are
+        the built-in ones (standard_cursor_image), not the host's."""
         pos = self.mouse_pos
         edge = self.resize_edge if self.resizing_window else None
         if edge is None and not (self.dragging_window or self.dragging_scrollbar):
@@ -17518,27 +17640,22 @@ class PseudoWindowsGUI:
                     break
         cursor = None
         if edge:
-            key = ('system', self.RESIZE_CURSORS[edge])
+            cursor = standard_cursor_image(self.RESIZE_CURSORS[edge])
         else:
             program, cursor = (self._program_cursor(pos)
                                if not (self.dragging_window or self.dragging_scrollbar)
                                else (False, None))
             if not program:
-                key = ('system', "ARROW")
-            elif cursor is None:
-                key = ('hidden',)
-            elif 'system' in cursor:
-                key = ('system', self.SYSTEM_CURSORS.get(cursor['system'], "ARROW"))
-            else:
-                key = ('custom', id(cursor))
+                cursor = standard_cursor_image(WinAPIHandler.IDC_ARROW)
+            elif cursor is not None and 'system' in cursor:
+                cursor = standard_cursor_image(cursor['system'])
+        key = ('hidden',) if cursor is None else ('custom', id(cursor))
         if key == self.current_cursor:
             return
         self.current_cursor = key
         try:
             pygame.mouse.set_visible(key[0] != 'hidden')
-            if key[0] == 'system':
-                pygame.mouse.set_cursor(getattr(pygame, 'SYSTEM_CURSOR_' + key[1]))
-            elif key[0] == 'custom':
+            if key[0] == 'custom':
                 cached = self.cursor_cache.get(key[1])
                 if cached is None or cached[0] is not cursor:
                     surface = pygame.image.frombuffer(cursor['rgba'], cursor['size'],
