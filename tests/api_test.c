@@ -201,6 +201,24 @@ static void test_user32(void)
     RECT r = {0, 0, 200, 100};
     char *p;
 
+    printf("\n--- user32: cursors ---\n");
+    {
+        BYTE and_plane[2 * 16], xor_plane[2 * 16];
+        HCURSOR arrow = LoadCursorA(NULL, IDC_ARROW), custom;
+        memset(and_plane, 0xFF, sizeof(and_plane));
+        memset(xor_plane, 0, sizeof(xor_plane));
+        check(arrow && LoadCursorA(NULL, IDC_ARROW) == arrow, "LoadCursorA (shared IDC_ARROW)");
+        check(!LoadCursorA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(999)),
+              "LoadCursorA (missing resource)");
+        custom = CreateCursor(GetModuleHandleA(NULL), 3, 4, 16, 16, and_plane, xor_plane);
+        check(custom != NULL, "CreateCursor");
+        SetCursor(arrow);
+        check(SetCursor(custom) == arrow && GetCursor() == custom, "SetCursor / GetCursor");
+        check(ShowCursor(FALSE) == -1 && ShowCursor(TRUE) == 0, "ShowCursor counter");
+        SetCursor(arrow);
+        check(DestroyCursor(custom) && !DestroyCursor(custom), "DestroyCursor");
+    }
+
     printf("\n--- user32: characters and formatting ---\n");
     CharUpperW(w);
     check(lstrcmpW(w, L"HELLO") == 0, "CharUpperW (string)");

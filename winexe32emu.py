@@ -1110,6 +1110,7 @@ class WinAPIHandler:
         'LoadKeyboardLayoutA': 2, 'CreateCursor': 7, 'DestroyIcon': 1,
         'DestroyCursor': 1, 'IsZoomed': 1, 'ShowCursor': 1, 'DialogBoxParamA': 5,
         'GetWindowPlacement': 2, 'SetWindowPlacement': 2, 'DialogBoxParamW': 5,
+        'GetCursor': 0,
         'CreateDialogParamA': 5, 'CreateDialogParamW': 5, 'IsDialogMessageW': 2,
         'GetDlgItemTextW': 4, 'SetDlgItemTextW': 3, 'ExitWindowsEx': 2,
         # gdi32
@@ -1316,8 +1317,13 @@ class WinAPIHandler:
         self.dialogs = {}
 
         # Cursor (SetCursor/ShowCursor) and keyboard toggle state (SetKeyboardState)
-        self.current_cursor = 0
+        # current_cursor: SetCursor handle (None until the first SetCursor or
+        # WM_SETCURSOR); cursors: handle -> {'system': IDC_*} or
+        # {'hotspot': (x, y), 'size': (w, h), 'rgba': bytes}
+        self.current_cursor = None
         self.cursor_count = 0
+        self.cursors = {}
+        self._system_cursors = {}
         self.keyboard_toggles = bytearray(256)
 
         # Multimedia: wave output devices, ACM streams, MCI devices (by handle/id)
@@ -1726,6 +1732,11 @@ class WinAPIHandler:
                     self.message_queue[-1]['hwnd'] == msg['hwnd']):
                 self.message_queue[-1] = msg
                 return
+            if message == self.WM_SETCURSOR:
+                # Only the latest one per window matters
+                self.message_queue[:] = [m for m in self.message_queue
+                                         if m['message'] != self.WM_SETCURSOR
+                                         or m['hwnd'] != msg['hwnd']]
             self.message_queue.append(msg)
 
     # KERNEL32.DLL functions
@@ -1836,14 +1847,28 @@ class WinAPIHandler:
         log.debug(f"SetUnhandledExceptionFilter(0x{args[0]:08x})")
         return 0
 
-    def LoadCursorA(self, args):
-        """LoadCursorA emulation - opaque cursor handle"""
-        log.debug(f"LoadCursorA(0x{args[0]:x}, 0x{args[1]:x})")
-        return self.get_next_handle()
+    def LoadCursorA(self, args, wide=False):
+        """LoadCursorA/W emulation - a system cursor (hInstance NULL, IDC_*) or
+        an RT_GROUP_CURSOR resource of the EXE"""
+        hInstance, lpCursorName = args[0], args[1]
+        if hInstance == 0:
+            cursor = self._system_cursor(lpCursorName) if lpCursorName < 0x10000 else 0
+        else:
+            if lpCursorName < 0x10000:
+                key = lpCursorName
+            else:
+                name = self._read_text(lpCursorName, wide)
+                key = (int(name[1:]) if name.startswith('#') and name[1:].isdigit()
+                       else name.upper())
+            cursor = self._load_resource_cursor(key) if self._is_own_module(hInstance) else 0
+        log.debug(f"LoadCursor(0x{hInstance:x}, 0x{lpCursorName:x}) -> 0x{cursor:x}")
+        if not cursor:
+            self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
+        return cursor
 
     def LoadCursorW(self, args):
         """LoadCursorW emulation"""
-        return self.LoadCursorA(args)
+        return self.LoadCursorA(args, wide=True)
 
     def LoadIconA(self, args):
         """LoadIconA emulation - opaque icon handle"""
@@ -4610,6 +4635,7 @@ class WinAPIHandler:
             style = struct.unpack("<I", wndclass_data[0:4])[0]
             lpfnWndProc = struct.unpack("<I", wndclass_data[4:8])[0]
             hInstance = struct.unpack("<I", wndclass_data[16:20])[0]
+            hCursor = struct.unpack("<I", wndclass_data[24:28])[0]
             hbrBackground = struct.unpack("<I", wndclass_data[28:32])[0]
             lpszClassName = struct.unpack("<I", wndclass_data[36:40])[0]
             
@@ -4624,6 +4650,7 @@ class WinAPIHandler:
                 'wndproc': lpfnWndProc,
                 'hInstance': hInstance,
                 'background': hbrBackground,
+                'cursor': hCursor,
             }
             self.atoms[atom] = class_name
             
@@ -4646,6 +4673,7 @@ class WinAPIHandler:
             style = struct.unpack("<I", wcex_data[4:8])[0]
             lpfnWndProc = struct.unpack("<I", wcex_data[8:12])[0]
             hInstance = struct.unpack("<I", wcex_data[20:24])[0]
+            hCursor = struct.unpack("<I", wcex_data[28:32])[0]
             hbrBackground = struct.unpack("<I", wcex_data[32:36])[0]
             lpszClassName = struct.unpack("<I", wcex_data[40:44])[0]
             
@@ -4660,6 +4688,7 @@ class WinAPIHandler:
                 'wndproc': lpfnWndProc,
                 'hInstance': hInstance,
                 'background': hbrBackground,
+                'cursor': hCursor,
             }
             self.atoms[atom] = class_name
             
@@ -5831,10 +5860,78 @@ class WinAPIHandler:
 
     # ---------- Cursors, icons ----------
 
+    IDC_ARROW = 32512
+    # Standard cursors (LoadCursor with hInstance NULL): IDC_ARROW, IDC_IBEAM,
+    # IDC_WAIT, IDC_CROSS, IDC_UPARROW, IDC_SIZE, IDC_ICON, IDC_SIZENWSE,
+    # IDC_SIZENESW, IDC_SIZEWE, IDC_SIZENS, IDC_SIZEALL, IDC_NO, IDC_HAND,
+    # IDC_APPSTARTING, IDC_HELP
+    SYSTEM_CURSOR_IDS = (32512, 32513, 32514, 32515, 32516, 32640, 32641, 32642, 32643,
+                         32644, 32645, 32646, 32648, 32649, 32650, 32651)
+
+    def _system_cursor(self, cursor_id):
+        """Shared handle of a standard cursor (always the same one, like Windows),
+        or 0 if cursor_id is not one"""
+        if cursor_id not in self.SYSTEM_CURSOR_IDS:
+            return 0
+        handle = self._system_cursors.get(cursor_id)
+        if handle is None:
+            handle = self.get_next_handle()
+            self._system_cursors[cursor_id] = handle
+            self.cursors[handle] = {'system': cursor_id}
+        return handle
+
+    def _new_cursor(self, hotspot, width, height, rgba):
+        handle = self.get_next_handle()
+        self.cursors[handle] = {'hotspot': hotspot, 'size': (width, height), 'rgba': rgba}
+        return handle
+
+    def _load_resource_cursor(self, key):
+        """Cursor from an RT_GROUP_CURSOR resource of the EXE (its 32x32 image,
+        else the first one), or 0"""
+        group = self._find_resource(12, key)  # RT_GROUP_CURSOR
+        if group is None:
+            return 0
+        try:
+            data = bytes(self.emu.uc.mem_read(*group))
+            count = struct.unpack_from('<H', data, 4)[0]
+            # CURSORDIR entries: width, height (x2), planes, bit count, size, RT_CURSOR id
+            entries = [struct.unpack_from('<HHHHIH', data, 6 + 14 * i) for i in range(count)]
+        except (struct.error, UcError):
+            return 0
+        if not entries:
+            return 0
+        entry = max(entries, key=lambda e: (e[0] == 32, e[3]))
+        found = self._find_resource(1, entry[5])  # RT_CURSOR
+        if found is None:
+            return 0
+        try:
+            data = bytes(self.emu.uc.mem_read(*found))
+            hotspot = struct.unpack_from('<HH', data, 0)
+            bpp = struct.unpack_from('<H', data, 4 + 14)[0]
+        except (struct.error, UcError):
+            return 0
+        image = _icon_image_rgba(data[4:])
+        if image is None:
+            return 0
+        width, height, rgba = image
+        if bpp == 1:
+            # Monochrome: masked pixels with a set XOR bit invert the screen;
+            # they are drawn black (outlines stay visible)
+            rgba = bytearray(rgba)
+            for i in range(0, len(rgba), 4):
+                if not rgba[i + 3] and rgba[i]:
+                    rgba[i:i + 4] = b'\x00\x00\x00\xff'
+            rgba = bytes(rgba)
+        return self._new_cursor(hotspot, width, height, rgba)
+
     def SetCursor(self, args):
         """SetCursor emulation - returns the previous cursor"""
         previous, self.current_cursor = self.current_cursor, args[0]
-        return previous
+        return previous or 0
+
+    def GetCursor(self, args):
+        """GetCursor emulation"""
+        return self.current_cursor or 0
 
     def ShowCursor(self, args):
         """ShowCursor emulation - display counter (the cursor shows while >= 0)"""
@@ -5842,12 +5939,102 @@ class WinAPIHandler:
         return self.cursor_count & 0xFFFFFFFF
 
     def CreateCursor(self, args):
-        """CreateCursor emulation - opaque cursor handle"""
-        return self.get_next_handle()
+        """CreateCursor emulation - a monochrome cursor from an AND and an XOR
+        bit plane (rows padded to 16 bits)"""
+        x_hot, y_hot = self._read_signed_args(args, 1, 2)
+        width, height = self._read_signed_args(args, 3, 2)
+        and_plane, xor_plane = args[5], args[6]
+        if not 0 < width <= 256 or not 0 < height <= 256:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        stride = (width + 15) // 16 * 2
+        try:
+            and_bits = bytes(self.emu.uc.mem_read(and_plane, stride * height))
+            xor_bits = bytes(self.emu.uc.mem_read(xor_plane, stride * height))
+        except UcError:
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        rgba = bytearray(width * height * 4)
+        for y in range(height):
+            for x in range(width):
+                index, bit = y * stride + (x >> 3), 0x80 >> (x & 7)
+                masked, xor = and_bits[index] & bit, xor_bits[index] & bit
+                if not masked or xor:
+                    # Black, white, or an inverted pixel (drawn black)
+                    value = 255 if xor and not masked else 0
+                    rgba[(y * width + x) * 4:(y * width + x + 1) * 4] = bytes(
+                        (value, value, value, 255))
+        log.debug(f"CreateCursor({width}x{height}, hotspot ({x_hot},{y_hot}))")
+        return self._new_cursor((x_hot, y_hot), width, height, bytes(rgba))
 
     def DestroyCursor(self, args):
-        """DestroyCursor emulation"""
+        """DestroyCursor emulation (the standard cursors are shared and kept)"""
+        cursor = self.cursors.get(args[0])
+        if cursor is None:
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        if 'system' not in cursor:
+            del self.cursors[args[0]]
         return 1
+
+    def _class_cursor(self, hwnd):
+        """hCursor of a window's class (0 if it has none)"""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        wndclass = self.registered_classes.get(getattr(win, 'class_name', None) or '')
+        return wndclass.get('cursor', 0) if wndclass else 0
+
+    def displayed_cursor(self, hwnd):
+        """Cursor shown over the client area of hwnd (called by the GUI thread):
+        a cursor dict, or None if hidden (ShowCursor counter, SetCursor(NULL))"""
+        if self.cursor_count < 0:
+            return None
+        handle = self.current_cursor
+        if handle is None:
+            handle = self._class_cursor(hwnd) or self._system_cursor(self.IDC_ARROW)
+        return self.cursors.get(handle) if handle else None
+
+    WM_SETCURSOR = 0x0020
+    HTCLIENT = 1
+
+    def _default_set_cursor(self, hwnd, wParam, lParam):
+        """DefWindowProc's WM_SETCURSOR: a child window asks its parent first,
+        then the client area gets the class cursor, the rest the arrow"""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if win is not None and win.parent:
+            parent_proc = self._find_wndproc_for_hwnd(win.parent)
+            if parent_proc and self.emu.call_wndproc(parent_proc, win.parent,
+                                                     self.WM_SETCURSOR, wParam, lParam):
+                return 1
+        if lParam & 0xFFFF == self.HTCLIENT:
+            cursor = self._class_cursor(hwnd)
+            if cursor:
+                self.current_cursor = cursor
+        else:
+            self.current_cursor = self._system_cursor(self.IDC_ARROW)
+        return 0
+
+    def _deliver_set_cursor(self):
+        """Send the pending WM_SETCURSOR messages (posted by the GUI thread when
+        the mouse moves over a window); they are sent, never returned by
+        GetMessage/PeekMessage"""
+        with self.message_lock:
+            pending = [m for m in self.message_queue if m['message'] == self.WM_SETCURSOR]
+            if not pending:
+                return
+            self.message_queue[:] = [m for m in self.message_queue
+                                     if m['message'] != self.WM_SETCURSOR]
+        for msg in pending:
+            hwnd = msg['hwnd']
+            if not self.gui or hwnd not in self.gui.windows:
+                continue
+            if hwnd in self.dialogs:  # DefDlgProc: the dialog class cursor
+                self.current_cursor = self._system_cursor(self.IDC_ARROW)
+                continue
+            wndproc = self._find_wndproc_for_hwnd(hwnd)
+            if wndproc:
+                self.emu.call_wndproc(wndproc, hwnd, self.WM_SETCURSOR, hwnd, msg['lParam'])
+            else:
+                self._default_set_cursor(hwnd, hwnd, msg['lParam'])
 
     def DestroyIcon(self, args):
         """DestroyIcon emulation"""
@@ -8478,6 +8665,7 @@ class WinAPIHandler:
             return (msg_min == 0 and msg_max == 0) or msg_min <= message <= msg_max
 
         self._audio_pump()
+        self._deliver_set_cursor()
 
         # Send WM_PAINT for visible windows not yet painted
         windows = []
@@ -8671,6 +8859,8 @@ class WinAPIHandler:
         lParam = args[3]
         log.debug(f"DefWindowProcA(0x{hWnd:x}, 0x{Msg:x})")
 
+        if Msg == self.WM_SETCURSOR:
+            return self._default_set_cursor(hWnd, wParam, lParam)
         # Default WM_CLOSE handling: destroy the window (like real Windows)
         if Msg == self.WM_CLOSE:
             self.DestroyWindow([hWnd])
@@ -15598,7 +15788,8 @@ class PseudoWindowsGUI:
         self.resize_edge = None      # Active edge: 'left','right','top','bottom' + corners
         self.resize_start_mouse = (0, 0)  # Mouse pos when resize began
         self.resize_start_rect = (0, 0, 0, 0)  # Window (x, y, w, h) when resize began
-        self.current_cursor = None   # Currently set system cursor (avoid redundant sets)
+        self.current_cursor = None   # Shown cursor key (avoid redundant sets)
+        self.cursor_cache = {}       # id(cursor dict) -> (cursor dict, pygame Cursor)
 
     def start(self):
         """Start GUI thread"""
@@ -15653,6 +15844,7 @@ class PseudoWindowsGUI:
                     self.pending_mode = None
                     self._focus_host_window()
                 self._process_frame()
+                self._update_mouse_cursor()
                 self._post_size_changes()
                 self._post_activation_changes()
             
@@ -15715,8 +15907,6 @@ class PseudoWindowsGUI:
                     win.x = max(0, min(win.x, self.width - 50))
                     win.y = max(0, min(win.y, self.height - 60))
                 else:
-                    # Update mouse cursor based on hovered edge
-                    self._update_resize_cursor(event.pos)
                     # Forward WM_MOUSEMOVE to the app window
                     self._forward_mouse_move(event.pos, event.buttons)
             elif event.type == pygame.KEYDOWN:
@@ -17284,36 +17474,82 @@ class PseudoWindowsGUI:
 
         win.x, win.y, win.width, win.height = new_x, new_y, new_w, new_h
 
-    def _update_resize_cursor(self, pos):
-        """Set the mouse cursor to a resize arrow when hovering an edge."""
-        x, y = pos
-        edge = None
+    RESIZE_CURSORS = {"left": "SIZEWE", "right": "SIZEWE", "top": "SIZENS",
+                      "bottom": "SIZENS", "topleft": "SIZENWSE", "bottomright": "SIZENWSE",
+                      "topright": "SIZENESW", "bottomleft": "SIZENESW"}
 
-        # Find the topmost window under the cursor
+    # Standard cursors (IDC_*) -> pygame system cursor names
+    SYSTEM_CURSORS = {32513: "IBEAM", 32514: "WAIT", 32515: "CROSSHAIR", 32642: "SIZENWSE",
+                      32643: "SIZENESW", 32644: "SIZEWE", 32645: "SIZENS", 32646: "SIZEALL",
+                      32640: "SIZEALL", 32648: "NO", 32649: "HAND", 32650: "WAITARROW"}
+
+    def _program_cursor(self, pos):
+        """Cursor a program shows at pos: (True, cursor dict or None if hidden),
+        or (False, None) if pos is not over a program's client area"""
+        if self.start_menu_open or self.desktop_menu or self.open_menu or self.open_combo:
+            return False, None
+        captured = self._capture_target()
+        if captured is not None:
+            return True, captured.owner.displayed_cursor(captured.hwnd)
+        x, y = pos
+        if y >= self.height - self.TASKBAR_H and self._fullscreen_window() is None:
+            return False, None
         for hwnd in reversed(self.z_order):
             win = self.windows.get(hwnd)
-            if win and win.visible and not win.minimized and win.contains_point(x, y):
-                edge = self._get_resize_edge(win, x, y)
-                break
+            if not (win and win.visible and not win.minimized and win.contains_point(x, y)):
+                continue
+            if (win.is_dialog or not self._is_app_window(hwnd) or
+                    self._get_resize_edge(win, x, y) or y < self.client_origin(win)[1]):
+                return False, None
+            return True, win.owner.displayed_cursor(hwnd)
+        return False, None
 
-        cursor_map = {
-            "left": pygame.SYSTEM_CURSOR_SIZEWE,
-            "right": pygame.SYSTEM_CURSOR_SIZEWE,
-            "top": pygame.SYSTEM_CURSOR_SIZENS,
-            "bottom": pygame.SYSTEM_CURSOR_SIZENS,
-            "topleft": pygame.SYSTEM_CURSOR_SIZENWSE,
-            "bottomright": pygame.SYSTEM_CURSOR_SIZENWSE,
-            "topright": pygame.SYSTEM_CURSOR_SIZENESW,
-            "bottomleft": pygame.SYSTEM_CURSOR_SIZENESW,
-        }
-        cursor = cursor_map.get(edge, pygame.SYSTEM_CURSOR_ARROW)
-
-        if cursor != self.current_cursor:
-            try:
-                pygame.mouse.set_cursor(cursor)
-                self.current_cursor = cursor
-            except Exception:
-                pass
+    def _update_mouse_cursor(self):
+        """Show the cursor of the mouse position (every frame): a resize arrow
+        on window edges, the program's cursor (SetCursor, class cursor,
+        ShowCursor) over its client area, else the arrow"""
+        pos = self.mouse_pos
+        edge = self.resize_edge if self.resizing_window else None
+        if edge is None and not (self.dragging_window or self.dragging_scrollbar):
+            for hwnd in reversed(self.z_order):
+                win = self.windows.get(hwnd)
+                if win and win.visible and not win.minimized and win.contains_point(*pos):
+                    edge = self._get_resize_edge(win, *pos)
+                    break
+        cursor = None
+        if edge:
+            key = ('system', self.RESIZE_CURSORS[edge])
+        else:
+            program, cursor = (self._program_cursor(pos)
+                               if not (self.dragging_window or self.dragging_scrollbar)
+                               else (False, None))
+            if not program:
+                key = ('system', "ARROW")
+            elif cursor is None:
+                key = ('hidden',)
+            elif 'system' in cursor:
+                key = ('system', self.SYSTEM_CURSORS.get(cursor['system'], "ARROW"))
+            else:
+                key = ('custom', id(cursor))
+        if key == self.current_cursor:
+            return
+        self.current_cursor = key
+        try:
+            pygame.mouse.set_visible(key[0] != 'hidden')
+            if key[0] == 'system':
+                pygame.mouse.set_cursor(getattr(pygame, 'SYSTEM_CURSOR_' + key[1]))
+            elif key[0] == 'custom':
+                cached = self.cursor_cache.get(key[1])
+                if cached is None or cached[0] is not cursor:
+                    surface = pygame.image.frombuffer(cursor['rgba'], cursor['size'],
+                                                      'RGBA').copy()
+                    cached = (cursor, pygame.cursors.Cursor(cursor['hotspot'], surface))
+                    if len(self.cursor_cache) >= 64:
+                        self.cursor_cache.clear()
+                    self.cursor_cache[key[1]] = cached
+                pygame.mouse.set_cursor(cached[1])
+        except (pygame.error, AttributeError, TypeError, ValueError):
+            pass  # The video driver may not support (color) cursors
 
     def _is_app_window(self, hwnd):
         """True if hwnd is an emulated application window with a WndProc.
@@ -17916,6 +18152,10 @@ class PseudoWindowsGUI:
             if win is None:
                 return
             target, cx, cy = self._mouse_target(win, x, y)
+            # Without capture the window under the mouse chooses the cursor first
+            self.winapi.post_window_message(
+                win.hwnd, self.winapi.WM_SETCURSOR, win.hwnd,
+                (self.winapi.WM_MOUSEMOVE << 16) | self.winapi.HTCLIENT)
         self.winapi.post_window_message(target, self.winapi.WM_MOUSEMOVE,
                                         wparam, self._make_lparam(cx, cy))
 
