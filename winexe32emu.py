@@ -25222,22 +25222,53 @@ class PseudoWindowsGUI:
         
         self.show_window(hwnd)
 
-    def _draw_messagebox_icon(self, icon, x, y):
-        """32x32 MessageBox icon: 1 stop, 2 question, 3 exclamation, 4 information"""
-        center = (x + 16, y + 16)
-        if icon == 3:
-            points = [(x + 16, y + 1), (x + 31, y + 30), (x + 1, y + 30)]
-            pygame.draw.polygon(self.screen, (255, 220, 0), points)
-            pygame.draw.polygon(self.screen, (0, 0, 0), points, 1)
-            glyph, color = '!', (0, 0, 0)
+    def _messagebox_icon_surface(self, icon):
+        """32x32 MessageBox icon (1 stop, 2 question, 3 exclamation, 4
+        information) drawn with shapes, not font glyphs (a bold "i" may look
+        like an "I" or "!"); drawn 4x larger and smoothly scaled down, cached"""
+        cache = self.__dict__.setdefault('_messagebox_icons', {})
+        if icon in cache:
+            return cache[icon]
+        k = 4
+        big = pygame.Surface((32 * k, 32 * k), pygame.SRCALPHA)
+
+        def circle(color, cx, cy, r, width=0):
+            pygame.draw.circle(big, color, (cx * k, cy * k), r * k, width * k)
+
+        def rect(color, x, y, w, h):
+            pygame.draw.rect(big, color, (x * k, y * k, w * k, h * k))
+
+        if icon == 3:  # Exclamation: yellow triangle with a black "!"
+            points = [(16 * k, 1 * k), (31 * k, 29 * k), (1 * k, 29 * k)]
+            pygame.draw.polygon(big, (255, 220, 0), points)
+            pygame.draw.polygon(big, (0, 0, 0), points, k)
+            rect((0, 0, 0), 14.5, 9, 3, 12)
+            rect((0, 0, 0), 14.5, 23, 3, 3)
         else:
-            fill = {1: (210, 0, 0), 2: (0, 70, 200), 4: (0, 70, 200)}[icon]
-            pygame.draw.circle(self.screen, fill, center, 15)
-            pygame.draw.circle(self.screen, (40, 40, 40), center, 15, 1)
-            glyph, color = {1: 'X', 2: '?', 4: 'i'}[icon], (255, 255, 255)
-        surface = self.font_bold.render(glyph, True, color)
-        offset = 4 if icon == 3 else 0
-        self.screen.blit(surface, surface.get_rect(center=(center[0], center[1] + offset)))
+            fill = {1: (210, 0, 0), 2: (0, 70, 200)}.get(icon, (0, 70, 200))
+            circle(fill, 16, 16, 15)
+            circle((40, 40, 40), 16, 16, 15, 1)
+            white = (255, 255, 255)
+            if icon == 1:  # Stop: white "X"
+                for a, b in (((10, 10), (22, 22)), ((22, 10), (10, 22))):
+                    pygame.draw.line(big, white, (a[0] * k, a[1] * k), (b[0] * k, b[1] * k),
+                                     int(3.5 * k))
+            elif icon == 2:  # Question: white "?" (arc, stem and dot)
+                pygame.draw.arc(big, white, (11 * k, 6 * k, 10 * k, 10 * k), -1.2, 3.3, 3 * k)
+                rect(white, 14.5, 15, 3, 5)
+                rect(white, 14.5, 22, 3, 3)
+            else:  # Information: white "i" (dot and stem)
+                circle(white, 16, 8.5, 2)
+                rect(white, 14.5, 13, 3, 12)
+                rect(white, 12.5, 13, 3, 2)
+                rect(white, 12.5, 23, 7, 2)
+        surface = pygame.transform.smoothscale(big, (32, 32))
+        cache[icon] = surface
+        return surface
+
+    def _draw_messagebox_icon(self, icon, x, y):
+        """32x32 MessageBox icon at (x, y)"""
+        self.screen.blit(self._messagebox_icon_surface(icon), (x, y))
 
     def _messagebox_done(self, hwnd, result):
         """A message box closes with result (a button id)"""
