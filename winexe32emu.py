@@ -22269,6 +22269,50 @@ class PseudoWindowsGUI:
 
     VIEW_GLYPHS = {8: 'up', 10: 'new'}  # Standard VIEW_* bitmaps (IDB_VIEW_*_COLOR)
 
+    def _view_glyph_surface(self, glyph, width, height):
+        """16x16 picture of a standard VIEW_* toolbar bitmap (scaled to the
+        toolbar's bitmap size), cached"""
+        cache = self.__dict__.setdefault('_view_glyph_cache', {})
+        key = (glyph, width, height)
+        if key in cache:
+            return cache[key]
+        surface = pygame.Surface((16, 16), pygame.SRCALPHA)
+        fill, line = self.SYS_ICON_COLORS[1]
+        # Folder in the lower left: tab and body
+        pygame.draw.rect(surface, fill, (1, 4, 6, 3))
+        pygame.draw.rect(surface, line, (1, 4, 6, 3), 1)
+        pygame.draw.rect(surface, fill, (1, 6, 11, 9))
+        pygame.draw.rect(surface, line, (1, 6, 11, 9), 1)
+        pygame.draw.line(surface, (255, 240, 170), (2, 7), (10, 7))
+        if glyph == 'up':
+            # Arrow out of the folder's top right corner
+            pygame.draw.polygon(surface, (0, 0, 0), [(9, 5), (15, 5), (12, 2)])
+            pygame.draw.rect(surface, (0, 0, 0), (11, 5, 2, 6))
+        elif glyph == 'new':
+            # Sparkle on the folder's top right corner
+            sparkle = (255, 230, 0)
+            pygame.draw.line(surface, sparkle, (12, 1), (12, 7))
+            pygame.draw.line(surface, sparkle, (9, 4), (15, 4))
+            pygame.draw.line(surface, sparkle, (10, 2), (14, 6))
+            pygame.draw.line(surface, sparkle, (10, 6), (14, 2))
+        if (width, height) != (16, 16):
+            surface = pygame.transform.scale(surface, (width, height))
+        cache[key] = surface
+        return surface
+
+    @staticmethod
+    def _disabled_glyph(surface):
+        """Disabled toolbar image like Windows draws it: a gray silhouette
+        embossed with a white one offset by a pixel"""
+        mask = pygame.mask.from_surface(surface)
+        width, height = surface.get_size()
+        result = pygame.Surface((width + 1, height + 1), pygame.SRCALPHA)
+        result.blit(mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0)),
+                    (1, 1))
+        result.blit(mask.to_surface(setcolor=(128, 128, 128, 255), unsetcolor=(0, 0, 0, 0)),
+                    (0, 0))
+        return result
+
     def _draw_toolbar(self, win, cx, cy, cw, ch):
         st = win.nstate
         owner = win.owner
@@ -22312,14 +22356,11 @@ class PseudoWindowsGUI:
                                                    ix, iy, disabled=not enabled)
             if not drawn:
                 glyph = self.VIEW_GLYPHS.get(button['bitmap'])
-                color = (0, 0, 0) if enabled else (128, 128, 128)
-                if glyph == 'up':
-                    self._draw_system_icon(1, ix, iy + 1)
-                    pygame.draw.polygon(self.screen, color, [(ix + 8, iy + 3), (ix + 4, iy + 8),
-                                                             (ix + 12, iy + 8)])
-                    pygame.draw.rect(self.screen, color, (ix + 7, iy + 8, 2, 5))
-                elif glyph == 'new':
-                    self._draw_system_icon(1, ix, iy + 1)
+                if glyph:
+                    surface = self._view_glyph_surface(glyph, bw or 16, bh or 16)
+                    if not enabled:
+                        surface = self._disabled_glyph(surface)
+                    self.screen.blit(surface, (ix, iy))
             if text and st['max_text_rows']:
                 label = self._fit_text(self.font_small, text, rect.width - 4)
                 surface = self.font_small.render(label, True, (0, 0, 0) if enabled else
