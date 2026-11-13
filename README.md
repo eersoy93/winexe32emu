@@ -22,6 +22,12 @@ python3 winexe32emu.py
 
 Use `-h` parameter for command-line help.
 
+Everything after the EXE name is passed to the program as its command line, for example:
+
+```bash
+python3 winexe32emu.py --no-gui "C:\Program Files\7-Zip\7z.exe" a "C:\Windows\Temp\test.7z" "C:\Windows\Temp\file_test.tmp"
+```
+
 The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
 ## Folder Structure

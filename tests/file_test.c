@@ -23,7 +23,8 @@ Everything happens inside the emulated C: drive (the host c_drive/ folder):
   3. Files inside directories: the environment folder created at startup
      (C:\\Windows\\Temp) and new nested directories in the test's own
      folder (the current directory).
-  4. A sandbox-escape attempt ("C:\\..\\escape.txt") that must be refused.
+  4. Win32 file namespace paths ("\\\\?\\C:\\...") and the missing-file error.
+  5. A sandbox-escape attempt ("C:\\..\\escape.txt") that must be refused.
 */
 
 #include <windows.h>
@@ -151,7 +152,38 @@ int main(void)
         fclose(fp);
     }
 
-    /* ---- 4. Sandbox escape must be refused ---- */
+    /* ---- 4. Win32 file namespace ("\\\\?\\") paths ---- */
+    int failed = 0;
+    WIN32_FIND_DATAA find;
+    if (GetTempPathA(sizeof(dir), dir))
+    {
+        wsprintfA(path, "\\\\?\\%sfile_test.tmp", dir);
+        HANDLE hFind = FindFirstFileA(path, &find);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            FindClose(hFind);
+            WriteString(hOut, "(Prefix) '\\\\?\\' path has been found!\n");
+        }
+        else
+        {
+            WriteString(hOut, "(Prefix) '\\\\?\\' path couldn't be found!\n");
+            failed = 1;
+        }
+
+        wsprintfA(path, "\\\\?\\%sfile_test_missing.tmp", dir);
+        if (FindFirstFileA(path, &find) == INVALID_HANDLE_VALUE &&
+            GetLastError() == ERROR_FILE_NOT_FOUND)
+        {
+            WriteString(hOut, "(Prefix) Missing file gives ERROR_FILE_NOT_FOUND!\n");
+        }
+        else
+        {
+            WriteString(hOut, "(Prefix) Missing file gives a wrong error!\n");
+            failed = 1;
+        }
+    }
+
+    /* ---- 5. Sandbox escape must be refused ---- */
     hFile = CreateFileA("C:\\..\\escape.txt", GENERIC_WRITE, 0, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
@@ -162,6 +194,6 @@ int main(void)
         CloseHandle(hFile);
     }
 
-    ExitProcess(0);
+    ExitProcess(failed);
     return 0;
 }

@@ -161,6 +161,35 @@ class DebugLogger:
             sys.stdout.write(text)
             sys.stdout.flush()
             cls._at_line_start = text.endswith('\n')
+            cls._output_tag = None
+
+    _output_tag = None
+    PROGRAM_OUTPUT_COLORS = {'STDOUT': Fore.YELLOW, 'STDERR': Fore.RED,
+                             'CONSOLE': Fore.YELLOW}
+
+    @classmethod
+    def program_output(cls, tag, text):
+        """Write a program's console output, tagging each line once ([STDOUT],
+        [STDERR], ...): programs write lines in pieces and redraw progress
+        indicators with backspaces, so the tag must not split a line"""
+        if not text:
+            return
+        color = cls.PROGRAM_OUTPUT_COLORS.get(tag, Fore.YELLOW)
+        prefix = f"{color}[{tag}]{Style.RESET_ALL} "
+        out = []
+        with cls._lock:
+            if not cls._at_line_start and cls._output_tag != tag:
+                out.append('\n')
+                cls._at_line_start = True
+            for piece in re.findall(r'[^\n]*\n|[^\n]+', text):
+                if cls._at_line_start:
+                    out.append(prefix)
+                # A carriage return redraws the line from column 0: keep the tag
+                out.append(re.sub(r'\r(?!\n|$)', lambda m: '\r' + prefix, piece))
+                cls._at_line_start = piece.endswith('\n')
+            cls._output_tag = tag
+            sys.stdout.write(''.join(out))
+            sys.stdout.flush()
 
     @classmethod
     def _line(cls, text):
@@ -170,6 +199,7 @@ class DebugLogger:
             sys.stdout.write(f"{prefix}{text}\n")
             sys.stdout.flush()
             cls._at_line_start = True
+            cls._output_tag = None
 
     @classmethod
     def info(cls, msg):
@@ -367,7 +397,7 @@ class PELoader:
         log.header("Export Table")
 
         if not hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT'):
-            log.warning("Export table not found (normal for EXE)!")
+            log.info("Export table not found (normal for EXE)!")
             return
 
         for exp in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
@@ -468,9 +498,9 @@ class ConsoleStream:
         text = self._out.decode(ANSI_CODEPAGE, errors='replace')
         self._out.clear()
         if self.kind == 'stderr':
-            log.write(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}")
+            log.program_output("STDERR", text)
         else:
-            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
+            log.program_output("STDOUT", text)
         self.handler.console_output.append(text)
         self.handler.console_write(text, self.kind)
 
@@ -591,6 +621,18 @@ class _ScanSource:
         return self._la if self._la not in (None, -1) else None
 
 
+def strip_win32_path_prefix(name):
+    """Drop a Win32 file namespace prefix ("\\\\?\\C:\\x", "\\\\.\\C:\\x", "\\??\\C:\\x")
+    in front of a drive path. Returns name unchanged without a prefix, or
+    None for prefixed paths that are not on a drive (UNC shares, devices)."""
+    if name[:4].replace('/', '\\') not in ('\\\\?\\', '\\\\.\\', '\\??\\'):
+        return name
+    rest = name[4:]
+    if len(rest) >= 2 and rest[1] == ':' and rest[0].isalpha():
+        return rest
+    return None
+
+
 def resolve_c_drive_path(filename):
     """Map a Windows-style filename into the c_drive/ sandbox.
 
@@ -611,7 +653,10 @@ def resolve_c_drive_path(filename):
         return None
 
     # Normalise Windows path syntax to a relative POSIX-ish path.
-    name = filename.replace('\\', '/')
+    name = strip_win32_path_prefix(filename)
+    if name is None:
+        return None
+    name = name.replace('\\', '/')
 
     # Strip a drive-letter prefix ("C:/...", "c:foo"). Everything is
     # treated as living on the emulated C: drive regardless of letter.
@@ -1697,7 +1742,11 @@ class WinAPIHandler:
         if command_line:
             return command_line
         path = self.windows_exe_path()
-        return f'"{path}"' if ' ' in path else path
+        command_line = f'"{path}"' if ' ' in path else path
+        program_args = getattr(self.emu, 'program_args', None)
+        if program_args:
+            command_line += ' ' + subprocess.list2cmdline(program_args)
+        return command_line
 
     # ==================== CONSOLE ====================
 
@@ -1878,7 +1927,10 @@ class WinAPIHandler:
         """
         if not filename:
             return None
-        name = filename.replace('/', '\\')
+        name = strip_win32_path_prefix(filename)
+        if name is None:
+            return None
+        name = name.replace('/', '\\')
         if len(name) >= 2 and name[1] == ':':
             name = name[2:]
         if not name.startswith('\\'):
@@ -2317,12 +2369,12 @@ class WinAPIHandler:
 
             if hFile in [0x11]:  # stdout
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-                log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
+                log.program_output("STDOUT", text)
                 self.console_output.append(text)
                 self.console_write(text)
             elif hFile in [0x12]:  # stderr
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-                log.write(f"{Fore.RED}[STDERR]{Style.RESET_ALL} {text}")
+                log.program_output("STDERR", text)
                 self.console_output.append(text)
                 self.console_write(text, 'stderr')
             else:
@@ -2363,7 +2415,7 @@ class WinAPIHandler:
             else:
                 data = self.emu.uc.mem_read(lpBuffer, nNumberOfCharsToWrite)
                 text = data.decode(ANSI_CODEPAGE, errors='replace')
-            log.write(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}")
+            log.program_output("CONSOLE", text)
             self.console_output.append(text)
             self.console_write(text)
             
@@ -3588,8 +3640,9 @@ class WinAPIHandler:
         """True if a root path argument (NULL: current drive) names drive C:"""
         if not address:
             return True
-        root = self._read_text(address, wide)
-        return not (len(root) >= 2 and root[1] == ':' and root[0].upper() != 'C')
+        root = strip_win32_path_prefix(self._read_text(address, wide))
+        return root is not None and not (len(root) >= 2 and root[1] == ':'
+                                         and root[0].upper() != 'C')
 
     def GetLogicalDriveStringsA(self, args, wide=False):
         """GetLogicalDriveStringsA/W emulation - only C:\\"""
@@ -15850,6 +15903,11 @@ class WinAPIHandler:
     IID_IPERSISTFILE = '0000010b-0000-0000-c000-000000000046'
     IID_ISHELLLINKA = '000214ee-0000-0000-c000-000000000046'
     IID_ISHELLLINKW = '000214f9-0000-0000-c000-000000000046'
+    CLSID_TASKBARLIST = '56fdf344-fd6d-11d0-958a-006097c9a090'
+    IID_ITASKBARLIST = '56fdf342-fd6d-11d0-958a-006097c9a090'
+    IID_ITASKBARLIST2 = '602d4995-b13a-429b-a66e-1935e44f4317'
+    IID_ITASKBARLIST3 = 'ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf'
+    IID_ITASKBARLIST4 = 'c43dc798-95d1-4bea-9030-bb99e2983a1a'
 
     # Interface kind -> methods (name, argument count with "this") in vtable order
     COM_INTERFACES = {
@@ -15864,6 +15922,16 @@ class WinAPIHandler:
             ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetClassID', 2),
             ('IsDirty', 1), ('Load', 3), ('Save', 3), ('SaveCompleted', 2),
             ('GetCurFile', 2)],
+        # ITaskbarList4 (and the ITaskbarList..3 prefixes of its vtable);
+        # SetProgressValue takes two ULONGLONGs
+        'taskbar_list': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('HrInit', 1),
+            ('AddTab', 2), ('DeleteTab', 2), ('ActivateTab', 2), ('SetActiveAlt', 2),
+            ('MarkFullscreenWindow', 3), ('SetProgressValue', 6), ('SetProgressState', 3),
+            ('RegisterTab', 3), ('UnregisterTab', 2), ('SetTabOrder', 3), ('SetTabActive', 4),
+            ('ThumbBarAddButtons', 4), ('ThumbBarUpdateButtons', 4),
+            ('ThumbBarSetImageList', 3), ('SetOverlayIcon', 4), ('SetThumbnailTooltip', 3),
+            ('SetThumbnailClip', 3), ('SetTabProperties', 3)],
     }
 
     def _read_guid(self, address):
@@ -15939,7 +16007,8 @@ class WinAPIHandler:
         return None
 
     def CoCreateInstance(self, args):
-        """CoCreateInstance emulation - only the shell link object (CLSID_ShellLink)"""
+        """CoCreateInstance emulation - the shell link object (CLSID_ShellLink)
+        and the taskbar list (CLSID_TaskbarList)"""
         rclsid, pUnkOuter, _, riid, ppv = args[:5]
         clsid, iid = self._read_guid(rclsid), self._read_guid(riid)
         log.debug(f"CoCreateInstance({{{clsid}}}, {{{iid}}})")
@@ -15948,6 +16017,16 @@ class WinAPIHandler:
         self._mem_write(ppv, struct.pack('<I', 0))
         if pUnkOuter:
             return self.CLASS_E_NOAGGREGATION
+        if clsid == self.CLSID_TASKBARLIST:
+            pointers = self._com_new_object(
+                [((self.IID_ITASKBARLIST4, self.IID_ITASKBARLIST3, self.IID_ITASKBARLIST2,
+                   self.IID_ITASKBARLIST, self.IID_IUNKNOWN),
+                  self._com_vtable('ITaskbarList4', 'taskbar_list'))],
+                {})
+            unknown = pointers[self.IID_IUNKNOWN]
+            result = self._com_unknown('QueryInterface', [unknown, riid, ppv])
+            self._com_unknown('Release', [unknown])
+            return result
         if clsid != self.CLSID_SHELLLINK:
             log.warning(f"CoCreateInstance: COM class {{{clsid}}} is not emulated")
             return self.REGDB_E_CLASSNOTREG
@@ -15964,6 +16043,18 @@ class WinAPIHandler:
         result = self._com_unknown('QueryInterface', [unknown, riid, ppv])
         self._com_unknown('Release', [unknown])
         return result
+
+    def _com_taskbar_list(self, method, wide, args):
+        """ITaskbarList..4 methods: the fake taskbar has no tab thumbnails,
+        overlays or progress bars, so every call just succeeds"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        if method == 'SetProgressValue':
+            completed = args[2] | (args[3] << 32)
+            total = args[4] | (args[5] << 32)
+            log.debug(f"ITaskbarList3::SetProgressValue(0x{args[1]:x}, {completed}, {total})")
+        return self.S_OK
 
     def _com_write_text(self, address, size, text, wide):
         """Copy text to a caller buffer of size characters (truncated)"""
@@ -17924,7 +18015,7 @@ class WinAPIHandler:
 
         if fp is None:
             text = data.decode(ANSI_CODEPAGE, errors='replace')
-            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
+            log.program_output("STDOUT", text)
             self.console_output.append(text)
             self.console_write(text)
             return nmemb
@@ -18111,7 +18202,7 @@ class WinAPIHandler:
         fp = self._p_stream(stream)
         if fp is None:
             # Treat unknown stream as stdout.
-            log.write(f"{Fore.YELLOW}[STDOUT]{Style.RESET_ALL} {text}")
+            log.program_output("STDOUT", text)
             self.console_output.append(text)
             self.console_write(text)
             return 0
@@ -22489,6 +22580,12 @@ class PseudoWindowsGUI:
 
     SS_NOPREFIX = 0x80
 
+    @staticmethod
+    def _mnemonic_text(text):
+        """Control text as drawn: "&x" marks the mnemonic (underlined on
+        Windows), "&&" is a literal "&"""
+        return re.sub(r'&(.)', r'\1', text or '')
+
     def _draw_static(self, control, rect):
         """Draw a STATIC control by its SS_* type"""
         kind = control.style & 0x1F
@@ -22510,10 +22607,13 @@ class PseudoWindowsGUI:
         elif kind in (0, 1, 2, 0xB, 0xC):  # Text: left, center, right, simple, no wrap
             text = control.text
             if not control.style & self.SS_NOPREFIX:
-                text = re.sub(r'&(.)', r'\1', text)
+                text = self._mnemonic_text(text)
             lines = self._wrap_text(text, w) if kind <= 2 else text.split('\n')
             prev_clip = self.screen.get_clip()
-            self.screen.set_clip(rect.clip(prev_clip) if prev_clip else rect)
+            # The first line is never cut: the font may be taller than the
+            # one-line height the dialog template gives the control
+            text_rect = pygame.Rect(x, y, w, max(h, self.font.get_linesize()))
+            self.screen.set_clip(text_rect.clip(prev_clip) if prev_clip else text_rect)
             line_y = y
             for line in lines:
                 surface = self.font.render(line, True, self.COLOR_TEXT)
@@ -22611,8 +22711,7 @@ class PseudoWindowsGUI:
             self._draw_statusbar(control, abs_x, abs_y)
         elif control.class_name == "BUTTON":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            # "&x" marks the mnemonic (underlined on Windows), "&&" is a literal "&"
-            label = re.sub(r'&(.)', r'\1', control.text)
+            label = self._mnemonic_text(control.text)
             if (control.style & 0xF) == 7:  # BS_GROUPBOX
                 self._draw_group_box(control, rect)
             elif (control.style & 0xF) == 1:  # BS_DEFPUSHBUTTON: black outer frame
@@ -22711,7 +22810,8 @@ class PseudoWindowsGUI:
                 pygame.draw.circle(self.screen, (128, 128, 128), center, 6, 1)
                 if control.checked:
                     pygame.draw.circle(self.screen, self.COLOR_TEXT, center, 2)
-                text = self.font.render(control.text, True, self.COLOR_TEXT)
+                text = self.font.render(self._mnemonic_text(control.text), True,
+                                        self.COLOR_TEXT)
                 self.screen.blit(text, (abs_x + 18, abs_y))
                 return
             # Checkbox box
@@ -22724,7 +22824,7 @@ class PseudoWindowsGUI:
                 pygame.draw.line(self.screen, self.COLOR_TEXT, 
                                (abs_x + 5, abs_y + 11), (abs_x + 11, abs_y + 4), 2)
             # Label
-            text = self.font.render(control.text, True, self.COLOR_TEXT)
+            text = self.font.render(self._mnemonic_text(control.text), True, self.COLOR_TEXT)
             self.screen.blit(text, (abs_x + 18, abs_y))
             
         elif control.class_name == "PROGRESSBAR":
@@ -22753,7 +22853,8 @@ class PseudoWindowsGUI:
     
     def _draw_group_box(self, control, rect):
         """BS_GROUPBOX: etched frame with the caption on its top edge"""
-        text = self.font.render(control.text, True, self.COLOR_TEXT) if control.text else None
+        caption = self._mnemonic_text(control.text)
+        text = self.font.render(caption, True, self.COLOR_TEXT) if caption else None
         top = rect.y + (text.get_height() // 2 if text else 0)
         frame = pygame.Rect(rect.x, top, rect.width - 1, rect.bottom - top - 1)
         pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame, 1)
@@ -25729,12 +25830,17 @@ def main():
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Tests/ "
-               "(C:\\Windows\\Tests).\nExample: python3 winexe32emu.py api_test.exe"
+               "(C:\\Windows\\Tests).\nExample: python3 winexe32emu.py api_test.exe\n"
+               "Example: python3 winexe32emu.py --no-gui \"C:\\Program Files\\7-Zip\\7z.exe\" "
+               "l \"C:\\Windows\\Temp\\test.7z\""
     )
     parser.add_argument("exe", nargs="?",
                         help="PE file to run: a name in C:\\ or C:\\Windows\\Tests, or a "
                              "Windows path inside c_drive/; optional with the GUI, "
                              "programs can also be started from the Start menu")
+    parser.add_argument("program_args", nargs=argparse.REMAINDER, metavar="args",
+                        help="Command-line arguments passed to the program "
+                             "(everything after the EXE name)")
     parser.add_argument("-n", "--max-instructions", type=int, default=0,
                         help="Maximum instructions to execute "
                              "(default: 0 = unlimited)")
@@ -25860,7 +25966,7 @@ def main():
     # Started programs: [(CPUEmulator, emulation thread)]; they run side by side
     programs = []
 
-    def load_program(name, command_line=None, current_directory=None):
+    def load_program(name, command_line=None, current_directory=None, program_args=None):
         """Load an EXE from the emulated C drive and emulate it in a new thread.
         Returns the CPUEmulator, or None on failure."""
         exe_path = find_program(name)
@@ -25876,6 +25982,7 @@ def main():
 
         emulator = CPUEmulator(loader, gui)
         emulator.command_line = command_line
+        emulator.program_args = program_args
         if not emulator.initialize():
             log.error("Failed to initialize CPU emulator!")
             return None
@@ -25914,7 +26021,8 @@ def main():
         gui.launcher = launch
         log.info("GUI window is open, close the window to exit!")
 
-    if args.exe is not None and not load_program(args.exe):
+    if args.exe is not None and not load_program(args.exe,
+                                                 program_args=args.program_args):
         if gui:
             gui.stop()
         sys.exit(1)
