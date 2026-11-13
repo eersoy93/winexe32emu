@@ -1593,6 +1593,7 @@ class WinAPIHandler:
         self.imagelists = {}
         self._sys_imagelists = {}
         self.icons = {}
+        self._dialog_fonts = {}  # (face, size) of a dialog template -> GDI font handle
         self.accelerators = {}
         self.clipboard_open = False
         self.mapping_views = {}  # id(file mapping info) -> its address here
@@ -2194,14 +2195,45 @@ class WinAPIHandler:
         """LoadCursorW emulation"""
         return self.LoadCursorA(args, wide=True)
 
-    def LoadIconA(self, args):
-        """LoadIconA emulation - opaque icon handle"""
-        log.debug(f"LoadIconA(0x{args[0]:x}, 0x{args[1]:x})")
-        return self.get_next_handle()
+    def _load_icon_image(self, key, size=32):
+        """(width, height, RGBA) of the EXE's RT_GROUP_ICON key: its image
+        closest to size x size with the most colors; None if there is none"""
+        group = self._find_resource(14, key)
+        if group is None:
+            return None
+        try:
+            data = bytes(self.emu.uc.mem_read(*group))
+            count = struct.unpack_from('<H', data, 4)[0]
+            images = []
+            for i in range(count):
+                w, _, _, _, _, bits, _, icon_id = struct.unpack_from('<BBBBHHIH', data,
+                                                                     6 + 14 * i)
+                images.append((abs((w or 256) - size), -bits, icon_id))
+            for _, _, icon_id in sorted(images):
+                icon = self._find_resource(3, icon_id)
+                decoded = _icon_image_rgba(bytes(self.emu.uc.mem_read(*icon))) if icon else None
+                if decoded:
+                    return decoded
+        except (struct.error, UcError):
+            pass
+        return None
+
+    def LoadIconA(self, args, wide=False):
+        """LoadIconA/W emulation - an icon of the EXE's resources (its image is
+        kept for SS_ICON statics and image lists); system icons are opaque"""
+        log.debug(f"LoadIcon(0x{args[0]:x}, 0x{args[1]:x})")
+        handle = self.get_next_handle()
+        if args[0] and self._is_own_module(args[0]):
+            image = self._load_icon_image(self._resource_name_key(args[1], wide))
+            if image is None:
+                self._last_error = 1813  # ERROR_RESOURCE_TYPE_NOT_FOUND
+                return 0
+            self.icons[handle] = image
+        return handle
 
     def LoadIconW(self, args):
         """LoadIconW emulation"""
-        return self.LoadIconA(args)
+        return self.LoadIconA(args, wide=True)
 
     # ---------- Resources of the loaded EXE ----------
 
@@ -6013,41 +6045,45 @@ class WinAPIHandler:
         log.debug(f"GetSystemMetrics({nIndex}) -> {result}")
         return result
     
-    def MessageBoxA(self, args):
-        """MessageBoxA emulation"""
-        hWnd = args[0]
-        lpText = args[1]
-        lpCaption = args[2]
-        uType = args[3]
-        
-        text = self.read_string(lpText) if lpText else ""
-        caption = self.read_string(lpCaption) if lpCaption else ""
-        
+    # MB_OK ... MB_CANCELTRYCONTINUE: (label, result id) of the buttons
+    MESSAGEBOX_BUTTONS = {0: [('OK', 1)], 1: [('OK', 1), ('Cancel', 2)],
+                          2: [('&Abort', 3), ('&Retry', 4), ('&Ignore', 5)],
+                          3: [('&Yes', 6), ('&No', 7), ('Cancel', 2)],
+                          4: [('&Yes', 6), ('&No', 7)], 5: [('&Retry', 4), ('Cancel', 2)],
+                          6: [('Cancel', 2), ('&Try Again', 10), ('&Continue', 11)]}
+
+    @classmethod
+    def messagebox_buttons(cls, utype):
+        """(buttons, index of the default button, result of Esc/close or None)"""
+        buttons = cls.MESSAGEBOX_BUTTONS.get(utype & 0xF, cls.MESSAGEBOX_BUTTONS[0])
+        default = min((utype >> 8) & 0xF, len(buttons) - 1)
+        ids = [result for _, result in buttons]
+        cancel = 2 if 2 in ids else (1 if ids == [1] else None)
+        return buttons, default, cancel
+
+    def _message_box(self, text, caption, utype):
+        """Modal message box: blocks until a button is chosen, returns its id"""
         log.info(f"{Fore.YELLOW}[MESSAGEBOX]{Style.RESET_ALL} {caption}: {text}")
-        
-        # Show MessageBox if GUI exists
-        if self.gui and self.gui.running:
-            return self.gui.show_messagebox(caption, text, uType)
-        
-        return 1  # IDOK
-    
+        buttons, default, cancel = self.messagebox_buttons(utype)
+        if not (self.gui and self.gui.running):
+            return buttons[default][1]  # Nobody can answer: the default button
+        request = {'result': None}
+        self.gui.show_messagebox(caption, text, utype, request)
+        self.emu.wait_until(lambda: request['result'] is not None or not self.gui.running)
+        if request['result'] is None:
+            return cancel or buttons[default][1]
+        return request['result']
+
+    def MessageBoxA(self, args, wide=False):
+        """MessageBoxA/W emulation"""
+        lpText, lpCaption, uType = args[1], args[2], args[3]
+        text = self._read_text(lpText, wide) if lpText else ""
+        caption = self._read_text(lpCaption, wide) if lpCaption else "Error"
+        return self._message_box(text, caption, uType)
+
     def MessageBoxW(self, args):
-        """MessageBoxW emulation (Unicode)"""
-        hWnd = args[0]
-        lpText = args[1]
-        lpCaption = args[2]
-        uType = args[3]
-        
-        text = self.read_wide_string(lpText) if lpText else ""
-        caption = self.read_wide_string(lpCaption) if lpCaption else ""
-        
-        log.info(f"{Fore.YELLOW}[MESSAGEBOX]{Style.RESET_ALL} {caption}: {text}")
-        
-        if self.gui and self.gui.running:
-            return self.gui.show_messagebox(caption, text, uType)
-        
-        return 1  # IDOK
-    
+        return self.MessageBoxA(args, wide=True)
+
     def RegisterClassA(self, args, wide=False):
         """RegisterClassA/W emulation"""
         lpWndClass = args[0]
@@ -6191,7 +6227,7 @@ class WinAPIHandler:
                 # For child controls hMenu carries the control ID (used by WM_COMMAND)
                 hwnd = self.gui.create_control(hWndParent, control_class, window_name,
                                                x, y, nWidth, nHeight, dwStyle,
-                                               control_id=hMenu)
+                                               control_id=hMenu, ex_style=dwExStyle)
                 self.dirty_controls[hwnd] = True
             else:
                 parent = hWndParent if dwStyle & self.WS_CHILD else 0
@@ -6254,6 +6290,8 @@ class WinAPIHandler:
     WS_CHILD = 0x40000000
     WS_POPUP = 0x80000000
     WS_VISIBLE = 0x10000000
+    WS_BORDER = 0x00800000
+    WS_EX_CLIENTEDGE = 0x00000200
     WM_SIZE = 0x0005
     WM_ACTIVATE = 0x0006
 
@@ -8216,8 +8254,29 @@ class WinAPIHandler:
         self._create_dialog_items(hwnd, template, bx, by)
         return hwnd
 
+    def _dialog_font(self, template):
+        """GDI font handle of a dialog template's DS_SETFONT font (shared by the
+        dialogs that use it), or 0. Its point size is for 96 DPI, like the
+        dialog units the controls are laid out with."""
+        if not template['font']:
+            return 0
+        face, size = template['font']
+        if not isinstance(face, str):
+            face = ''
+        key = (face.lower(), size)
+        if key not in self._dialog_fonts:
+            handle = self.get_next_handle()
+            self.gdi_objects[handle] = {
+                'type': 'font', 'height': max(1, round(size * 96 / 72)), 'cell': False,
+                'bold': False, 'italic': False, 'underline': False,
+                'face': 'Tahoma' if key[0] in ('ms shell dlg', 'ms shell dlg 2') else face}
+            self._dialog_fonts[key] = handle
+        return self._dialog_fonts[key]
+
     def _create_dialog_items(self, hwnd, template, bx, by):
-        """Create the controls of a dialog template"""
+        """Create the controls of a dialog template; they get the dialog's font
+        (WM_SETFONT) like on Windows"""
+        font_handle = self._dialog_font(template)
         for item in template['items']:
             cls = item['class']
             cls = self.DIALOG_CLASS_ATOMS.get(cls, 'STATIC') if isinstance(cls, int) else cls
@@ -8239,12 +8298,30 @@ class WinAPIHandler:
                 cls = 'STATUSBAR'
             elif cls.upper() == 'MSCTLS_PROGRESS32':
                 cls = 'PROGRESSBAR'
+            ex_style = item['ex_style']
+            if cls.upper() == 'EDIT' and style & self.WS_BORDER:
+                # Like the dialog manager of Windows 95 and later (DS_3DLOOK):
+                # a bordered edit control gets the sunken 3D client edge
+                style &= ~self.WS_BORDER
+                ex_style |= self.WS_EX_CLIENTEDGE
             chwnd = self.gui.create_control(
                 hwnd, cls, text, round(item['x'] * bx), round(item['y'] * by),
                 round(item['cx'] * bx), round(item['cy'] * by), style,
-                control_id=item['id'] & 0xFFFF)
+                control_id=item['id'] & 0xFFFF, ex_style=ex_style)
             self.dirty_controls[chwnd] = True
             control = self.gui.controls[chwnd]
+            if font_handle:
+                control.font_handle = font_handle
+                control.font = self.gdi_objects[font_handle]
+            if cls.upper() == 'STATIC' and style & 0x1F == 3 and item['text'] not in ('', None):
+                # SS_ICON: the text names an icon resource; the control takes its size
+                key = item['text'] if isinstance(item['text'], int) else \
+                    (int(item['text'][1:]) if item['text'][1:].isdigit() and
+                     item['text'][:1] == '#' else item['text'].upper())
+                control.text = ''
+                control.icon = self._load_icon_image(key)
+                if control.icon and not style & 0x40:  # SS_REALSIZECONTROL
+                    control.width, control.height = control.icon[0], control.icon[1]
             control.visible = bool(style & self.WS_VISIBLE)
             control.enabled = not style & 0x08000000  # WS_DISABLED
 
@@ -8349,11 +8426,13 @@ class WinAPIHandler:
             if message == self.WM_KEYDOWN and wParam == 0x09:  # Tab: next edit control
                 win = self.gui.windows.get(dlg)
                 edits = [c.hwnd for c in (win.controls if win else [])
-                         if c.class_name == 'EDIT' and c.visible and c.enabled]
+                         if self._is_text_input(c) and c.visible and c.enabled]
                 if edits:
                     current = self.gui.focused_control
                     index = edits.index(current) + 1 if current in edits else 0
                     self.gui.focused_control = edits[index % len(edits)]
+                    # The dialog manager selects the text of the edit it moves to
+                    self.gui.controls[self.gui.focused_control].select_all()
                 return 0
             return self._dialog_message(dlg, message, wParam, lParam)
         wndproc = self._find_wndproc_for_hwnd(hwnd)
@@ -8397,11 +8476,18 @@ class WinAPIHandler:
             self._close_dialog(dlg)
         return result
 
+    @staticmethod
+    def _is_text_input(control):
+        """An EDIT control or the edit field of a CBS_SIMPLE/CBS_DROPDOWN combo box"""
+        return control.class_name == 'EDIT' or (control.class_name == 'COMBOBOX' and
+                                                control.style & 0x3 in (1, 2))
+
     def _show_dialog(self, dlg, init_param, show=True):
         """Send WM_INITDIALOG to a new dialog, focus its first edit control and
         show it (a modeless one only if its template has WS_VISIBLE)"""
         win = self.gui.windows[dlg]
-        edits = [c for c in win.controls if c.class_name == 'EDIT' and c.visible and c.enabled]
+        edits = [c for c in win.controls
+                 if self._is_text_input(c) and c.visible and c.enabled]
         first = next((c for c in win.controls
                       if c.visible and c.enabled and c.style & 0x00010000), None)  # WS_TABSTOP
         set_focus = self._dialog_message(dlg, self.WM_INITDIALOG,
@@ -8410,6 +8496,7 @@ class WinAPIHandler:
             return
         if set_focus and edits and self.gui.focused_control not in [c.hwnd for c in edits]:
             self.gui.focused_control = edits[0].hwnd
+            edits[0].select_all()  # Like DefDlgProc's initial focus (EM_SETSEL 0, -1)
         if show:
             self.gui.show_window(dlg, True)
 
@@ -10265,6 +10352,22 @@ class WinAPIHandler:
         if Msg == WM_GETFONT:
             return control.font_handle
 
+        if control.class_name == 'EDIT' or (control.class_name == 'COMBOBOX' and
+                                            Msg in (0x0140, 0x0141, 0x0142)):
+            result = self._edit_message(control, Msg, wParam, lParam, wide)
+            if result is not None:
+                return result
+
+        if control.class_name == 'STATIC' and Msg in (0x0170, 0x0171, 0x0172, 0x0173):
+            # STM_SETICON, STM_GETICON, STM_SETIMAGE, STM_GETIMAGE
+            previous = control.icon_handle
+            if Msg == 0x0170 or (Msg == 0x0172 and wParam == 1):  # IMAGE_ICON
+                handle = wParam if Msg == 0x0170 else lParam
+                control.icon_handle = handle
+                control.icon = self.icons.get(handle)
+                return previous
+            return previous if Msg == 0x0171 or wParam == 1 else 0
+
         # ----- Checkbox / button messages -----
         if Msg == self.BM_GETCHECK:
             return 1 if control.checked else 0
@@ -10340,6 +10443,7 @@ class WinAPIHandler:
             if (Msg == self.CB_SETCURSEL and control.class_name == 'COMBOBOX' and
                     control.style & 0x3 in (1, 2) and 0 <= control.sel_index < len(control.items)):
                 control.text = control.items[control.sel_index]
+                control.select_all()
             return result
         if control.class_name == 'COMBOBOX':
             if Msg == 0x014A:  # CB_INSERTSTRING
@@ -10400,6 +10504,144 @@ class WinAPIHandler:
 
         log.debug(f"Unhandled control message 0x{Msg:04x} for {control.class_name}")
         return 0
+
+    @staticmethod
+    def clipboard_text():
+        """Text on the clipboard (CF_UNICODETEXT, else CF_TEXT), or None"""
+        data = WinAPIHandler.clipboard_data.get(13)
+        if data is not None:
+            text = data.decode('utf-16-le', errors='replace')
+        else:
+            data = WinAPIHandler.clipboard_data.get(1)
+            if data is None:
+                return None
+            text = data.decode(ANSI_CODEPAGE, errors='replace')
+        return text.split('\x00', 1)[0]
+
+    @staticmethod
+    def set_clipboard_text(text):
+        """Put text on the clipboard (CF_UNICODETEXT and CF_TEXT)"""
+        WinAPIHandler.clipboard_data = {
+            13: text.encode('utf-16-le') + b'\x00\x00',
+            1: text.encode(ANSI_CODEPAGE, errors='replace') + b'\x00'}
+
+    EM_GETSEL, EM_SETSEL, EM_SCROLLCARET, EM_GETMODIFY, EM_SETMODIFY = 0xB0, 0xB1, 0xB7, 0xB8, 0xB9
+    EM_GETLINECOUNT, EM_LINEINDEX, EM_LINELENGTH, EM_REPLACESEL = 0xBA, 0xBB, 0xC1, 0xC2
+    EM_GETLINE, EM_LIMITTEXT, EM_CANUNDO, EM_UNDO, EM_LINEFROMCHAR = 0xC4, 0xC5, 0xC6, 0xC7, 0xC9
+    EM_SETPASSWORDCHAR, EM_EMPTYUNDOBUFFER, EM_GETFIRSTVISIBLELINE = 0xCC, 0xCD, 0xCE
+    EM_SETREADONLY, EM_GETPASSWORDCHAR, EM_SETMARGINS, EM_GETMARGINS = 0xCF, 0xD2, 0xD3, 0xD4
+    EM_GETLIMITTEXT = 0xD5
+    WM_CUT, WM_COPY, WM_PASTE, WM_CLEAR = 0x300, 0x301, 0x302, 0x303
+    ES_MULTILINE, ES_PASSWORD, ES_READONLY = 0x4, 0x20, 0x800
+
+    def _edit_message(self, control, Msg, wParam, lParam, wide):
+        """EDIT control messages (and the CB_*EDITSEL ones of an editable
+        combo box); None if not one of them"""
+        def signed(value):
+            return value - (1 << 32) if value & 0x80000000 else value
+
+        def line_index(line):
+            lines = control.edit_lines()
+            if line == -1:
+                line = control.line_of(control.sel_caret)
+            return lines[line][0] if 0 <= line < len(lines) else -1
+
+        readonly = control.class_name == 'EDIT' and control.style & self.ES_READONLY
+        if Msg in (self.EM_GETSEL, 0x0140):  # CB_GETEDITSEL
+            start, end = control.selection()
+            if wParam:
+                self._mem_write(wParam, struct.pack('<I', start))
+            if lParam:
+                self._mem_write(lParam, struct.pack('<I', end))
+            return 0xFFFFFFFF if max(start, end) > 0xFFFF else (end << 16) | start
+        if Msg in (self.EM_SETSEL, 0x0142):  # CB_SETEDITSEL: both in lParam
+            if Msg == 0x0142:
+                def s16(value):
+                    return value - 0x10000 if value & 0x8000 else value
+                start, end = s16(lParam & 0xFFFF), s16((lParam >> 16) & 0xFFFF)
+            else:
+                start, end = signed(wParam), signed(lParam)
+            n = len(control.text)
+            if start < 0:  # Remove the selection, the caret stays
+                control.set_selection(control.sel_caret)
+            else:
+                control.set_selection(min(start, n), n if end < 0 else min(end, n))
+            return 1 if Msg == 0x0142 else 0
+        if Msg in (self.EM_LIMITTEXT, 0x0141):  # CB_LIMITTEXT
+            control.text_limit = wParam
+            return 1 if Msg == 0x0141 else 0
+        if Msg == self.EM_GETLIMITTEXT:
+            return control.text_limit or (0x7FFFFFFE if control.style & self.ES_MULTILINE
+                                          else 30000)
+        if Msg == self.EM_REPLACESEL:
+            text = self._read_text(lParam, wide) if lParam else ''
+            control.replace_selection(text)
+            return 0
+        if Msg == self.EM_GETMODIFY:
+            return 1 if control.modified else 0
+        if Msg == self.EM_SETMODIFY:
+            control.modified = bool(wParam)
+            return 0
+        if Msg == self.EM_GETLINECOUNT:
+            return len(control.edit_lines()) if control.style & self.ES_MULTILINE else 1
+        if Msg == self.EM_LINEINDEX:
+            return line_index(signed(wParam)) & 0xFFFFFFFF
+        if Msg == self.EM_LINEFROMCHAR:
+            offset = signed(wParam)
+            return control.line_of(control.selection()[0] if offset < 0 else offset)
+        if Msg == self.EM_LINELENGTH:
+            offset = signed(wParam)
+            if offset < 0:
+                start, end = control.selection()
+                lines = control.edit_lines()
+                first, last = control.line_of(start), control.line_of(end)
+                return (start - lines[first][0]) + (lines[last][1] - end)
+            start, end = control.edit_lines()[control.line_of(offset)]
+            return end - start
+        if Msg == self.EM_GETLINE:
+            lines = control.edit_lines()
+            if not lParam or not 0 <= wParam < len(lines):
+                return 0
+            size = struct.unpack('<H', self.emu.uc.mem_read(lParam, 2))[0]
+            start, end = lines[wParam]
+            units = self._text_units(control.text[start:end], wide)[:size]
+            self._write_units(lParam, units, wide, terminate=False)
+            return len(units)
+        if Msg == self.EM_SETREADONLY:
+            control.style = (control.style | self.ES_READONLY) if wParam else \
+                (control.style & ~self.ES_READONLY)
+            return 1
+        if Msg == self.EM_SETPASSWORDCHAR:
+            control.password_char = chr(wParam) if wParam else ''
+            control.style = (control.style | self.ES_PASSWORD) if wParam else \
+                (control.style & ~self.ES_PASSWORD)
+            return 0
+        if Msg == self.EM_GETPASSWORDCHAR:
+            return ord(control.password_char) if control.password_char else 0
+        if Msg in (self.EM_SCROLLCARET, self.EM_EMPTYUNDOBUFFER):
+            return 1 if Msg == self.EM_SCROLLCARET else 0
+        if Msg in (self.EM_CANUNDO, self.EM_UNDO, self.EM_SETMARGINS, self.EM_GETMARGINS,
+                   self.EM_GETFIRSTVISIBLELINE):
+            return control.edit_top_line if Msg == self.EM_GETFIRSTVISIBLELINE else 0
+        if Msg in (self.WM_COPY, self.WM_CUT):
+            start, end = control.selection()
+            if start != end and not control.password_char:
+                self.set_clipboard_text(control.text[start:end])
+                if Msg == self.WM_CUT and not readonly:
+                    control.replace_selection('')
+            return 0
+        if Msg == self.WM_CLEAR:
+            if not readonly:
+                control.replace_selection('')
+            return 0
+        if Msg == self.WM_PASTE:
+            text = self.clipboard_text()
+            if text and not readonly:
+                if not control.style & self.ES_MULTILINE:
+                    text = text.split('\r', 1)[0].split('\n', 1)[0]
+                control.replace_selection(text)
+            return 0
+        return None
     
     def PostMessageA(self, args):
         """PostMessageA emulation - queue a message for the message loop"""
@@ -12689,18 +12931,24 @@ class WinAPIHandler:
     def _build_menu_tree(self, hmenu, depth=0):
         """Convert menu handles into the plain structure the GUI renders:
         [{'text', 'shortcut', 'id', 'items' (submenu or None), 'separator',
-        'grayed', 'checked', 'radio', 'hmenu'}]"""
+        'grayed', 'checked', 'radio', 'hmenu', 'break'}]; 'break' is 'bar'
+        (MF_MENUBARBREAK) or 'plain' (MF_MENUBREAK) for an item that starts a
+        new column"""
         tree = []
         for item in self.menus.get(hmenu, []):
             flags = item['flags']
+            column_break = ('bar' if flags & self.MF_MENUBARBREAK else
+                            'plain' if flags & self.MF_MENUBREAK else None)
             if flags & self.MF_SEPARATOR:
-                tree.append({'separator': True, 'text': '', 'id': 0, 'items': None})
+                tree.append({'separator': True, 'text': '', 'id': 0, 'items': None,
+                             'break': column_break})
                 continue
             label, shortcut = self._menu_label(item['text'])
             node = {'text': label, 'shortcut': shortcut, 'id': item['id'], 'items': None,
                     'grayed': bool(flags & (self.MF_GRAYED | self.MF_DISABLED)),
                     'checked': bool(flags & self.MF_CHECKED),
-                    'radio': bool(flags & self.MFT_RADIOCHECK), 'hmenu': 0}
+                    'radio': bool(flags & self.MFT_RADIOCHECK), 'hmenu': 0,
+                    'break': column_break}
             if flags & self.MF_POPUP:
                 node['id'] = 0
                 node['hmenu'] = item['submenu']
@@ -12739,6 +12987,7 @@ class WinAPIHandler:
 
     MF_GRAYED, MF_DISABLED, MF_CHECKED, MF_BYPOSITION = 0x1, 0x2, 0x8, 0x400
     MFT_RADIOCHECK, MF_DEFAULT = 0x200, 0x1000
+    MF_MENUBARBREAK, MF_MENUBREAK = 0x20, 0x40
     WM_INITMENUPOPUP = 0x0117
 
     def _new_menu(self, items=None):
@@ -12771,6 +13020,8 @@ class WinAPIHandler:
                     text = read_text()
                     item = {'flags': (mtype & 0xFFFF) | (mstate & 0x100B), 'id': mid,
                             'text': text, 'submenu': 0}
+                    if not text and not flags & 0x1:
+                        item['flags'] |= self.MF_SEPARATOR  # Like Windows: a NULL item
                     if flags & 0x1:
                         pos = (pos + 3) & ~3
                         pos += 4  # dwHelpId
@@ -13693,18 +13944,50 @@ class WinAPIHandler:
             address += (len(text) + 1) * (2 if wide else 1)
         return names
 
+    FOF_NOCONFIRMATION = 0x10
+    ERROR_CANCELLED = 1223
+
+    def _confirm_delete(self, sources, hosts):
+        """The shell's delete confirmation (there is no Recycle Bin: the
+        files are deleted for good); True if confirmed"""
+        if len(sources) == 1:
+            name = ntpath.basename(sources[0].rstrip('\\'))
+            if os.path.isdir(hosts[0]):
+                caption = "Delete Folder"
+                text = (f"Are you sure you want to permanently delete the folder '{name}' "
+                        f"and all of its contents?")
+            else:
+                caption = "Delete File"
+                text = f"Are you sure you want to permanently delete '{name}'?"
+        else:
+            caption = "Delete Multiple Items"
+            text = f"Are you sure you want to permanently delete these {len(sources)} items?"
+        return self._message_box(text, caption, 0x34) == 6  # MB_YESNO | MB_ICONEXCLAMATION
+
     def SHFileOperationA(self, args, wide=False):
         """SHFileOperationA/W emulation - delete/copy/move/rename in the sandbox
-        (deleted files don't go to a Recycle Bin)"""
+        (deleted files don't go to a Recycle Bin). Asks like the shell unless
+        FOF_NOCONFIRMATION: before deleting and before replacing a file."""
         hwnd, func, p_from, p_to, flags = self._read_struct(args[0], '<IIIIH')
         sources = self._read_multi_string(p_from, wide)
         targets = self._read_multi_string(p_to, wide) if p_to else []
         log.info(f"SHFileOperation({func}, {sources}, {targets})")
+        confirm = not flags & self.FOF_NOCONFIRMATION
+        aborted = False
+
+        def finish(code):
+            self._mem_write(args[0] + 18, struct.pack('<I', 1 if aborted else 0))
+            return code
+
+        hosts = [self.resolve_c_drive_path(source) for source in sources]
+        for src in hosts:
+            if src is None or not os.path.exists(src):
+                return finish(2)  # ERROR_FILE_NOT_FOUND (DE_FILENOTFOUND)
+        if func == 3 and confirm and sources and not self._confirm_delete(sources, hosts):
+            aborted = True
+            return finish(self.ERROR_CANCELLED)
         try:
-            for i, source in enumerate(sources):
-                src = self.resolve_c_drive_path(source)
-                if src is None or not os.path.exists(src):
-                    return 2  # ERROR_FILE_NOT_FOUND (DE_FILENOTFOUND)
+            for i, src in enumerate(hosts):
                 if func == 3:  # FO_DELETE
                     if os.path.isdir(src):
                         shutil.rmtree(src)
@@ -13714,21 +13997,34 @@ class WinAPIHandler:
                 target = targets[i] if i < len(targets) else (targets[0] if targets else '')
                 dst = self.resolve_c_drive_path(target)
                 if dst is None:
-                    return 5
+                    return finish(5)
                 if os.path.isdir(dst) and func in (1, 2):
                     dst = os.path.join(dst, os.path.basename(src))
+                if os.path.isfile(dst) and os.path.isfile(src) and \
+                        os.path.realpath(dst) != os.path.realpath(src):
+                    if confirm:
+                        answer = self._message_box(
+                            f"This folder already contains a file named "
+                            f"'{os.path.basename(dst)}'.\n\nWould you like to replace the "
+                            f"existing file?", "Confirm File Replace", 0x33)  # YESNOCANCEL
+                        if answer == 2:  # Cancel
+                            aborted = True
+                            return finish(self.ERROR_CANCELLED)
+                        if answer == 7:  # No: skip this file
+                            aborted = True
+                            continue
+                    os.remove(dst)
                 if func == 2:  # FO_COPY
                     if os.path.isdir(src):
-                        shutil.copytree(src, dst)
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
                     else:
                         shutil.copy2(src, dst)
                 else:  # FO_MOVE, FO_RENAME
                     shutil.move(src, dst)
         except OSError as e:
             log.warning(f"SHFileOperation failed: {e}")
-            return 5  # ERROR_ACCESS_DENIED
-        self._mem_write(args[0] + 18, struct.pack('<I', 0))  # fAnyOperationsAborted
-        return 0
+            return finish(5)  # ERROR_ACCESS_DENIED
+        return finish(0)
 
     def SHFileOperationW(self, args):
         return self.SHFileOperationA(args, wide=True)
@@ -14195,10 +14491,65 @@ class WinAPIHandler:
             return 0
         return self.LV_HEADER_H
 
-    def lv_rows_per_page(self, win):
+    LV_ICON_CELL = (76, 66)  # Large icon spacing: the icon and two label lines
+
+    def lv_icon_space(self, win):
+        """Pixels before an item's label in the report, list and small icon
+        views: the small icon (none without a LVSIL_SMALL image list)"""
+        return 20 if win.nstate['imagelists'].get(1) else 0
+
+    def lv_cell_width(self, win):
+        """Cell width of the small icon and list views: the widest label known"""
+        st = win.nstate
+        width = 80
+        for item in st['items']:
+            text = item['cache'].get(0)
+            if text is None:
+                text = item['texts'].get(0) or ''
+            if text:
+                width = max(width, self._native_text_width(text) + 10 + self.lv_icon_space(win))
+        return min(width, 320)
+
+    def lv_grid(self, win):
+        """Item layout of a list view: (cell width, cell height, items per line,
+        visible lines, column major). A line is a row of the report, small icon
+        and icon views and a column of the list view; st['top'] is the first
+        item of the first visible line."""
         width, height = self.gui.client_size(win)
-        return max(1, (height - self.lv_header_height(win) - (16 if self._lv_hscroll_needed(win)
-                                                                else 0)) // self.LV_ROW_H)
+        view = self._lv_view(win)
+        if view == 1:
+            rows = (height - self.lv_header_height(win) -
+                    (16 if self._lv_hscroll_needed(win) else 0)) // self.LV_ROW_H
+            return width, self.LV_ROW_H, 1, max(1, rows), False
+        if view == 3:  # LVS_LIST: columns from top to bottom, scrolled sideways
+            cell_w = win.nstate.get('cell_w') or 120
+            rows = max(1, (height - 16) // self.LV_ROW_H)
+            columns = max(1, width // cell_w)
+            if (len(win.nstate['items']) + rows - 1) // rows <= columns:
+                rows = max(1, height // self.LV_ROW_H)  # No scroll bar needed
+            return cell_w, self.LV_ROW_H, rows, columns, True
+        cell_w, cell_h = self.LV_ICON_CELL if view == 0 else             (win.nstate.get('cell_w') or 120, self.LV_ROW_H)
+        per_row = max(1, (width - 16) // cell_w)
+        return cell_w, cell_h, per_row, max(1, height // cell_h), False
+
+    def lv_rows_per_page(self, win):
+        """Items that fit in the view (LVM_GETCOUNTPERPAGE)"""
+        _, _, per_line, lines, _ = self.lv_grid(win)
+        return per_line * lines
+
+    def lv_item_rect(self, win, index):
+        """(left, top, right, bottom) of an item in client coordinates"""
+        st = win.nstate
+        cell_w, cell_h, per_line, _, column_major = self.lv_grid(win)
+        relative = index - st['top']
+        line, position = relative // per_line, relative % per_line
+        if self._lv_view(win) == 1:
+            top = self.lv_header_height(win) + relative * cell_h
+            return (-st['hscroll'], top,
+                    sum(c['width'] for c in st['columns']) - st['hscroll'], top + cell_h)
+        column, row = (line, position) if column_major else (position, line)
+        left, top = column * cell_w, row * cell_h
+        return left, top, left + cell_w, top + cell_h
 
     def _lv_hscroll_needed(self, win):
         width = self.gui.client_size(win)[0] if self.gui else 0
@@ -14274,21 +14625,33 @@ class WinAPIHandler:
             win.nstate['mark'] = index
             self._lv_ensure_visible(win, index)
 
+    def _lv_top_limit(self, win, top):
+        """top kept inside the items and on the start of a line"""
+        _, _, per_line, lines, _ = self.lv_grid(win)
+        count = len(win.nstate['items'])
+        last_line = max(0, (count + per_line - 1) // per_line - lines)
+        return max(0, min(top // per_line, last_line)) * per_line
+
     def _lv_ensure_visible(self, win, index):
         st = win.nstate
-        rows = self.lv_rows_per_page(win)
+        _, _, per_line, lines, _ = self.lv_grid(win)
+        page = per_line * lines
         if index < st['top']:
             st['top'] = index
-        elif index >= st['top'] + rows:
-            st['top'] = index - rows + 1
-        st['top'] = max(0, min(st['top'], max(0, len(st['items']) - rows)))
+        elif index >= st['top'] + page:
+            st['top'] = index - page + per_line
+        st['top'] = self._lv_top_limit(win, st['top'])
         st['dirty'] = True
 
     def _lv_scroll_to(self, win, top):
         st = win.nstate
-        rows = self.lv_rows_per_page(win)
-        st['top'] = max(0, min(top, max(0, len(st['items']) - rows)))
+        st['top'] = self._lv_top_limit(win, top)
         st['dirty'] = True
+
+    def _lv_scroll_lines(self, win, lines):
+        """Scroll by whole lines (rows, or columns of the list view)"""
+        per_line = self.lv_grid(win)[2]
+        self._lv_scroll_to(win, win.nstate['top'] + lines * per_line)
 
     def _lv_item_text(self, win, index, sub):
         """Text of an item/subitem, asking the parent (LVN_GETDISPINFOW) for
@@ -14342,7 +14705,10 @@ class WinAPIHandler:
                 continue
             st = win.nstate
             st['dirty'] = False
-            rows = self.lv_rows_per_page(win) + 1
+            if self._lv_view(win) in (2, 3):
+                st['cell_w'] = self.lv_cell_width(win)
+            st['top'] = self._lv_top_limit(win, st['top'])  # The view may have changed
+            rows = self.lv_rows_per_page(win) + self.lv_grid(win)[2]
             columns = st['columns'] if self._lv_view(win) == 1 else [{'sub': 0}]
             if not columns:
                 columns = [{'sub': 0}]
@@ -14358,6 +14724,30 @@ class WinAPIHandler:
         header = self.lv_header_height(win)
         if y < header:
             return -1, 0
+        if self._lv_view(win) != 1:
+            cell_w, cell_h, per_line, _, column_major = self.lv_grid(win)
+            if x < 0 or y < 0:
+                return -1, 0
+            column, row = x // cell_w, y // cell_h
+            if column_major:
+                if row >= per_line:
+                    return -1, 0
+                index = st['top'] + column * per_line + row
+            else:
+                if column >= per_line:
+                    return -1, 0
+                index = st['top'] + row * per_line + column
+            if not 0 <= index < len(st['items']):
+                return -1, 0
+            # Only the icon and the label are the item
+            left = x - column * cell_w
+            label_w = self._native_text_width(self._lv_item_text(win, index, 0))
+            if self._lv_view(win) == 0:
+                if abs(left - cell_w // 2) > max(18, min(cell_w, label_w + 4) // 2):
+                    return -1, 0
+            elif left > self.lv_icon_space(win) + label_w + 4:
+                return -1, 0
+            return index, 0
         index = st['top'] + (y - header) // self.LV_ROW_H
         if not 0 <= index < len(st['items']):
             return -1, 0
@@ -14399,13 +14789,21 @@ class WinAPIHandler:
         if self._notify_simple(win, self.LVN_BEGINLABELEDITW, payload):
             return 0
         self._lv_ensure_visible(win, index)
-        top = self.lv_header_height(win) + (index - st['top']) * self.LV_ROW_H
-        width = st['columns'][0]['width'] - 20 if st['columns'] and self._lv_view(win) == 1 \
-            else self.gui.client_size(win)[0] - 20
-        edit = self.gui.create_control(win.hwnd, 'EDIT', text, 20, top, max(width, 40),
+        left, top, right, bottom = self.lv_item_rect(win, index)
+        view = self._lv_view(win)
+        icon = self.lv_icon_space(win)
+        if view == 1:
+            x, width = left + icon, (st['columns'][0]['width'] - icon if st['columns']
+                                     else right - left - icon)
+        elif view == 0:  # Under the icon
+            x, width, top = left, right - left, top + 38
+        else:
+            x, width = left + icon, max(right - left - icon, self._native_text_width(text) + 12)
+        edit = self.gui.create_control(win.hwnd, 'EDIT', text, x, top, max(width, 40),
                                        self.LV_ROW_H, 0x50800080, control_id=0)
         st['edit'] = (edit, index)
         self.gui.focused_control = edit
+        self.gui.controls[edit].select_all()
         return edit
 
     def _lv_end_edit(self, win, accept):
@@ -14434,10 +14832,15 @@ class WinAPIHandler:
         self.SetFocus([win.hwnd])
 
     def _lv_activate(self, win, index, code):
-        """NM_DBLCLK/NM_RETURN followed by LVN_ITEMACTIVATE"""
+        """NM_DBLCLK/NM_RETURN (none for Alt+Enter) followed by LVN_ITEMACTIVATE;
+        uKeyFlags tells the modifier keys (LVKF_ALT, LVKF_CONTROL, LVKF_SHIFT)"""
         param = win.nstate['items'][index]['param'] if 0 <= index < len(win.nstate['items']) else 0
-        payload = struct.pack('<iiIIIiiII', index, 0, 0, 0, 0, 0, 0, param, 0)
-        self._notify_simple(win, code, payload)
+        keys = self.gui.key_states if self.gui else {}
+        flags = (1 if keys.get(0x12) else 0) | (2 if keys.get(0x11) else 0) | \
+            (4 if keys.get(0x10) else 0)
+        payload = struct.pack('<iiIIIiiII', index, 0, 0, 0, 0, 0, 0, param, flags)
+        if code is not None:
+            self._notify_simple(win, code, payload)
         if self._native_window(win.hwnd) is not None:
             self._notify_simple(win, self.LVN_ITEMACTIVATE, payload)
 
@@ -14450,19 +14853,31 @@ class WinAPIHandler:
         if st.get('edit'):
             self._lv_end_edit(win, True)
         self.SetFocus([win.hwnd])
-        if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and x >= width - 16 and \
-                len(st['items']) > self.lv_rows_per_page(win):
+        _, _, per_line, lines, column_major = self.lv_grid(win)
+        if column_major and msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and \
+                y >= height - 16 and len(st['items']) > per_line * lines:
+            # Horizontal scroll bar of the list view: arrows and page areas
+            if x < 16:
+                self._lv_scroll_lines(win, -1)
+            elif x >= width - 16:
+                self._lv_scroll_lines(win, 1)
+            else:
+                total = (len(st['items']) + per_line - 1) // per_line
+                thumb = 16 + int((width - 32) * (st['top'] // per_line) / max(1, total))
+                self._lv_scroll_lines(win, lines if x > thumb else -lines)
+            return 0
+        if not column_major and msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and \
+                x >= width - 16 and len(st['items']) > per_line * lines:
             # Vertical scroll bar: arrows and page areas
-            rows = self.lv_rows_per_page(win)
             header = self.lv_header_height(win)
             if y < header + 16:
-                self._lv_scroll_to(win, st['top'] - 1)
+                self._lv_scroll_lines(win, -1)
             elif y >= height - 16:
-                self._lv_scroll_to(win, st['top'] + 1)
+                self._lv_scroll_lines(win, 1)
             else:
                 track = max(1, height - header - 32)
                 thumb = header + 16 + int(track * st['top'] / max(1, len(st['items'])))
-                self._lv_scroll_to(win, st['top'] + (rows if y > thumb else -rows))
+                self._lv_scroll_lines(win, lines if y > thumb else -lines)
             return 0
         if msg == self.WM_LBUTTONDOWN and y < self.lv_header_height(win):
             column = self._lv_header_hit(win, x)
@@ -14522,13 +14937,21 @@ class WinAPIHandler:
             return 0
         if not count:
             return 0
-        rows = self.lv_rows_per_page(win)
+        _, _, per_line, lines, column_major = self.lv_grid(win)
+        rows = per_line * lines
         focus = st['focus'] if st['focus'] >= 0 else 0
         moves = {0x26: focus - 1, 0x28: focus + 1, 0x24: 0, 0x23: count - 1,
                  0x21: focus - rows + 1, 0x22: focus + rows - 1}  # Up Down Home End PgUp PgDn
+        view = self._lv_view(win)
+        if view == 3:  # List: Left/Right go to the neighbor column
+            moves.update({0x25: focus - per_line, 0x27: focus + per_line})
+        elif view in (0, 2):  # Icons: rows of per_line items
+            moves.update({0x25: focus - 1, 0x27: focus + 1, 0x26: focus - per_line,
+                          0x28: focus + per_line, 0x21: focus - (lines - 1 or 1) * per_line,
+                          0x22: focus + (lines - 1 or 1) * per_line})
         if vk in moves:
             target = max(0, min(count - 1, moves[vk]))
-            if st['focus'] < 0 and vk in (0x26, 0x28):
+            if st['focus'] < 0 and vk in (0x25, 0x26, 0x27, 0x28):
                 target = 0
             ctrl = bool(self.gui.key_states.get(0x11))
             shift = bool(self.gui.key_states.get(0x10))
@@ -14629,9 +15052,16 @@ class WinAPIHandler:
             return self._lv_mouse(win, msg, wParam, lParam)
         if msg == self.WM_KEYDOWN:
             return self._lv_key(win, wParam)
+        if msg == self.WM_SYSKEYDOWN and wParam == 0x0D:  # Alt+Enter activates too
+            if st['focus'] >= 0 and self._native_window(win.hwnd) is not None:
+                self._lv_activate(win, st['focus'], None)
+            return 0
         if msg == self.WM_MOUSEWHEEL:
             delta = (wParam >> 16) - 0x10000 if wParam & 0x80000000 else wParam >> 16
-            self._lv_scroll_to(win, st['top'] - 3 * delta // 120)
+            if self._lv_view(win) == 1:
+                self._lv_scroll_to(win, st['top'] - 3 * delta // 120)
+            else:
+                self._lv_scroll_lines(win, -delta // 120)
             return 0
         if msg == self.WM_SETFOCUS:
             self._notify_simple(win, self.NM_SETFOCUS)
@@ -14745,18 +15175,24 @@ class WinAPIHandler:
             if not 0 <= wParam < len(items):
                 return 0
             code = struct.unpack('<i', self.emu.uc.mem_read(lParam, 4))[0]
-            top = self.lv_header_height(win) + (wParam - st['top']) * self.LV_ROW_H
-            width = sum(c['width'] for c in st['columns']) if self._lv_view(win) == 1 else \
-                self.gui.client_size(win)[0]
-            left = 0 if code != 2 else 20  # LVIR_LABEL starts after the icon
-            right = 18 if code == 1 else (st['columns'][0]['width'] if code == 2 and
-                                          st['columns'] else width)
-            self._mem_write(lParam, struct.pack('<iiii', left - st['hscroll'], top,
-                                                right - st['hscroll'], top + self.LV_ROW_H))
+            left, top, right, bottom = self.lv_item_rect(win, wParam)
+            if self._lv_view(win) == 0:  # Icon above the label
+                if code == 1:  # LVIR_ICON
+                    left, right, bottom = left + (right - left - 32) // 2, \
+                        left + (right - left + 32) // 2, top + 36
+                elif code == 2:  # LVIR_LABEL
+                    top += 36
+            elif code == 1:  # LVIR_ICON
+                right = left + self.lv_icon_space(win)
+            elif code == 2:  # LVIR_LABEL starts after the icon
+                left += self.lv_icon_space(win)
+                if self._lv_view(win) == 1 and st['columns']:
+                    right = left - self.lv_icon_space(win) + st['columns'][0]['width']
+            self._mem_write(lParam, struct.pack('<iiii', left, top, right, bottom))
             return 1
         if msg == 0x1010:  # LVM_GETITEMPOSITION
-            top = self.lv_header_height(win) + (wParam - st['top']) * self.LV_ROW_H
-            self._mem_write(lParam, struct.pack('<ii', 0, top))
+            left, top, _, _ = self.lv_item_rect(win, wParam)
+            self._mem_write(lParam, struct.pack('<ii', left, top))
             return 1
         if msg == 0x1011:  # LVM_GETSTRINGWIDTH
             return self._native_text_width(self._read_text(lParam, wide))
@@ -14777,8 +15213,13 @@ class WinAPIHandler:
                 self._lv_ensure_visible(win, wParam)
             return 1
         if msg == 0x1014:  # LVM_SCROLL
+            dx = signed_w
             dy = lParam - (1 << 32) if lParam & 0x80000000 else lParam
-            self._lv_scroll_to(win, st['top'] + dy // self.LV_ROW_H)
+            cell_w, cell_h, _, _, column_major = self.lv_grid(win)
+            if column_major:
+                self._lv_scroll_lines(win, int(dx / cell_w))
+            else:
+                self._lv_scroll_lines(win, int(dy / cell_h))
             return 1
         if msg in (0x1015, 0x102A):  # LVM_REDRAWITEMS, LVM_UPDATE
             self._invalidate_native(win)
@@ -14840,7 +15281,8 @@ class WinAPIHandler:
                 width = lParam & 0xFFFF
                 if width >= 0xFFFE:  # LVSCW_AUTOSIZE(_USEHEADER)
                     width = max([self._native_text_width(st['columns'][wParam]['text']) + 12] +
-                                [self._native_text_width(self._lv_item_text(win, i, st['columns'][wParam]['sub'])) + 24
+                                [self._native_text_width(self._lv_item_text(win, i, st['columns'][wParam]['sub'])) + 12 +
+                                 (self.lv_icon_space(win) if st['columns'][wParam]['sub'] == 0 else 0)
                                  for i in range(min(len(items), 200))])
                 columns = [dict(c) for c in st['columns']]
                 columns[wParam]['width'] = width - 0x10000 if width & 0x8000 else width
@@ -14893,8 +15335,10 @@ class WinAPIHandler:
             return self._lv_sort(win, lParam, wParam, True)
         if msg == 0x1032:  # LVM_GETSELECTEDCOUNT
             return sum(1 for item in items if item['state'] & self.LVIS_SELECTED)
-        if msg == 0x1033:  # LVM_GETITEMSPACING
-            return (self.LV_ROW_H << 16) | 64
+        if msg == 0x1033:  # LVM_GETITEMSPACING (wParam: small icon view)
+            cell_w, cell_h = self.LV_ICON_CELL if not wParam else \
+                (st.get('cell_w') or 120, self.LV_ROW_H)
+            return (cell_h << 16) | cell_w
         if msg == 0x1036:  # LVM_SETEXTENDEDLISTVIEWSTYLE
             previous = st['ex_style']
             mask = wParam or 0xFFFFFFFF
@@ -20614,7 +21058,7 @@ class FakeWindow:
 class FakeControl:
     """Fake Windows control (Button, Edit, Static, etc.)"""
     
-    def __init__(self, hwnd, class_name, text, x, y, width, height, style=0):
+    def __init__(self, hwnd, class_name, text, x, y, width, height, style=0, ex_style=0):
         self.hwnd = hwnd
         self.class_name = class_name.upper()
         self.text = text
@@ -20623,6 +21067,7 @@ class FakeControl:
         self.width = width
         self.height = height
         self.style = style
+        self.ex_style = ex_style
         self.visible = True
         self.enabled = True
         self.parent_hwnd = 0
@@ -20648,6 +21093,69 @@ class FakeControl:
         self.progress_step = 10
         self.progress_bar_color = None  # (r, g, b) of PBM_SETBARCOLOR, None: default
         self.progress_bk_color = None   # (r, g, b) of PBM_SETBKCOLOR, None: default
+        # EDIT (and editable COMBOBOX) selection: the anchor and the caret end;
+        # character offsets into self.text, clamped when used
+        self.sel_anchor = 0
+        self.sel_caret = 0
+        self.edit_scroll = 0  # Pixels the text is scrolled left (caret kept visible)
+        self.edit_top_line = 0  # First visible line of a multiline edit
+        self.text_limit = 0  # EM_LIMITTEXT (0: no limit)
+        self.icon = None  # SS_ICON static: (width, height, RGBA) of its icon
+        self.icon_handle = 0
+        self.modified = False  # EM_GETMODIFY
+        # ES_PASSWORD shows this character instead of the text ('' : plain text)
+        self.password_char = '*' if self.class_name == 'EDIT' and style & 0x20 else ''
+
+    # ---------- EDIT selection ----------
+
+    def selection(self):
+        """(start, end) of the selection, start <= end"""
+        n = len(self.text)
+        anchor = min(max(self.sel_anchor, 0), n)
+        caret = min(max(self.sel_caret, 0), n)
+        return min(anchor, caret), max(anchor, caret)
+
+    def set_selection(self, anchor, caret=None):
+        n = len(self.text)
+        self.sel_anchor = min(max(anchor, 0), n)
+        self.sel_caret = min(max(anchor if caret is None else caret, 0), n)
+
+    def select_all(self):
+        self.set_selection(0, len(self.text))
+
+    def replace_selection(self, text):
+        """Replace the selection with text (cut to the text limit); the caret
+        ends after it. Returns True if the text changed."""
+        start, end = self.selection()
+        if self.text_limit:
+            text = text[:max(0, self.text_limit - (len(self.text) - (end - start)))]
+        if not text and start == end:
+            return False
+        self.text = self.text[:start] + text + self.text[end:]
+        self.set_selection(start + len(text))
+        self.modified = True
+        return True
+
+    def edit_lines(self):
+        """[(start, end)] character ranges of the lines (CR LF or LF breaks)"""
+        lines = []
+        start = 0
+        text = self.text
+        while True:
+            newline = text.find('\n', start)
+            if newline < 0:
+                lines.append((start, len(text)))
+                return lines
+            end = newline - 1 if newline > start and text[newline - 1] == '\r' else newline
+            lines.append((start, end))
+            start = newline + 1
+
+    def line_of(self, offset):
+        """Index of the line that contains character offset"""
+        for index, (start, end) in enumerate(self.edit_lines()):
+            if offset <= end:
+                return index
+        return len(self.edit_lines()) - 1
 
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
@@ -20825,6 +21333,7 @@ class PseudoWindowsGUI:
         
         # MessageBox queue
         self.messagebox_queue = queue.Queue()
+        self.messageboxes = {}  # hwnd -> MessageBox state (buttons, request)
         # Guards windows/controls/z_order and display lists across threads
         self.lock = threading.RLock()
         self.messagebox_result = None
@@ -21773,6 +22282,9 @@ class PseudoWindowsGUI:
         for shape in window.drawn_shapes:
             self._draw_shape(shape, client_x, client_y)
 
+        if getattr(window, 'messagebox_icon', 0):
+            self._draw_messagebox_icon(window.messagebox_icon, client_x + 20, client_y + 18)
+
         # Draw controls
         for control in window.controls:
             self._draw_control(control, client_x, client_y)
@@ -22176,6 +22688,9 @@ class PseudoWindowsGUI:
         st = win.nstate
         owner = win.owner
         report = (win.style & 0x3) == 1
+        if not report and owner is not None:
+            self._draw_listview_grid(win, cx, cy, cw, ch)
+            return
         header_h = owner.lv_header_height(win) if owner else 0
         row_h = WinAPIHandler.LV_ROW_H
         columns = sorted(st['columns'], key=lambda c: c.get('order', 0)) if report else []
@@ -22237,7 +22752,8 @@ class PseudoWindowsGUI:
                     image = item.get('cache_image', item['image'])
                     if image is not None and image >= 0 and himl:
                         self._draw_imagelist_image(owner, himl, image, x + 2, y + 1)
-                    tx = x + 22
+                    # No small image list: no icon space (like comctl32)
+                    tx = x + 2 + (owner.lv_icon_space(win) if owner else 20)
                 width = column['width'] - (tx - x) - 4
                 if width > 0 and text:
                     label = self._fit_text(self.font, text, width)
@@ -22265,6 +22781,93 @@ class PseudoWindowsGUI:
             if track > 8:
                 thumb_h = max(10, track * rows // max(1, len(items)))
                 thumb_y = bar.y + 16 + (track - thumb_h) * st['top'] // max(1, len(items) - rows)
+                self._draw_button_3d(pygame.Rect(bar.x, thumb_y, 16, thumb_h), '')
+
+    def _draw_listview_grid(self, win, cx, cy, cw, ch):
+        """Icon, small icon and list views: items in cells laid out by the
+        owner's lv_grid (rows of cells, or columns for the list view)"""
+        st = win.nstate
+        owner = win.owner
+        icons = (win.style & 0x3) == 0
+        cell_w, cell_h, per_line, lines, column_major = owner.lv_grid(win)
+        focused = self.focused_window == win.hwnd and self.top_level_of(win.hwnd) == \
+            self.active_window
+        himl = (st['imagelists'].get(0) or st['imagelists'].get(1)) if icons else \
+            (st['imagelists'].get(1) or st['imagelists'].get(0))
+        items = st['items']
+        clip = self.screen.get_clip()
+        body = pygame.Rect(cx, cy, cw, ch)
+        self.screen.set_clip(body.clip(clip) if clip else body)
+        page = per_line * (lines + 1)
+        for index in range(st['top'], min(len(items), st['top'] + page)):
+            item = items[index]
+            left, top, right, bottom = owner.lv_item_rect(win, index)
+            x, y = cx + left, cy + top
+            selected = item['state'] & 0x2
+            text = item['cache'].get(0)
+            if text is None:
+                text = item['texts'].get(0) or ''
+            image = item.get('cache_image', item['image'])
+            text_color = (255, 255, 255) if selected and focused else self.COLOR_TEXT
+            select_color = self.COLOR_TITLE_BAR if focused else (192, 192, 192)
+            if icons:
+                if image is not None and image >= 0 and himl:
+                    self._draw_imagelist_image(owner, himl, image, x + (cell_w - 32) // 2, y + 2)
+                lines_text = self._wrap_text(text, cell_w - 4)[:2]
+                if len(self._wrap_text(text, cell_w - 4)) > 2:
+                    lines_text[1] = self._fit_text(self.font, lines_text[1] + '...', cell_w - 4)
+                label_h = len(lines_text) * self.font.get_linesize()
+                label_w = max([self.font.size(line)[0] for line in lines_text] + [8])
+                label = pygame.Rect(x + (cell_w - label_w) // 2 - 2, y + 37, label_w + 4, label_h)
+                if selected:
+                    pygame.draw.rect(self.screen, select_color, label)
+                for n, line in enumerate(lines_text):
+                    surface = self.font.render(line, True, text_color)
+                    self.screen.blit(surface, (x + (cell_w - surface.get_width()) // 2,
+                                               label.y + n * self.font.get_linesize()))
+                if index == st['focus'] and focused:
+                    pygame.draw.rect(self.screen, (128, 128, 128), label, 1)
+                continue
+            if image is not None and image >= 0 and himl:
+                self._draw_imagelist_image(owner, himl, image, x + 2, y + 1)
+            icon = owner.lv_icon_space(win)
+            label_text = self._fit_text(self.font, text, max(0, cell_w - icon - 6))
+            surface = self.font.render(label_text, True, text_color)
+            label = pygame.Rect(x + icon, y, surface.get_width() + 4, cell_h)
+            if selected:
+                pygame.draw.rect(self.screen, select_color, label)
+            self.screen.blit(surface, (label.x + 2, y + (cell_h - surface.get_height()) // 2))
+            if index == st['focus'] and focused:
+                pygame.draw.rect(self.screen, (128, 128, 128), label, 1)
+        self.screen.set_clip(clip)
+        lines_total = (len(items) + per_line - 1) // per_line
+        if lines_total <= lines:
+            return
+        # Scroll bar: horizontal for the list view's columns, vertical otherwise
+        first_line = st['top'] // per_line
+        if column_major:
+            bar = pygame.Rect(cx, cy + ch - 16, cw, 16)
+            pygame.draw.rect(self.screen, (230, 228, 222), bar)
+            for rect, arrow in ((pygame.Rect(bar.x, bar.y, 16, 16), 'left'),
+                                (pygame.Rect(bar.right - 16, bar.y, 16, 16), 'right')):
+                self._draw_button_3d(rect, '')
+                self._draw_arrow(rect, arrow)
+            track = bar.width - 32
+            if track > 8:
+                thumb_w = max(10, track * lines // lines_total)
+                thumb_x = bar.x + 16 + (track - thumb_w) * first_line // max(1, lines_total - lines)
+                self._draw_button_3d(pygame.Rect(thumb_x, bar.y, thumb_w, 16), '')
+        else:
+            bar = pygame.Rect(cx + cw - 16, cy, 16, ch)
+            pygame.draw.rect(self.screen, (230, 228, 222), bar)
+            for rect, arrow in ((pygame.Rect(bar.x, bar.y, 16, 16), 'up'),
+                                (pygame.Rect(bar.x, bar.bottom - 16, 16, 16), 'down')):
+                self._draw_button_3d(rect, '')
+                self._draw_arrow(rect, arrow)
+            track = bar.height - 32
+            if track > 8:
+                thumb_h = max(10, track * lines // lines_total)
+                thumb_y = bar.y + 16 + (track - thumb_h) * first_line // max(1, lines_total - lines)
                 self._draw_button_3d(pygame.Rect(bar.x, thumb_y, 16, thumb_h), '')
 
     VIEW_GLYPHS = {8: 'up', 10: 'new'}  # Standard VIEW_* bitmaps (IDB_VIEW_*_COLOR)
@@ -22424,24 +23027,37 @@ class PseudoWindowsGUI:
     MENU_SEP_H = 7
 
     def _menu_panel_rects(self, items, x, y):
-        """Panel rect and item rects of a menu panel opened at (x, y)"""
-        width = 120
+        """Panel rect and item rects of a menu panel opened at (x, y); an item
+        with a column break (MF_MENUBREAK, MF_MENUBARBREAK) starts a new column"""
+        columns = []
         for sub in items:
-            if sub.get('text'):
-                shortcut_w = (self.font.size(sub['shortcut'])[0] + 24
-                              if sub.get('shortcut') else 0)
-                width = max(width, self.font.size(sub['text'])[0] + 48 + shortcut_w)
-        height = sum(self.MENU_SEP_H if sub.get('separator') else self.MENU_ITEM_H
-                     for sub in items) + 4
-        x = max(0, min(x, self.width - width))
+            if not columns or sub.get('break'):
+                columns.append([])
+            columns[-1].append(sub)
+        widths = []
+        for column in columns:
+            width = 120 if len(columns) == 1 else 60
+            for sub in column:
+                if sub.get('text'):
+                    shortcut_w = (self.font.size(sub['shortcut'])[0] + 24
+                                  if sub.get('shortcut') else 0)
+                    width = max(width, self.font.size(sub['text'])[0] + 48 + shortcut_w)
+            widths.append(width)
+        height = max(sum(self.MENU_SEP_H if sub.get('separator') else self.MENU_ITEM_H
+                         for sub in column) for column in columns) + 4 if columns else 4
+        total = sum(widths) + 4 * (len(widths) - 1) if widths else 120
+        x = max(0, min(x, self.width - total))
         y = max(0, min(y, self.height - height))
-        panel = pygame.Rect(x, y, width, height)
+        panel = pygame.Rect(x, y, total, height)
         rects = []
-        top = y + 2
-        for sub in items:
-            h = self.MENU_SEP_H if sub.get('separator') else self.MENU_ITEM_H
-            rects.append(pygame.Rect(x + 2, top, width - 4, h))
-            top += h
+        left = x
+        for column, width in zip(columns, widths):
+            top = y + 2
+            for sub in column:
+                h = self.MENU_SEP_H if sub.get('separator') else self.MENU_ITEM_H
+                rects.append(pygame.Rect(left + 2, top, width - 4, h))
+                top += h
+            left += width + 4
         return panel, rects
 
     def _menu_panels(self, items, x, y, path):
@@ -22465,7 +23081,14 @@ class PseudoWindowsGUI:
             pygame.draw.rect(self.screen, (64, 64, 64), panel.move(3, 3))
             pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, panel)
             pygame.draw.rect(self.screen, (128, 128, 128), panel, 1)
-            for sub, rect in zip(items, rects):
+            for index, (sub, rect) in enumerate(zip(items, rects)):
+                if index and sub.get('break') == 'bar':
+                    # Etched vertical line between the columns
+                    bar_x = rect.x - 5
+                    pygame.draw.line(self.screen, (128, 128, 128), (bar_x, panel.y + 2),
+                                     (bar_x, panel.bottom - 3))
+                    pygame.draw.line(self.screen, (255, 255, 255), (bar_x + 1, panel.y + 2),
+                                     (bar_x + 1, panel.bottom - 3))
                 if sub.get('separator'):
                     mid = rect.y + rect.height // 2
                     pygame.draw.line(self.screen, (128, 128, 128), (rect.x + 2, mid),
@@ -22621,6 +23244,71 @@ class PseudoWindowsGUI:
 
     SS_NOPREFIX = 0x80
 
+    def _draw_edit_text(self, control, rect, padding=4):
+        """Text of an EDIT control (or an editable combo box) with the selection,
+        the blinking caret and the scrolling that keeps the caret visible"""
+        font = self.font
+        shown = self._edit_display_text(control)
+        focused = control.hwnd == self.focused_control
+        start, end = control.selection()
+        caret = min(max(control.sel_caret, 0), len(shown))
+        lines = control.edit_lines()
+        line_h = font.get_linesize()
+        multiline = control.class_name == "EDIT" and control.style & 0x4
+        inner_w = max(1, rect.width - 2 * padding)
+        caret_line = control.line_of(caret)
+        caret_px = font.size(shown[lines[caret_line][0]:caret])[0]
+        if caret_px - control.edit_scroll > inner_w - 1:
+            control.edit_scroll = caret_px - inner_w + 1
+        elif caret_px < control.edit_scroll:
+            control.edit_scroll = max(0, caret_px - inner_w // 3)
+        if multiline:
+            visible = max(1, (rect.height - 4) // line_h)
+            if caret_line < control.edit_top_line:
+                control.edit_top_line = caret_line
+            elif caret_line >= control.edit_top_line + visible:
+                control.edit_top_line = caret_line - visible + 1
+            top, first_y = control.edit_top_line, rect.y + 2
+        else:
+            top, first_y = 0, rect.y + (rect.height - font.get_height()) // 2
+        color = self.COLOR_TEXT if control.enabled else (128, 128, 128)
+        show_selection = focused or control.style & 0x100  # ES_NOHIDESEL
+        prev_clip = self.screen.get_clip()
+        inner = rect.inflate(-2, -2)
+        self.screen.set_clip(inner.clip(prev_clip) if prev_clip else inner)
+        x0 = rect.x + padding - control.edit_scroll
+        for index in range(top, len(lines)):
+            line_start, line_end = lines[index]
+            y = first_y + (index - top) * line_h
+            if y > rect.bottom:
+                break
+            first, last = max(start, line_start), min(end, line_end)
+            if show_selection and first < last:
+                x = x0
+                for piece, selected in ((shown[line_start:first], False),
+                                        (shown[first:last], True),
+                                        (shown[last:line_end], False)):
+                    if not piece:
+                        continue
+                    width = font.size(piece)[0]
+                    if selected:
+                        pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, (x, y, width, line_h))
+                    self.screen.blit(font.render(piece, True, self.COLOR_TITLE_TEXT if selected
+                                                 else color), (x, y))
+                    x += width
+            elif line_end > line_start:
+                self.screen.blit(font.render(shown[line_start:line_end], True, color), (x0, y))
+        if focused and (pygame.time.get_ticks() // 500) % 2 == 0:
+            caret_x = x0 + caret_px
+            if multiline:
+                caret_y = first_y + (caret_line - top) * line_h
+                pygame.draw.line(self.screen, self.COLOR_TEXT, (caret_x, caret_y),
+                                 (caret_x, caret_y + line_h - 1))
+            else:
+                pygame.draw.line(self.screen, self.COLOR_TEXT, (caret_x, rect.y + 3),
+                                 (caret_x, rect.bottom - 4))
+        self.screen.set_clip(prev_clip)
+
     @staticmethod
     def _mnemonic_text(text):
         """Control text as drawn: "&x" marks the mnemonic (underlined on
@@ -22641,6 +23329,13 @@ class PseudoWindowsGUI:
         elif kind == 0x12:  # SS_ETCHEDFRAME
             pygame.draw.rect(self.screen, light, (x + 1, y + 1, w - 1, h - 1), 1)
             pygame.draw.rect(self.screen, dark, (x, y, w - 1, h - 1), 1)
+        elif kind == 3:  # SS_ICON
+            if control.icon:
+                surface = self._image_surface_rgba(control.icon)
+                if control.style & 0x200:  # SS_CENTERIMAGE
+                    self.screen.blit(surface, surface.get_rect(center=rect.center))
+                else:
+                    self.screen.blit(surface, (x, y))
         elif kind in (4, 5, 6):  # SS_BLACKRECT, SS_GRAYRECT, SS_WHITERECT
             pygame.draw.rect(self.screen, ((0, 0, 0), dark, light)[kind - 4], rect)
         elif kind in (7, 8, 9):  # SS_BLACKFRAME, SS_GRAYFRAME, SS_WHITEFRAME
@@ -22768,33 +23463,12 @@ class PseudoWindowsGUI:
             
         elif control.class_name == "EDIT":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
-            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled
+            # Disabled and read-only edit controls have the dialog color
+            readonly = control.style & 0x800  # ES_READONLY
+            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled and not readonly
                              else self.COLOR_BUTTON, rect)
-            border_color = (0, 0, 128) if control.hwnd == self.focused_control else (128, 128, 128)
-            pygame.draw.rect(self.screen, border_color, rect, 1)
-            # Sunken effect
-            pygame.draw.line(self.screen, (64, 64, 64), (abs_x, abs_y), (abs_x + control.width, abs_y))
-            pygame.draw.line(self.screen, (64, 64, 64), (abs_x, abs_y), (abs_x, abs_y + control.height))
-
-            # Show the tail of the text if it is wider than the control
-            text_str = control.text
-            max_text_w = control.width - 8
-            while text_str and self.font.size(text_str)[0] > max_text_w:
-                text_str = text_str[1:]
-
-            prev_clip = self.screen.get_clip()
-            self.screen.set_clip(rect)
-            text = self.font.render(text_str, True, self.COLOR_TEXT if control.enabled
-                                    else (128, 128, 128))
-            text_y = abs_y + (control.height - text.get_height()) // 2
-            self.screen.blit(text, (abs_x + 4, text_y))
-
-            # Blinking caret when focused
-            if control.hwnd == self.focused_control and (pygame.time.get_ticks() // 500) % 2 == 0:
-                caret_x = abs_x + 4 + text.get_width() + 1
-                pygame.draw.line(self.screen, self.COLOR_TEXT,
-                                 (caret_x, abs_y + 3), (caret_x, abs_y + control.height - 4))
-            self.screen.set_clip(prev_clip)
+            inset = self._draw_window_edge(rect, control.style, control.ex_style)
+            self._draw_edit_text(control, rect, padding=inset + 2)
             
         elif control.class_name == "LISTBOX":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
@@ -22822,15 +23496,15 @@ class PseudoWindowsGUI:
         elif control.class_name == "COMBOBOX":
             box_h = min(control.height, 24)
             rect = pygame.Rect(abs_x, abs_y, control.width, box_h)
-            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
-            pygame.draw.rect(self.screen, (128, 128, 128), rect, 1)
+            pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled
+                             else self.COLOR_BUTTON, rect)
+            self._draw_window_edge(rect, 0, 0x200)  # Sunken like WS_EX_CLIENTEDGE
 
             # Selected item text (editable combos: the edit field's text)
             sel_text = ""
             if control.style & 0x3 in (1, 2):  # CBS_SIMPLE, CBS_DROPDOWN
-                sel_text = control.text
-                if self.focused_control == control.hwnd:
-                    sel_text += '|' if (pygame.time.get_ticks() // 500) % 2 else ''
+                self._draw_edit_text(control, pygame.Rect(abs_x, abs_y, control.width - 18,
+                                                          box_h))
             elif 0 <= control.sel_index < len(control.items):
                 sel_text = control.items[control.sel_index]
             if sel_text:
@@ -22840,8 +23514,8 @@ class PseudoWindowsGUI:
                 self.screen.blit(text, (abs_x + 4, abs_y + (box_h - text.get_height()) // 2))
                 self.screen.set_clip(prev_clip)
 
-            # Dropdown arrow
-            arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 1, 17, box_h - 2)
+            # Dropdown arrow inside the sunken edge
+            arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 2, 16, box_h - 4)
             self._draw_button_3d(arrow_rect, "", small=True, arrow='down')
             
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
@@ -22892,6 +23566,33 @@ class PseudoWindowsGUI:
                         self.dragging_scrollbar[0] == control.hwnd)
             self._draw_button_3d(m['thumb'], "", pressed=dragging)
     
+    def _draw_window_edge(self, rect, style, ex_style):
+        """Classic border of a child window by its styles: WS_EX_CLIENTEDGE
+        (2 px sunken), WS_EX_STATICEDGE (1 px sunken), WS_BORDER (1 px black).
+        Returns the border width."""
+        x, y, r, b = rect.x, rect.y, rect.right - 1, rect.bottom - 1
+        draw = pygame.draw.line
+        if ex_style & 0x200:  # WS_EX_CLIENTEDGE
+            draw(self.screen, (128, 128, 128), (x, y), (r - 1, y))
+            draw(self.screen, (128, 128, 128), (x, y), (x, b - 1))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (x, b), (r, b))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (r, y), (r, b))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_DARK, (x + 1, y + 1), (r - 2, y + 1))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_DARK, (x + 1, y + 1), (x + 1, b - 2))
+            draw(self.screen, self.COLOR_BUTTON, (x + 1, b - 1), (r - 1, b - 1))
+            draw(self.screen, self.COLOR_BUTTON, (r - 1, y + 1), (r - 1, b - 1))
+            return 2
+        if ex_style & 0x20000:  # WS_EX_STATICEDGE
+            draw(self.screen, (128, 128, 128), (x, y), (r - 1, y))
+            draw(self.screen, (128, 128, 128), (x, y), (x, b - 1))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (x, b), (r, b))
+            draw(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (r, y), (r, b))
+            return 1
+        if style & 0x00800000:  # WS_BORDER
+            pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
+            return 1
+        return 0
+
     def _draw_group_box(self, control, rect):
         """BS_GROUPBOX: etched frame with the caption on its top edge"""
         caption = self._mnemonic_text(control.text)
@@ -23719,6 +24420,7 @@ class PseudoWindowsGUI:
                         control.sel_index = i
                         if control.style & 0x3 in (1, 2):
                             control.text = control.items[i]
+                            control.select_all()
                         self.open_combo = None
                         win = self.windows.get(control.parent_hwnd)
                         if win and self.winapi:
@@ -24026,6 +24728,9 @@ class PseudoWindowsGUI:
                             # Clicking a button takes focus away from edits
                             self.focused_control = None
                             # If dialog window (MessageBox) - OK/Cancel button closes it
+                            if hwnd in self.messageboxes:
+                                self._messagebox_done(hwnd, getattr(control, 'mb_result', 1))
+                                return
                             if win.is_dialog and not self._is_app_window(hwnd):
                                 self._close_window(hwnd)
                                 return
@@ -24034,9 +24739,15 @@ class PseudoWindowsGUI:
                                 self._post_button_command(win, control)
                             return
                         elif control.class_name == "EDIT":
-                            # Give keyboard focus to the edit control
+                            # Give keyboard focus to the edit control, the caret
+                            # goes where it was clicked
                             if button == 1:
                                 self.focused_control = control.hwnd
+                                offset = self._edit_caret_from_x(control, x - ctrl_x,
+                                                                 y - ctrl_y)
+                                shift = pygame.key.get_mods() & pygame.KMOD_SHIFT
+                                control.set_selection(control.sel_anchor if shift else offset,
+                                                      offset)
                             return
                         elif control.class_name == "CHECKBOX":
                             if button == 1:
@@ -24072,6 +24783,10 @@ class PseudoWindowsGUI:
                             if (button == 1 and control.style & 0x3 in (1, 2) and
                                     x < ctrl_x + control.width - 18):
                                 self.focused_control = control.hwnd  # Type into it
+                                offset = self._edit_caret_from_x(control, x - ctrl_x)
+                                shift = pygame.key.get_mods() & pygame.KMOD_SHIFT
+                                control.set_selection(control.sel_anchor if shift else offset,
+                                                      offset)
                                 self.open_combo = None
                                 return
                             if button == 1:
@@ -24243,6 +24958,8 @@ class PseudoWindowsGUI:
             else:
                 self._forward_key_to_window(event)
             return
+        if self._messagebox_key(event):
+            return
 
         # The active console window takes the line its program is waiting for
         console = self.consoles.get(self.active_window)
@@ -24295,49 +25012,272 @@ class PseudoWindowsGUI:
             parent.owner.post_window_message(control.hwnd, WinAPIHandler.WM_KEYDOWN, vk, 1)
             return True
 
-        if event.key == pygame.K_BACKSPACE:
-            control.text = control.text[:-1]
-        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE, pygame.K_TAB):
-            if win.owner is not None and control.parent_hwnd in win.owner.dialogs:
+        multiline = control.class_name == "EDIT" and control.style & 0x4  # ES_MULTILINE
+        in_dialog = win.owner is not None and control.parent_hwnd in win.owner.dialogs
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and multiline and (
+                control.style & 0x1000 or not in_dialog):  # ES_WANTRETURN
+            self._edit_insert(win, control, '\r\n')
+            return True
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE, pygame.K_TAB):
+            if in_dialog:
                 return False  # The dialog handles them (default button, Cancel, next edit)
             self.focused_control = None
-        elif event.unicode and event.unicode.isprintable():
-            control.text += event.unicode
+            return True
+        self._edit_key(win, control, event)
         return True
+
+    @staticmethod
+    def _edit_word_boundary(text, offset, direction):
+        """Offset of the previous (-1) or next (1) word start from offset"""
+        if direction < 0:
+            while offset > 0 and text[offset - 1].isspace():
+                offset -= 1
+            while offset > 0 and not text[offset - 1].isspace():
+                offset -= 1
+        else:
+            while offset < len(text) and not text[offset].isspace():
+                offset += 1
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+        return offset
+
+    def _edit_notify_change(self, win, control):
+        """EN_CHANGE (CBN_EDITCHANGE for a combo box) after the user changed the text"""
+        if win.owner is None:
+            return
+        parent = self.windows.get(control.parent_hwnd)
+        if parent is not None and parent.native:
+            return  # Edit of a common control (ComboBoxEx, list view label)
+        self._post_control_command(win, control, 5 if control.class_name == "COMBOBOX"
+                                   else 0x0300)
+
+    def _edit_insert(self, win, control, text):
+        """Type text into an edit control (replacing the selection)"""
+        if control.class_name == "EDIT":
+            if control.style & 0x800:  # ES_READONLY
+                return
+            if control.style & 0x2000 and not text.isdigit():  # ES_NUMBER
+                return
+            if control.style & 0x8:  # ES_UPPERCASE
+                text = text.upper()
+            elif control.style & 0x10:  # ES_LOWERCASE
+                text = text.lower()
+        if control.replace_selection(text):
+            self._edit_notify_change(win, control)
+
+    def _edit_key(self, win, control, event):
+        """Caret movement, selection, deletion, clipboard and typing in an
+        edit control (or the edit part of a combo box)"""
+        text = control.text
+        ctrl = bool(event.mod & pygame.KMOD_CTRL)
+        shift = bool(event.mod & pygame.KMOD_SHIFT)
+        readonly = control.class_name == "EDIT" and control.style & 0x800
+        start, end = control.selection()
+        caret = min(max(control.sel_caret, 0), len(text))
+        lines = control.edit_lines()
+
+        def move(offset):
+            # Never stop between the CR and LF of a line break
+            if 0 < offset < len(text) and text[offset - 1] == '\r' and text[offset] == '\n':
+                offset += 1 if offset > caret else -1
+            control.set_selection(control.sel_anchor if shift else offset, offset)
+
+        def delete(first, last):
+            if readonly or first == last:
+                return
+            control.set_selection(first, last)
+            control.replace_selection('')
+            self._edit_notify_change(win, control)
+
+        key = event.key
+        if key in (pygame.K_LEFT, pygame.K_RIGHT):
+            step = -1 if key == pygame.K_LEFT else 1
+            if start != end and not shift:
+                offset = start if step < 0 else end
+            elif ctrl:
+                offset = self._edit_word_boundary(text, caret, step)
+            else:
+                offset = max(0, min(len(text), caret + step))
+                if step < 0 and offset > 0 and text[offset - 1:offset + 1] == '\r\n':
+                    offset -= 1
+                elif step > 0 and text[caret:caret + 2] == '\r\n':
+                    offset = caret + 2
+            move(offset)
+        elif key in (pygame.K_HOME, pygame.K_END):
+            line_start, line_end = lines[control.line_of(caret)]
+            if ctrl:
+                offset = 0 if key == pygame.K_HOME else len(text)
+            else:
+                offset = line_start if key == pygame.K_HOME else line_end
+            move(offset)
+        elif key in (pygame.K_UP, pygame.K_DOWN) and len(lines) > 1:
+            index = control.line_of(caret)
+            target = index + (-1 if key == pygame.K_UP else 1)
+            if 0 <= target < len(lines):
+                column = caret - lines[index][0]
+                move(min(lines[target][0] + column, lines[target][1]))
+        elif key == pygame.K_BACKSPACE:
+            if start != end:
+                delete(start, end)
+            elif ctrl:
+                delete(self._edit_word_boundary(text, caret, -1), caret)
+            elif caret > 0:
+                delete(caret - 2 if text[caret - 2:caret] == '\r\n' else caret - 1, caret)
+        elif key == pygame.K_DELETE:
+            if start != end:
+                if shift:  # Shift+Del: cut
+                    WinAPIHandler.set_clipboard_text(text[start:end])
+                delete(start, end)
+            elif caret < len(text):
+                delete(caret, caret + 2 if text[caret:caret + 2] == '\r\n' else caret + 1)
+        elif ctrl and key == pygame.K_a:
+            control.select_all()
+        elif (ctrl and key in (pygame.K_c, pygame.K_x, pygame.K_INSERT)) and start != end:
+            if not control.password_char:
+                WinAPIHandler.set_clipboard_text(text[start:end])
+                if key == pygame.K_x:
+                    delete(start, end)
+        elif (ctrl and key == pygame.K_v) or (shift and key == pygame.K_INSERT):
+            pasted = WinAPIHandler.clipboard_text()
+            if pasted:
+                if not control.style & 0x4:
+                    pasted = pasted.split('\r', 1)[0].split('\n', 1)[0]
+                self._edit_insert(win, control, pasted)
+        elif event.unicode and event.unicode.isprintable() and not ctrl:
+            self._edit_insert(win, control, event.unicode)
+
+    def _edit_caret_from_x(self, control, x, y=None):
+        """Character offset nearest to a click at control-relative (x, y)"""
+        font = self.font
+        lines = control.edit_lines()
+        index = 0
+        if y is not None and control.style & 0x4 and len(lines) > 1:
+            index = min(len(lines) - 1, max(0, control.edit_top_line +
+                                            (y - 3) // font.get_linesize()))
+        start, end = lines[index]
+        shown = self._edit_display_text(control)
+        target = x - 4 + control.edit_scroll
+        best, best_d = start, abs(target)
+        for offset in range(start, end + 1):
+            d = abs(font.size(shown[start:offset])[0] - target)
+            if d < best_d:
+                best, best_d = offset, d
+        return best
+
+    @staticmethod
+    def _edit_display_text(control):
+        """Text as an edit control shows it (password characters)"""
+        if control.password_char:
+            return ''.join(c if c in '\r\n' else control.password_char for c in control.text)
+        return control.text
 
     def _check_messagebox(self):
         """Check MessageBox requests"""
         try:
             msg = self.messagebox_queue.get_nowait()
-            self._show_messagebox(msg['caption'], msg['text'], msg['type'])
+            self._show_messagebox(msg['caption'], msg['text'], msg['type'], msg.get('request'))
         except queue.Empty:
             pass
     
-    def _show_messagebox(self, caption, text, msg_type):
-        """Show MessageBox; each line of text gets its own row"""
+    def _show_messagebox(self, caption, text, msg_type, request=None):
+        """Show MessageBox; each line of text gets its own row, the buttons of
+        its MB_* type below. request (if any) gets the chosen button's id."""
+        buttons, default, cancel = WinAPIHandler.messagebox_buttons(msg_type)
         lines = text.replace('\r\n', '\n').split('\n')
         line_h = 18
+        icon = (msg_type >> 4) & 0x7  # MB_ICONHAND, QUESTION, EXCLAMATION, ASTERISK
+        text_x = 64 if icon in (1, 2, 3, 4) else 20
+        button_w, gap = 80, 8
+        buttons_w = len(buttons) * button_w + (len(buttons) - 1) * gap
         text_w = max(self.font.size(line)[0] for line in lines)
-        width = min(max(300, text_w + 50), self.width - 20)
-        height = 90 + len(lines) * line_h
+        width = min(max(300, text_w + text_x + 30, buttons_w + 40), self.width - 20)
+        height = 90 + max(len(lines) * line_h, 40 if text_x > 20 else 0)
         x = (self.width - width) // 2
         y = (self.height - height) // 2
         
         hwnd = self.create_window(caption, x, y, width, height)
         win = self.windows[hwnd]
         win.is_dialog = True  # Show only close button
+        win.messagebox_icon = icon if text_x > 20 else 0
         
         # Text
         for i, line in enumerate(lines):
             if line:
                 win.controls.append(FakeControl(self.get_next_hwnd(), "STATIC", line,
-                                                20, 20 + i * line_h, width - 40, line_h))
+                                                text_x, 20 + i * line_h, width - text_x - 20,
+                                                line_h, 0x80))  # SS_NOPREFIX
         
-        # OK button
-        ok_btn = FakeControl(self.get_next_hwnd(), "BUTTON", "OK", (width - 80) // 2, height - 60, 80, 25)
-        win.controls.append(ok_btn)
+        # Buttons, the default one with the thick frame
+        left = (width - buttons_w) // 2
+        controls = []
+        for index, (label, result) in enumerate(buttons):
+            button = FakeControl(self.get_next_hwnd(), "BUTTON", label,
+                                 left + index * (button_w + gap), height - 60, button_w, 25,
+                                 1 if index == default else 0)  # BS_DEFPUSHBUTTON
+            button.mb_result = result
+            win.controls.append(button)
+            controls.append(button)
+        self.messageboxes[hwnd] = {'request': request, 'buttons': controls,
+                                   'focus': default, 'cancel': cancel}
         
         self.show_window(hwnd)
+
+    def _draw_messagebox_icon(self, icon, x, y):
+        """32x32 MessageBox icon: 1 stop, 2 question, 3 exclamation, 4 information"""
+        center = (x + 16, y + 16)
+        if icon == 3:
+            points = [(x + 16, y + 1), (x + 31, y + 30), (x + 1, y + 30)]
+            pygame.draw.polygon(self.screen, (255, 220, 0), points)
+            pygame.draw.polygon(self.screen, (0, 0, 0), points, 1)
+            glyph, color = '!', (0, 0, 0)
+        else:
+            fill = {1: (210, 0, 0), 2: (0, 70, 200), 4: (0, 70, 200)}[icon]
+            pygame.draw.circle(self.screen, fill, center, 15)
+            pygame.draw.circle(self.screen, (40, 40, 40), center, 15, 1)
+            glyph, color = {1: 'X', 2: '?', 4: 'i'}[icon], (255, 255, 255)
+        surface = self.font_bold.render(glyph, True, color)
+        offset = 4 if icon == 3 else 0
+        self.screen.blit(surface, surface.get_rect(center=(center[0], center[1] + offset)))
+
+    def _messagebox_done(self, hwnd, result):
+        """A message box closes with result (a button id)"""
+        box = self.messageboxes.pop(hwnd, None)
+        if box is not None and box['request'] is not None:
+            box['request']['result'] = result
+        if hwnd in self.windows:
+            self._remove_window(hwnd)
+
+    def _messagebox_focus(self, hwnd, index):
+        """Move the default button frame (keyboard focus) to button index"""
+        box = self.messageboxes[hwnd]
+        index %= len(box['buttons'])
+        box['focus'] = index
+        for n, button in enumerate(box['buttons']):
+            button.style = 1 if n == index else 0
+
+    def _messagebox_key(self, event):
+        """Keyboard input of the active message box; True if it took the key"""
+        hwnd = self.active_window
+        box = self.messageboxes.get(hwnd)
+        if box is None:
+            return False
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            self._messagebox_done(hwnd, box['buttons'][box['focus']].mb_result)
+        elif event.key == pygame.K_ESCAPE:
+            if box['cancel'] is not None:
+                self._messagebox_done(hwnd, box['cancel'])
+        elif event.key in (pygame.K_LEFT, pygame.K_UP) or (
+                event.key == pygame.K_TAB and event.mod & pygame.KMOD_SHIFT):
+            self._messagebox_focus(hwnd, box['focus'] - 1)
+        elif event.key in (pygame.K_RIGHT, pygame.K_DOWN, pygame.K_TAB):
+            self._messagebox_focus(hwnd, box['focus'] + 1)
+        elif event.unicode:
+            for button in box['buttons']:
+                mnemonic = re.search(r'&([^&])', button.text)
+                if mnemonic and mnemonic.group(1).lower() == event.unicode.lower():
+                    self._messagebox_done(hwnd, button.mb_result)
+                    break
+        return True
     
     @gui_locked
     def _close_window(self, hwnd, notify_app=True):
@@ -24348,6 +25288,13 @@ class PseudoWindowsGUI:
         DestroyWindow calls this with notify_app=False to avoid a loop.
         """
         if hwnd not in self.windows:
+            return
+
+        box = self.messageboxes.get(hwnd)
+        if box is not None:
+            # Only a message box with a Cancel (or a lone OK) button can be closed
+            if box['cancel'] is not None:
+                self._messagebox_done(hwnd, box['cancel'])
             return
 
         console = self.consoles.get(hwnd)
@@ -24399,10 +25346,11 @@ class PseudoWindowsGUI:
         return hwnd
     
     @gui_locked
-    def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0, control_id=0):
+    def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0,
+                       control_id=0, ex_style=0):
         """Create new control"""
         hwnd = self.get_next_hwnd()
-        control = FakeControl(hwnd, class_name, text, x, y, width, height, style)
+        control = FakeControl(hwnd, class_name, text, x, y, width, height, style, ex_style)
         control.parent_hwnd = parent_hwnd
         control.control_id = control_id
 
@@ -24447,7 +25395,12 @@ class PseudoWindowsGUI:
             self.windows[hwnd].title = text
             self.windows[hwnd].text = text
         elif hwnd in self.controls:
-            self.controls[hwnd].text = text
+            control = self.controls[hwnd]
+            control.text = text
+            # Like WM_SETTEXT of an edit control: caret at the start, unmodified
+            control.set_selection(0)
+            control.edit_scroll = control.edit_top_line = 0
+            control.modified = False
     
     def get_window_text(self, hwnd):
         """Get window/control text"""
@@ -24457,12 +25410,14 @@ class PseudoWindowsGUI:
             return self.controls[hwnd].text
         return ""
     
-    def show_messagebox(self, caption, text, msg_type=0):
-        """Show MessageBox (thread-safe)"""
+    def show_messagebox(self, caption, text, msg_type=0, request=None):
+        """Show MessageBox (thread-safe); the chosen button's id is stored in
+        request['result'] when it closes"""
         self.messagebox_queue.put({
             'caption': caption,
             'text': text,
-            'type': msg_type
+            'type': msg_type,
+            'request': request,
         })
         return 1  # IDOK
     
@@ -24685,6 +25640,19 @@ class CPUEmulator:
     X87_ARGS_ADDR = CALLBACK_RETURN_ADDR + 0x110
     # Return address of thread start routines (returning ends the thread)
     THREAD_EXIT_ADDR = CALLBACK_RETURN_ADDR + 0x30
+    # Hot CRT routines run as guest code here (no API hook: calling into
+    # Python for every small memcpy makes loops such as 7-Zip's AES key
+    # derivation take minutes); unmapped memory faults like on Windows
+    NATIVE_CODE_ADDR = CALLBACK_RETURN_ADDR + 0x1000
+    NATIVE_ROUTINES = {
+        # memmove semantics (overlap-safe), like msvcrt's memcpy
+        'memmove': bytes.fromhex('57568b7c240c8b7424108b4c241489f8fc39f776158d140e39d7730e'
+                                 '8d740eff8d7c0ffffdf3a4fceb02f3a45e5fc3'),
+        'memset': bytes.fromhex('578b7c24088b44240c8b4c241089fafcf3aa89d05fc3'),
+    }
+    NATIVE_ROUTINES['memcpy'] = NATIVE_ROUTINES['memmove']
+    NATIVE_ROUTINE_DLLS = ('msvcrt.dll', 'ntdll.dll', 'ucrtbase.dll',
+                           'api-ms-win-crt-string-l1-1-0.dll', 'vcruntime140.dll')
     # A thread that runs this long without blocking lets the others run
     THREAD_TIME_SLICE = 0.02
     
@@ -25291,6 +26259,9 @@ class CPUEmulator:
         Some CRT helpers take their arguments in x87 registers; their stub
         starts with native code that spills them to memory before the RET.
         """
+        native = getattr(self, 'native_routines', {}).get(func_name)
+        if native and dll_name.lower() in self.NATIVE_ROUTINE_DLLS:
+            return native
         prologue = self.api_handler.native_prologue(func_name)
         entry = self.next_hook_addr
         hook_addr = entry + len(prologue)
@@ -25435,6 +26406,16 @@ class CPUEmulator:
             self.uc.mem_write(self.X87_RETURN_STUB,
                               b'\xDD\x05' + struct.pack('<I', self.X87_RESULT_ADDR) + b'\xC3')
             log.debug(f"Callback return hook: 0x{self.callback_return_addr:08x}")
+            self.map_shared(self.NATIVE_CODE_ADDR, 0x1000, UC_PROT_READ | UC_PROT_EXEC)
+            self.native_routines = {}
+            placed = {}  # Code -> address (memcpy shares memmove's)
+            address = self.NATIVE_CODE_ADDR
+            for name, code in self.NATIVE_ROUTINES.items():
+                if code not in placed:
+                    self.uc.mem_write(address, code)
+                    placed[code] = address
+                    address = (address + len(code) + 15) & ~15
+                self.native_routines[name] = placed[code]
         except UcError as e:
             log.warning(f"Could not setup callback return hook: {e}")
     

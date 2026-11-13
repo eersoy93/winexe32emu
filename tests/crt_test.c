@@ -133,6 +133,18 @@ static void test_strings(void)
     wcscpy(wbuf, L"Hello");
     wcscat(wbuf, L" World");
     check(wcscmp(wbuf, L"Hello World") == 0 && wcslen(wbuf) == 11, "wcscpy/wcscat");
+    {
+        /* Through pointers so the compiler calls msvcrt instead of inlining */
+        void *(*volatile move)(void *, const void *, size_t) = memmove;
+        void *(*volatile fill)(void *, int, size_t) = memset;
+        char mem[16] = "0123456789";
+        check(move(mem + 2, mem, 6) == mem + 2 && memcmp(mem, "0101234589", 10) == 0,
+              "memmove overlap (dst > src)");
+        check(move(mem, mem + 4, 6) == mem && memcmp(mem, "2345894589", 10) == 0,
+              "memmove overlap (dst < src)");
+        check(fill(mem + 1, 'x', 3) == mem + 1 && memcmp(mem, "2xxx894589", 10) == 0 &&
+              fill(mem, 'y', 0) == mem && mem[0] == '2', "memset");
+    }
     check(wcschr(wbuf, L'W') == wbuf + 6 && wcsrchr(wbuf, L'o') == wbuf + 7, "wcschr/wcsrchr");
     check(wcsstr(wbuf, L"World") == wbuf + 6, "wcsstr");
     check(_wcsicmp(L"ABC", L"abc") == 0 && wcsncmp(L"abcd", L"abcx", 3) == 0, "_wcsicmp/wcsncmp");
