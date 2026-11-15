@@ -30,6 +30,8 @@ python3 winexe32emu.py --no-gui "C:\Program Files\7-Zip\7z.exe" a "C:\Windows\Te
 
 The emulator exits with the command-line program's exit code (1 if the emulated program crashes).
 
+The ANSI code page (`GetACP`, the "A" APIs and narrow C runtime strings) is `cp1252` by default, like an English (United States) Windows. Use `--codepage` to change it, for example `--codepage cp1254` for a Turkish Windows or `--codepage utf-8` for programs whose narrow strings are UTF-8 (MinGW string literals are).
+
 ## Folder Structure
 
 - `apps/` - App C source codes, one folder per app (`apps/filemanager/` - File manager)
@@ -50,6 +52,8 @@ The emulator exits with the command-line program's exit code (1 if the emulated 
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support (user32, kernel32, gdi32, advapi32, winmm, msvcrt, shell32, ole32, oleaut32, comctl32, comdlg32)
 - Loading the programs' own DLLs (relocation, imports, exports, `DllMain`)
+- Structured exception handling: access violations, CPU exceptions and `RaiseException` reach the program's handlers (`_except_handler3/4`, C++ `catch`, other handlers, vectored handlers, `SetUnhandledExceptionFilter`)
+- A registry shared by the emulated programs and saved to `C:\Windows\System32\config\registry.json`
 - Fake C drive environment support
 
 ## Versioning

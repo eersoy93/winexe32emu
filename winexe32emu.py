@@ -39,10 +39,16 @@ import time
 import datetime
 import unicodedata
 import fnmatch
+import inspect
+import json
 import ntpath
 import warnings
 import wave
 from functools import cmp_to_key, wraps
+try:
+    import ordlookup  # installed with pefile: names of ordinal-only exports
+except ImportError:
+    ordlookup = None
 from colorama import init, Fore, Style
 
 # Version info
@@ -96,10 +102,11 @@ TESTS_FOLDER = 'C:\\Windows\\Tests'
 # Folders searched for a bare EXE name (command line), in this order
 PROGRAM_FOLDERS = ('C:\\', TESTS_FOLDER)
 
-# Code page used for the "A" (ANSI) APIs and CRT narrow strings. UTF-8 by
-# default because MinGW emits string literals as UTF-8; set via --codepage
-# (e.g. cp1254, cp1252) to behave like a localized Windows.
-ANSI_CODEPAGE = "utf-8"
+# Code page used for the "A" (ANSI) APIs and CRT narrow strings: cp1252 by
+# default, like the English (United States) Windows the emulator reports
+# (LCID 0x0409); set via --codepage (e.g. cp1254 for a Turkish Windows, or
+# utf-8 for programs that use UTF-8 narrow strings, like MinGW literals).
+ANSI_CODEPAGE = "cp1252"
 
 from unicorn import *
 from unicorn.x86_const import *
@@ -238,8 +245,21 @@ class PELoader:
     """PE file loader and analyzer"""
 
     # Imports by ordinal that the emulator implements by name: (dll, ordinal) -> name
+    # (pefile's ordlookup knows oleaut32, ws2_32 and wsock32)
     KNOWN_ORDINALS = {('comctl32.dll', 17): 'InitCommonControls',
                       ('comctl32.dll', 6): 'CreateStatusWindowA'}
+
+    @classmethod
+    def ordinal_name(cls, dll_name, ordinal):
+        """Name of a system DLL export known by its ordinal, or 'Ordinal_N'"""
+        key = dll_name.lower()
+        if '.' not in key:
+            key += '.dll'
+        name = cls.KNOWN_ORDINALS.get((key, ordinal))
+        if name is None and ordlookup is not None:
+            found = ordlookup.ordLookup(key.encode('ascii', 'replace'), ordinal)
+            name = found.decode('ascii', 'replace') if found else None
+        return name or f"Ordinal_{ordinal}"
 
     def __init__(self, filepath):
         self.filepath = filepath
@@ -381,8 +401,7 @@ class PELoader:
                 if imp.name:
                     func_name = imp.name.decode('utf-8')
                 else:
-                    func_name = self.KNOWN_ORDINALS.get(
-                        (dll_name.lower(), imp.ordinal), f"Ordinal_{imp.ordinal}")
+                    func_name = self.ordinal_name(dll_name, imp.ordinal)
 
                 self.imports[dll_name].append({
                     'name': func_name,
@@ -576,14 +595,17 @@ class QWordResult:
 
 
 class ApiJump:
-    """API result that transfers control elsewhere (longjmp, a catch block)."""
-    __slots__ = ('eip', 'esp', 'eax', 'ebp')
+    """API result that transfers control elsewhere (longjmp, a catch block,
+    an exception handler). regs: other registers to set ({'ebx': value, ...};
+    ebx, ecx, edx, esi, edi, eflags)."""
+    __slots__ = ('eip', 'esp', 'eax', 'ebp', 'regs')
 
-    def __init__(self, eip, esp, eax, ebp=None):
+    def __init__(self, eip, esp, eax, ebp=None, regs=None):
         self.eip = eip
         self.esp = esp
         self.eax = eax
         self.ebp = ebp
+        self.regs = regs
 
 
 class GuestUnwind(Exception):
@@ -1171,6 +1193,17 @@ class SoundPlayer:
         if cls._play_sound is not None and cls._play_owner is owner:
             cls.stop()
 
+
+def registry_locked(method):
+    """Run a registry API under the lock of the registry the emulated
+    programs share (they run on their own host threads)"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with WinAPIHandler._registry_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class WinAPIHandler:
     """Windows API emulation"""
 
@@ -1198,6 +1231,7 @@ class WinAPIHandler:
         'LsaOpenPolicy': 4, 'OpenProcessToken': 3, 'RegCloseKey': 1, 'RegCreateKeyExA': 9,
         'RegCreateKeyExW': 9, 'RegDeleteKeyA': 2, 'RegDeleteKeyW': 2, 'RegDeleteValueA': 2,
         'RegDeleteValueW': 2, 'RegEnumKeyExA': 8, 'RegEnumKeyExW': 8, 'RegEnumValueA': 8,
+        'RegEnumValueW': 8, 'RegFlushKey': 1,
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6, 'RegQueryValueExW': 6,
         'RegSetValueExA': 6, 'RegSetValueExW': 6, 'SetFileSecurityW': 3,
         # comctl32
@@ -1531,6 +1565,7 @@ class WinAPIHandler:
         self.condition_variables = {}  # CONDITION_VARIABLE address -> [waiter tokens]
         self.page_protections = []  # [(start, end, protection)] set by VirtualProtect
         self.vectored_handlers = {}  # AddVectoredExceptionHandler handle -> handler
+        self.unhandled_exception_filter = 0  # SetUnhandledExceptionFilter
         self.std_handles = {}  # SetStdHandle: STD_*_HANDLE -> handle
         self.module_handles = {}  # lowercase DLL name -> fake HMODULE
         self.virtual_allocs = {}  # VirtualAlloc base -> reserved size
@@ -1641,10 +1676,10 @@ class WinAPIHandler:
         self.clipboard_open = False
         self.mapping_views = {}  # id(file mapping info) -> its address here
 
-        # In-memory registry: predefined HKEY -> key node, open HKEY -> key node
-        self.registry_roots = {}
+        # Registry: predefined HKEY -> key node (shared by the emulated
+        # programs and saved to REGISTRY_FILE), open HKEY -> key node
+        self.registry_roots = self._shared_registry_roots()
         self.registry_handles = {}
-        self._init_registry()
 
         # Additional CRT state (strtok, getenv strings, signals, time buffers)
         self.next_fd = 3  # CRT file descriptors handed out by fopen
@@ -1715,13 +1750,70 @@ class WinAPIHandler:
     def _last_error(self, value):
         self.emu.current_thread.last_error = value
 
-    def get_api_handler(self, func_name):
-        """Find API handler"""
-        # First search in mapping
-        if func_name in self._api_map:
-            return self._api_map[func_name]
-        # Then search as normal attribute
-        return getattr(self, func_name, None)
+    # Methods with an API handler's signature that are helpers, not exports
+    INTERNAL_HANDLER_NAMES = frozenset({
+        '_crt_noop', '_crt_raise', '_std_exception_copy', '_std_exception_destroy',
+        '_std_type_info_compare', '_std_type_info_name',
+    })
+    _handler_names = None  # cache of _api_method_names()
+
+    @classmethod
+    def _api_method_names(cls):
+        """Names of the methods that emulate an API: they are called as
+        handler(args), so their only required parameter is "args" (helpers
+        with other parameters, properties and the like never match an
+        imported name)"""
+        if cls._handler_names is None:
+            names = set()
+            for name, func in inspect.getmembers(cls, inspect.isfunction):
+                params = list(inspect.signature(func).parameters.values())
+                if (len(params) >= 2 and params[0].name == 'self' and
+                        params[1].name == 'args' and
+                        all(p.default is not p.empty for p in params[2:])):
+                    names.add(name)
+            cls._handler_names = frozenset(names - cls.INTERNAL_HANDLER_NAMES)
+        return cls._handler_names
+
+    # Windows DLLs without an emulated API of their own whose exports may
+    # still be emulated by name (besides EMULATED_DLLS, SYSTEM_DLLS and the C
+    # runtime DLLs)
+    OTHER_SYSTEM_DLLS = {
+        'msimg32.dll', 'gdiplus.dll', 'wininet.dll', 'urlmon.dll', 'netapi32.dll',
+        'msvfw32.dll', 'avifil32.dll', 'ddraw.dll', 'dsound.dll', 'dinput.dll',
+        'dinput8.dll', 'd3d8.dll', 'd3d9.dll', 'opengl32.dll', 'glu32.dll', 'lz32.dll',
+        'olepro32.dll', 'oledlg.dll', 'riched20.dll', 'riched32.dll', 'msftedit.dll',
+        'iphlpapi.dll', 'wintrust.dll', 'cabinet.dll', 'powrprof.dll', 'wtsapi32.dll',
+        'normaliz.dll', 'bcrypt.dll', 'ncrypt.dll', 'dnsapi.dll', 'winhttp.dll',
+        'mscoree.dll', 'msi.dll', 'usp10.dll', 'hhctrl.ocx', 'oleacc.dll', 'mapi32.dll',
+        'odbc32.dll', 'avrt.dll', 'xinput1_3.dll', 'shfolder.dll', 'sensapi.dll',
+    }
+
+    def is_system_dll_name(self, dll_name):
+        """Is dll_name a Windows DLL (whose exports the emulator may emulate)?
+        The emulated API of a name never stands in for another DLL's export."""
+        key = dll_name.replace('/', '\\').rsplit('\\', 1)[-1].lower()
+        if '.' not in key:
+            key += '.dll'
+        return (self._is_system_dll(key) or key in self.OTHER_SYSTEM_DLLS or
+                key.startswith(self.CDECL_DLL_PREFIXES) or key.startswith('msvcirt'))
+
+    def get_api_handler(self, func_name, dll_name=None):
+        """Handler of an emulated API (None if not emulated). With dll_name,
+        only the exports of Windows DLLs are emulated."""
+        if dll_name is not None and not self.is_system_dll_name(dll_name):
+            return None
+        handler = self._api_map.get(func_name)
+        if handler is not None:
+            return handler
+        if func_name in self._api_method_names():
+            return getattr(self, func_name)
+        return None
+
+    # ntdll's C runtime exports are cdecl, except these helpers of 64-bit
+    # arithmetic (stdcall: number of DWORD arguments; the shifts take registers)
+    NTDLL_STDCALL_HELPERS = {'_alldiv': 4, '_alldvrm': 4, '_allmul': 4, '_allrem': 4,
+                             '_aulldiv': 4, '_aulldvrm': 4, '_aullrem': 4,
+                             '_allshl': 0, '_allshr': 0, '_aullshr': 0}
 
     def stack_cleanup_bytes(self, dll_name, func_name):
         """Bytes of arguments the callee pops on return (stdcall).
@@ -1732,6 +1824,9 @@ class WinAPIHandler:
         dll = dll_name.lower()
         if dll.startswith(self.CDECL_DLL_PREFIXES):
             return 4 * self.CRT_STDCALL_ARG_COUNTS.get(func_name, 0)
+        if dll in ('ntdll.dll', 'ntdll') and (func_name[:1].islower() or
+                                              func_name[:1] == '_'):
+            return 4 * self.NTDLL_STDCALL_HELPERS.get(func_name, 0)
         if func_name in self.CDECL_FUNCTIONS:
             return 0
         argc = self.STDCALL_ARG_COUNTS.get(func_name, self.com_arg_counts.get(func_name))
@@ -2138,7 +2233,9 @@ class WinAPIHandler:
             module = self.load_real_dll(name)
             if module is not None:
                 return module['base']
-            if self._real_dll_path(name) is not None or '\\' in name or '/' in name:
+            if (self._real_dll_path(name) is not None or '\\' in name or '/' in name or
+                    not self.is_system_dll_name(key)):
+                # A file that did not load, or a missing non-Windows DLL
                 self._last_error = 126  # ERROR_MOD_NOT_FOUND
                 return 0
         handle = self.module_handles.get(key)
@@ -2154,7 +2251,7 @@ class WinAPIHandler:
 
     def is_emulated(self, dll_name, func_name):
         """True if calls to dll_name!func_name can be emulated safely"""
-        return (self.get_api_handler(func_name) is not None and
+        return (self.get_api_handler(func_name, dll_name) is not None and
                 self.stack_cleanup_bytes(dll_name, func_name) is not None)
     
     def GetProcAddress(self, args):
@@ -2172,14 +2269,15 @@ class WinAPIHandler:
                 proc_name = self.read_string(lpProcName)
                 addr = module['exports'].get(proc_name, 0)
             log.debug(f"GetProcAddress(\"{module['name']}\", \"{proc_name}\") -> 0x{addr:08x}")
-        elif lpProcName < 0x10000:
-            log.debug(f"GetProcAddress(0x{hModule:08x}, Ordinal_{lpProcName}) -> not supported")
-            addr = 0
         elif not info or info.get('type') != 'module':
             log.debug(f"GetProcAddress(0x{hModule:08x}) -> unknown module")
             addr = 0
         else:
-            proc_name = self.read_string(lpProcName)
+            if lpProcName < 0x10000:
+                # By ordinal: the emulated APIs are known by name
+                proc_name = PELoader.ordinal_name(info['name'], lpProcName)
+            else:
+                proc_name = self.read_string(lpProcName)
             addr = self.emu.get_api_stub(info['name'], proc_name)
             log.debug(f"GetProcAddress(\"{info['name']}\", \"{proc_name}\") -> 0x{addr:08x}")
         if not addr:
@@ -2221,9 +2319,12 @@ class WinAPIHandler:
         return self.emu.cmdline_wide_addr
     
     def SetUnhandledExceptionFilter(self, args):
-        """SetUnhandledExceptionFilter emulation - no previous filter"""
+        """SetUnhandledExceptionFilter emulation - the filter of unhandled
+        exceptions; returns the previous one"""
         log.debug(f"SetUnhandledExceptionFilter(0x{args[0]:08x})")
-        return 0
+        previous = self.unhandled_exception_filter
+        self.unhandled_exception_filter = args[0]
+        return previous
 
     def LoadCursorA(self, args, wide=False):
         """LoadCursorA/W emulation - a system cursor (hInstance NULL, IDC_*) or
@@ -3004,15 +3105,18 @@ class WinAPIHandler:
         return self.LCMapStringA(args, wide=True)
 
     def RtlUnwind(self, args):
-        """RtlUnwind emulation - drops SEH records above TargetFrame (handlers are not called)"""
-        target_frame, return_value = args[0], args[3]
-        if target_frame:
-            self._mem_write(self.emu.teb_addr, struct.pack('<I', target_frame))
+        """RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue)
+        emulation - unwinds the SEH frames above TargetFrame (NULL: all of
+        them): their __finally blocks and destructors run and their handlers
+        are called with EXCEPTION_UNWINDING; then returns to the caller"""
+        target_frame, record, return_value = args[0], args[2], args[3]
+        self._global_unwind(target_frame, record)
         return return_value
 
     def UnhandledExceptionFilter(self, args):
-        """UnhandledExceptionFilter emulation - EXCEPTION_EXECUTE_HANDLER (terminate)"""
-        return 1
+        """UnhandledExceptionFilter emulation - runs the SetUnhandledExceptionFilter
+        filter: EXCEPTION_CONTINUE_EXECUTION or EXCEPTION_EXECUTE_HANDLER (terminate)"""
+        return 0xFFFFFFFF if self._top_level_filter(args[0]) == -1 else 1
 
     def TerminateProcess(self, args):
         """TerminateProcess emulation - only the current process can be terminated"""
@@ -3703,16 +3807,24 @@ class WinAPIHandler:
         return previous
 
     def RaiseException(self, args):
-        """RaiseException emulation - no SEH support, so the exception is fatal
-        (debugger notifications are ignored)"""
-        code, flags = args[0], args[1]
+        """RaiseException emulation - dispatched to the program's exception
+        handlers (debugger notifications are ignored: there is no debugger)"""
+        code, flags, count, lpArguments = args[:4]
         if code in (0x406D1388, 0x40010006, 0x4001000A):  # thread name, debug string
             return 0
-        log.error(f"Unhandled exception 0x{code:08x} (RaiseException, flags 0x{flags:x}); "
-                  f"exception handling is not emulated")
-        self.emu.crashed = True
-        self.emu.stop_emulation = True
-        return 0
+        count = min(count, 15)
+        try:
+            params = list(struct.unpack(f'<{count}I', self.emu.uc.mem_read(lpArguments, 4 * count))
+                          ) if count and lpArguments else []
+        except UcError:
+            params = []
+        if (code == self.CXX_EXCEPTION and len(params) > 2 and not params[1] and
+                not params[2]):
+            # "throw;" of a static C++ runtime: rethrow the exception being handled
+            params = self._cxx_rethrow_params() or params
+        log.debug(f"RaiseException(0x{code:08x}, flags 0x{flags:x}, {params})")
+        return self.raise_guest_exception(code, flags & self.EXCEPTION_NONCONTINUABLE,
+                                          params, 16)
 
     def HeapSize(self, args):
         """HeapSize emulation - usable size of a heap block"""
@@ -4098,31 +4210,23 @@ class WinAPIHandler:
         return base
 
     def RtlCaptureContext(self, args):
-        """RtlCaptureContext emulation - the caller's registers (CONTEXT_FULL)"""
-        uc = self.emu.uc
-        regs = {reg: uc.reg_read(reg) for reg in (
-            UC_X86_REG_GS, UC_X86_REG_FS, UC_X86_REG_ES, UC_X86_REG_DS, UC_X86_REG_EDI,
-            UC_X86_REG_ESI, UC_X86_REG_EBX, UC_X86_REG_EDX, UC_X86_REG_ECX, UC_X86_REG_EAX,
-            UC_X86_REG_EBP, UC_X86_REG_CS, UC_X86_REG_EFLAGS, UC_X86_REG_SS)}
+        """RtlCaptureContext emulation - the caller's registers (CONTEXT_FULL),
+        EIP/ESP as after the return"""
         esp = self.emu.api_call_esp
-        self._mem_write(args[0], struct.pack('<I', 0x10007))  # ContextFlags
-        self._mem_write(args[0] + 0x8C, struct.pack(
-            '<16I', regs[UC_X86_REG_GS], regs[UC_X86_REG_FS], regs[UC_X86_REG_ES],
-            regs[UC_X86_REG_DS], regs[UC_X86_REG_EDI], regs[UC_X86_REG_ESI],
-            regs[UC_X86_REG_EBX], regs[UC_X86_REG_EDX], regs[UC_X86_REG_ECX],
-            regs[UC_X86_REG_EAX], regs[UC_X86_REG_EBP], self._read_u32(esp),  # Eip
-            regs[UC_X86_REG_CS], regs[UC_X86_REG_EFLAGS], esp + 8,  # Esp after the return
-            regs[UC_X86_REG_SS]))
+        self._write_context(args[0], self.capture_context(eip=self._read_u32(esp),
+                                                          esp=esp + 8))
         return 0
 
-    # Vectored exception handlers are registered, but exceptions are only
-    # dispatched to the SEH frames
+    # Vectored exception handlers run before the SEH frames (dispatch_exception)
 
     def AddVectoredExceptionHandler(self, args):
+        """AddVectoredExceptionHandler(First, Handler) emulation"""
         handle = self.get_next_handle()
-        self.vectored_handlers[handle] = args[1]
-        log.debug(f"AddVectoredExceptionHandler(0x{args[1]:08x}): vectored handlers "
-                  f"are not called")
+        if args[0]:  # called first
+            self.vectored_handlers = {handle: args[1], **self.vectored_handlers}
+        else:
+            self.vectored_handlers[handle] = args[1]
+        log.debug(f"AddVectoredExceptionHandler(0x{args[1]:08x}) -> 0x{handle:x}")
         return handle
 
     def RemoveVectoredExceptionHandler(self, args):
@@ -14916,48 +15020,6 @@ class WinAPIHandler:
 
     # ---------- advapi32 ----------
 
-    def _with_ansi_strings(self, func, args, string_args):
-        """Call an A registry function with W string arguments converted"""
-        temps = []
-        new_args = list(args)
-        for index in string_args:
-            if new_args[index]:
-                data = self.read_wide_string(new_args[index]).encode(ANSI_CODEPAGE, 'replace')
-                temp = self.emu.heap_alloc(len(data) + 1)
-                self._mem_write(temp, data + b'\x00')
-                temps.append(temp)
-                new_args[index] = temp
-        try:
-            return func(new_args)
-        finally:
-            for temp in temps:
-                self.emu.heap_free(temp)
-
-    def RegDeleteValueW(self, args):
-        return self._with_ansi_strings(self.RegDeleteValueA, args, [1])
-
-    def RegDeleteKeyW(self, args):
-        return self._with_ansi_strings(self.RegDeleteKeyA, args, [1])
-
-    def RegEnumKeyExW(self, args):
-        """RegEnumKeyExW emulation"""
-        hKey, dwIndex, lpName, lpcchName = args[0], args[1], args[2], args[3]
-        node, error = self._registry_key(hKey)
-        if node is None:
-            return error
-        keys = sorted(node['keys'].values(), key=lambda k: k['name'].lower())
-        if dwIndex >= len(keys):
-            return self.ERROR_NO_MORE_ITEMS
-        name = keys[dwIndex]['name']
-        size = struct.unpack('<I', self.emu.uc.mem_read(lpcchName, 4))[0]
-        if len(name) + 1 > size:
-            return self.ERROR_MORE_DATA
-        self._write_text(lpName, name, True)
-        self._mem_write(lpcchName, struct.pack('<I', len(name)))
-        if args[7]:
-            self._mem_write(args[7], struct.pack('<Q', keys[dwIndex]['time']))
-        return self.ERROR_SUCCESS
-
     def GetFileSecurityW(self, args):
         """GetFileSecurityW emulation - the file system has no security descriptors"""
         self._last_error = 50  # ERROR_NOT_SUPPORTED
@@ -16935,12 +16997,108 @@ class WinAPIHandler:
             return 0
         return None
 
-    # ADVAPI32.DLL APIs - in-memory registry (per process, not persisted)
+    # ADVAPI32.DLL APIs - registry: one tree shared by the emulated programs
+    # (like the machine's registry), saved to REGISTRY_FILE after each change;
+    # volatile keys (REG_OPTION_VOLATILE) are not saved
 
     # Predefined keys (HKEY_CLASSES_ROOT ... HKEY_CURRENT_CONFIG)
     REGISTRY_ROOTS = {0x80000000: 'HKEY_CLASSES_ROOT', 0x80000001: 'HKEY_CURRENT_USER',
                       0x80000002: 'HKEY_LOCAL_MACHINE', 0x80000003: 'HKEY_USERS',
                       0x80000005: 'HKEY_CURRENT_CONFIG'}
+    HKEY_CLASSES_ROOT = 0x80000000  # a view of HKEY_LOCAL_MACHINE\SOFTWARE\Classes
+    REGISTRY_FILE = os.path.join(C_DRIVE_PATH, 'Windows', 'System32', 'config',
+                                 'registry.json')
+    _registry_lock = threading.RLock()
+    _shared_registry = None  # predefined HKEY -> root key node
+
+    @classmethod
+    def _shared_registry_roots(cls):
+        """The registry tree: the saved one, or the default keys of Windows"""
+        with cls._registry_lock:
+            if cls._shared_registry is None:
+                roots = cls._default_registry()
+                saved = cls._load_registry_file()
+                for hkey, name in cls.REGISTRY_ROOTS.items():
+                    if hkey != cls.HKEY_CLASSES_ROOT and name in saved:
+                        roots[hkey] = saved[name]
+                node = roots[0x80000002]
+                for part in ('SOFTWARE', 'Classes'):
+                    node = node['keys'].setdefault(part.lower(), cls._new_registry_key(part))
+                roots[cls.HKEY_CLASSES_ROOT] = node
+                cls._shared_registry = roots
+            return cls._shared_registry
+
+    @classmethod
+    def _default_registry(cls):
+        roots = {hkey: cls._new_registry_key(name) for hkey, name in cls.REGISTRY_ROOTS.items()}
+        for hkey, name in ((0x80000001, 'Software'), (0x80000002, 'SOFTWARE')):
+            roots[hkey]['keys'][name.lower()] = cls._new_registry_key(name)
+        # Default values of a Windows installation
+        node = roots[0x80000002]
+        for part in ('SOFTWARE', 'Microsoft', 'Windows', 'CurrentVersion'):
+            node = node['keys'].setdefault(part.lower(), cls._new_registry_key(part))
+        for name, folder in (('ProgramFilesDir', PROGRAM_FILES_FOLDER),
+                             ('CommonFilesDir', PROGRAM_FILES_FOLDER + '\\Common Files')):
+            node['values'][name.lower()] = {'name': name, 'type': 1, 'data': folder + '\x00'}
+        return roots
+
+    @classmethod
+    def _registry_to_json(cls, node):
+        values = []
+        for value in node['values'].values():
+            item = {'name': value['name'], 'type': value['type']}
+            if isinstance(value['data'], str):
+                item['text'] = value['data']
+            else:
+                item['hex'] = bytes(value['data']).hex()
+            values.append(item)
+        return {'name': node['name'], 'time': node['time'], 'values': values,
+                'keys': [cls._registry_to_json(child) for child in node['keys'].values()
+                         if not child.get('volatile')]}
+
+    @classmethod
+    def _registry_from_json(cls, item):
+        node = cls._new_registry_key(str(item['name']))
+        node['time'] = int(item.get('time', node['time']))
+        for value in item.get('values', []):
+            data = value['text'] if 'text' in value else bytes.fromhex(value.get('hex', ''))
+            node['values'][value['name'].lower()] = {
+                'name': value['name'], 'type': int(value['type']), 'data': data}
+        for child in item.get('keys', []):
+            child_node = cls._registry_from_json(child)
+            node['keys'][child_node['name'].lower()] = child_node
+        return node
+
+    @classmethod
+    def _load_registry_file(cls):
+        """Saved root key nodes by name ({} if there is no valid file)"""
+        try:
+            with open(cls.REGISTRY_FILE, encoding='utf-8') as f:
+                data = json.load(f)
+            return {name: cls._registry_from_json(item)
+                    for name, item in data.get('roots', {}).items()}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            log.warning(f"Registry file {cls.REGISTRY_FILE} is not valid ({e}); "
+                        f"starting with the default registry")
+            return {}
+
+    def _save_registry(self):
+        """Write the registry to REGISTRY_FILE (atomically)"""
+        cls = WinAPIHandler
+        with cls._registry_lock:
+            roots = {cls.REGISTRY_ROOTS[hkey]: cls._registry_to_json(node)
+                     for hkey, node in cls._shared_registry.items()
+                     if hkey != cls.HKEY_CLASSES_ROOT}
+            temp = cls.REGISTRY_FILE + '.tmp'
+            try:
+                os.makedirs(os.path.dirname(cls.REGISTRY_FILE), exist_ok=True)
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump({'version': 1, 'roots': roots}, f, ensure_ascii=False, indent=1)
+                os.replace(temp, cls.REGISTRY_FILE)
+            except OSError as e:
+                log.warning(f"Cannot save the registry to {cls.REGISTRY_FILE}: {e}")
     REG_STRING_TYPES = (1, 2, 7)  # REG_SZ, REG_EXPAND_SZ, REG_MULTI_SZ
 
     ERROR_SUCCESS = 0
@@ -16953,22 +17111,9 @@ class WinAPIHandler:
     ERROR_KEY_DELETED = 1018
 
     @staticmethod
-    def _new_registry_key(name):
+    def _new_registry_key(name, volatile=False):
         return {'name': name, 'keys': {}, 'values': {}, 'deleted': False,
-                'time': int((time.time() + 11644473600) * 10000000)}
-
-    def _init_registry(self):
-        for hkey, name in self.REGISTRY_ROOTS.items():
-            self.registry_roots[hkey] = self._new_registry_key(name)
-        for hkey, name in ((0x80000001, 'Software'), (0x80000002, 'SOFTWARE')):
-            self.registry_roots[hkey]['keys'][name.lower()] = self._new_registry_key(name)
-        # Default values of a Windows installation
-        node = self.registry_roots[0x80000002]
-        for part in ('SOFTWARE', 'Microsoft', 'Windows', 'CurrentVersion'):
-            node = node['keys'].setdefault(part.lower(), self._new_registry_key(part))
-        for name, folder in (('ProgramFilesDir', PROGRAM_FILES_FOLDER),
-                             ('CommonFilesDir', PROGRAM_FILES_FOLDER + '\\Common Files')):
-            node['values'][name.lower()] = {'name': name, 'type': 1, 'data': folder + '\x00'}
+                'volatile': volatile, 'time': int((time.time() + 11644473600) * 10000000)}
 
     def _registry_key(self, hkey):
         """(key node, error code) of an open or predefined HKEY"""
@@ -16983,22 +17128,26 @@ class WinAPIHandler:
     def _registry_path(subkey):
         return [part for part in subkey.split('\\') if part]
 
-    def _registry_open_common(self, hKey, subkey, phkResult, create, lpdwDisposition=0):
+    def _registry_open_common(self, hKey, subkey, phkResult, create, lpdwDisposition=0,
+                              volatile=False):
         node, error = self._registry_key(hKey)
         if node is None:
             return error
+        if not phkResult:
+            return self.ERROR_INVALID_PARAMETER
         disposition = 2  # REG_OPENED_EXISTING_KEY
         for part in self._registry_path(subkey):
             child = node['keys'].get(part.lower())
             if child is None:
                 if not create:
                     return self.ERROR_FILE_NOT_FOUND
-                child = self._new_registry_key(part)
+                # A volatile key's subkeys are volatile too
+                child = self._new_registry_key(part, volatile or node.get('volatile', False))
                 node['keys'][part.lower()] = child
                 disposition = 1  # REG_CREATED_NEW_KEY
             node = child
-        if not phkResult:
-            return self.ERROR_INVALID_PARAMETER
+        if disposition == 1 and not node['volatile']:
+            self._save_registry()
         handle = self.get_next_handle()
         self.registry_handles[handle] = node
         self.emu.uc.mem_write(phkResult, struct.pack('<I', handle))
@@ -17006,6 +17155,7 @@ class WinAPIHandler:
             self.emu.uc.mem_write(lpdwDisposition, struct.pack('<I', disposition))
         return self.ERROR_SUCCESS
 
+    @registry_locked
     def RegOpenKeyExA(self, args, wide=False):
         """RegOpenKeyExA/W emulation"""
         hKey, lpSubKey, phkResult = args[0], args[1], args[4]
@@ -17017,11 +17167,13 @@ class WinAPIHandler:
     def RegOpenKeyExW(self, args):
         return self.RegOpenKeyExA(args, wide=True)
 
+    @registry_locked
     def RegCreateKeyExA(self, args, wide=False):
-        """RegCreateKeyExA/W emulation"""
+        """RegCreateKeyExA/W emulation (REG_OPTION_VOLATILE keys are not saved)"""
         hKey, lpSubKey, phkResult, lpdwDisposition = args[0], args[1], args[7], args[8]
         subkey = self._read_text(lpSubKey, wide) if lpSubKey else ""
-        result = self._registry_open_common(hKey, subkey, phkResult, True, lpdwDisposition)
+        result = self._registry_open_common(hKey, subkey, phkResult, True, lpdwDisposition,
+                                            volatile=bool(args[4] & 1))
         log.debug(f"RegCreateKeyEx{'W' if wide else 'A'}(0x{hKey:x}, \"{subkey}\") -> {result}")
         return result
 
@@ -17036,6 +17188,13 @@ class WinAPIHandler:
             return self.ERROR_SUCCESS
         return self.ERROR_INVALID_HANDLE
 
+    @registry_locked
+    def RegFlushKey(self, args):
+        """RegFlushKey emulation - the registry is already saved after each change"""
+        node, error = self._registry_key(args[0])
+        return error
+
+    @registry_locked
     def RegSetValueExA(self, args, wide=False):
         """RegSetValueExA/W emulation"""
         hKey, lpValueName, dwType, lpData, cbData = args[0], args[1], args[3], args[4], args[5]
@@ -17053,6 +17212,8 @@ class WinAPIHandler:
             data = data.decode('utf-16-le' if wide else ANSI_CODEPAGE, errors='replace')
         node['values'][name.lower()] = {'name': name, 'type': dwType, 'data': data}
         node['time'] = int((time.time() + 11644473600) * 10000000)
+        if not node['volatile']:
+            self._save_registry()
         return self.ERROR_SUCCESS
 
     def RegSetValueExW(self, args):
@@ -17080,6 +17241,7 @@ class WinAPIHandler:
             self.emu.uc.mem_write(lpData, data)
         return self.ERROR_SUCCESS
 
+    @registry_locked
     def RegQueryValueExA(self, args, wide=False):
         """RegQueryValueExA/W emulation"""
         hKey, lpValueName = args[0], args[1]
@@ -17096,23 +17258,30 @@ class WinAPIHandler:
     def RegQueryValueExW(self, args):
         return self.RegQueryValueExA(args, wide=True)
 
-    def RegDeleteValueA(self, args):
-        """RegDeleteValueA emulation"""
+    @registry_locked
+    def RegDeleteValueA(self, args, wide=False):
+        """RegDeleteValueA/W emulation"""
         hKey = args[0]
-        name = self.read_string(args[1]) if args[1] else ""
-        log.debug(f"RegDeleteValueA(0x{hKey:x}, \"{name}\")")
+        name = self._read_text(args[1], wide) if args[1] else ""
+        log.debug(f"RegDeleteValue{'W' if wide else 'A'}(0x{hKey:x}, \"{name}\")")
         node, error = self._registry_key(hKey)
         if node is None:
             return error
         if node['values'].pop(name.lower(), None) is None:
             return self.ERROR_FILE_NOT_FOUND
+        if not node['volatile']:
+            self._save_registry()
         return self.ERROR_SUCCESS
 
-    def RegDeleteKeyA(self, args):
-        """RegDeleteKeyA emulation - the key must have no subkeys"""
+    def RegDeleteValueW(self, args):
+        return self.RegDeleteValueA(args, wide=True)
+
+    @registry_locked
+    def RegDeleteKeyA(self, args, wide=False):
+        """RegDeleteKeyA/W emulation - the key must have no subkeys"""
         hKey = args[0]
-        subkey = self.read_string(args[1]) if args[1] else ""
-        log.debug(f"RegDeleteKeyA(0x{hKey:x}, \"{subkey}\")")
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        log.debug(f"RegDeleteKey{'W' if wide else 'A'}(0x{hKey:x}, \"{subkey}\")")
         node, error = self._registry_key(hKey)
         if node is None:
             return error
@@ -17130,21 +17299,27 @@ class WinAPIHandler:
             return self.ERROR_ACCESS_DENIED
         del node['keys'][path[-1].lower()]
         target['deleted'] = True  # Open handles to it now fail
+        if not target['volatile']:
+            self._save_registry()
         return self.ERROR_SUCCESS
 
-    def _registry_store_name(self, name, lpName, lpcchName):
-        """Copy an ANSI key/value name; *lpcchName is in/out (chars)"""
-        data = name.encode(ANSI_CODEPAGE, errors='replace')
+    def RegDeleteKeyW(self, args):
+        return self.RegDeleteKeyA(args, wide=True)
+
+    def _registry_store_name(self, name, lpName, lpcchName, wide=False):
+        """Copy a key/value name; *lpcchName is in/out (TCHARs, without the NUL)"""
+        units = self._text_units(name, wide)
         if not lpName or not lpcchName:
             return self.ERROR_INVALID_PARAMETER
-        if self._read_u32(lpcchName) <= len(data):
+        if self._read_u32(lpcchName) <= len(units):
             return self.ERROR_MORE_DATA
-        self.emu.uc.mem_write(lpName, data + b'\x00')
-        self.emu.uc.mem_write(lpcchName, struct.pack('<I', len(data)))
+        self._write_units(lpName, units, wide)
+        self.emu.uc.mem_write(lpcchName, struct.pack('<I', len(units)))
         return self.ERROR_SUCCESS
 
-    def RegEnumKeyExA(self, args):
-        """RegEnumKeyExA emulation - subkeys in alphabetical order"""
+    @registry_locked
+    def RegEnumKeyExA(self, args, wide=False):
+        """RegEnumKeyExA/W emulation - subkeys in alphabetical order"""
         hKey, dwIndex, lpName, lpcchName = args[0], args[1], args[2], args[3]
         lpClass, lpcchClass, lpftLastWriteTime = args[5], args[6], args[7]
         node, error = self._registry_key(hKey)
@@ -17154,19 +17329,23 @@ class WinAPIHandler:
         if dwIndex >= len(keys):
             return self.ERROR_NO_MORE_ITEMS
         key = keys[dwIndex]
-        error = self._registry_store_name(key['name'], lpName, lpcchName)
+        error = self._registry_store_name(key['name'], lpName, lpcchName, wide)
         if error:
             return error
         if lpClass:
-            self.emu.uc.mem_write(lpClass, b'\x00')
+            self.emu.uc.mem_write(lpClass, b'\x00\x00' if wide else b'\x00')
         if lpcchClass:
             self.emu.uc.mem_write(lpcchClass, struct.pack('<I', 0))
         if lpftLastWriteTime:
             self.emu.uc.mem_write(lpftLastWriteTime, struct.pack('<Q', key['time']))
         return self.ERROR_SUCCESS
 
-    def RegEnumValueA(self, args):
-        """RegEnumValueA emulation - values in creation order"""
+    def RegEnumKeyExW(self, args):
+        return self.RegEnumKeyExA(args, wide=True)
+
+    @registry_locked
+    def RegEnumValueA(self, args, wide=False):
+        """RegEnumValueA/W emulation - values in creation order"""
         hKey, dwIndex, lpValueName, lpcchValueName = args[0], args[1], args[2], args[3]
         lpType, lpData, lpcbData = args[5], args[6], args[7]
         node, error = self._registry_key(hKey)
@@ -17176,10 +17355,13 @@ class WinAPIHandler:
         if dwIndex >= len(values):
             return self.ERROR_NO_MORE_ITEMS
         value = values[dwIndex]
-        error = self._registry_store_name(value['name'], lpValueName, lpcchValueName)
+        error = self._registry_store_name(value['name'], lpValueName, lpcchValueName, wide)
         if error:
             return error
-        return self._registry_store_data(value, False, lpType, lpData, lpcbData)
+        return self._registry_store_data(value, wide, lpType, lpData, lpcbData)
+
+    def RegEnumValueW(self, args):
+        return self.RegEnumValueA(args, wide=True)
     
     # OLE32.DLL APIs
     def OleInitialize(self, args):
@@ -17833,9 +18015,11 @@ class WinAPIHandler:
         return 0  # EXCEPTION_CONTINUE_SEARCH
     
     def _except_handler3(self, args):
-        """_except_handler3 emulation - called directly (not by the exception
-        dispatcher, which handles its frames itself): continue the search"""
-        return 1  # ExceptionContinueSearch
+        """_except_handler3(record, frame, context, dispatcher) emulation - when
+        called directly (the exception dispatcher handles its frames itself)"""
+        record, node, context = args[0], args[1], args[2]
+        return self._frame_handler(record, node, context, lambda exc: (
+            self._seh3_handle(node, exc) if exc else self._seh3_unwind_to(node, -1)))
     
     def api__CxxFrameHandler3(self, args):
         """__CxxFrameHandler emulation - called directly (not by the exception
@@ -17844,14 +18028,81 @@ class WinAPIHandler:
 
     # ---------- Exception handling (MSVC x86: SEH chain at FS:[0]) ----------
     #
-    # Exceptions are dispatched in Python: the SEH registration nodes are
-    # walked from FS:[0]; C++ frames (a "mov eax, FuncInfo; jmp
-    # __CxxFrameHandler" thunk) and _except_handler3 frames are interpreted
-    # here, their catch/__except/__finally/unwind funclets run in the guest.
+    # Exceptions are dispatched in Python like ntdll does: the vectored
+    # handlers, then the SEH registration nodes from FS:[0], then the
+    # top-level filter (SetUnhandledExceptionFilter). The frames of the
+    # Microsoft compilers are interpreted here (their catch/__except/
+    # __finally/unwind funclets run in the guest): C++ frames (a "mov eax,
+    # FuncInfo; jmp __CxxFrameHandler" thunk), _except_handler3 (msvcrt or
+    # the static VC6-2003 CRT) and _except_handler4 (Visual C++ 2005+, the
+    # scope table is encoded with the __security_cookie). Other handlers
+    # (other compilers, hand-written ones) are called in the guest.
 
     CXX_EXCEPTION = 0xE06D7363
     CXX_FRAME_HANDLERS = ('__CxxFrameHandler', '__CxxFrameHandler2', '__CxxFrameHandler3')
+    CXX_FUNCINFO_MAGICS = (0x19930520, 0x19930521, 0x19930522)
     SEH3_HANDLERS = ('_except_handler3', '__except_handler3')
+    # Start of _except_handler3 of the static VC6-2003 CRT (exsup3.asm)
+    SEH3_STATIC_CODE = bytes.fromhex('558bec83ec0853565755fc8b5d0c8b4508f7400406000000')
+    # _except_handler4 of the Visual C++ runtime: push the 4 arguments,
+    # push __security_check_cookie, push __security_cookie (group 1), call
+    # _except_handler4_common (a static or an imported one)
+    # ("mov ebp, esp" has two encodings)
+    SEH4_STUB_CODE = re.compile(rb'\x55(?:\x8B\xEC|\x89\xE5)\xFF\x75\x14\xFF\x75\x10\xFF\x75\x0C'
+                                rb'\xFF\x75\x08\x68.{4}\x68(.{4})(?:\xE8|\xFF\x15)', re.DOTALL)
+    SEH4_TOPMOST = -2
+    EXCEPTION_NONCONTINUABLE = 0x1
+    EXCEPTION_UNWINDING = 0x2
+    EXCEPTION_EXIT_UNWIND = 0x4
+    STATUS_UNWIND = 0xC0000027
+    MAX_NESTED_EXCEPTIONS = 8
+
+    # CONTEXT (x86): register -> offset (ContextFlags at 0, FloatSave at 0x1C)
+    CONTEXT_SIZE = 0x2CC
+    CONTEXT_OFFSETS = (('gs', 0x8C), ('fs', 0x90), ('es', 0x94), ('ds', 0x98),
+                       ('edi', 0x9C), ('esi', 0xA0), ('ebx', 0xA4), ('edx', 0xA8),
+                       ('ecx', 0xAC), ('eax', 0xB0), ('ebp', 0xB4), ('eip', 0xB8),
+                       ('cs', 0xBC), ('eflags', 0xC0), ('esp', 0xC4), ('ss', 0xC8))
+    CONTEXT_REGISTERS = {
+        'gs': UC_X86_REG_GS, 'fs': UC_X86_REG_FS, 'es': UC_X86_REG_ES, 'ds': UC_X86_REG_DS,
+        'edi': UC_X86_REG_EDI, 'esi': UC_X86_REG_ESI, 'ebx': UC_X86_REG_EBX,
+        'edx': UC_X86_REG_EDX, 'ecx': UC_X86_REG_ECX, 'eax': UC_X86_REG_EAX,
+        'ebp': UC_X86_REG_EBP, 'eip': UC_X86_REG_EIP, 'cs': UC_X86_REG_CS,
+        'eflags': UC_X86_REG_EFLAGS, 'esp': UC_X86_REG_ESP, 'ss': UC_X86_REG_SS}
+
+    @staticmethod
+    def _signed(value):
+        value &= 0xFFFFFFFF
+        return value - 0x100000000 if value & 0x80000000 else value
+
+    def capture_context(self, eip=None, esp=None):
+        """The calling thread's registers ({'eax': ...}), EIP/ESP replaced"""
+        uc = self.emu.uc
+        regs = {name: uc.reg_read(reg) for name, reg in self.CONTEXT_REGISTERS.items()}
+        if eip is not None:
+            regs['eip'] = eip
+        if esp is not None:
+            regs['esp'] = esp
+        return regs
+
+    def _write_context(self, address, regs):
+        """Fill a CONTEXT (CONTEXT_FULL: control, integer and segment registers)"""
+        data = bytearray(self.CONTEXT_SIZE)
+        struct.pack_into('<I', data, 0, 0x10007)
+        for name, offset in self.CONTEXT_OFFSETS:
+            struct.pack_into('<I', data, offset, regs.get(name, 0) & 0xFFFFFFFF)
+        return self._mem_write(address, data)
+
+    def _context_jump(self, address):
+        """ApiJump that resumes with the registers of a CONTEXT
+        (EXCEPTION_CONTINUE_EXECUTION / ExceptionContinueExecution)"""
+        data = bytes(self.emu.uc.mem_read(address, 0xCC))
+
+        def reg(name):
+            return struct.unpack_from('<I', data, dict(self.CONTEXT_OFFSETS)[name])[0]
+        return ApiJump(reg('eip'), reg('esp'), reg('eax'), ebp=reg('ebp'),
+                       regs={name: reg(name) for name in ('ebx', 'ecx', 'edx', 'esi', 'edi',
+                                                          'eflags')})
 
     def _read_i32(self, address):
         return struct.unpack('<i', self.emu.uc.mem_read(address, 4))[0]
@@ -17876,16 +18127,46 @@ class WinAPIHandler:
                 return None
         return None
 
+    def _security_cookie_address(self, address):
+        """Address of the __security_cookie of the EXE/DLL holding address (from
+        its load configuration), or 0"""
+        base = self._module_at(address)
+        if not base:
+            return 0
+        if base == self.emu.pe_loader.image_base:
+            pe = self.emu.pe_loader.pe
+        else:
+            pe = self.emu.dlls[base]['pe']
+        config = getattr(pe, 'DIRECTORY_ENTRY_LOAD_CONFIG', None)
+        cookie = getattr(getattr(config, 'struct', None), 'SecurityCookie', 0) or 0
+        # (the VA is for the preferred base; relocated images moved it)
+        return (cookie - pe.OPTIONAL_HEADER.ImageBase + base) & 0xFFFFFFFF if cookie else 0
+
     def _classify_seh_handler(self, handler):
-        """('cxx', FuncInfo) / ('seh3', None) / ('other', None)"""
+        """('cxx', FuncInfo) / ('seh3', None) / ('seh4', cookie) / ('other', None)"""
         try:
-            code = bytes(self.emu.uc.mem_read(handler, 10))
+            code = bytes(self.emu.uc.mem_read(handler, 64))
+        except UcError:
+            return 'other', None
+        try:
             if code[0] == 0xB8 and code[5] == 0xE9:  # mov eax, FuncInfo; jmp handler
+                func_info = struct.unpack_from('<I', code, 1)[0]
                 target = (handler + 10 + struct.unpack_from('<i', code, 6)[0]) & 0xFFFFFFFF
-                if self._api_name_at(target) in self.CXX_FRAME_HANDLERS:
-                    return 'cxx', struct.unpack_from('<I', code, 1)[0]
-            if self._api_name_at(handler) in self.SEH3_HANDLERS:
+                if (self._api_name_at(target) in self.CXX_FRAME_HANDLERS or
+                        self._read_u32(func_info) in self.CXX_FUNCINFO_MAGICS):
+                    return 'cxx', func_info  # an imported or a static frame handler
+            if (self._api_name_at(handler) in self.SEH3_HANDLERS or
+                    code.startswith(self.SEH3_STATIC_CODE)):
                 return 'seh3', None
+            # _except_handler4: "push offset __security_cookie" then a call of
+            # _except_handler4_common (imported or static); the cookie is
+            # known from the load configuration or the stub's code
+            cookie = self._security_cookie_address(handler)
+            if cookie and b'\x68' + struct.pack('<I', cookie) in code[:48]:
+                return 'seh4', cookie
+            match = self.SEH4_STUB_CODE.match(code)
+            if match:
+                return 'seh4', struct.unpack('<I', match.group(1))[0]
         except UcError:
             pass
         return 'other', None
@@ -17929,23 +18210,87 @@ class WinAPIHandler:
             level = previous
             guard += 1
 
-    def _global_unwind(self, target_node):
+    # _except_handler4 frames: like _except_handler3's, but the scope table
+    # (16-byte header of GS/EH cookie offsets, then {EnclosingLevel,
+    # FilterFunc, HandlerFunc} records) is XORed with the __security_cookie
+    # and the outermost level is -2
+
+    def _seh4_scope_record(self, node, cookie_address, level):
+        table = (self._read_u32(node + 8) ^ self._read_u32(cookie_address)) & 0xFFFFFFFF
+        return struct.unpack('<iII', self.emu.uc.mem_read(table + 16 + 12 * level, 12))
+
+    def _seh4_unwind_to(self, node, cookie_address, stop_level):
+        """Run the __finally blocks of an _except_handler4 frame down to stop_level"""
+        level = self._read_i32(node + 0xC)
+        guard = 0
+        while level != stop_level and level >= 0 and guard < 1000:
+            enclosing, filter_func, handler = self._seh4_scope_record(node, cookie_address, level)
+            self._mem_write(node + 0xC, struct.pack('<i', enclosing))
+            if not filter_func:
+                self._call_funclet(handler, node + 0x10)
+            level = enclosing
+            guard += 1
+
+    def _seh4_handle(self, node, exc, cookie_address):
+        """An _except_handler4 frame: run its filters; the jump to the __except
+        block that takes the exception (or EXCEPTION_CONTINUE_EXECUTION), or None"""
+        level = self._read_i32(node + 0xC)
+        guard = 0
+        while level >= 0 and guard < 1000:
+            enclosing, filter_func, handler = self._seh4_scope_record(node, cookie_address, level)
+            if filter_func:
+                self._mem_write(node - 4, struct.pack('<I', exc['pointers']))
+                verdict = self._signed(self._call_funclet(filter_func, node + 0x10))
+                if verdict < 0:  # EXCEPTION_CONTINUE_EXECUTION
+                    return self._context_jump(exc['context'])
+                if verdict > 0:  # EXCEPTION_EXECUTE_HANDLER
+                    self._global_unwind(node, exc['record'])
+                    self._seh4_unwind_to(node, cookie_address, level)
+                    self._mem_write(node + 0xC, struct.pack('<i', enclosing))
+                    return ApiJump(handler, self._read_u32(node - 8), exc['code'],
+                                   ebp=node + 0x10)
+            level = enclosing
+            guard += 1
+        return None
+
+    def _unwind_record(self, record, target_node):
+        """EXCEPTION_RECORD for the unwinding handler calls: the given one marked
+        EXCEPTION_UNWINDING, or a new STATUS_UNWIND one"""
+        flags = self.EXCEPTION_UNWINDING | (self.EXCEPTION_EXIT_UNWIND if not target_node else 0)
+        if record:
+            self._mem_write(record + 4, struct.pack('<I', self._read_u32(record + 4) | flags))
+            return record
+        record = self.emu.heap_alloc(0x50)
+        self._mem_write(record, struct.pack('<5I', self.STATUS_UNWIND, flags, 0, 0, 0))
+        return record
+
+    def _global_unwind(self, target_node, record=0):
         """Unwind the frames registered above target_node (their destructors and
-        __finally blocks run) and make it the head of the SEH chain"""
+        __finally blocks run; other handlers are called with EXCEPTION_UNWINDING)
+        and make it the head of the SEH chain (target_node 0: all frames)"""
         head = self._seh_head_addr()
         node = self._read_u32(head)
         guard = 0
+        unwind_record = None
         while node not in (0xFFFFFFFF, 0, target_node) and guard < 10000:
             next_node, handler = struct.unpack('<II', self.emu.uc.mem_read(node, 8))
-            kind, func_info = self._classify_seh_handler(handler)
+            kind, info = self._classify_seh_handler(handler)
             if kind == 'cxx':
-                self._cxx_unwind_to(node, self._cxx_func_info(func_info), -1)
+                self._cxx_unwind_to(node, self._cxx_func_info(info), -1)
             elif kind == 'seh3':
                 self._seh3_unwind_to(node, -1)
+            elif kind == 'seh4':
+                self._seh4_unwind_to(node, info, self.SEH4_TOPMOST)
+            elif self._memory_region(handler) is not None:
+                if unwind_record is None:
+                    unwind_record = self._unwind_record(record, target_node)
+                    unwind_context = self.emu.heap_alloc(self.CONTEXT_SIZE)
+                    self._write_context(unwind_context, self.capture_context())
+                self.emu.call_callback(handler, [unwind_record, node, unwind_context, 0])
             self._mem_write(head, struct.pack('<I', next_node))
             node = next_node
             guard += 1
-        self._mem_write(head, struct.pack('<I', target_node))
+        self._mem_write(head, struct.pack('<I', target_node or 0xFFFFFFFF))
 
     def _catchable_types(self, throw_info):
         """[(properties, type name, pType, mdisp, pdisp, vdisp, size, copy ctor)]"""
@@ -17993,7 +18338,7 @@ class WinAPIHandler:
         """Unwind to the catching frame, run the catch block; returns the ApiJump
         that continues after it"""
         (try_low, _), (adjectives, disp, handler), catch_type = found
-        self._global_unwind(node)
+        self._global_unwind(node, exc['record'])
         self._cxx_unwind_to(node, info, try_low)
         ebp = node + 0xC
         obj = exc['object']
@@ -18026,8 +18371,8 @@ class WinAPIHandler:
         return ApiJump(continuation, saved_esp, continuation, ebp=ebp)
 
     def _seh3_handle(self, node, exc):
-        """An _except_handler3 frame: run its filters; ApiJump to the __except
-        block that takes the exception, or None"""
+        """An _except_handler3 frame: run its filters; the jump to the __except
+        block that takes the exception (or EXCEPTION_CONTINUE_EXECUTION), or None"""
         scope_table = self._read_u32(node + 8)
         level = self._read_i32(node + 0xC)
         guard = 0
@@ -18036,9 +18381,11 @@ class WinAPIHandler:
                 scope_table + 12 * level, 12))
             if filter_func:
                 self._mem_write(node - 4, struct.pack('<I', exc['pointers']))
-                verdict = self._call_funclet(filter_func, node + 0x10)
-                if verdict == 1:  # EXCEPTION_EXECUTE_HANDLER
-                    self._global_unwind(node)
+                verdict = self._signed(self._call_funclet(filter_func, node + 0x10))
+                if verdict < 0:  # EXCEPTION_CONTINUE_EXECUTION
+                    return self._context_jump(exc['context'])
+                if verdict > 0:  # EXCEPTION_EXECUTE_HANDLER
+                    self._global_unwind(node, exc['record'])
                     self._seh3_unwind_to(node, level)
                     self._mem_write(node + 0xC, struct.pack('<i', previous))
                     return ApiJump(handler, self._read_u32(node - 8), exc['code'],
@@ -18047,64 +18394,190 @@ class WinAPIHandler:
             guard += 1
         return None
 
-    def dispatch_exception(self, code, flags, params, address):
-        """Find the handler of an exception; returns the ApiJump to it or None"""
-        record = self.emu.heap_alloc(0x50 + 0x2CC + 8)
-        context = record + 0x50
-        pointers = context + 0x2CC
-        data = struct.pack('<5I', code, flags, 0, address, len(params))
+    def _new_exception(self, code, flags, params, address, context):
+        """Write EXCEPTION_RECORD, CONTEXT and EXCEPTION_POINTERS; the
+        exception's info dict"""
+        record = self.emu.heap_alloc(0x50 + self.CONTEXT_SIZE + 8)
+        context_addr = record + 0x50
+        pointers = context_addr + self.CONTEXT_SIZE
+        data = struct.pack('<5I', code, flags, 0, address, min(len(params), 15))
         data += b''.join(struct.pack('<I', p & 0xFFFFFFFF) for p in params[:15])
         self._mem_write(record, data)
-        self._mem_write(pointers, struct.pack('<II', record, context))
-        exc = {'code': code, 'record': record, 'pointers': pointers,
-               'object': params[1] if code == self.CXX_EXCEPTION and len(params) > 2 else 0,
-               'throw_info': params[2] if code == self.CXX_EXCEPTION and len(params) > 2 else 0}
-        node = self._read_u32(self._seh_head_addr())
-        guard = 0
+        self._write_context(context_addr, context)
+        self._mem_write(pointers, struct.pack('<II', record, context_addr))
+        cxx = code == self.CXX_EXCEPTION and len(params) > 2
+        return {'code': code, 'flags': flags, 'record': record, 'context': context_addr,
+                'pointers': pointers, 'object': params[1] if cxx else 0,
+                'throw_info': params[2] if cxx else 0}
+
+    def _continue_execution(self, exc):
+        """Jump of EXCEPTION_CONTINUE_EXECUTION (None if the exception is
+        noncontinuable)"""
+        if exc['flags'] & self.EXCEPTION_NONCONTINUABLE:
+            log.error(f"Exception 0x{exc['code']:08x} is noncontinuable "
+                      f"(STATUS_NONCONTINUABLE_EXCEPTION)")
+            return None
+        return self._context_jump(exc['context'])
+
+    def dispatch_exception(self, code, flags, params, address, context=None):
+        """Find the handler of an exception like ntdll does: the vectored
+        handlers, the SEH frames, then the top-level filter. Returns the
+        ApiJump to the handler (or back to the faulting code), or None if the
+        exception is unhandled. context: the registers at the exception
+        (default: the current ones, EIP = address)."""
+        thread = self.emu.current_thread
+        if thread.dispatch_depth >= self.MAX_NESTED_EXCEPTIONS:
+            log.error(f"Exception 0x{code:08x} while dispatching "
+                      f"{thread.dispatch_depth} exceptions")
+            return None
+        exc = self._new_exception(code, flags, params, address,
+                                  context or self.capture_context(eip=address))
+        thread.dispatch_depth += 1
         try:
+            for handler in list(self.vectored_handlers.values()):
+                verdict = self._signed(self.emu.call_callback(handler, [exc['pointers']]))
+                if verdict == -1:  # EXCEPTION_CONTINUE_EXECUTION
+                    return self._continue_execution(exc)
+            node = self._read_u32(self._seh_head_addr())
+            guard = 0
             while node not in (0xFFFFFFFF, 0) and guard < 10000:
                 next_node, handler = struct.unpack('<II', self.emu.uc.mem_read(node, 8))
-                kind, func_info = self._classify_seh_handler(handler)
-                if kind == 'cxx' and code == self.CXX_EXCEPTION:
-                    info = self._cxx_func_info(func_info)
-                    found = self._cxx_find_catch(node, info, exc)
-                    if found is not None:
-                        return self._cxx_catch(node, info, found, exc)
+                kind, info = self._classify_seh_handler(handler)
+                if kind == 'cxx':
+                    if code == self.CXX_EXCEPTION:
+                        func_info = self._cxx_func_info(info)
+                        found = self._cxx_find_catch(node, func_info, exc)
+                        if found is not None:
+                            return self._cxx_catch(node, func_info, found, exc)
                 elif kind == 'seh3':
                     jump = self._seh3_handle(node, exc)
                     if jump is not None:
                         return jump
+                elif kind == 'seh4':
+                    jump = self._seh4_handle(node, exc, info)
+                    if jump is not None:
+                        return jump
+                elif self._memory_region(handler) is not None:
+                    # Another compiler's (or a hand-written) handler:
+                    # EXCEPTION_DISPOSITION handler(record, frame, context, dispatcher)
+                    disposition = self.emu.call_callback(
+                        handler, [exc['record'], node, exc['context'], 0])
+                    if disposition == 0:  # ExceptionContinueExecution
+                        return self._continue_execution(exc)
+                    # ExceptionContinueSearch, ExceptionNestedException, ...
+                else:
+                    log.warning(f"Invalid exception handler 0x{handler:08x} in the "
+                                f"SEH chain (frame 0x{node:08x})")
+                    break
                 node = next_node
                 guard += 1
+            if self._top_level_filter(exc['pointers']) == -1:
+                return self._continue_execution(exc)
         except UcError as e:
             log.error(f"Exception dispatch failed: {e}")
+        finally:
+            thread.dispatch_depth -= 1
         return None
-    
+
+    def _top_level_filter(self, pointers):
+        """The SetUnhandledExceptionFilter filter's verdict (0: none set)"""
+        if not self.unhandled_exception_filter:
+            return 0
+        return self._signed(self.emu.call_callback(self.unhandled_exception_filter, [pointers]))
+
+    def raise_guest_exception(self, code, flags, params, popped_bytes):
+        """Raise an exception from an API call (RaiseException,
+        _CxxThrowException): the ApiJump to its handler, or 0 after ending
+        the process if it is unhandled. popped_bytes: the API's stack arguments
+        (the context continues after the call)."""
+        return_address = self._read_u32(self.emu.api_call_esp)
+        context = self.capture_context(
+            eip=return_address, esp=self.emu.api_call_esp + 4 + popped_bytes)
+        context['eax'] = 0
+        jump = self.dispatch_exception(code, flags, params, return_address, context)
+        if jump is not None or self.emu.stop_emulation:
+            return jump or 0
+        if code == self.CXX_EXCEPTION and len(params) > 2:
+            names = [t[1] for t in self._catchable_types(params[2])] if params[2] else []
+            log.error(f"Unhandled C++ exception {names[:1]}: process terminated")
+        else:
+            log.error(f"Unhandled exception 0x{code:08x} (RaiseException) at "
+                      f"0x{return_address:08x}: process terminated")
+        self._set_exit_code(code)
+        self.emu.crashed = True
+        self.emu.stop_emulation = True
+        return 0
+
+    def _cxx_rethrow_params(self):
+        """Exception parameters of "throw;" (the C++ exception being handled),
+        or None outside a catch block"""
+        thread = self.emu.current_thread
+        current = (getattr(thread, 'cxx_exceptions', None) or [None])[-1]
+        if current is None:
+            return None
+        current['rethrown'] = True
+        return [0x19930520, current['object'], current['throw_info']]
+
     def _CxxThrowException(self, args):
         """_CxxThrowException emulation - throw a C++ exception (throw;
         without an object rethrows the one being handled)"""
         obj, throw_info = args[0], args[1]
-        thread = self.emu.current_thread
+        params = [0x19930520, obj, throw_info]
         if not obj and not throw_info:
-            current = (getattr(thread, 'cxx_exceptions', None) or [None])[-1]
-            if current is None:
+            params = self._cxx_rethrow_params()
+            if params is None:
                 log.error("C++ rethrow (throw;) without an exception being handled")
                 self.emu.crashed = True
                 self.emu.stop_emulation = True
                 return 0
-            current['rethrown'] = True
-            obj, throw_info = current['object'], current['throw_info']
-        names = [t[1] for t in self._catchable_types(throw_info)] if throw_info else []
+        names = [t[1] for t in self._catchable_types(params[2])] if params[2] else []
         log.debug(f"C++ exception thrown: {names[:1]}")
-        return_address = self._read_u32(self.emu.api_call_esp)
-        jump = self.dispatch_exception(self.CXX_EXCEPTION, 1,
-                                       [0x19930520, obj, throw_info], return_address)
-        if jump is None:
-            log.error(f"Unhandled C++ exception {names[:1]} (_CxxThrowException)")
-            self.emu.crashed = True
-            self.emu.stop_emulation = True
-            return 0
-        return jump
+        return self.raise_guest_exception(self.CXX_EXCEPTION, self.EXCEPTION_NONCONTINUABLE,
+                                          params, 8)
+
+    # Exception handler entry points the compiled code (or a handler) calls
+    # itself: the frames are handled like the dispatcher does
+
+    def _exception_from_record(self, record, context):
+        """Info dict of an exception the guest passes (EXCEPTION_RECORD, CONTEXT)"""
+        code, flags = struct.unpack('<II', self.emu.uc.mem_read(record, 8))
+        pointers = self.emu.heap_alloc(8)
+        self._mem_write(pointers, struct.pack('<II', record, context))
+        return {'code': code, 'flags': flags, 'record': record, 'context': context,
+                'pointers': pointers, 'object': 0, 'throw_info': 0}
+
+    def _frame_handler(self, record, node, context, handle):
+        """Common part of _except_handler3/_except_handler4_common: unwind
+        (EXCEPTION_UNWINDING) or handle the exception (ExceptionContinueSearch: 1)"""
+        if self._read_u32(record + 4) & (self.EXCEPTION_UNWINDING | self.EXCEPTION_EXIT_UNWIND):
+            handle(None)
+            return 1
+        jump = handle(self._exception_from_record(record, context))
+        return jump if jump is not None else 1
+
+    def _except_handler4_common(self, args):
+        """_except_handler4_common(CookiePointer, CookieCheckFunction, record,
+        frame, context, dispatcher) emulation (vcruntime140/msvcrt)"""
+        cookie, record, node, context = args[0], args[2], args[3], args[4]
+        return self._frame_handler(record, node, context, lambda exc: (
+            self._seh4_handle(node, exc, cookie) if exc else
+            self._seh4_unwind_to(node, cookie, self.SEH4_TOPMOST)))
+
+    def _local_unwind4(self, args):
+        """_local_unwind4(CookiePointer, frame, TargetLevel) emulation: run
+        the frame's __finally blocks down to TargetLevel"""
+        self._seh4_unwind_to(args[1], args[0], self._signed(args[2]))
+        return 0
+
+    def _local_unwind2(self, args):
+        """_local_unwind2(frame, StopLevel) emulation (msvcrt)"""
+        self._seh3_unwind_to(args[0], self._signed(args[1]))
+        return 0
+
+    def _global_unwind2(self, args):
+        """_global_unwind2(frame) emulation (msvcrt): unwind the frames above"""
+        self._global_unwind(args[0])
+        return 0
     
     def _onexit(self, args):
         """_onexit emulation - atexit registration"""
@@ -21532,12 +22005,9 @@ class WinAPIHandler:
             self.emu.crashed = True
             self.emu.stop_emulation = True
             return 0
-        uc = self.emu.uc
-        uc.reg_write(UC_X86_REG_EBP, ebp)
-        uc.reg_write(UC_X86_REG_EBX, ebx)
-        uc.reg_write(UC_X86_REG_EDI, edi)
-        uc.reg_write(UC_X86_REG_ESI, esi)
-        return ApiJump(eip, esp, value or 1)
+        # (the registers are set where the jump lands, also outside a callback)
+        return ApiJump(eip, esp, value or 1, ebp=ebp,
+                       regs={'ebx': ebx, 'edi': edi, 'esi': esi})
 
     # ---- Time ----
 
@@ -26665,6 +27135,8 @@ class GuestThread:
         self.exit_code = 259  # STILL_ACTIVE
         self.stop = False  # ExitThread: stop this thread's emulation
         self.python_thread = None
+        self.pending_fault = None  # access violation the memory hook saw
+        self.dispatch_depth = 0  # exceptions being dispatched (nested ones)
 
 
 class CPUEmulator:
@@ -26955,7 +27427,7 @@ class CPUEmulator:
                     self.wait_until(lambda: thread.suspend_count == 0)
                     self._slice_start = time.monotonic()
                     if not (self.stop_emulation or thread.stop):
-                        uc.emu_start(start, self.THREAD_EXIT_ADDR, 0, 0)
+                        self.emulate(uc, start, self.THREAD_EXIT_ADDR)
                         if (not thread.exited and
                                 uc.reg_read(UC_X86_REG_EIP) == self.THREAD_EXIT_ADDR):
                             thread.exit_code = uc.reg_read(UC_X86_REG_EAX)
@@ -27408,8 +27880,7 @@ class CPUEmulator:
                 if imp.name:
                     func_name = imp.name.decode('ascii', 'replace')
                 else:
-                    func_name = PELoader.KNOWN_ORDINALS.get(
-                        (dll_name.lower(), imp.ordinal), f"Ordinal_{imp.ordinal}")
+                    func_name = PELoader.ordinal_name(dll_name, imp.ordinal)
                 if real:
                     target = (real['exports'].get(func_name) if imp.name
                               else real['ordinals'].get(imp.ordinal))
@@ -27478,6 +27949,20 @@ class CPUEmulator:
         emulation level (not to a frame outside the running callback)?"""
         stack = self.callback_stack
         return not stack or jump.esp < stack[-1]['saved_state']['esp']
+
+    JUMP_REGISTERS = {'ebx': UC_X86_REG_EBX, 'ecx': UC_X86_REG_ECX, 'edx': UC_X86_REG_EDX,
+                      'esi': UC_X86_REG_ESI, 'edi': UC_X86_REG_EDI,
+                      'eflags': UC_X86_REG_EFLAGS}
+
+    def apply_jump(self, uc, jump):
+        """Set the registers of an ApiJump (continue at jump.eip)"""
+        uc.reg_write(UC_X86_REG_EAX, jump.eax & 0xFFFFFFFF)
+        uc.reg_write(UC_X86_REG_ESP, jump.esp)
+        uc.reg_write(UC_X86_REG_EIP, jump.eip)
+        if jump.ebp is not None:
+            uc.reg_write(UC_X86_REG_EBP, jump.ebp)
+        for name, value in (jump.regs or {}).items():
+            uc.reg_write(self.JUMP_REGISTERS[name], value & 0xFFFFFFFF)
 
     def call_callback(self, callback_addr, args, return_handler=None, regs=None):
         """
@@ -27551,7 +28036,7 @@ class CPUEmulator:
         # let the Python-side max_instructions check in _hook_code limit
         # everything uniformly.
         try:
-            self.uc.emu_start(callback_addr, self.callback_return_addr, 0, 0)
+            self.emulate(self.uc, callback_addr, self.callback_return_addr)
         except UcError as e:
             log.error(f"Callback error: {e}")
         
@@ -27616,6 +28101,10 @@ class CPUEmulator:
         uc.hook_add(UC_HOOK_CODE, self._hook_code,
                     begin=self.callback_return_addr,
                     end=self.callback_return_addr)
+        # Reached inside a callback only if the code left it without returning
+        # (an exception handler that continued in the program): see _hook_code
+        for address in (self.PROCESS_EXIT_ADDR, self.THREAD_EXIT_ADDR):
+            uc.hook_add(UC_HOOK_CODE, self._hook_code, begin=address, end=address)
 
         # Memory access error hook
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._hook_mem_invalid)
@@ -27649,7 +28138,17 @@ class CPUEmulator:
                 address == self.callback_return_addr):
             uc.emu_stop()
             return
-        
+        if address in (self.PROCESS_EXIT_ADDR, self.THREAD_EXIT_ADDR):
+            if self.callback_stack:
+                # The program returned from its entry point (or thread start
+                # routine) inside a callback it never returned from: continue
+                # at that return address on the level that waits for it
+                self.pending_unwind = ApiJump(address, uc.reg_read(UC_X86_REG_ESP),
+                                              uc.reg_read(UC_X86_REG_EAX),
+                                              ebp=uc.reg_read(UC_X86_REG_EBP))
+            uc.emu_stop()
+            return
+
         hook_info = self.api_hooks.get(address)
         if hook_info:
             self.maybe_yield()
@@ -27684,7 +28183,7 @@ class CPUEmulator:
                     args.append(0)
         
         # Find and call handler
-        handler = self.api_handler.get_api_handler(func_name)
+        handler = self.api_handler.get_api_handler(func_name, dll_name)
         self.api_call_esp = esp
         
         if handler:
@@ -27713,11 +28212,7 @@ class CPUEmulator:
                 self.pending_unwind = result
                 self.uc.emu_stop()
                 return
-            self.uc.reg_write(UC_X86_REG_EAX, result.eax & 0xFFFFFFFF)
-            self.uc.reg_write(UC_X86_REG_ESP, result.esp)
-            self.uc.reg_write(UC_X86_REG_EIP, result.eip)
-            if result.ebp is not None:
-                self.uc.reg_write(UC_X86_REG_EBP, result.ebp)
+            self.apply_jump(self.uc, result)
             return
 
         x87_result = isinstance(result, X87Result)
@@ -27764,14 +28259,58 @@ class CPUEmulator:
                 for base, region in self.current_thread.mapped.items()):
             return True
 
-        # Like Windows, an access to unmapped memory is fatal (there is no
-        # SEH support to hand it to the program). Mapping memory on demand
-        # would silently turn NULL-pointer bugs into reads of zeros.
-        log.error(f"Access violation: {access_type} @ 0x{address:08x}, "
+        # Like Windows, an access to unmapped memory is an access violation
+        # for the program's exception handlers: emulate() dispatches it when
+        # Unicorn stops. Mapping memory on demand would silently turn
+        # NULL-pointer bugs into reads of zeros.
+        log.debug(f"Access violation: {access_type} @ 0x{address:08x}, "
                   f"size={size}, EIP=0x{eip:08x}")
-        self.crashed = True
-        self.stop_emulation = True
+        kind = {UC_MEM_WRITE_UNMAPPED: 1, UC_MEM_FETCH_UNMAPPED: 8}.get(access, 0)
+        fault_address = address if access == UC_MEM_FETCH_UNMAPPED else eip
+        self.current_thread.pending_fault = (
+            self.STATUS_ACCESS_VIOLATION, [kind, address & 0xFFFFFFFF], fault_address,
+            f"access violation: {access_type.lower()} of 0x{address:08x}")
         return False
+
+    def emulate(self, uc, start, until):
+        """uc.emu_start(start, until), continuing in the program's exception
+        handler after an access violation or an illegal instruction, like on
+        Windows; an unhandled one ends the process. Other errors are raised."""
+        address = start
+        while True:
+            try:
+                uc.emu_start(address, until, 0, 0)
+                return
+            except UcError as e:
+                thread = self.current_thread
+                fault, thread.pending_fault = thread.pending_fault, None
+                if fault is None and e.errno == UC_ERR_INSN_INVALID:
+                    eip = uc.reg_read(UC_X86_REG_EIP)
+                    fault = (0xC000001D, [], eip, "illegal instruction")
+                if fault is None or self.stop_emulation or thread.stop:
+                    raise
+            code, params, fault_address, description = fault
+            jump = None
+            try:
+                jump = self.api_handler.dispatch_exception(
+                    code, 0, params, fault_address,
+                    self.api_handler.capture_context(eip=fault_address))
+            except GuestUnwind as unwind:  # a filter or funclet threw
+                jump = unwind.jump
+            if self.stop_emulation or self.current_thread.stop:
+                return
+            if jump is None:
+                log.error(f"Unhandled exception 0x{code:08x} ({description}) at "
+                          f"0x{fault_address:08x}: process terminated")
+                self._terminate_on_exception(uc, code)
+                return
+            log.debug(f"Exception 0x{code:08x} ({description}) at 0x{fault_address:08x} "
+                      f"is handled at 0x{jump.eip:08x}")
+            if not self.jump_belongs_here(jump):
+                self.pending_unwind = jump  # the handler is outside the running callback
+                return
+            self.apply_jump(uc, jump)
+            address = jump.eip
     
     # CPU exceptions -> (Windows exception code, description, faulting
     # instruction length: 0 when EIP already points at it)
@@ -27923,12 +28462,8 @@ class CPUEmulator:
             self.pending_unwind = jump
             uc.emu_stop()
             return
-        uc.reg_write(UC_X86_REG_EAX, jump.eax & 0xFFFFFFFF)
-        uc.reg_write(UC_X86_REG_ESP, jump.esp)
-        uc.reg_write(UC_X86_REG_EIP, jump.eip)
-        if jump.ebp is not None:
-            uc.reg_write(UC_X86_REG_EBP, jump.ebp)
-    
+        self.apply_jump(uc, jump)
+
     def run(self, max_instructions=None):
         """Start emulation"""
         if max_instructions is not None:
@@ -27963,7 +28498,7 @@ class CPUEmulator:
             # The instruction limit is enforced in _hook_code. Passing a count
             # to Unicorn would break nested emu_start calls (callbacks,
             # _initterm, atexit) and can crash the process.
-            self.uc.emu_start(entry_point, self.PROCESS_EXIT_ADDR, 0, 0)
+            self.emulate(self.uc, entry_point, self.PROCESS_EXIT_ADDR)
 
             if (not self.crashed and
                     self.uc.reg_read(UC_X86_REG_EIP) == self.PROCESS_EXIT_ADDR):
@@ -28060,9 +28595,10 @@ def main():
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
                         help="Run without GUI")
-    parser.add_argument("--codepage", default="utf-8",
+    parser.add_argument("--codepage", default="cp1252",
                         help="ANSI code page for 'A' APIs and CRT strings "
-                             "(default: utf-8; e.g. cp1254, cp1252)")
+                             "(default: cp1252 like an English Windows; e.g. cp1254, "
+                             "or utf-8 for UTF-8 narrow strings)")
     parser.add_argument("--clean", action="store_true",
                         help="Only delete c_drive/ (scripts/remove_c_drive_environment.sh "
                              "--all, asks for confirmation) and exit")

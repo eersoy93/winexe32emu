@@ -32,19 +32,24 @@ export SDL_AUDIODRIVER=dummy
 passed=0
 failed=0
 
-# run_test NAME EXPECTED [INPUT]: EXPECTED is a fixed string the output must contain
+# run_test NAME EXPECTED [INPUT [CODEPAGE]]: EXPECTED is a fixed string the
+# output must contain; CODEPAGE is the --codepage option (default: cp1252)
 run_test() {
     name=$1
     expected=$2
     input=$3
+    codepage=${4:-cp1252}
+    label=$name
+    [ -n "$4" ] && label="${name} (${codepage})"
     output=$(printf '%s\n' "$input" | timeout "$TIMEOUT" "$PYTHON" winexe32emu.py \
-        --no-gui --no-create-environment --no-apps -q "${name}.exe" 2>&1)
+        --no-gui --no-create-environment --no-apps -q --codepage "$codepage" \
+        "${name}.exe" 2>&1)
     code=$?
     if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -qF -- "$expected"; then
-        echo "PASS: ${name}"
+        echo "PASS: ${label}"
         passed=$((passed + 1))
     else
-        echo "FAIL: ${name} (exit code ${code})"
+        echo "FAIL: ${label} (exit code ${code})"
         printf '%s\n' "$output" | tail -n 10 | sed 's/^/    /'
         failed=$((failed + 1))
     fi
@@ -90,6 +95,7 @@ run_args_test() {
 
 run_test crt_test "== 0 failure(s) =="
 run_test api_test "== 0 failure(s) =="
+run_test api_test "== 0 failure(s) ==" "" utf-8
 run_test file_test "was blocked! Good!"
 run_test sysinfo_test "Escape attempt (copy)   : 0, error 5"
 run_test console_test "Hello, Tester!" "Tester"
@@ -98,8 +104,13 @@ run_test thread_test "== 0 failure(s) =="
 run_test vista_api_test "== 0 failure(s) =="
 run_test exception_test "== 0 failure(s) =="
 run_args_test argv_test "== 0 failure(s) ==" plain "two words" 'a\b' 'q"uote' '' end
+# Two processes: the second one finds what the first one saved
+run_args_test registry_test "== 0 failure(s) ==" write
+run_args_test registry_test "== 0 failure(s) ==" read
 run_crash_test exception_test fastfail "__fastfail(7)"
 run_crash_test exception_test int3 "Unhandled exception 0x80000003"
+run_test seh_test "== 0 failure(s) =="
+run_crash_test seh_test av "Unhandled exception 0xc0000005"
 
 echo "== ${passed} passed, ${failed} failed =="
 exit "$failed"
