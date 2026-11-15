@@ -1740,6 +1740,7 @@ class WinAPIHandler:
             '??1type_info@@UAE@XZ': lambda args: 0,  # thiscall, nothing to free
         }
         self._api_map.update(self._crt_extra_api_map())
+        self._api_map.update(self._crt_variable_api_map())
 
     @property
     def _last_error(self):
@@ -1997,6 +1998,7 @@ class WinAPIHandler:
             '_wenviron': lambda: self._ensure_env_ptr('_wenviron_ptr_addr', wide=True),
             '__winitenv': lambda: self._ensure_env_ptr('_winitenv_addr', wide=True),
         }
+        resolvers.update(self._crt_variable_resolvers())
         resolver = resolvers.get(name)
         return resolver() if resolver else None
         
@@ -20063,6 +20065,117 @@ class WinAPIHandler:
         index = args[0]
         log.debug(f"__acrt_iob_func({index})")
         return self._ensure_iob() + (index * self._FILE_SIZE)
+
+    # ---- msvcrt.dll variables (the "C" locale) and their __p__ accessors ----
+
+    def _crt_variable(self, name, data):
+        """Address of a C runtime variable, allocated with its initial bytes once"""
+        cells = self.__dict__.setdefault('_crt_variables', {})
+        if name not in cells:
+            address = self.emu.heap_alloc(max(len(data), 4))
+            self._mem_write(address, data)
+            cells[name] = address
+        return cells[name]
+
+    def _ctype_table(self, wide):
+        """The "C" locale's character classification table (_UPPER, _LOWER,
+        _DIGIT, ... like CT_CTYPE1): _pctype points to the entry of character
+        0 with the EOF (-1) entry before it; _pwctype has 256 entries"""
+        if wide:
+            flags = [self._ctype1(chr(c)) for c in range(256)]
+            return self._crt_variable('_pwctype table', struct.pack('<256H', *flags))
+        flags = [self._ctype1(chr(c)) if c < 0x80 else 0 for c in range(256)]
+        return self._crt_variable('_pctype table', struct.pack('<257H', 0, *flags)) + 2
+
+    def _crt_pointer_variable(self, name, target):
+        return self._crt_variable(name, struct.pack('<I', target))
+
+    def _pgmptr_variable(self, wide):
+        """_pgmptr/_wpgmptr: the program's full path"""
+        name = '_wpgmptr' if wide else '_pgmptr'
+        cells = self.__dict__.setdefault('_crt_variables', {})
+        if name not in cells:
+            units = self._text_units(self.windows_exe_path(), wide) + [0]
+            text = self.emu.heap_alloc(len(units) * (2 if wide else 1))
+            self._write_units(text, units, wide, terminate=False)
+            self._crt_pointer_variable(name, text)
+        return cells[name]
+
+    def _tzname_variable(self):
+        """_tzname: {standard name, daylight saving time name}"""
+        cells = self.__dict__.setdefault('_crt_variables', {})
+        if '_tzname' not in cells:
+            names = []
+            for text in time.tzname:
+                data = text.encode(ANSI_CODEPAGE, errors='replace')[:63] + b'\x00'
+                names.append(self.emu.heap_alloc(64))
+                self._mem_write(names[-1], data)
+            self._crt_variable('_tzname', struct.pack('<II', *names))
+        return cells['_tzname']
+
+    def _crt_variable_resolvers(self):
+        """msvcrt variables: name -> function returning the variable's address"""
+        version = self.GetVersion([])
+        major, minor, build = version & 0xFF, (version >> 8) & 0xFF, version >> 16
+        return {
+            '_pctype': lambda: self._crt_pointer_variable('_pctype', self._ctype_table(False)),
+            '_pwctype': lambda: self._crt_pointer_variable('_pwctype', self._ctype_table(True)),
+            '__mb_cur_max': lambda: self._crt_variable('__mb_cur_max', struct.pack('<i', 1)),
+            '_pgmptr': lambda: self._pgmptr_variable(False),
+            '_wpgmptr': lambda: self._pgmptr_variable(True),
+            '_timezone': lambda: self._crt_variable('_timezone', struct.pack('<i', time.timezone)),
+            '_daylight': lambda: self._crt_variable('_daylight', struct.pack('<i', time.daylight)),
+            '_tzname': self._tzname_variable,
+            '_osver': lambda: self._crt_variable('_osver', struct.pack('<I', build)),
+            '_winver': lambda: self._crt_variable('_winver',
+                                                  struct.pack('<I', (major << 8) | minor)),
+            '_winmajor': lambda: self._crt_variable('_winmajor', struct.pack('<I', major)),
+            '_winminor': lambda: self._crt_variable('_winminor', struct.pack('<I', minor)),
+        }
+
+    def _crt_variable_api_map(self):
+        """The __p__ accessors and helper functions of the msvcrt variables"""
+        variables = self._crt_variable_resolvers()
+        api = {f'__p_{name}': (lambda resolve: lambda args: resolve())(resolve)
+               for name, resolve in variables.items()}
+        api.update({
+            '__p__iob': self.api__iob_func,
+            '__pctype_func': lambda args: self._ctype_table(False),
+            '__pwctype_func': lambda args: self._ctype_table(True),
+            '___mb_cur_max_func': lambda args: 1,  # single-byte "C" locale
+            '___lc_codepage_func': lambda args: 0,  # the "C" locale
+            '___lc_collate_cp_func': lambda args: 0,
+            '___lc_handle_func': lambda args: self._crt_variable('__lc_handle', b'\x00' * 24),
+            '__lconv_init': self._crt_noop,
+            '__doserrno': lambda args: self._crt_variable('_doserrno', b'\x00' * 4),
+            '__threadid': lambda args: self.emu.current_thread.tid,
+            '__threadhandle': lambda args: 0xFFFFFFFE,  # GetCurrentThread()
+        })
+        return api
+
+    def _get_pgmptr(self, args):
+        """_get_pgmptr(char **) emulation"""
+        self._mem_write(args[0], struct.pack('<I', self._read_u32(self._pgmptr_variable(False))))
+        return 0
+
+    def _get_wpgmptr(self, args):
+        self._mem_write(args[0], struct.pack('<I', self._read_u32(self._pgmptr_variable(True))))
+        return 0
+
+    def _assert_common(self, message, file, line):
+        self._ensure_iob()
+        text = f"Assertion failed: {message}, file {file}, line {line}\n"
+        self.std_streams[2].write(text.encode(ANSI_CODEPAGE, errors='replace'))
+        return self.abort([])
+
+    def _assert(self, args):
+        """_assert emulation - prints the failed assertion and aborts"""
+        return self._assert_common(self.read_string(args[0]), self.read_string(args[1]),
+                                   args[2])
+
+    def _wassert(self, args):
+        return self._assert_common(self.read_wide_string(args[0]),
+                                   self.read_wide_string(args[1]), args[2])
     
     def _errno(self, args):
         """_errno emulation - address of the thread's errno variable"""

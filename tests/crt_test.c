@@ -17,10 +17,14 @@ limitations under the License.
 /*
 C runtime test - exercises the emulator's msvcrt support:
 formatted I/O, strings, wide strings, number conversion, math,
-time, environment, file system, signals and setjmp/longjmp.
+time, environment, file system, signals and setjmp/longjmp, and the
+msvcrt variables (_iob, _pctype, __mb_cur_max, ...) with the __p__
+functions other MinGW-w64 versions import.
 Every check prints PASS or FAIL; the exit code is the failure count.
 */
 
+#include <windows.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +38,8 @@ Every check prints PASS or FAIL; the exit code is the failure count.
 #include <stdarg.h>
 #include <io.h>
 #include <direct.h>
+
+#undef near  /* <windows.h> defines near and far for 16-bit code */
 
 static int failures = 0;
 
@@ -71,6 +77,49 @@ static jmp_buf jump_target;
 static void jump_back(int value)
 {
     longjmp(jump_target, value);
+}
+
+/* An msvcrt.dll export called by name (cdecl, no arguments) */
+typedef void *(__cdecl *pointer_func)(void);
+typedef int (__cdecl *int_func)(void);
+
+static FARPROC msvcrt_proc(const char *name)
+{
+    return GetProcAddress(GetModuleHandleA("msvcrt.dll"), name);
+}
+
+static void test_crt_variables(void)
+{
+    pointer_func p_iob = (pointer_func)(void (*)(void))msvcrt_proc("__p__iob");
+    pointer_func iob_func = (pointer_func)(void (*)(void))msvcrt_proc("__iob_func");
+    pointer_func pctype_func = (pointer_func)(void (*)(void))msvcrt_proc("__pctype_func");
+    pointer_func p_pctype = (pointer_func)(void (*)(void))msvcrt_proc("__p__pctype");
+    int_func mb_cur_max = (int_func)(void (*)(void))msvcrt_proc("___mb_cur_max_func");
+    int_func lc_codepage = (int_func)(void (*)(void))msvcrt_proc("___lc_codepage_func");
+    pointer_func p_pgmptr = (pointer_func)(void (*)(void))msvcrt_proc("__p__pgmptr");
+    pointer_func p_winmajor = (pointer_func)(void (*)(void))msvcrt_proc("__p__winmajor");
+    pointer_func p_timezone = (pointer_func)(void (*)(void))msvcrt_proc("__p__timezone");
+    const unsigned short *table;
+    const char *path = NULL;
+
+    printf("\n--- msvcrt variables ---\n");
+    check(p_iob && iob_func && p_iob() == iob_func() && (FILE *)p_iob() + 1 == stdout,
+          "__p__iob is _iob (stdout is its second FILE)");
+    table = pctype_func ? (const unsigned short *)pctype_func() : NULL;
+    check(table && (table['A'] & _UPPER) && (table['a'] & _LOWER) && (table['7'] & _DIGIT) &&
+          (table[' '] & _SPACE) && (table['!'] & _PUNCT) && table[-1] == 0,
+          "__pctype_func: the \"C\" locale's character classes (EOF entry at -1)");
+    check(p_pctype && *(const unsigned short **)p_pctype() == table && _pctype == table,
+          "__p__pctype and the _pctype variable");
+    check(mb_cur_max && mb_cur_max() == 1 && __mb_cur_max == 1 && MB_CUR_MAX == 1,
+          "___mb_cur_max_func and __mb_cur_max");
+    check(lc_codepage && lc_codepage() == 0, "___lc_codepage_func (the \"C\" locale)");
+    if (p_pgmptr)
+        path = *(const char **)p_pgmptr();
+    check(path && strstr(path, "crt_test.exe") != NULL, "__p__pgmptr is the program path");
+    check(p_winmajor && *(unsigned *)p_winmajor() == (GetVersion() & 0xFF),
+          "__p__winmajor agrees with GetVersion");
+    check(p_timezone && *(long *)p_timezone() == _timezone, "__p__timezone and _timezone");
 }
 
 static void test_formatting(void)
@@ -284,6 +333,7 @@ int main(void)
     test_time();
     test_environment_and_files();
     test_control_flow();
+    test_crt_variables();
     printf("== %d failure(s) ==\n", failures);
     return failures;
 }
