@@ -15,7 +15,9 @@
 
 # Compiles each app in apps/ (apps/NAME/*.c, and apps/NAME/*.rc resources like
 # the icon) into C:\Windows\NAME.exe of the emulated C drive
-# (C:\Windows\filemanager.exe). Exit code: number of failed apps.
+# (C:\Windows\filemanager.exe). An app whose EXE is newer than its files and
+# this script is up to date and not compiled again (--force compiles all).
+# Exit code: number of failed apps.
 
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
@@ -25,11 +27,22 @@ mkdir -p "$APPS_DIR" || exit 1
 
 CFLAGS="-Wall -Wextra -Wno-unused-parameter"
 
+force=0
+[ "$1" = "--force" ] && force=1
+
 failed=0
 
 for dir in apps/*/; do
     [ -d "$dir" ] || continue
     name=$(basename "$dir")
+    exe="${APPS_DIR}/${name}.exe"
+
+    # Up to date: the EXE exists and no file of the app (nor this script) is newer
+    if [ "$force" -eq 0 ] && [ -f "$exe" ] && ! [ scripts/compile_apps.sh -nt "$exe" ] &&
+            [ -z "$(find "$dir" -type f -newer "$exe" | head -n 1)" ]; then
+        echo "OK: ${name}.exe (up to date)"
+        continue
+    fi
 
     # Resources (.rc) are compiled into objects linked with the sources
     objects=""
@@ -43,7 +56,7 @@ for dir in apps/*/; do
 
     # GUI applications
     # shellcheck disable=SC2086
-    if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "${APPS_DIR}/${name}.exe" \
+    if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "$exe" \
         "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -mwindows; then
         echo "OK: ${name}.exe"
     else

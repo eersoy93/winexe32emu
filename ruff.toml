@@ -1,0 +1,7 @@
+# Lint settings (ruff check): Pyflakes errors and syntax errors
+[lint]
+select = ["F", "E9"]
+ignore = [
+    "F403", "F405",  # "from unicorn import *" & co. are on purpose
+    "F841",          # API handlers name their unused arguments (args[n]) for clarity
+]

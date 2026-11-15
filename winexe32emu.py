@@ -288,7 +288,7 @@ class PELoader:
 
         # Check PE type
         if self.pe.FILE_HEADER.Machine != 0x14c:  # IMAGE_FILE_MACHINE_I386
-            log.error(f"This emulator only supports 32-bit (i386) PE files!")
+            log.error("This emulator only supports 32-bit (i386) PE files!")
             log.error(f"The PE file type: 0x{self.pe.FILE_HEADER.Machine:04x}")
             return False
 
@@ -326,7 +326,7 @@ class PELoader:
             2: "Windows GUI",
             3: "Windows Console",
         }
-        subsystem_name = subsystem_names.get(subsystem, f"Unknown")
+        subsystem_name = subsystem_names.get(subsystem, "Unknown")
         log.info(f"Subsystem: {subsystem_name} ({subsystem})")
         if subsystem_name == "Unknown":
             log.error(f"Unknown subsystem: {subsystem}")
@@ -5239,7 +5239,7 @@ class WinAPIHandler:
         if lpPerformanceCount != 0:
             self.emu.uc.mem_write(lpPerformanceCount, struct.pack('<Q', count))
         
-        log.debug(f"QueryPerformanceCounter()")
+        log.debug("QueryPerformanceCounter()")
         return 1
     
     def GetSystemTimeAsFileTime(self, args):
@@ -10199,14 +10199,6 @@ class WinAPIHandler:
         ch = self._ansi_char(args[0])
         return 1 if ch and ch.islower() else 0
 
-    def CharUpperA(self, args):
-        """CharUpperA emulation"""
-        return self._char_case_common(args[0], True)
-
-    def CharLowerA(self, args):
-        """CharLowerA emulation"""
-        return self._char_case_common(args[0], False)
-
     def IsCharAlphaA(self, args):
         """IsCharAlphaA emulation"""
         ch = self._ansi_char(args[0])
@@ -11756,7 +11748,7 @@ class WinAPIHandler:
         wMsgFilterMin = args[2]
         wMsgFilterMax = args[3]
 
-        log.debug(f"GetMessageA() - Message loop")
+        log.debug("GetMessageA() - Message loop")
 
         # Block until a message is available, the app quits, or the GUI closes.
         # This runs on the emulation thread; the GUI thread feeds message_queue.
@@ -11821,13 +11813,13 @@ class WinAPIHandler:
     def TranslateMessage(self, args):
         """TranslateMessage emulation"""
         lpMsg = args[0]
-        log.debug(f"TranslateMessage()")
+        log.debug("TranslateMessage()")
         return 1
     
     def DispatchMessageA(self, args):
         """DispatchMessageA emulation - Call WndProc"""
         lpMsg = args[0]
-        log.debug(f"DispatchMessageA()")
+        log.debug("DispatchMessageA()")
         
         # Read MSG structure: hwnd, message, wParam, lParam, time, pt.x, pt.y
         try:
@@ -19267,26 +19259,19 @@ class WinAPIHandler:
         n = len(text)
         while i < n and text[i] in ' \t\n\r\v\f':
             i += 1
-        start = i
         sign = 1
         if i < n and text[i] in '+-':
             if text[i] == '-':
                 sign = -1
             i += 1
-        # Determine/skip base prefix
+        # Determine/skip base prefix ("0x"; an octal number's 0 is a digit)
+        hex_prefix = text[i:i + 1] == '0' and text[i + 1:i + 2] in ('x', 'X')
         if base == 0:
-            if i < n and text[i] == '0':
-                if i + 1 < n and text[i + 1] in 'xX':
-                    base = 16
-                    i += 2
-                else:
-                    base = 8
-                    i += 1
-            else:
-                base = 10
-        elif base == 16 and i + 1 < n and text[i] == '0' and text[i + 1] in 'xX':
+            base = 16 if hex_prefix else 8 if text[i:i + 1] == '0' else 10
+        if base == 16 and hex_prefix:
+            if text[i + 2:i + 3].lower() not in tuple('0123456789abcdef'):
+                return 0, i + 1  # "0x" without hex digits: the number is the 0
             i += 2
-        digits_start = i
         digits = ''
         while i < n:
             ch = text[i].lower()
@@ -25176,9 +25161,6 @@ class PseudoWindowsGUI:
                        (rect.x + rect.width - 1, rect.y + rect.height - 1))
         
         # Draw symbol
-        center_x = rect.x + rect.width // 2
-        center_y = rect.y + rect.height // 2
-        
         if btn_type == "close":
             # X mark
             pygame.draw.line(self.screen, (0, 0, 0), 
