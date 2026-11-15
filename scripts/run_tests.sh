@@ -50,6 +50,44 @@ run_test() {
     fi
 }
 
+# run_crash_test NAME ARG EXPECTED: "NAME.exe ARG" must end the process
+# (nonzero exit code) and print EXPECTED
+run_crash_test() {
+    name=$1
+    arg=$2
+    expected=$3
+    output=$(timeout "$TIMEOUT" "$PYTHON" winexe32emu.py \
+        --no-gui --no-create-environment --no-apps -q "${name}.exe" "$arg" 2>&1 </dev/null)
+    code=$?
+    if [ "$code" -ne 0 ] && [ "$code" -ne 124 ] &&
+            printf '%s' "$output" | grep -qF -- "$expected"; then
+        echo "PASS: ${name} ${arg}"
+        passed=$((passed + 1))
+    else
+        echo "FAIL: ${name} ${arg} (exit code ${code})"
+        printf '%s\n' "$output" | tail -n 10 | sed 's/^/    /'
+        failed=$((failed + 1))
+    fi
+}
+
+# run_args_test NAME EXPECTED ARGS...: like run_test, with command-line arguments
+run_args_test() {
+    name=$1
+    expected=$2
+    shift 2
+    output=$(timeout "$TIMEOUT" "$PYTHON" winexe32emu.py \
+        --no-gui --no-create-environment --no-apps -q "${name}.exe" "$@" 2>&1 </dev/null)
+    code=$?
+    if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -qF -- "$expected"; then
+        echo "PASS: ${name}"
+        passed=$((passed + 1))
+    else
+        echo "FAIL: ${name} (exit code ${code})"
+        printf '%s\n' "$output" | tail -n 10 | sed 's/^/    /'
+        failed=$((failed + 1))
+    fi
+}
+
 run_test crt_test "== 0 failure(s) =="
 run_test api_test "== 0 failure(s) =="
 run_test file_test "was blocked! Good!"
@@ -57,6 +95,11 @@ run_test sysinfo_test "Escape attempt (copy)   : 0, error 5"
 run_test console_test "Hello, Tester!" "Tester"
 run_test sound_test "Done!"
 run_test thread_test "== 0 failure(s) =="
+run_test vista_api_test "== 0 failure(s) =="
+run_test exception_test "== 0 failure(s) =="
+run_args_test argv_test "== 0 failure(s) ==" plain "two words" 'a\b' 'q"uote' '' end
+run_crash_test exception_test fastfail "__fastfail(7)"
+run_crash_test exception_test int3 "Unhandled exception 0x80000003"
 
 echo "== ${passed} passed, ${failed} failed =="
 exit "$failed"

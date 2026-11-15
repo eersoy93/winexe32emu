@@ -1175,7 +1175,15 @@ class WinAPIHandler:
     """Windows API emulation"""
 
     # Imports from these DLLs use cdecl (caller cleans the stack)
-    CDECL_DLL_PREFIXES = ('msvcr', 'msvcp', 'crtdll', 'ucrtbase', 'api-ms-win-crt-')
+    CDECL_DLL_PREFIXES = ('msvcr', 'msvcp', 'crtdll', 'ucrtbase', 'api-ms-win-crt-',
+                          'vcruntime')
+
+    # The stdcall exceptions among the exports of the cdecl CRT DLLs
+    CRT_STDCALL_ARG_COUNTS = {
+        '_CxxThrowException': 2, '__vcrt_GetModuleFileNameW': 3,
+        '__vcrt_GetModuleHandleW': 1, '__vcrt_InitializeCriticalSectionEx': 3,
+        '__vcrt_LoadLibraryExW': 3,
+    }
 
     # Variadic functions exported by stdcall DLLs are cdecl
     CDECL_FUNCTIONS = {'wsprintfA', 'wsprintfW'}
@@ -1300,6 +1308,35 @@ class WinAPIHandler:
         'SetThreadPriority': 2, 'SuspendThread': 1, 'SwitchToThread': 0, 'TlsAlloc': 0,
         'TlsFree': 1, 'TlsGetValue': 1, 'TlsSetValue': 2, 'WaitForMultipleObjects': 4,
         'WaitForMultipleObjectsEx': 5, 'WaitForSingleObjectEx': 3,
+        # kernel32: Vista+ APIs of the Visual C++ 2015+ runtime
+        'AcquireSRWLockExclusive': 1, 'AcquireSRWLockShared': 1,
+        'AddVectoredExceptionHandler': 2, 'CompareStringEx': 9, 'CompareStringOrdinal': 5,
+        'CompareStringW': 6, 'CreateMutexExW': 4, 'CreateSemaphoreExW': 6,
+        'DecodePointer': 1, 'DecodeSystemPointer': 1, 'EncodePointer': 1,
+        'EncodeSystemPointer': 1, 'EnumSystemLocalesA': 2, 'EnumSystemLocalesEx': 4,
+        'EnumSystemLocalesW': 2, 'FindFirstFileExA': 6, 'FindFirstFileExW': 6, 'FlsAlloc': 1,
+        'FlsFree': 1, 'FlsGetValue': 1, 'FlsSetValue': 2, 'GetConsoleCP': 0,
+        'GetConsoleOutputCP': 0, 'GetDateFormatA': 6, 'GetDateFormatEx': 7,
+        'GetDateFormatW': 6, 'GetFullPathNameW': 4, 'GetLocaleInfoA': 4, 'GetLocaleInfoEx': 4,
+        'GetLocaleInfoW': 4, 'GetModuleHandleExA': 3, 'GetModuleHandleExW': 3,
+        'GetNativeSystemInfo': 1, 'GetSystemDefaultLocaleName': 2,
+        'GetSystemTimePreciseAsFileTime': 1, 'GetTimeFormatA': 6, 'GetTimeFormatEx': 6,
+        'GetTimeFormatW': 6, 'GetTimeZoneInformation': 1, 'GetUserDefaultLocaleName': 2,
+        'InitializeConditionVariable': 1, 'InitializeSListHead': 1, 'InitializeSRWLock': 1,
+        'InitOnceExecuteOnce': 4, 'InitOnceInitialize': 1, 'InterlockedFlushSList': 1,
+        'InterlockedPopEntrySList': 1, 'InterlockedPushEntrySList': 2, 'IsValidCodePage': 1,
+        'IsValidLocale': 2, 'IsValidLocaleName': 1, 'LCIDToLocaleName': 4,
+        'LCMapStringEx': 9, 'LocaleNameToLCID': 2, 'OutputDebugStringA': 1,
+        'OutputDebugStringW': 1, 'QueryDepthSList': 1, 'ReadConsoleW': 5,
+        'ReleaseSRWLockExclusive': 1, 'ReleaseSRWLockShared': 1,
+        'RemoveVectoredExceptionHandler': 1, 'RtlCaptureContext': 1, 'RtlPcToFileHeader': 2,
+        'SetStdHandle': 2, 'SetThreadStackGuarantee': 1, 'SleepConditionVariableCS': 3,
+        'SleepConditionVariableSRW': 4, 'TryAcquireSRWLockExclusive': 1,
+        'TryAcquireSRWLockShared': 1, 'VirtualProtect': 4, 'VirtualProtectEx': 5,
+        'VirtualQuery': 3, 'VirtualQueryEx': 4, 'WakeAllConditionVariable': 1,
+        'WakeConditionVariable': 1,
+        # advapi32: RtlGenRandom
+        'SystemFunction036': 2,
         # msacm32
         'acmFormatSuggest': 5, 'acmStreamClose': 2, 'acmStreamConvert': 3, 'acmStreamOpen': 8,
         'acmStreamPrepareHeader': 3, 'acmStreamSize': 4, 'acmStreamUnprepareHeader': 3,
@@ -1489,6 +1526,12 @@ class WinAPIHandler:
         self.handles = {}
         self.critical_sections = {}  # CRITICAL_SECTION address -> [owner tid, count]
         self.tls_used = set()  # Allocated TLS slot indexes
+        self.fls_callbacks = {}  # FLS index (a TLS slot) -> its FlsAlloc callback
+        self.srw_locks = {}  # SRWLOCK address -> {'owner': tid or None, 'shared': count}
+        self.condition_variables = {}  # CONDITION_VARIABLE address -> [waiter tokens]
+        self.page_protections = []  # [(start, end, protection)] set by VirtualProtect
+        self.vectored_handlers = {}  # AddVectoredExceptionHandler handle -> handler
+        self.std_handles = {}  # SetStdHandle: STD_*_HANDLE -> handle
         self.module_handles = {}  # lowercase DLL name -> fake HMODULE
         self.virtual_allocs = {}  # VirtualAlloc base -> reserved size
         self.mapped_virtual_allocs = set()  # Bases mapped at a requested address
@@ -1618,6 +1661,7 @@ class WinAPIHandler:
         self._environ_addr = 0
         self._wenviron_addr = 0
         self._argc = 0
+        self._argc_value = 0  # argc of the command line (set with the argv arrays)
         self._argv_addr = 0
         self.exit_handlers = []
         self.exit_code = None
@@ -1686,7 +1730,9 @@ class WinAPIHandler:
         but its argument count is unknown.
         """
         dll = dll_name.lower()
-        if dll.startswith(self.CDECL_DLL_PREFIXES) or func_name in self.CDECL_FUNCTIONS:
+        if dll.startswith(self.CDECL_DLL_PREFIXES):
+            return 4 * self.CRT_STDCALL_ARG_COUNTS.get(func_name, 0)
+        if func_name in self.CDECL_FUNCTIONS:
             return 0
         argc = self.STDCALL_ARG_COUNTS.get(func_name, self.com_arg_counts.get(func_name))
         return None if argc is None else argc * 4
@@ -2028,7 +2074,14 @@ class WinAPIHandler:
                    'shlwapi.dll', 'version.dll', 'msacm32.dll', 'uxtheme.dll',
                    'psapi.dll', 'mpr.dll', 'winspool.drv', 'imm32.dll', 'kernelbase.dll',
                    'ws2_32.dll', 'wsock32.dll', 'rpcrt4.dll', 'secur32.dll', 'crypt32.dll',
-                   'dbghelp.dll', 'setupapi.dll', 'userenv.dll', 'dwmapi.dll'}
+                   'dbghelp.dll', 'setupapi.dll', 'userenv.dll', 'dwmapi.dll',
+                   # The emulated C runtime (programs often ship copies of these)
+                   'vcruntime140.dll', 'ucrtbase.dll'}
+
+    def _is_system_dll(self, key):
+        """Is a lower-case DLL file name emulated (never loaded from a file)?"""
+        return (key in self.EMULATED_DLLS or key in self.SYSTEM_DLLS or
+                key.startswith(('api-ms-win-', 'ext-ms-win-')))
 
     def _real_dll_path(self, name):
         """(Windows path, host path) of a DLL file to load for a LoadLibrary
@@ -2060,7 +2113,7 @@ class WinAPIHandler:
         module = self.emu.find_dll(key)
         if module is not None:
             return module
-        if key in self.EMULATED_DLLS or key in self.SYSTEM_DLLS:
+        if self._is_system_dll(key):
             return None
         found = self._real_dll_path(name)
         if found is None:
@@ -2081,7 +2134,7 @@ class WinAPIHandler:
         module = self.emu.find_dll(key)
         if module is not None:
             return module['base']
-        if load and key not in self.EMULATED_DLLS and key not in self.SYSTEM_DLLS:
+        if load and not self._is_system_dll(key):
             module = self.load_real_dll(name)
             if module is not None:
                 return module['base']
@@ -2359,7 +2412,9 @@ class WinAPIHandler:
         
         name = handle_names.get(nStdHandle & 0xFFFFFFFF, f"Unknown({nStdHandle})")
         log.debug(f"GetStdHandle({name})")
-        
+        if (nStdHandle & 0xFFFFFFFF) in self.std_handles:  # SetStdHandle
+            return self.std_handles[nStdHandle & 0xFFFFFFFF]
+
         # Return fixed handle values
         if (nStdHandle & 0xFFFFFFFF) == 0xFFFFFFF6:
             return 0x10
@@ -3664,6 +3719,801 @@ class WinAPIHandler:
         size = self.emu.heap_block_size(args[2]) if args[2] else None
         return 0xFFFFFFFF if size is None else size
 
+    # ---------- Vista+ kernel32 APIs (used by the Visual C++ 2015+ runtime) ----------
+
+    def EncodePointer(self, args):
+        """EncodePointer emulation - pointers are kept as they are"""
+        return args[0]
+
+    def DecodePointer(self, args):
+        return args[0]
+
+    def EncodeSystemPointer(self, args):
+        return args[0]
+
+    def DecodeSystemPointer(self, args):
+        return args[0]
+
+    # Fiber local storage: there are no fibers, so FLS slots are TLS slots
+
+    def FlsAlloc(self, args):
+        """FlsAlloc emulation - a TLS slot; the callback runs at FlsFree"""
+        index = self.TlsAlloc(args)
+        if index != 0xFFFFFFFF and args[0]:
+            self.fls_callbacks[index] = args[0]
+        return index
+
+    def FlsFree(self, args):
+        """FlsFree emulation - the callback gets the calling thread's value"""
+        callback = self.fls_callbacks.pop(args[0], None)
+        value = self.TlsGetValue(args) if args[0] in self.tls_used else 0
+        if not self.TlsFree(args):
+            return 0
+        if callback and value:
+            self.emu.call_callback(callback, [value])
+        return 1
+
+    def FlsGetValue(self, args):
+        return self.TlsGetValue(args)
+
+    def FlsSetValue(self, args):
+        return self.TlsSetValue(args)
+
+    # Interlocked singly linked lists: SLIST_HEADER is {Next, Depth, Sequence}
+
+    def _slist_header(self, head):
+        try:
+            return struct.unpack('<IHH', self.emu.uc.mem_read(head, 8))
+        except UcError:
+            return None
+
+    def InitializeSListHead(self, args):
+        self._mem_write(args[0], b'\x00' * 8)
+        return 0
+
+    def InterlockedPushEntrySList(self, args):
+        """InterlockedPushEntrySList emulation - the previous first entry"""
+        head, entry = args[0], args[1]
+        header = self._slist_header(head)
+        if header is None:
+            return 0
+        first, depth, sequence = header
+        self._mem_write(entry, struct.pack('<I', first))
+        self._mem_write(head, struct.pack('<IHH', entry, (depth + 1) & 0xFFFF,
+                                          (sequence + 1) & 0xFFFF))
+        return first
+
+    def InterlockedPopEntrySList(self, args):
+        """InterlockedPopEntrySList emulation - the removed entry (NULL if empty)"""
+        header = self._slist_header(args[0])
+        if header is None or not header[0]:
+            return 0
+        first, depth, sequence = header
+        self._mem_write(args[0], struct.pack('<IHH', self._read_u32(first),
+                                             max(depth - 1, 0), (sequence + 1) & 0xFFFF))
+        return first
+
+    def InterlockedFlushSList(self, args):
+        """InterlockedFlushSList emulation - the whole list (NULL if empty)"""
+        header = self._slist_header(args[0])
+        if header is None:
+            return 0
+        self._mem_write(args[0], struct.pack('<IHH', 0, 0, (header[2] + 1) & 0xFFFF))
+        return header[0]
+
+    def QueryDepthSList(self, args):
+        header = self._slist_header(args[0])
+        return header[1] if header else 0
+
+    # Slim reader/writer locks and condition variables (the guest threads run
+    # one at a time, so the state is kept here; waiting lets the others run)
+
+    def _try_srw(self, address, shared):
+        lock = self.srw_locks.setdefault(address, {'owner': None, 'shared': 0})
+        if lock['owner'] is not None and not self._thread_alive(lock['owner']):
+            lock['owner'] = None
+        if lock['owner'] is not None:
+            return False
+        if shared:
+            lock['shared'] += 1
+            return True
+        if lock['shared']:
+            return False
+        lock['owner'] = self.emu.current_thread.tid
+        return True
+
+    def InitializeSRWLock(self, args):
+        self.srw_locks.pop(args[0], None)
+        self._mem_write(args[0], b'\x00' * 4)
+        return 0
+
+    def AcquireSRWLockExclusive(self, args):
+        """AcquireSRWLockExclusive emulation - waits while others hold the lock"""
+        self.emu.wait_until(lambda: self._try_srw(args[0], False))
+        return 0
+
+    def AcquireSRWLockShared(self, args):
+        """AcquireSRWLockShared emulation - waits while a writer holds the lock"""
+        self.emu.wait_until(lambda: self._try_srw(args[0], True))
+        return 0
+
+    def TryAcquireSRWLockExclusive(self, args):
+        return 1 if self._try_srw(args[0], False) else 0
+
+    def TryAcquireSRWLockShared(self, args):
+        return 1 if self._try_srw(args[0], True) else 0
+
+    def ReleaseSRWLockExclusive(self, args):
+        lock = self.srw_locks.get(args[0])
+        if lock is not None and lock['owner'] == self.emu.current_thread.tid:
+            lock['owner'] = None
+            self.emu.wake_threads()
+        return 0
+
+    def ReleaseSRWLockShared(self, args):
+        lock = self.srw_locks.get(args[0])
+        if lock is not None and lock['shared'] > 0:
+            lock['shared'] -= 1
+            if not lock['shared']:
+                self.emu.wake_threads()
+        return 0
+
+    def InitializeConditionVariable(self, args):
+        self.condition_variables.pop(args[0], None)
+        self._mem_write(args[0], b'\x00' * 4)
+        return 0
+
+    def _sleep_condition_variable(self, cv, release, reacquire, timeout):
+        """Release a lock, wait for a wake-up (or the timeout), take the lock back"""
+        token = {'woken': False}
+        waiters = self.condition_variables.setdefault(cv, [])
+        waiters.append(token)
+        state = release()
+        woken = self.emu.wait_until(lambda: token['woken'], timeout)
+        if not woken:
+            waiters[:] = [t for t in waiters if t is not token]
+        reacquire(state)
+        if not woken:
+            self._last_error = 1460  # ERROR_TIMEOUT
+            return 0
+        return 1
+
+    def SleepConditionVariableCS(self, args):
+        """SleepConditionVariableCS emulation (cv, critical section, timeout)"""
+        cv, cs, timeout = args[0], args[1], args[2]
+        tid = self.emu.current_thread.tid
+
+        def release():
+            owner = self.critical_sections.pop(cs, None)
+            self.emu.wake_threads()
+            return owner[1] if owner is not None and owner[0] == tid else 1
+
+        def reacquire(count):
+            if self.emu.wait_until(lambda: self._try_enter_cs(cs)):
+                self.critical_sections[cs][1] = count
+        return self._sleep_condition_variable(cv, release, reacquire, timeout)
+
+    def SleepConditionVariableSRW(self, args):
+        """SleepConditionVariableSRW emulation (cv, SRW lock, timeout, flags)"""
+        cv, srw, timeout, shared = args[0], args[1], args[2], bool(args[3] & 1)
+
+        def release():
+            if shared:
+                self.ReleaseSRWLockShared([srw])
+            else:
+                self.ReleaseSRWLockExclusive([srw])
+
+        def reacquire(_):
+            self.emu.wait_until(lambda: self._try_srw(srw, shared))
+        return self._sleep_condition_variable(cv, release, reacquire, timeout)
+
+    def WakeConditionVariable(self, args):
+        waiters = self.condition_variables.get(args[0])
+        if waiters:
+            waiters.pop(0)['woken'] = True
+            self.emu.wake_threads()
+        return 0
+
+    def WakeAllConditionVariable(self, args):
+        waiters = self.condition_variables.get(args[0])
+        if waiters:
+            for token in waiters:
+                token['woken'] = True
+            waiters.clear()
+            self.emu.wake_threads()
+        return 0
+
+    # INIT_ONCE: 0 = not run, 1 = running, (context & ~3) | 2 = done
+
+    def InitOnceInitialize(self, args):
+        self._mem_write(args[0], b'\x00' * 4)
+        return 0
+
+    def InitOnceExecuteOnce(self, args):
+        """InitOnceExecuteOnce emulation - runs InitFn once (other threads wait)"""
+        init_once, init_fn, parameter, lpContext = args[:4]
+        self.emu.wait_until(lambda: self._read_u32(init_once) & 3 != 1)
+        state = self._read_u32(init_once)
+        if state & 3 == 2:
+            if lpContext:
+                self._mem_write(lpContext, struct.pack('<I', state & ~3))
+            return 1
+        self._mem_write(init_once, struct.pack('<I', 1))
+        cell = self.emu.heap_alloc(4)
+        self._mem_write(cell, b'\x00' * 4)
+        ok = False
+        try:
+            ok = self.emu.call_callback(init_fn, [init_once, parameter, cell]) != 0
+        finally:
+            value = self._read_u32(cell)
+            self.emu.heap_free(cell)
+            self._mem_write(init_once, struct.pack('<I', (value & ~3) | 2 if ok else 0))
+            self.emu.wake_threads()
+        if not ok:
+            return 0
+        if lpContext:
+            self._mem_write(lpContext, struct.pack('<I', value))
+        return 1
+
+    # Memory: emulated memory is always readable, writable and executable;
+    # VirtualProtect only remembers the protection for VirtualQuery
+
+    PAGE_EXECUTE_READWRITE = 0x40
+
+    def _memory_region(self, address):
+        """(start, end) of the mapped memory region holding address, or None"""
+        for start, end, _ in self.emu.uc.mem_regions():
+            if start <= address <= end:
+                return start, end + 1
+        return None
+
+    def _image_ranges(self):
+        """[(base, end)] of the EXE and the loaded DLLs"""
+        pe = self.emu.pe_loader
+        ranges = [(pe.image_base, pe.image_base + pe.pe.OPTIONAL_HEADER.SizeOfImage)]
+        ranges += [(m['base'], m['base'] + m['size']) for m in self.emu.dlls.values()]
+        return ranges
+
+    def _module_at(self, address):
+        """HMODULE of the EXE or DLL image holding address, or 0"""
+        for start, end in self._image_ranges():
+            if start <= address < end:
+                return start
+        return 0
+
+    def _page_protection(self, page):
+        for start, end, protection in reversed(self.page_protections):
+            if start <= page < end:
+                return protection
+        return self.PAGE_EXECUTE_READWRITE
+
+    def VirtualProtect(self, args):
+        """VirtualProtect emulation - the old protection; nothing is enforced"""
+        address, size, protection, lpflOldProtect = args[:4]
+        if not lpflOldProtect:
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        if not size or self._memory_region(address) is None:
+            self._last_error = 487  # ERROR_INVALID_ADDRESS
+            return 0
+        start = address & ~0xFFF
+        end = (address + size + 0xFFF) & ~0xFFF
+        old = self._page_protection(start)
+        self.page_protections = [r for r in self.page_protections
+                                 if not (start <= r[0] and r[1] <= end)]
+        self.page_protections.append((start, end, protection))
+        self._mem_write(lpflOldProtect, struct.pack('<I', old))
+        return 1
+
+    def VirtualProtectEx(self, args):
+        if args[0] != 0xFFFFFFFF:  # only the own process
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        return self.VirtualProtect(args[1:])
+
+    def VirtualQuery(self, args):
+        """VirtualQuery emulation - fills MEMORY_BASIC_INFORMATION (28 bytes)"""
+        address, lpBuffer, length = args[:3]
+        if length < 28:
+            self._last_error = 24  # ERROR_BAD_LENGTH
+            return 0
+        if address >= 0x7FFF0000:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        page = address & ~0xFFF
+        region = self._memory_region(address)
+        if region is None:
+            following = [start for start, _, _ in self.emu.uc.mem_regions() if start > page]
+            end = min(following + [0x7FFF0000])
+            # MEM_FREE, PAGE_NOACCESS
+            info = (page, 0, 0, end - page, 0x10000, 0x01, 0)
+        else:
+            start, end = region
+            allocation_base, kind = start, 0x20000  # MEM_PRIVATE
+            for base, size in self.virtual_allocs.items():
+                if base <= address < base + size:
+                    allocation_base, end = base, min(end, base + size)
+                    break
+            image = self._module_at(address)
+            if image:
+                allocation_base, kind = image, 0x1000000  # MEM_IMAGE
+            # The region ends where the protection changes
+            for r_start, r_end, _ in self.page_protections:
+                for edge in (r_start, r_end):
+                    if page < edge < end:
+                        end = edge
+            info = (page, allocation_base, self.PAGE_EXECUTE_READWRITE, end - page,
+                    0x1000, self._page_protection(page), kind)  # MEM_COMMIT
+        if not self._mem_write(lpBuffer, struct.pack('<7I', *info)):
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0
+        return 28
+
+    def VirtualQueryEx(self, args):
+        if args[0] != 0xFFFFFFFF:
+            self._last_error = 5
+            return 0
+        return self.VirtualQuery(args[1:])
+
+    def SetThreadStackGuarantee(self, args):
+        """SetThreadStackGuarantee emulation - the previous guarantee is 0"""
+        if args[0]:
+            self._mem_write(args[0], b'\x00' * 4)
+        return 1
+
+    def GetNativeSystemInfo(self, args):
+        """GetNativeSystemInfo emulation - a 32-bit Windows (same as GetSystemInfo)"""
+        return self.GetSystemInfo(args)
+
+    def GetSystemTimePreciseAsFileTime(self, args):
+        return self.GetSystemTimeAsFileTime(args)
+
+    # Modules
+
+    def GetModuleHandleExA(self, args, wide=False):
+        """GetModuleHandleExA/W emulation (flags, name or address, phModule)"""
+        flags, name, phModule = args[:3]
+        if not phModule:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if flags & 4:  # GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+            module = self._module_at(name)
+        elif name:
+            module = (self.GetModuleHandleW if wide else self.GetModuleHandleA)([name])
+        else:
+            module = self.emu.pe_loader.image_base
+        self._mem_write(phModule, struct.pack('<I', module))
+        if not module:
+            self._last_error = 126  # ERROR_MOD_NOT_FOUND
+            return 0
+        return 1
+
+    def GetModuleHandleExW(self, args):
+        return self.GetModuleHandleExA(args, wide=True)
+
+    def RtlPcToFileHeader(self, args):
+        """RtlPcToFileHeader emulation - image base of the module holding PcValue"""
+        base = self._module_at(args[0])
+        self._mem_write(args[1], struct.pack('<I', base))
+        return base
+
+    def RtlCaptureContext(self, args):
+        """RtlCaptureContext emulation - the caller's registers (CONTEXT_FULL)"""
+        uc = self.emu.uc
+        regs = {reg: uc.reg_read(reg) for reg in (
+            UC_X86_REG_GS, UC_X86_REG_FS, UC_X86_REG_ES, UC_X86_REG_DS, UC_X86_REG_EDI,
+            UC_X86_REG_ESI, UC_X86_REG_EBX, UC_X86_REG_EDX, UC_X86_REG_ECX, UC_X86_REG_EAX,
+            UC_X86_REG_EBP, UC_X86_REG_CS, UC_X86_REG_EFLAGS, UC_X86_REG_SS)}
+        esp = self.emu.api_call_esp
+        self._mem_write(args[0], struct.pack('<I', 0x10007))  # ContextFlags
+        self._mem_write(args[0] + 0x8C, struct.pack(
+            '<16I', regs[UC_X86_REG_GS], regs[UC_X86_REG_FS], regs[UC_X86_REG_ES],
+            regs[UC_X86_REG_DS], regs[UC_X86_REG_EDI], regs[UC_X86_REG_ESI],
+            regs[UC_X86_REG_EBX], regs[UC_X86_REG_EDX], regs[UC_X86_REG_ECX],
+            regs[UC_X86_REG_EAX], regs[UC_X86_REG_EBP], self._read_u32(esp),  # Eip
+            regs[UC_X86_REG_CS], regs[UC_X86_REG_EFLAGS], esp + 8,  # Esp after the return
+            regs[UC_X86_REG_SS]))
+        return 0
+
+    # Vectored exception handlers are registered, but exceptions are only
+    # dispatched to the SEH frames
+
+    def AddVectoredExceptionHandler(self, args):
+        handle = self.get_next_handle()
+        self.vectored_handlers[handle] = args[1]
+        log.debug(f"AddVectoredExceptionHandler(0x{args[1]:08x}): vectored handlers "
+                  f"are not called")
+        return handle
+
+    def RemoveVectoredExceptionHandler(self, args):
+        return 1 if self.vectored_handlers.pop(args[0], None) is not None else 0
+
+    # Console and misc
+
+    def SetStdHandle(self, args):
+        """SetStdHandle emulation - GetStdHandle returns the new handle"""
+        if args[0] not in (0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4):
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        self.std_handles[args[0]] = args[1]
+        return 1
+
+    def GetConsoleCP(self, args):
+        """GetConsoleCP emulation - the emulated console uses the ANSI code page"""
+        return self._ansi_codepage_number()
+
+    def GetConsoleOutputCP(self, args):
+        return self._ansi_codepage_number()
+
+    def IsValidCodePage(self, args):
+        """IsValidCodePage emulation - code pages Python has a codec for"""
+        if args[0] in (0, 1, 2, 3, 42):  # CP_ACP & co. are not code pages
+            return 0
+        return 1 if self._codepage_name(args[0]) else 0
+
+    def OutputDebugStringA(self, args, wide=False):
+        """OutputDebugStringA/W emulation - shown in the debug log"""
+        log.debug(f"OutputDebugString: {self._read_text(args[0], wide).rstrip()}")
+        return 0
+
+    def OutputDebugStringW(self, args):
+        return self.OutputDebugStringA(args, wide=True)
+
+    def FindFirstFileExA(self, args, wide=False):
+        """FindFirstFileExA/W emulation - FindFirstFile (the search limits are hints)"""
+        return self.FindFirstFileA([args[0], args[2]], wide=wide)
+
+    def FindFirstFileExW(self, args):
+        return self.FindFirstFileExA(args, wide=True)
+
+    def CreateSemaphoreExW(self, args):
+        return self.CreateSemaphoreA(args[:4], wide=True)
+
+    def CreateMutexExW(self, args):
+        # CREATE_MUTEX_INITIAL_OWNER (1) in dwFlags
+        return self.CreateMutexA([args[0], args[2] & 1, args[1]], wide=True)
+
+    def SystemFunction036(self, args):
+        """SystemFunction036 (RtlGenRandom) emulation - host random bytes"""
+        return 1 if self._mem_write(args[0], os.urandom(args[1])) else 0
+
+    # ---------- Locales (only English - United States exists) ----------
+
+    LOCALE_DAY_NAMES = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday',
+                        'Saturday', 'Sunday')
+    LOCALE_MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
+                          'August', 'September', 'October', 'November', 'December')
+    # LCTYPE -> value (the day and month names and the code pages are added in
+    # _locale_value)
+    LOCALE_INFO = {
+        0x01: '0409', 0x02: 'English (United States)', 0x03: 'ENU', 0x04: 'English',
+        0x05: '1', 0x06: 'United States', 0x07: 'USA', 0x08: 'United States', 0x09: '0409',
+        0x0A: '1', 0x0C: ',', 0x0D: '1', 0x0E: '.', 0x0F: ',', 0x10: '3;0', 0x11: '2',
+        0x12: '1', 0x13: '0123456789', 0x14: '$', 0x15: 'USD', 0x16: '.', 0x17: ',',
+        0x18: '3;0', 0x19: '2', 0x1A: '2', 0x1B: '0', 0x1C: '0', 0x1D: '/', 0x1E: ':',
+        0x1F: 'M/d/yyyy', 0x20: 'dddd, MMMM d, yyyy', 0x21: '0', 0x22: '0', 0x23: '0',
+        0x24: '1', 0x25: '0', 0x26: '0', 0x27: '0', 0x28: 'AM', 0x29: 'PM', 0x50: '',
+        0x51: '-', 0x52: '3', 0x53: '0', 0x54: '1', 0x55: '0', 0x56: '1', 0x57: '0',
+        0x59: 'en', 0x5A: 'US', 0x5C: 'en-US', 0x5D: 'h:mm:ss', 0x67: 'eng', 0x68: 'USA',
+        0x69: 'NaN', 0x6A: 'Infinity', 0x6B: '-Infinity', 0x6D: 'en', 0x6E: 'en-US',
+        0x71: '0', 0x72: 'English (United States)', 0x73: 'English (United States)',
+        0x76: '%', 0x79: 'h:mm tt', 0x1001: 'English', 0x1002: 'United States',
+        0x1003: 'h:mm:ss tt', 0x1005: '0', 0x1006: 'MMMM yyyy', 0x1007: 'US Dollar',
+        0x1008: 'US Dollar', 0x1009: '1', 0x100B: '0', 0x100C: '6', 0x100D: '0',
+        0x100E: '', 0x100F: '', 0x1010: '1', 0x1011: '10000', 0x1012: '037',
+        0x1013: 'Default', 0x1014: '1',
+    }
+    # LCIDs and locale names that mean English (United States)
+    LOCALE_LCIDS = (0x0409, 0x0400, 0x0800, 0x0000)  # also LOCALE_USER/SYSTEM_DEFAULT
+    LOCALE_NAMES = ('en-us', 'en', '!x-sys-default-locale')
+
+    def _locale_value(self, lctype):
+        """Text of a locale information type, or None if unknown"""
+        days, months = self.LOCALE_DAY_NAMES, self.LOCALE_MONTH_NAMES
+        if 0x2A <= lctype <= 0x30:  # LOCALE_SDAYNAME1..7 (Monday first)
+            return days[lctype - 0x2A]
+        if 0x31 <= lctype <= 0x37:  # LOCALE_SABBREVDAYNAME1..7
+            return days[lctype - 0x31][:3]
+        if 0x60 <= lctype <= 0x66:  # LOCALE_SSHORTESTDAYNAME1..7
+            return days[lctype - 0x60][:2]
+        if 0x38 <= lctype <= 0x43:  # LOCALE_SMONTHNAME1..12
+            return months[lctype - 0x38]
+        if 0x44 <= lctype <= 0x4F:  # LOCALE_SABBREVMONTHNAME1..12
+            return months[lctype - 0x44][:3]
+        if lctype == 0x0B:  # LOCALE_IDEFAULTCODEPAGE (OEM)
+            return str(self.GetOEMCP([]))
+        if lctype == 0x1004:  # LOCALE_IDEFAULTANSICODEPAGE: like GetACP
+            return str(self._ansi_codepage_number())
+        return self.LOCALE_INFO.get(lctype)
+
+    def _write_counted_text(self, text, buffer, size, wide):
+        """Write text and its NUL to a buffer of size TCHARs; the length
+        written (with the NUL), the length needed if size is 0, else 0"""
+        units = self._text_units(text, wide) + [0]
+        if size == 0:
+            return len(units)
+        if size < len(units):
+            self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+            return 0
+        self._write_units(buffer, units, wide, terminate=False)
+        return len(units)
+
+    def _get_locale_info(self, lctype, buffer, size, wide):
+        value = self._locale_value(lctype & 0x07FFFFFF)  # without the LOCALE_* flags
+        if value is None:
+            self._last_error = 1004  # ERROR_INVALID_FLAGS
+            return 0
+        if lctype & 0x20000000:  # LOCALE_RETURN_NUMBER: a DWORD in the buffer
+            try:
+                number = int(value)
+            except ValueError:
+                self._last_error = 1004
+                return 0
+            count = 2 if wide else 4  # sizeof(DWORD) / sizeof(TCHAR)
+            if size == 0:
+                return count
+            if size < count:
+                self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+                return 0
+            self._mem_write(buffer, struct.pack('<I', number))
+            return count
+        return self._write_counted_text(value, buffer, size, wide)
+
+    def GetLocaleInfoA(self, args, wide=False):
+        """GetLocaleInfoA/W emulation (Locale, LCType, lpLCData, cchData)"""
+        return self._get_locale_info(args[1], args[2], args[3], wide)
+
+    def GetLocaleInfoW(self, args):
+        return self.GetLocaleInfoA(args, wide=True)
+
+    def GetLocaleInfoEx(self, args):
+        """GetLocaleInfoEx emulation (lpLocaleName, LCType, lpLCData, cchData)"""
+        return self._get_locale_info(args[1], args[2], args[3], True)
+
+    def IsValidLocale(self, args):
+        return 1 if args[0] in self.LOCALE_LCIDS + (0x7F,) else 0
+
+    def IsValidLocaleName(self, args):
+        name = self.read_wide_string(args[0]).lower() if args[0] else ''
+        return 1 if name in self.LOCALE_NAMES + ('',) else 0
+
+    def LocaleNameToLCID(self, args):
+        """LocaleNameToLCID emulation - NULL is the user default locale"""
+        if not args[0]:
+            return 0x0409
+        name = self.read_wide_string(args[0]).lower()
+        if name == '':
+            return 0x7F  # LOCALE_INVARIANT
+        if name in self.LOCALE_NAMES:
+            return 0x0409
+        self._last_error = 87  # ERROR_INVALID_PARAMETER
+        return 0
+
+    def LCIDToLocaleName(self, args):
+        """LCIDToLocaleName emulation (Locale, lpName, cchName, dwFlags)"""
+        if args[0] == 0x7F:
+            name = ''
+        elif args[0] in self.LOCALE_LCIDS:
+            name = 'en-US'
+        else:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        return self._write_counted_text(name, args[1], args[2], True)
+
+    def GetUserDefaultLocaleName(self, args):
+        """GetUserDefaultLocaleName emulation (lpLocaleName, cchLocaleName)"""
+        if not args[1]:
+            self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+            return 0
+        return self._write_counted_text('en-US', args[0], args[1], True)
+
+    def GetSystemDefaultLocaleName(self, args):
+        return self.GetUserDefaultLocaleName(args)
+
+    def _enum_locales(self, callback, text, extra=()):
+        address = self.emu.heap_alloc(2 * (len(text) + 1))
+        try:
+            self._write_text(address, text, True)
+            self.emu.call_callback(callback, [address, *extra])
+        finally:
+            self.emu.heap_free(address)
+        return 1
+
+    def EnumSystemLocalesA(self, args):
+        """EnumSystemLocalesA emulation - only 00000409"""
+        address = self.emu.heap_alloc(16)
+        try:
+            self._write_text(address, '00000409', False)
+            self.emu.call_callback(args[0], [address])
+        finally:
+            self.emu.heap_free(address)
+        return 1
+
+    def EnumSystemLocalesW(self, args):
+        return self._enum_locales(args[0], '00000409')
+
+    def EnumSystemLocalesEx(self, args):
+        """EnumSystemLocalesEx emulation (callback, flags, lParam, reserved) - en-US"""
+        return self._enum_locales(args[0], 'en-US', (0x1, args[2]))  # LOCALE_WINDOWS
+
+    def LCMapStringEx(self, args):
+        """LCMapStringEx emulation - LCMapStringW with the locale name"""
+        return self.LCMapStringW([0x0409] + list(args[1:6]))
+
+    def CompareStringW(self, args):
+        return self.CompareStringA(args, wide=True)
+
+    def CompareStringEx(self, args):
+        """CompareStringEx emulation - CompareStringW with the locale name"""
+        return self.CompareStringA([0x0409] + list(args[1:6]), wide=True)
+
+    def CompareStringOrdinal(self, args):
+        """CompareStringOrdinal emulation (s1, c1, s2, c2, bIgnoreCase): code unit order"""
+        strings = []
+        for address, count in ((args[0], args[1]), (args[2], args[3])):
+            units = self._counted_units(address, count, True) if address else None
+            if units is None:
+                self._last_error = 87  # ERROR_INVALID_PARAMETER
+                return 0
+            if count == 0xFFFFFFFF:
+                units = units[:-1]
+            text = self._units_text(units, True)
+            strings.append(self._text_units(text.upper() if args[4] else text, True))
+        return 1 if strings[0] < strings[1] else 3 if strings[0] > strings[1] else 2
+
+    # Date and time formats ("dddd, MMMM d, yyyy", "h:mm:ss tt", ...)
+
+    def _format_picture(self, picture, when, date):
+        """Text of a GetDateFormat/GetTimeFormat picture for a datetime"""
+        days, months = self.LOCALE_DAY_NAMES, self.LOCALE_MONTH_NAMES
+        out = []
+        i = 0
+        while i < len(picture):
+            ch = picture[i]
+            if ch == "'":  # quoted text; '' is a quote
+                j = picture.find("'", i + 1)
+                j = len(picture) if j < 0 else j
+                out.append(picture[i + 1:j] or "'")
+                i = j + 1
+                continue
+            j = i
+            while j < len(picture) and picture[j] == ch:
+                j += 1
+            n = j - i
+            if date and ch == 'd':
+                day = days[when.weekday()]
+                out.append(str(when.day) if n == 1 else f'{when.day:02}' if n == 2
+                           else day[:3] if n == 3 else day)
+            elif date and ch == 'M':
+                month = months[when.month - 1]
+                out.append(str(when.month) if n == 1 else f'{when.month:02}' if n == 2
+                           else month[:3] if n == 3 else month)
+            elif date and ch == 'y':
+                out.append(str(when.year % 100) if n == 1 else f'{when.year % 100:02}'
+                           if n == 2 else str(when.year))
+            elif date and ch == 'g':
+                out.append('A.D.')
+            elif not date and ch in 'hH':
+                hour = when.hour if ch == 'H' else when.hour % 12 or 12
+                out.append(str(hour) if n == 1 else f'{hour:02}')
+            elif not date and ch in 'ms':
+                value = when.minute if ch == 'm' else when.second
+                out.append(str(value) if n == 1 else f'{value:02}')
+            elif not date and ch == 't':
+                marker = 'AM' if when.hour < 12 else 'PM'
+                out.append(marker[0] if n == 1 else marker)
+            else:
+                out.append(picture[i:j])
+            i = j
+        return ''.join(out)
+
+    def _date_time_format(self, flags, lpTime, lpFormat, buffer, size, wide, date):
+        """GetDateFormat/GetTimeFormat core (lpTime: SYSTEMTIME or NULL for now)"""
+        try:
+            if lpTime:
+                year, month, _, day, hour, minute, second, _ = struct.unpack(
+                    '<8H', self.emu.uc.mem_read(lpTime, 16))
+                when = (datetime.datetime(year, month, day) if date else
+                        datetime.datetime(2000, 1, 1, hour, minute, second))
+            else:
+                when = datetime.datetime.now()
+        except (UcError, ValueError):
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        if lpFormat:
+            picture = self._read_text(lpFormat, wide)
+        elif date:
+            # DATE_LONGDATE (2), DATE_YEARMONTH (8), else DATE_SHORTDATE
+            picture = self.LOCALE_INFO[0x20 if flags & 2 else 0x1006 if flags & 8 else 0x1F]
+        else:
+            picture = self.LOCALE_INFO[0x1003]
+        if not date:
+            if flags & 1:  # TIME_NOMINUTESORSECONDS
+                picture = re.sub(r"[^hHt']*[ms]+", '', picture)
+            elif flags & 2:  # TIME_NOSECONDS
+                picture = re.sub(r"[^hHmt']*s+", '', picture)
+            if flags & 4:  # TIME_NOTIMEMARKER
+                picture = re.sub(r"\s*t+", '', picture)
+            if flags & 8:  # TIME_FORCE24HOURFORMAT
+                picture = picture.replace('h', 'H')
+        text = self._format_picture(picture, when, date)
+        return self._write_counted_text(text, buffer, size, wide)
+
+    def GetDateFormatA(self, args, wide=False):
+        """GetDateFormatA/W emulation (Locale, dwFlags, lpDate, lpFormat, lpDateStr, cchDate)"""
+        return self._date_time_format(args[1], args[2], args[3], args[4], args[5], wide, True)
+
+    def GetDateFormatW(self, args):
+        return self.GetDateFormatA(args, wide=True)
+
+    def GetDateFormatEx(self, args):
+        return self.GetDateFormatA(args, wide=True)  # the calendar argument is ignored
+
+    def GetTimeFormatA(self, args, wide=False):
+        """GetTimeFormatA/W emulation (Locale, dwFlags, lpTime, lpFormat, lpTimeStr, cchTime)"""
+        return self._date_time_format(args[1], args[2], args[3], args[4], args[5], wide, False)
+
+    def GetTimeFormatW(self, args):
+        return self.GetTimeFormatA(args, wide=True)
+
+    def GetTimeFormatEx(self, args):
+        return self.GetTimeFormatA(args, wide=True)
+
+    # Time zone of the host
+
+    def _dst_transitions(self, year):
+        """(daylight start, standard start) SYSTEMTIMEs of the host time zone in
+        "day of month" form (wYear 0), or None without daylight saving time"""
+        start = int(datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc).timestamp())
+        found = {}
+        step = 900  # every transition is on a quarter hour
+        previous = time.localtime(start).tm_isdst
+        for t in range(start + step, start + 366 * 86400, step):
+            isdst = time.localtime(t).tm_isdst
+            if isdst != previous and isdst >= 0:
+                # The wall clock time of the change, in the time before it
+                wall = datetime.datetime(*time.localtime(t - step)[:6]) + \
+                    datetime.timedelta(seconds=step)
+                days_in_month = ((wall.replace(day=28) + datetime.timedelta(days=4))
+                                 .replace(day=1) - datetime.timedelta(days=1)).day
+                week = 5 if wall.day + 7 > days_in_month else (wall.day - 1) // 7 + 1
+                found[isdst] = struct.pack('<8H', 0, wall.month, (wall.weekday() + 1) % 7,
+                                           week, wall.hour, wall.minute, 0, 0)
+            previous = isdst
+        if 0 in found and 1 in found:
+            return found[1], found[0]
+        return None
+
+    def GetTimeZoneInformation(self, args):
+        """GetTimeZoneInformation emulation - the host's time zone and its
+        daylight saving time rules for the current year"""
+        now = time.localtime()
+        cached = getattr(self, '_tz_cache', None)
+        if cached is None or cached[0] != now.tm_year:
+            transitions = self._dst_transitions(now.tm_year) if time.daylight else None
+            cached = self._tz_cache = (now.tm_year, transitions)
+        transitions = cached[1]
+        bias = time.timezone // 60
+        standard_name, daylight_name = time.tzname
+
+        def name(text):
+            return text.encode('utf-16-le')[:62].ljust(64, b'\x00')
+        if transitions:
+            daylight_date, standard_date = transitions
+            daylight_bias = (time.altzone - time.timezone) // 60
+            result = 2 if now.tm_isdst > 0 else 1  # TIME_ZONE_ID_DAYLIGHT/STANDARD
+        else:
+            daylight_date = standard_date = b'\x00' * 16
+            daylight_bias = 0
+            result = 0  # TIME_ZONE_ID_UNKNOWN
+        data = (struct.pack('<i', bias) + name(standard_name) + standard_date +
+                struct.pack('<i', 0) + name(daylight_name) + daylight_date +
+                struct.pack('<i', daylight_bias))
+        if not self._mem_write(args[0], data):
+            self._last_error = 998  # ERROR_NOACCESS
+            return 0xFFFFFFFF  # TIME_ZONE_ID_INVALID
+        return result
+
     # ---------- Drives and volumes (only C: exists) ----------
 
     volume_label = ''
@@ -4170,21 +5020,21 @@ class WinAPIHandler:
         self._last_error = 1314  # ERROR_PRIVILEGE_NOT_HELD
         return 0
 
-    def CompareStringA(self, args):
-        """CompareStringA emulation - CSTR_LESS_THAN/EQUAL/GREATER_THAN (1/2/3)"""
+    def CompareStringA(self, args, wide=False):
+        """CompareStringA/W emulation - CSTR_LESS_THAN/EQUAL/GREATER_THAN (1/2/3)"""
         flags = args[1]
         texts = []
         for address, count in ((args[2], args[3]), (args[4], args[5])):
             if count != 0xFFFFFFFF and count >= 0x80000000:
                 self._last_error = 87  # ERROR_INVALID_PARAMETER
                 return 0
-            units = self._counted_units(address, count, False) if address else None
+            units = self._counted_units(address, count, wide) if address else None
             if units is None:
                 self._last_error = 87
                 return 0
             if 0 in units:
                 units = units[:units.index(0)]
-            text = bytes(units).decode(ANSI_CODEPAGE, errors='replace')
+            text = self._units_text(units, wide)
             if flags & 1:  # NORM_IGNORECASE
                 text = text.lower()
             if flags & 4:  # NORM_IGNORESYMBOLS
@@ -5301,25 +6151,28 @@ class WinAPIHandler:
     def SetCurrentDirectoryW(self, args):
         return self.SetCurrentDirectoryA(args, wide=True)
 
-    def GetFullPathNameA(self, args):
-        """GetFullPathNameA emulation - resolves against the current directory"""
-        name = self.read_string(args[0])
+    def GetFullPathNameA(self, args, wide=False):
+        """GetFullPathNameA/W emulation - resolves against the current directory"""
+        name = self._read_text(args[0], wide)
         nBufferLength, lpBuffer, lpFilePart = args[1], args[2], args[3]
         full = self.full_windows_path(name, clamp=True)
-        log.debug(f"GetFullPathNameA(\"{name}\") -> \"{full}\"")
+        log.debug(f"GetFullPathName{'W' if wide else 'A'}(\"{name}\") -> \"{full}\"")
         if full is None:
             self._last_error = 123  # ERROR_INVALID_NAME
             return 0
-        data = full.encode(ANSI_CODEPAGE, errors='replace')
-        if not lpBuffer or nBufferLength <= len(data):
-            return len(data) + 1
-        self.emu.uc.mem_write(lpBuffer, data + b'\x00')
+        units = self._text_units(full, wide)  # lengths are in TCHARs
+        if not lpBuffer or nBufferLength <= len(units):
+            return len(units) + 1
+        self._write_units(lpBuffer, units, wide)
         if lpFilePart:
             # Last component, or NULL when the path ends with a separator
-            sep = data.rfind(b'\\')
-            part = lpBuffer + sep + 1 if sep + 1 < len(data) else 0
+            sep = len(units) - 1 - units[::-1].index(0x5C) if 0x5C in units else -1
+            part = lpBuffer + (sep + 1) * (2 if wide else 1) if sep + 1 < len(units) else 0
             self.emu.uc.mem_write(lpFilePart, struct.pack('<I', part))
-        return len(data)
+        return len(units)
+
+    def GetFullPathNameW(self, args):
+        return self.GetFullPathNameA(args, wide=True)
 
     def GetDiskFreeSpaceA(self, args):
         """GetDiskFreeSpaceA emulation - space of the host disk holding c_drive/"""
@@ -5773,16 +6626,17 @@ class WinAPIHandler:
 
         return 1
     
-    def ReadConsoleA(self, args):
-        """ReadConsoleA emulation - Read user input from console"""
+    def ReadConsoleA(self, args, wide=False):
+        """ReadConsoleA/W emulation - Read user input from console"""
         hConsoleInput = args[0]
         lpBuffer = args[1]
         nNumberOfCharsToRead = args[2]
         lpNumberOfCharsRead = args[3]
         # pInputControl = args[4]  # optional, usually NULL
-        
-        log.debug(f"ReadConsoleA(0x{hConsoleInput:x}, max {nNumberOfCharsToRead} chars)")
-        
+
+        log.debug(f"ReadConsole{'W' if wide else 'A'}(0x{hConsoleInput:x}, "
+                  f"max {nNumberOfCharsToRead} chars)")
+
         if self.gui:
             if self.console is None:
                 self._last_error = 6  # ERROR_INVALID_HANDLE: no console
@@ -5790,7 +6644,8 @@ class WinAPIHandler:
             user_input = self.console_read_line()
             if user_input is None:
                 user_input = ""
-            data = (user_input + "\r\n").encode(ANSI_CODEPAGE, errors='replace')
+            text = user_input + "\r\n"
+            data = None if wide else text.encode(ANSI_CODEPAGE, errors='replace')
         else:
             try:
                 line = sys.stdin.buffer.readline()
@@ -5799,15 +6654,28 @@ class WinAPIHandler:
             if line.endswith(b"\n") and not line.endswith(b"\r\n"):
                 line = line[:-1] + b"\r\n"
             data = line
+            if wide:
+                text = line.decode(sys.stdin.encoding or 'utf-8', errors='replace')
 
-        # ANSI console reads count bytes, not Unicode characters
-        data = data[:nNumberOfCharsToRead]
-        if data:
-            self.emu.uc.mem_write(lpBuffer, data)
+        if wide:
+            # Wide console reads count UTF-16 code units
+            units = self._text_units(text, True)[:nNumberOfCharsToRead]
+            if units:
+                self._write_units(lpBuffer, units, True, terminate=False)
+            count = len(units)
+        else:
+            # ANSI console reads count bytes, not Unicode characters
+            data = data[:nNumberOfCharsToRead]
+            if data:
+                self.emu.uc.mem_write(lpBuffer, data)
+            count = len(data)
         if lpNumberOfCharsRead != 0:
-            self.emu.uc.mem_write(lpNumberOfCharsRead, struct.pack('<I', len(data)))
-        log.debug(f"ReadConsoleA: {data!r} ({len(data)} bytes)")
+            self.emu.uc.mem_write(lpNumberOfCharsRead, struct.pack('<I', count))
+        log.debug(f"ReadConsole: {count} chars")
         return 1
+
+    def ReadConsoleW(self, args):
+        return self.ReadConsoleA(args, wide=True)
 
     def GetEnvironmentVariableA(self, args, wide=False):
         """GetEnvironmentVariableA/W emulation"""
@@ -16728,7 +17596,12 @@ class WinAPIHandler:
         """__set_app_type emulation"""
         app_type = args[0]
         log.debug(f"__set_app_type({app_type})")
+        self.crt_app_type = app_type
         return 0
+
+    def _query_app_type(self, args):
+        """_query_app_type emulation - the __set_app_type value (default: console)"""
+        return getattr(self, 'crt_app_type', 1)  # _crt_console_app
     
     def _controlfp(self, args):
         """_controlfp emulation - floating point control word"""
@@ -16768,6 +17641,81 @@ class WinAPIHandler:
         log.debug(f"_initterm_e(0x{args[0]:08x}, 0x{args[1]:08x})")
         return self._run_initializers(args[0], args[1], stop_on_error=True)
     
+    @staticmethod
+    def split_command_line(command_line):
+        """Split a command line into argv like the Microsoft C runtime:
+        argv[0] ends at the next quote (if quoted) or whitespace; in the
+        arguments 2n backslashes + '"' give n backslashes and toggle quoting,
+        2n+1 backslashes + '"' give n backslashes and a '"', other
+        backslashes are literal, and "" inside quotes is a '"'."""
+        argv = []
+        text = command_line
+        i, n = 0, len(text)
+        # Program name: no escapes
+        if text.startswith('"'):
+            end = text.find('"', 1)
+            end = n if end < 0 else end
+            argv.append(text[1:end])
+            i = end + 1
+        else:
+            while i < n and text[i] not in ' \t':
+                i += 1
+            argv.append(text[:i])
+        while True:
+            while i < n and text[i] in ' \t':
+                i += 1
+            if i >= n:
+                break
+            arg = []
+            in_quotes = False
+            while i < n and (in_quotes or text[i] not in ' \t'):
+                if text[i] == '\\':
+                    start = i
+                    while i < n and text[i] == '\\':
+                        i += 1
+                    count = i - start
+                    if i < n and text[i] == '"':
+                        arg.append('\\' * (count // 2))
+                        if count % 2:
+                            arg.append('"')
+                            i += 1
+                    else:
+                        arg.append('\\' * count)
+                elif text[i] == '"':
+                    if in_quotes and i + 1 < n and text[i + 1] == '"':
+                        arg.append('"')
+                        i += 2
+                    else:
+                        in_quotes = not in_quotes
+                        i += 1
+                else:
+                    arg.append(text[i])
+                    i += 1
+            argv.append(''.join(arg))
+        return argv
+
+    def _argv_array(self, wide):
+        """Address of the NULL-terminated argv (or wargv) array of the
+        command line (built once)"""
+        attr = '_wargv_addr' if wide else '_argv_addr'
+        if getattr(self, attr) == 0:
+            argv = self.split_command_line(self.windows_command_line())
+            pointers = []
+            for arg in argv:
+                units = self._text_units(arg, wide) + [0]
+                address = self.emu.heap_alloc(len(units) * (2 if wide else 1))
+                self._write_units(address, units, wide, terminate=False)
+                pointers.append(address)
+            array = self.emu.heap_alloc(4 * (len(pointers) + 1))
+            self._mem_write(array, struct.pack(f'<{len(pointers) + 1}I', *pointers, 0))
+            setattr(self, attr, array)
+            self._argc_value = len(argv)
+        return getattr(self, attr)
+
+    def _argc_count(self):
+        self._argv_array(False)
+        return self._argc_value
+
     def api__getmainargs(self, args):
         """__getmainargs emulation - Returns argc, argv, environ"""
         p_argc = args[0]
@@ -16775,25 +17723,12 @@ class WinAPIHandler:
         p_env = args[2]
         do_wildcard = args[3]
         # startinfo = args[4]  # Optional
-        
+
         log.debug(f"__getmainargs(0x{p_argc:08x}, 0x{p_argv:08x}, 0x{p_env:08x}, {do_wildcard})")
-        
-        # argc = 1
-        self.emu.uc.mem_write(p_argc, struct.pack('<I', 1))
-        
-        # Allocate memory for argv
-        if self._argv_addr == 0:
-            self._argv_addr = self.emu.heap_alloc(16)  # argv array
-            argv0_addr = self.emu.heap_alloc(256)  # argv[0] string
-            
-            # argv[0] = program name
-            prog_name = self.windows_exe_path().encode(ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(argv0_addr, prog_name[:255] + b'\x00')
-            
-            # argv[0] pointer, argv[1] = NULL
-            self.emu.uc.mem_write(self._argv_addr, struct.pack('<II', argv0_addr, 0))
-        
-        self.emu.uc.mem_write(p_argv, struct.pack('<I', self._argv_addr))
+
+        argv = self._argv_array(False)
+        self.emu.uc.mem_write(p_argc, struct.pack('<I', self._argc_count()))
+        self.emu.uc.mem_write(p_argv, struct.pack('<I', argv))
         
         # Allocate memory for environ
         if self._environ_addr == 0:
@@ -16813,22 +17748,9 @@ class WinAPIHandler:
         
         log.debug(f"__wgetmainargs(0x{p_argc:08x}, 0x{p_argv:08x}, 0x{p_env:08x}, {do_wildcard})")
         
-        # argc = 1
-        self.emu.uc.mem_write(p_argc, struct.pack('<I', 1))
-        
-        # Allocate memory for wargv
-        if self._wargv_addr == 0:
-            self._wargv_addr = self.emu.heap_alloc(16)  # wargv array
-            wargv0_addr = self.emu.heap_alloc(512)  # wargv[0] string
-            
-            # wargv[0] = program name (wide)
-            prog_name = self.windows_exe_path()[:255]
-            self.emu.uc.mem_write(wargv0_addr, prog_name.encode('utf-16-le') + b'\x00\x00')
-            
-            # wargv[0] pointer, wargv[1] = NULL
-            self.emu.uc.mem_write(self._wargv_addr, struct.pack('<II', wargv0_addr, 0))
-        
-        self.emu.uc.mem_write(p_argv, struct.pack('<I', self._wargv_addr))
+        wargv = self._argv_array(True)
+        self.emu.uc.mem_write(p_argc, struct.pack('<I', self._argc_count()))
+        self.emu.uc.mem_write(p_argv, struct.pack('<I', wargv))
         
         # Allocate memory for wenviron
         if self._wenviron_addr == 0:
@@ -16843,39 +17765,31 @@ class WinAPIHandler:
         """__p___argc emulation"""
         if self._argc == 0:
             self._argc = self.emu.heap_alloc(4)
-            self.emu.uc.mem_write(self._argc, struct.pack('<I', 1))
+            self.emu.uc.mem_write(self._argc, struct.pack('<I', self._argc_count()))
         log.debug(f"__p___argc() -> 0x{self._argc:08x}")
         return self._argc
-    
+
+    def _argv_variable(self, wide):
+        """Address of the __argv (or __wargv) variable (one per process, so a
+        program changing it sees its change everywhere)"""
+        attr = '_wargv_var' if wide else '_argv_var'
+        if not getattr(self, attr, 0):
+            variable = self.emu.heap_alloc(4)
+            self.emu.uc.mem_write(variable, struct.pack('<I', self._argv_array(wide)))
+            setattr(self, attr, variable)
+        return getattr(self, attr)
+
     def api__p___argv(self, args):
-        """__p___argv emulation"""
-        # Allocate memory for argv
-        if self._argv_addr == 0:
-            self._argv_addr = self.emu.heap_alloc(16)
-            argv0_addr = self.emu.heap_alloc(256)
-            prog_name = self.windows_exe_path().encode(ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(argv0_addr, prog_name[:255] + b'\x00')
-            self.emu.uc.mem_write(self._argv_addr, struct.pack('<II', argv0_addr, 0))
-        
-        # Return address of argv pointer
-        argv_ptr_addr = self.emu.heap_alloc(4)
-        self.emu.uc.mem_write(argv_ptr_addr, struct.pack('<I', self._argv_addr))
-        log.debug(f"__p___argv() -> 0x{argv_ptr_addr:08x}")
-        return argv_ptr_addr
-    
+        """__p___argv emulation - address of __argv"""
+        address = self._argv_variable(False)
+        log.debug(f"__p___argv() -> 0x{address:08x}")
+        return address
+
     def api__p___wargv(self, args):
-        """__p___wargv emulation"""
-        if self._wargv_addr == 0:
-            self._wargv_addr = self.emu.heap_alloc(16)
-            wargv0_addr = self.emu.heap_alloc(512)
-            prog_name = self.windows_exe_path()[:255]
-            self.emu.uc.mem_write(wargv0_addr, prog_name.encode('utf-16-le') + b'\x00\x00')
-            self.emu.uc.mem_write(self._wargv_addr, struct.pack('<II', wargv0_addr, 0))
-        
-        wargv_ptr_addr = self.emu.heap_alloc(4)
-        self.emu.uc.mem_write(wargv_ptr_addr, struct.pack('<I', self._wargv_addr))
-        log.debug(f"__p___wargv() -> 0x{wargv_ptr_addr:08x}")
-        return wargv_ptr_addr
+        """__p___wargv emulation - address of __wargv"""
+        address = self._argv_variable(True)
+        log.debug(f"__p___wargv() -> 0x{address:08x}")
+        return address
     
     def _amsg_exit(self, args):
         """_amsg_exit emulation - runtime error message and exit"""
@@ -18962,6 +19876,23 @@ class WinAPIHandler:
             '__stdio_common_vswscanf': self.api__stdio_common_vswscanf,
             '__stdio_common_vfscanf': self.api__stdio_common_vfscanf,
             'raise': self._crt_raise,  # Python keyword
+            # vcruntime140.dll
+            '__current_exception': lambda args: self._vcrt_exception_cells(),
+            '__current_exception_context': lambda args: self._vcrt_exception_cells() + 4,
+            '__std_exception_copy': self._std_exception_copy,
+            '__std_exception_destroy': self._std_exception_destroy,
+            '__std_terminate': self.abort,
+            '__std_type_info_compare': self._std_type_info_compare,
+            '__std_type_info_destroy_list': self._crt_noop,  # names are never freed
+            '__std_type_info_name': self._std_type_info_name,
+            '__telemetry_main_invoke_trigger': self._crt_noop,
+            '__telemetry_main_return_trigger': self._crt_noop,
+            '__uncaught_exception': self._crt_noop,
+            '__uncaught_exceptions': self._crt_noop,
+            '__vcrt_GetModuleFileNameW': self.GetModuleFileNameW,
+            '__vcrt_GetModuleHandleW': self.GetModuleHandleW,
+            '__vcrt_InitializeCriticalSectionEx': self.InitializeCriticalSectionEx,
+            '__vcrt_LoadLibraryExW': self.LoadLibraryExW,
         }
         # Double math functions: cdecl versions take stack arguments, the
         # MSVC _CI* intrinsics take them in x87 registers
@@ -18978,6 +19909,90 @@ class WinAPIHandler:
 
     def _crt_noop(self, args):
         return 0
+
+    # ---- vcruntime140: exception and type_info helpers ----
+
+    def _vcrt_exception_cells(self):
+        """The calling thread's {EXCEPTION_RECORD*, CONTEXT*} of the C++
+        exception being handled (__current_exception/_context)"""
+        thread = self.emu.current_thread
+        cells = getattr(thread, 'vcrt_exception_cells', 0)
+        if not cells:
+            cells = thread.vcrt_exception_cells = self.emu.heap_alloc(8)
+        current = (getattr(thread, 'cxx_exceptions', None) or [None])[-1]
+        record = current['record'] if current else 0
+        self._mem_write(cells, struct.pack('<II', record, record + 0x50 if record else 0))
+        return cells
+
+    def _std_exception_copy(self, args):
+        """__std_exception_copy(from, to): __std_exception_data is {_What, _DoFree}"""
+        source, target = args[0], args[1]
+        what = self._read_u32(source)
+        try:
+            do_free = self.emu.uc.mem_read(source + 4, 1)[0]
+        except UcError:
+            do_free = 0
+        if do_free and what:
+            text = self.read_cstring(what)
+            copy = self.emu.heap_alloc(len(text) + 1)
+            self._mem_write(copy, text + b'\x00')
+            self._mem_write(target, struct.pack('<IB', copy, 1))
+        else:
+            self._mem_write(target, struct.pack('<IB', what, 0))
+        return 0
+
+    def _std_exception_destroy(self, args):
+        """__std_exception_destroy(data): frees an owned message"""
+        what = self._read_u32(args[0])
+        try:
+            do_free = self.emu.uc.mem_read(args[0] + 4, 1)[0]
+        except UcError:
+            return 0
+        if do_free and what:
+            self.emu.heap_free(what)
+        self._mem_write(args[0], struct.pack('<IB', 0, 0))
+        return 0
+
+    def _std_type_info_compare(self, args):
+        """__std_type_info_compare(lhs, rhs): the data is {_UndecoratedName,
+        _DecoratedName[]}; compares the decorated names without the leading '.'"""
+        if args[0] == args[1]:
+            return 0
+        lhs, rhs = self.read_cstring(args[0] + 5), self.read_cstring(args[1] + 5)
+        return 0 if lhs == rhs else 0xFFFFFFFF if lhs < rhs else 1
+
+    _BASIC_TYPE_NAMES = {
+        '.C': 'signed char', '.D': 'char', '.E': 'unsigned char', '.F': 'short',
+        '.G': 'unsigned short', '.H': 'int', '.I': 'unsigned int', '.J': 'long',
+        '.K': 'unsigned long', '.M': 'float', '.N': 'double', '.O': 'long double',
+        '.X': 'void', '._J': '__int64', '._K': 'unsigned __int64', '._N': 'bool',
+        '._W': 'wchar_t',
+    }
+
+    def _undecorate_type_name(self, name):
+        """'.?AVFoo@ns@@' -> 'class ns::Foo' (other names stay decorated)"""
+        if name in self._BASIC_TYPE_NAMES:
+            return self._BASIC_TYPE_NAMES[name]
+        match = re.fullmatch(r'\.\?A([VUTW])(.+)@@', name)
+        if not match or '?' in match.group(2) or '$' in match.group(2):
+            return name
+        kind = {'V': 'class', 'U': 'struct', 'T': 'union', 'W': 'enum'}[match.group(1)]
+        body = match.group(2)
+        if kind == 'enum':
+            body = body[1:]  # the underlying type ("W4": int)
+        return f"{kind} {'::'.join(reversed(body.split('@')))}"
+
+    def _std_type_info_name(self, args):
+        """__std_type_info_name(data, list): type_info::name(), cached in the data"""
+        cached = self._read_u32(args[0])
+        if cached:
+            return cached
+        decorated = self.read_cstring(args[0] + 4).decode('ascii', errors='replace')
+        text = self._undecorate_type_name(decorated).encode('ascii', errors='replace')
+        address = self.emu.heap_alloc(len(text) + 1)
+        self._mem_write(address, text + b'\x00')
+        self._mem_write(args[0], struct.pack('<I', address))
+        return address
 
     # ---- Math (double results are returned in ST(0)) ----
 
@@ -20857,7 +21872,7 @@ class WinAPIHandler:
     # ---- UCRT startup / runtime configuration ----
 
     def _set_app_type(self, args):
-        return 0
+        return self.api__set_app_type(args)
 
     def _configure_narrow_argv(self, args):
         return 0
@@ -26758,17 +27773,161 @@ class CPUEmulator:
         self.stop_emulation = True
         return False
     
+    # CPU exceptions -> (Windows exception code, description, faulting
+    # instruction length: 0 when EIP already points at it)
+    CPU_EXCEPTIONS = {
+        0x00: (0xC0000094, "integer division by zero", 0),  # #DE
+        0x01: (0x80000004, "single step", 0),  # #DB (trap flag)
+        0x03: (0x80000003, "breakpoint (INT 3)", 1),  # #BP
+        0x04: (0xC0000095, "integer overflow (INTO)", 1),  # #OF
+        0x05: (0xC000008C, "array bounds exceeded (BOUND)", 0),  # #BR
+        0x06: (0xC000001D, "illegal instruction", 0),  # #UD
+        0x0D: (0xC0000005, "general protection fault", 0),  # #GP
+        0x2D: (0x80000003, "breakpoint (INT 0x2D debug service)", 2),
+    }
+    STATUS_ACCESS_VIOLATION = 0xC0000005
+    STATUS_STACK_BUFFER_OVERRUN = 0xC0000409  # __fastfail
+    CONTRIBUTORY_EXCEPTIONS = (0x00, 0x08, 0x0A, 0x0B, 0x0C, 0x0D)
+
+    # QEMU remembers a contributory CPU exception (#DE, #GP, ...) until it is
+    # delivered (env->old_exception). Unicorn hands it to the hook instead,
+    # so the field is never reset and the next such exception would become a
+    # double fault (#DF), then a triple fault. Its offset in a Unicorn
+    # context is found once with a test division by zero (None: not found).
+    _exception_state_offset = False
+
+    @staticmethod
+    def _find_exception_state_offset():
+        code = b'\x31\xc9\xf7\xf1\x90'  # xor ecx, ecx; div ecx; nop
+
+        def attempt(offset):
+            """Two divisions by zero; returns (interrupt numbers, candidate offsets)"""
+            uc = Uc(UC_ARCH_X86, UC_MODE_32)
+            uc.mem_map(0x1000, 0x1000)
+            uc.mem_write(0x1000, code)
+            before = bytes(uc.context_save())
+            seen, candidates = [], []
+
+            def hook(uc, intno, user_data):
+                seen.append(intno)
+                if len(seen) == 1:
+                    if offset is None:
+                        after = bytes(uc.context_save())
+                        candidates.extend(
+                            o for o in range(0, min(len(before), len(after)) - 3, 4)
+                            if before[o:o + 4] == b'\xff' * 4 and after[o:o + 4] == b'\0' * 4)
+                    else:
+                        CPUEmulator._patch_exception_state(uc, offset)
+                uc.reg_write(UC_X86_REG_EIP, 0x1000 if len(seen) < 2 else 0x1004)
+            uc.hook_add(UC_HOOK_INTR, hook)
+            uc.emu_start(0x1000, 0x1005, count=20)
+            return seen, candidates
+
+        try:
+            _, candidates = attempt(None)
+            for offset in candidates:
+                if attempt(offset)[0] == [0, 0]:
+                    return offset
+        except (UcError, ctypes.ArgumentError, TypeError) as e:
+            log.debug(f"CPU exception state calibration failed: {e}")
+        log.warning("CPU exception state not found: a second division by zero may be "
+                    "reported as a double fault")
+        return None
+
+    @staticmethod
+    def _patch_exception_state(uc, offset):
+        context = uc.context_save()
+        address = ctypes.cast(context.context, ctypes.c_void_p).value
+        ctypes.memmove(address + offset, b'\xff' * 4, 4)  # -1: no exception in flight
+        uc.context_restore(context)
+
+    def _clear_exception_state(self, uc):
+        """Forget the contributory exception just handled (see above)"""
+        if CPUEmulator._exception_state_offset is False:
+            CPUEmulator._exception_state_offset = self._find_exception_state_offset()
+        if CPUEmulator._exception_state_offset is not None:
+            self._patch_exception_state(uc, CPUEmulator._exception_state_offset)
+
     def _hook_interrupt(self, uc, intno, user_data):
-        """Interrupt hook"""
-        log.debug(f"Interrupt: {intno}")
-        
-        if intno == 0x80:
-            # Linux syscall (not used in Windows but catch anyway)
-            log.warning("Linux system call detected (INT 0x80)")
-        elif intno == 0x2E:
-            # Windows syscall
-            eax = uc.reg_read(UC_X86_REG_EAX)
-            log.warning(f"Windows system call: EAX=0x{eax:08x}")
+        """Interrupt hook: CPU exceptions and software interrupts become Windows
+        exceptions for the program's SEH handlers, like on Windows; __fastfail
+        (INT 0x29) ends the process at once"""
+        eip = uc.reg_read(UC_X86_REG_EIP)
+        log.debug(f"Interrupt: 0x{intno:x} at EIP=0x{eip:08x}")
+        if intno in self.CONTRIBUTORY_EXCEPTIONS:
+            self._clear_exception_state(uc)
+        if intno == 0x08:
+            # Double fault: an exception after one that was not cleared (only
+            # if the calibration failed); the instruction tells which it was
+            insn = None
+            if self.cs is not None:
+                try:
+                    insn = next(self.cs.disasm_lite(bytes(uc.mem_read(eip, 16)), eip), None)
+                except UcError:
+                    pass
+            intno = 0x00 if insn and insn[2] in ('div', 'idiv') else 0x0D
+
+        if intno == 0x29:
+            # __fastfail(code): no exception handler runs
+            code = uc.reg_read(UC_X86_REG_ECX)
+            log.error(f"__fastfail({code}) at 0x{eip - 2:08x}: process terminated "
+                      f"(STATUS_STACK_BUFFER_OVERRUN)")
+            self._terminate_on_exception(uc, self.STATUS_STACK_BUFFER_OVERRUN)
+            return
+
+        params = []
+        if intno in self.CPU_EXCEPTIONS:
+            code, description, length = self.CPU_EXCEPTIONS[intno]
+            address = (eip - length) & 0xFFFFFFFF
+            if code == 0x80000003:
+                params = [0]  # BREAKPOINT_BREAK
+        else:
+            # A software interrupt user code may not use (INT 0x2E system calls,
+            # INT 0x80, DOS INT 0x21, ...): a general protection fault, which
+            # Windows reports as an access violation reading 0xFFFFFFFF
+            code, address = self.STATUS_ACCESS_VIOLATION, (eip - 2) & 0xFFFFFFFF
+            description = f"INT 0x{intno:02X} (privileged software interrupt)"
+            if intno == 0x2E:
+                description += f", system call EAX=0x{uc.reg_read(UC_X86_REG_EAX):08x}"
+            params = [0, 0xFFFFFFFF]
+        self._raise_cpu_exception(uc, code, address, params, description)
+
+    def _terminate_on_exception(self, uc, code):
+        """End the process like an unhandled exception does (exit code = code)"""
+        if self.api_handler is not None:
+            self.api_handler._set_exit_code(code)
+        self.crashed = True
+        self.stop_emulation = True
+        uc.emu_stop()
+
+    def _raise_cpu_exception(self, uc, code, address, params, description):
+        """Dispatch an exception raised by an instruction to the SEH frames;
+        continue in the handler that takes it, or end the process"""
+        jump = None
+        try:
+            jump = self.api_handler.dispatch_exception(code, 0, params, address)
+        except GuestUnwind as unwind:  # a funclet threw a C++ exception
+            jump = unwind.jump
+        if self.stop_emulation:
+            uc.emu_stop()
+            return
+        if jump is None:
+            log.error(f"Unhandled exception 0x{code:08x} ({description}) at "
+                      f"0x{address:08x}: process terminated")
+            self._terminate_on_exception(uc, code)
+            return
+        log.debug(f"Exception 0x{code:08x} ({description}) at 0x{address:08x} is "
+                  f"handled at 0x{jump.eip:08x}")
+        if not self.jump_belongs_here(jump):
+            # The handler is in a frame outside the running callback
+            self.pending_unwind = jump
+            uc.emu_stop()
+            return
+        uc.reg_write(UC_X86_REG_EAX, jump.eax & 0xFFFFFFFF)
+        uc.reg_write(UC_X86_REG_ESP, jump.esp)
+        uc.reg_write(UC_X86_REG_EIP, jump.eip)
+        if jump.ebp is not None:
+            uc.reg_write(UC_X86_REG_EBP, jump.ebp)
     
     def run(self, max_instructions=None):
         """Start emulation"""
