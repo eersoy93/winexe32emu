@@ -1858,18 +1858,44 @@ class WinAPIHandler:
             if stream.kind != 'stdin':
                 stream.flush()
 
-    def _ensure_env_ptr(self, attr, wide=False):
-        """Allocate a pointer variable that points to an empty environment block."""
+    def _environ_array(self, wide):
+        """New NULL-terminated array of "NAME=value" strings of the
+        environment (the C runtime's environ/_wenviron)"""
+        pointers = []
+        for name, value in sorted(self.environment.items()):
+            units = self._text_units(f"{name}={value}", wide) + [0]
+            address = self.emu.heap_alloc(len(units) * (2 if wide else 1))
+            self._write_units(address, units, wide, terminate=False)
+            pointers.append(address)
+        array = self.emu.heap_alloc(4 * (len(pointers) + 1))
+        self._mem_write(array, struct.pack(f'<{len(pointers) + 1}I', *pointers, 0))
+        return array
+
+    def _initial_environ(self, wide):
+        """environ array of the environment at the program's start (also
+        __initenv; _putenv makes a new one for environ)"""
+        attr = '_wenviron_addr' if wide else '_environ_addr'
         if getattr(self, attr) == 0:
-            env_block_attr = '_wenviron_addr' if wide else '_environ_addr'
-            if getattr(self, env_block_attr) == 0:
-                block = self.emu.heap_alloc(8)
-                self.emu.uc.mem_write(block, struct.pack('<I', 0))
-                setattr(self, env_block_attr, block)
+            setattr(self, attr, self._environ_array(wide))
+        return getattr(self, attr)
+
+    def _ensure_env_ptr(self, attr, wide=False):
+        """Address of a C runtime environment variable (_environ, _wenviron,
+        __initenv, __winitenv): it points to the initial environ array"""
+        if getattr(self, attr) == 0:
             var = self.emu.heap_alloc(4)
-            self.emu.uc.mem_write(var, struct.pack('<I', getattr(self, env_block_attr)))
+            self.emu.uc.mem_write(var, struct.pack('<I', self._initial_environ(wide)))
             setattr(self, attr, var)
         return getattr(self, attr)
+
+    def _update_environ(self):
+        """_putenv changed the environment: _environ and _wenviron get new
+        arrays (__initenv keeps the initial one; like on Windows,
+        SetEnvironmentVariable does not change them)"""
+        for attr, wide in (('_environ_ptr_addr', False), ('_wenviron_ptr_addr', True)):
+            if getattr(self, attr):
+                self._mem_write(getattr(self, attr),
+                                struct.pack('<I', self._environ_array(wide)))
 
     def windows_exe_path(self):
         """Path of the main EXE as the program sees it (C:\\...)."""
@@ -17903,14 +17929,9 @@ class WinAPIHandler:
         argv = self._argv_array(False)
         self.emu.uc.mem_write(p_argc, struct.pack('<I', self._argc_count()))
         self.emu.uc.mem_write(p_argv, struct.pack('<I', argv))
-        
-        # Allocate memory for environ
-        if self._environ_addr == 0:
-            self._environ_addr = self.emu.heap_alloc(8)
-            self.emu.uc.mem_write(self._environ_addr, struct.pack('<I', 0))  # NULL terminated
-        
-        self.emu.uc.mem_write(p_env, struct.pack('<I', self._environ_addr))
-        
+        # The environment: the current _environ
+        self.emu.uc.mem_write(p_env, struct.pack(
+            '<I', self._read_u32(self._ensure_env_ptr('_environ_ptr_addr'))))
         return 0
     
     def api__wgetmainargs(self, args):
@@ -17925,14 +17946,8 @@ class WinAPIHandler:
         wargv = self._argv_array(True)
         self.emu.uc.mem_write(p_argc, struct.pack('<I', self._argc_count()))
         self.emu.uc.mem_write(p_argv, struct.pack('<I', wargv))
-        
-        # Allocate memory for wenviron
-        if self._wenviron_addr == 0:
-            self._wenviron_addr = self.emu.heap_alloc(8)
-            self.emu.uc.mem_write(self._wenviron_addr, struct.pack('<I', 0))  # NULL terminated
-        
-        self.emu.uc.mem_write(p_env, struct.pack('<I', self._wenviron_addr))
-        
+        self.emu.uc.mem_write(p_env, struct.pack(
+            '<I', self._read_u32(self._ensure_env_ptr('_wenviron_ptr_addr', wide=True))))
         return 0
     
     def api__p___argc(self, args):
@@ -21855,6 +21870,7 @@ class WinAPIHandler:
             self.environment[name.upper()] = value
         else:
             self.environment.pop(name.upper(), None)
+        self._update_environ()
         return 0
 
     def _putenv(self, args):
