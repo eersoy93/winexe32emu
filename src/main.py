@@ -69,7 +69,7 @@ def main():
                              "--all, asks for confirmation) and exit")
     parser.add_argument("--no-apps", action="store_true",
                         help="Don't compile the apps in apps/ (compile_apps.sh) into "
-                             "C:\\Windows, like the file manager (filemanager.exe)")
+                             "C:\\Windows, like Explorer (explorer.exe)")
     parser.add_argument("--tests", action="store_true",
                         help="Only compile the test programs into C:\\Windows\\Tests, run "
                              "each one without the GUI (scripts/run_tests.sh) and exit "

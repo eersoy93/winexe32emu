@@ -23,7 +23,7 @@ import ntpath
 import warnings
 
 from . import winapi
-from .config import FILE_MANAGER_PATH, PYGAME_AVAILABLE, WINEXE32EMU_VERSION
+from .config import EXPLORER_PATH, PYGAME_AVAILABLE, WINEXE32EMU_VERSION
 from .logger import log
 from .paths import _program_subfolders, resolve_c_drive_path
 from .resources import parse_shell_link, read_exe_icon, standard_cursor_image
@@ -392,12 +392,12 @@ class PseudoWindowsGUI:
 
     def _refresh_desktop_icons(self):
         """Read the desktop icons, (label, path or shortcut) pairs: My Computer
-        (the file manager, if compiled), then the shortcuts and programs of the
+        (Explorer, if compiled), then the shortcuts and programs of the
         user's (C:\\Users\\User\\Desktop) and the public Desktop folders"""
         self.desktop_icons, self.desktop_icon_paths = [], {}
-        if self._file_manager_available():
-            self.desktop_icons.append((self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH))
-            self.desktop_icon_paths[FILE_MANAGER_PATH] = resolve_c_drive_path(FILE_MANAGER_PATH)
+        if self._explorer_available():
+            self.desktop_icons.append((self._program_label(EXPLORER_PATH), EXPLORER_PATH))
+            self.desktop_icon_paths[EXPLORER_PATH] = resolve_c_drive_path(EXPLORER_PATH)
         folders = [winapi.WinAPIHandler.SHELL_FOLDERS[0x10],   # CSIDL_DESKTOPDIRECTORY
                    winapi.WinAPIHandler.SHELL_FOLDERS[0x19]]   # CSIDL_COMMON_DESKTOPDIRECTORY
         for folder in folders:
@@ -424,6 +424,53 @@ class PseudoWindowsGUI:
                          pygame.Rect(body.x, body.y, body.width, max(3, size * 6 // 32)))
         pygame.draw.rect(surface, self.COLOR_TEXT, body, 1)
         return surface
+
+    def _computer_icon(self, size):
+        """(normal, selected) size x size surfaces of the My Computer icon: a
+        monitor on a desktop case, drawn at 32x32 (cached)"""
+        key = ('computer', size)
+        images = self.exe_icon_cache.get(key)
+        if images is not None:
+            return images
+        image = pygame.Surface((32, 32), pygame.SRCALPHA)
+        beige, light, dark, black = (212, 208, 200), (255, 255, 255), (128, 128, 128), (32, 32, 32)
+        # Monitor: beige bezel with a 3D edge around a blue screen
+        bezel = pygame.Rect(4, 1, 24, 20)
+        pygame.draw.rect(image, beige, bezel)
+        pygame.draw.line(image, light, bezel.topleft, (bezel.right - 2, bezel.top))
+        pygame.draw.line(image, light, bezel.topleft, (bezel.left, bezel.bottom - 2))
+        pygame.draw.rect(image, black, bezel, 1)
+        screen = pygame.Rect(7, 4, 18, 13)
+        image.blit(self._gradient(screen.size, (0, 0, 128), (16, 132, 208)), screen.topleft)
+        pygame.draw.line(image, dark, (screen.left - 1, screen.top - 1), (screen.right, screen.top - 1))
+        pygame.draw.line(image, dark, (screen.left - 1, screen.top - 1), (screen.left - 1, screen.bottom))
+        pygame.draw.line(image, light, (screen.left, screen.bottom), (screen.right, screen.bottom))
+        pygame.draw.line(image, light, (screen.right, screen.top), (screen.right, screen.bottom))
+        pygame.draw.line(image, (200, 230, 255), (screen.left + 2, screen.top + 2),
+                         (screen.left + 6, screen.top + 2))  # Glare
+        # Stand
+        pygame.draw.rect(image, dark, pygame.Rect(13, 21, 6, 3))
+        # Case: a drive slot and a green power light
+        case = pygame.Rect(2, 24, 28, 7)
+        pygame.draw.rect(image, beige, case)
+        pygame.draw.line(image, light, case.topleft, (case.right - 2, case.top))
+        pygame.draw.rect(image, black, case, 1)
+        pygame.draw.line(image, black, (6, 27), (15, 27))
+        pygame.draw.line(image, dark, (6, 28), (15, 28))
+        pygame.draw.rect(image, (0, 192, 0), pygame.Rect(24, 27, 2, 2))
+        if size != 32:
+            image = pygame.transform.smoothscale(image, (size, size))
+        selected = image.copy()
+        selected.fill((96, 96, 200, 255), special_flags=pygame.BLEND_RGBA_MULT)
+        self.exe_icon_cache[key] = (image, selected)
+        return image, selected
+
+    def _program_icon(self, data, host_path, size):
+        """(normal, selected) icons of a desktop or Start menu entry: My
+        Computer's own icon for Explorer, else the program's EXE icon"""
+        if isinstance(data, str) and data.lower() == EXPLORER_PATH.lower():
+            return self._computer_icon(size)
+        return self._exe_icon(host_path, size)
 
     def _exe_icon(self, host_path, size):
         """(normal, selected) size x size surfaces of an EXE's own icon, or of
@@ -474,7 +521,8 @@ class PseudoWindowsGUI:
         for i, ((name, data), rect) in enumerate(zip(self.desktop_icons,
                                                      self._desktop_icon_rects())):
             selected = (i == self.selected_icon)
-            normal, tinted = self._exe_icon(self.desktop_icon_paths.get(data), self.ICON_SIZE)
+            normal, tinted = self._program_icon(data, self.desktop_icon_paths.get(data),
+                                                self.ICON_SIZE)
             self.screen.blit(tinted if selected else normal,
                              (rect.centerx - self.ICON_SIZE // 2, rect.y + 4))
             label = self._fit_text(self.font_small, name, rect.width - 6)
@@ -580,8 +628,8 @@ class PseudoWindowsGUI:
         return pygame.Rect(2, self.height - self.TASKBAR_H + 3, 66, self.TASKBAR_H - 6)
 
     @staticmethod
-    def _file_manager_available():
-        path = resolve_c_drive_path(FILE_MANAGER_PATH)
+    def _explorer_available():
+        path = resolve_c_drive_path(EXPLORER_PATH)
         return bool(path) and os.path.isfile(path)
 
     def _fill_start_menu(self):
@@ -594,9 +642,9 @@ class PseudoWindowsGUI:
         shortcut_rows = self._shortcut_rows([winapi.WinAPIHandler.SHELL_FOLDERS[0x02],    # CSIDL_PROGRAMS
                                              winapi.WinAPIHandler.SHELL_FOLDERS[0x17]])  # COMMON_PROGRAMS
         rows = []
-        if self._file_manager_available():
-            rows = [('program', self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH)]
-            self.start_icon_paths[FILE_MANAGER_PATH] = resolve_c_drive_path(FILE_MANAGER_PATH)
+        if self._explorer_available():
+            rows = [('program', self._program_label(EXPLORER_PATH), EXPLORER_PATH)]
+            self.start_icon_paths[EXPLORER_PATH] = resolve_c_drive_path(EXPLORER_PATH)
         if shortcut_rows:
             rows = shortcut_rows + ([('separator', None, None)] + rows if rows else [])
         self.start_menu_rows = [
@@ -813,7 +861,7 @@ class PseudoWindowsGUI:
 
     @staticmethod
     def _program_label(path):
-        if path.lower() == FILE_MANAGER_PATH.lower():
+        if path.lower() == EXPLORER_PATH.lower():
             return "My Computer"
         return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
 
@@ -852,7 +900,7 @@ class PseudoWindowsGUI:
                     pygame.draw.polygon(self.screen, color,
                                         [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
                 elif kind == 'program':
-                    icon = self._exe_icon(self.start_icon_paths.get(data), icon_size)[0]
+                    icon = self._program_icon(data, self.start_icon_paths.get(data), icon_size)[0]
                     self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
                 elif kind == 'exit':
                     icon = self._scaled_icon('exit', self._exit_icon(), icon_size)

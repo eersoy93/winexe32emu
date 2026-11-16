@@ -15,14 +15,14 @@ limitations under the License.
 */
 
 /*
-My Computer (the file manager) - browses the emulated C drive and runs EXE files.
+Explorer (the desktop's My Computer) - browses the emulated C drive and runs EXE files.
 
   - Double-click / Enter / Open: enter a folder, or run an EXE
   - Backspace / Up: go to the parent folder
   - F5 / Refresh: read the folder again
   - The status line shows the size and date of the selected entry
 
-Usage: filemanager.exe [folder]  (default: C:\)
+Usage: explorer.exe [folder]  (default: C:\)
 */
 
 #include <windows.h>
@@ -451,7 +451,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc.hIcon = LoadIconA(hInstance, MAKEINTRESOURCEA(1));
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "WinExe32EmuFileManager";
+    wc.lpszClassName = "WinExe32EmuExplorer";
     if (!RegisterClassA(&wc))
         return 1;
 

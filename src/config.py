@@ -59,8 +59,8 @@ DEFAULT_ENVIRONMENT = {
 # Variables whose value is a file path; only its parent folder is created
 ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 
-# File manager app (the desktop's My Computer) compiled from apps/filemanager/ at every start (compile_apps.sh)
-FILE_MANAGER_PATH = 'C:\\Windows\\filemanager.exe'
+# Explorer app (the desktop's My Computer) compiled from apps/explorer/ at every start (compile_apps.sh)
+EXPLORER_PATH = 'C:\\Windows\\explorer.exe'
 
 # Emulated folder holding the test programs compiled with --tests (c_drive/Windows/Tests/)
 TESTS_FOLDER = 'C:\\Windows\\Tests'

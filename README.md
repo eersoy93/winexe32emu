@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 Pygame (`pygame-ce`) is optional: it is only needed for the fake desktop and sound.
 
-The apps (like the file manager) and the test programs are compiled with the 32-bit MinGW-w64 toolchain (`i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`):
+The apps (like Explorer) and the test programs are compiled with the 32-bit MinGW-w64 toolchain (`i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`):
 
 | System | Command |
 | --- | --- |

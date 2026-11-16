@@ -15,7 +15,7 @@
 
 # Compiles each app in apps/ (apps/NAME/*.c, and apps/NAME/*.rc resources like
 # the icon) into C:\Windows\NAME.exe of the emulated C drive
-# (C:\Windows\filemanager.exe). An app whose EXE is newer than its files and
+# (C:\Windows\explorer.exe). An app whose EXE is newer than its files and
 # this script is up to date and not compiled again (--force compiles all).
 # Exit code: number of failed apps.
 

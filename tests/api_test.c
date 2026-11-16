@@ -408,7 +408,7 @@ static void test_shell(void)
                           (void **)&link);
     check(SUCCEEDED(hr) && link, "CoCreateInstance (ShellLink)");
     if (link) {
-        link->lpVtbl->SetPath(link, "C:\\Windows\\filemanager.exe");
+        link->lpVtbl->SetPath(link, "C:\\Windows\\explorer.exe");
         link->lpVtbl->SetArguments(link, "/x");
         hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&file);
         check(SUCCEEDED(hr) && file->lpVtbl->Save(file, L"C:\\api_test.lnk", TRUE) == S_OK,
@@ -424,7 +424,7 @@ static void test_shell(void)
         char args[16] = "";
         check(file->lpVtbl->Load(file, L"C:\\api_test.lnk", STGM_READ) == S_OK &&
               link->lpVtbl->GetPath(link, buf, sizeof(buf), NULL, 0) == S_OK &&
-              strcmp(buf, "C:\\Windows\\filemanager.exe") == 0 &&
+              strcmp(buf, "C:\\Windows\\explorer.exe") == 0 &&
               link->lpVtbl->GetArguments(link, args, sizeof(args)) == S_OK &&
               strcmp(args, "/x") == 0, "IPersistFile::Load reads the saved link");
         file->lpVtbl->Release(file);
