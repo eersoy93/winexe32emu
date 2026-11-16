@@ -14852,12 +14852,6 @@ class WinAPIHandler:
         self._mem_write(ppidl, struct.pack('<I', pidl))
         return 0
 
-    def SHGetDesktopFolder(self, args):
-        """SHGetDesktopFolder emulation - shell folder objects are not emulated"""
-        if args[0]:
-            self._mem_write(args[0], struct.pack('<I', 0))
-        return 0x80004001  # E_NOTIMPL
-
     def SHChangeNotify(self, args):
         return 0
 
@@ -17629,6 +17623,321 @@ class WinAPIHandler:
             total = args[4] | (args[5] << 32)
             log.debug(f"ITaskbarList3::SetProgressValue(0x{args[1]:x}, {completed}, {total})")
         return self.S_OK
+
+    # ---------- Shell namespace: IShellFolder, IContextMenu ----------
+
+    IID_ISHELLFOLDER = '000214e6-0000-0000-c000-000000000046'
+    IID_ICONTEXTMENU = '000214e4-0000-0000-c000-000000000046'
+    IID_ICONTEXTMENU2 = '000214f4-0000-0000-c000-000000000046'
+    IID_ICONTEXTMENU3 = 'bcfce0a0-ec17-11d0-8d10-00a0c90f2719'
+    E_NOTIMPL = 0x80004001
+    HRESULT_FILE_NOT_FOUND = 0x80070002  # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+
+    COM_INTERFACES.update({
+        'shell_folder': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('ParseDisplayName', 7),
+            ('EnumObjects', 4), ('BindToObject', 5), ('BindToStorage', 5),
+            ('CompareIDs', 4), ('CreateViewObject', 4), ('GetAttributesOf', 4),
+            ('GetUIObjectOf', 7), ('GetDisplayNameOf', 4), ('SetNameOf', 6)],
+        # IContextMenu3 (IContextMenu and IContextMenu2 are prefixes of its vtable)
+        'context_menu': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('QueryContextMenu', 6),
+            ('InvokeCommand', 2), ('GetCommandString', 6), ('HandleMenuMsg', 4),
+            ('HandleMenuMsg2', 5)],
+    })
+
+    # SFGAO_CANCOPY | CANMOVE | CANLINK | CANDELETE | HASPROPSHEET | FILESYSTEM;
+    # SFGAO_FOLDER | FILESYSANCESTOR | HASSUBFOLDER for folders
+    SFGAO_FILE = 0x1 | 0x2 | 0x4 | 0x20 | 0x40 | 0x40000000
+    SFGAO_DIRECTORY = 0x20000000 | 0x10000000 | 0x80000000
+
+    def _shell_folder_object(self, path):
+        """New IShellFolder of a folder ('' is the desktop); returns its pointer"""
+        pointers = self._com_new_object(
+            [((self.IID_ISHELLFOLDER, self.IID_IUNKNOWN),
+              self._com_vtable('IShellFolder', 'shell_folder', wide=True))],
+            {'path': path})
+        return pointers[self.IID_IUNKNOWN]
+
+    def _com_query_new(self, unknown, riid, ppv):
+        """QueryInterface a new object for the caller, dropping the creation reference"""
+        result = self._com_unknown('QueryInterface', [unknown, riid, ppv])
+        self._com_unknown('Release', [unknown])
+        return result
+
+    def SHGetDesktopFolder(self, args):
+        """SHGetDesktopFolder emulation - the desktop's IShellFolder: it parses
+        file system paths of the sandbox into PIDLs and makes the shell's
+        context menu of files (GetUIObjectOf IContextMenu)"""
+        if not args[0]:
+            return self.E_INVALIDARG
+        self._mem_write(args[0], struct.pack('<I', self._shell_folder_object('')))
+        return self.S_OK
+
+    def _shell_item_attributes(self, path):
+        host = self.resolve_c_drive_path(path)
+        if host is None or not os.path.exists(host):
+            return 0
+        return self.SFGAO_FILE | (self.SFGAO_DIRECTORY if os.path.isdir(host) else 0)
+
+    def _com_shell_folder(self, method, wide, args):
+        """IShellFolder of a sandbox folder; its PIDLs hold full Windows paths
+        (self.pidls), relative ones too"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        if method == 'ParseDisplayName':
+            _, _, _, name_ptr, eaten, ppidl, attributes = args[:7]
+            if not ppidl or not name_ptr:
+                return self.E_INVALIDARG
+            self._mem_write(ppidl, struct.pack('<I', 0))
+            name = self._read_text(name_ptr, True)
+            full = self.full_windows_path(ntpath.join(state['path'], name) if state['path']
+                                          else name)
+            host = self.resolve_c_drive_path(full) if full else None
+            if host is None or not os.path.exists(host):
+                return self.HRESULT_FILE_NOT_FOUND
+            if len(full) > 3:
+                full = full.rstrip('\\')
+            if eaten:
+                self._mem_write(eaten, struct.pack('<I', len(name)))
+            if attributes:
+                wanted = struct.unpack('<I', self.emu.uc.mem_read(attributes, 4))[0]
+                self._mem_write(attributes, struct.pack(
+                    '<I', wanted & self._shell_item_attributes(full)))
+            self._mem_write(ppidl, struct.pack('<I', self._make_pidl(full)))
+            return self.S_OK
+        if method == 'BindToObject':
+            _, pidl, _, riid, ppv = args[:5]
+            if not ppv:
+                return self.E_POINTER
+            self._mem_write(ppv, struct.pack('<I', 0))
+            path = self.pidls.get(pidl)
+            host = self.resolve_c_drive_path(path) if path else None
+            if host is None or not os.path.isdir(host):
+                return self.E_INVALIDARG
+            return self._com_query_new(self._shell_folder_object(path), riid, ppv)
+        if method == 'CompareIDs':
+            first = self.pidls.get(args[2], '').lower()
+            second = self.pidls.get(args[3], '').lower()
+            return (first > second) - (first < second) & 0xFFFF
+        if method == 'GetAttributesOf':
+            _, count, apidl, inout = args[:4]
+            if not inout:
+                return self.E_INVALIDARG
+            wanted = struct.unpack('<I', self.emu.uc.mem_read(inout, 4))[0]
+            for pidl in self._read_struct(apidl, f'<{count}I') if count else ():
+                wanted &= self._shell_item_attributes(self.pidls.get(pidl, ''))
+            self._mem_write(inout, struct.pack('<I', wanted))
+            return self.S_OK
+        if method == 'GetUIObjectOf':
+            _, hwnd, count, apidl, riid, _, ppv = args[:7]
+            if not ppv:
+                return self.E_POINTER
+            self._mem_write(ppv, struct.pack('<I', 0))
+            paths = [self.pidls.get(pidl) for pidl in
+                     (self._read_struct(apidl, f'<{count}I') if count and apidl else ())]
+            if not paths or None in paths:
+                return self.E_INVALIDARG
+            if self._read_guid(riid) not in (self.IID_ICONTEXTMENU, self.IID_ICONTEXTMENU2,
+                                             self.IID_ICONTEXTMENU3):
+                return self.E_NOINTERFACE
+            pointers = self._com_new_object(
+                [((self.IID_ICONTEXTMENU3, self.IID_ICONTEXTMENU2, self.IID_ICONTEXTMENU,
+                   self.IID_IUNKNOWN), self._com_vtable('IContextMenu3', 'context_menu'))],
+                {'paths': paths, 'folder': state['path'], 'hwnd': hwnd})
+            return self._com_query_new(pointers[self.IID_IUNKNOWN], riid, ppv)
+        if method == 'GetDisplayNameOf':
+            _, pidl, flags, strret = args[:4]
+            path = self.pidls.get(pidl)
+            if path is None or not strret:
+                return self.E_INVALIDARG
+            # SHGDN_FORPARSING without SHGDN_INFOLDER: the full path
+            name = path if flags & 0x8000 and not flags & 0x1 else \
+                (ntpath.basename(path.rstrip('\\')) or path)
+            text = self.emu.heap_alloc((len(name) + 1) * 2)
+            self._write_text(text, name, True)
+            self._mem_write(strret, struct.pack('<II', 0, text))  # STRRET_WSTR
+            return self.S_OK
+        return self.E_NOTIMPL  # EnumObjects, BindToStorage, CreateViewObject, SetNameOf
+
+    # The shell's own verbs of files: (verb, menu text, help text); the offset
+    # of a command is its index here
+    SHELL_VERBS = [('open', '&Open', 'Opens the selected item.'),
+                   ('link', 'Create &Shortcut', 'Creates a shortcut to the selected item.'),
+                   ('delete', '&Delete', 'Deletes the selected items.'),
+                   ('properties', 'P&roperties', 'Displays the properties of the selected '
+                                                 'items.')]
+
+    def _shell_menu_verbs(self, paths):
+        """Offsets of the shell verbs that apply to the items (None: separator)"""
+        runnable = all(path.lower().endswith(('.exe', '.com')) and
+                       os.path.isfile(self.resolve_c_drive_path(path) or '') for path in paths)
+        return ([0, None] if runnable else []) + [1, None, 2, None, 3]
+
+    def _com_context_menu(self, method, wide, args):
+        """IContextMenu..3 of files and folders: Open (programs), Create
+        Shortcut, Delete and Properties"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        if method == 'QueryContextMenu':
+            _, hmenu, index, first, last, flags = args[:6]
+            items = self.menus.get(hmenu)
+            if items is None:
+                return self.E_INVALIDARG
+            verbs = self._shell_menu_verbs(state['paths'])
+            if flags & 0x1:  # CMF_DEFAULTONLY
+                verbs = verbs[:1]
+            new, top = [], 0
+            for offset in verbs:
+                if offset is None:
+                    if new and not new[-1]['flags'] & self.MF_SEPARATOR:
+                        new.append({'flags': self.MF_SEPARATOR, 'id': 0, 'text': '',
+                                    'submenu': 0})
+                    continue
+                if first + offset > last:
+                    continue
+                new.append({'flags': self.MF_DEFAULT if not new else 0, 'id': first + offset,
+                            'text': self.SHELL_VERBS[offset][1], 'submenu': 0})
+                top = max(top, offset + 1)
+            if new and new[-1]['flags'] & self.MF_SEPARATOR:
+                new.pop()
+            index = len(items) if index >= len(items) else index
+            self.menus[hmenu] = list(items[:index]) + new + list(items[index:])
+            self._menus_changed()
+            return top  # MAKE_HRESULT(SEVERITY_SUCCESS, 0, largest offset + 1)
+        if method == 'GetCommandString':
+            _, offset, kind, _, buffer, size = args[:6]
+            if not 0 <= offset < len(self.SHELL_VERBS):
+                return self.E_INVALIDARG
+            verb, _, help_text = self.SHELL_VERBS[offset]
+            if kind & 0x3 == 2:  # GCS_VALIDATEA/W
+                return self.S_OK
+            text = help_text if kind & 0x3 == 1 else verb  # GCS_HELPTEXT / GCS_VERB
+            if not self._com_write_text(buffer, size, text, bool(kind & 0x4)):
+                return self.E_INVALIDARG
+            return self.S_OK
+        if method == 'InvokeCommand':
+            return self._shell_invoke(state, args[1])
+        if method == 'HandleMenuMsg2' and args[4]:
+            self._mem_write(args[4], struct.pack('<I', 0))
+        return self.S_OK  # HandleMenuMsg(2): nothing is owner-drawn
+
+    def _shell_invoke(self, state, info):
+        """IContextMenu::InvokeCommand: CMINVOKECOMMANDINFO(EX) names the
+        command by its offset or by its verb"""
+        size, mask, hwnd, verb_ptr = self._read_struct(info, '<4I')
+        if mask & 0x4000 and size >= 0x3C:  # CMIC_MASK_UNICODE: CMINVOKECOMMANDINFOEX
+            verb_w = self._read_struct(info + 40, '<I')[0]
+            if verb_w >> 16:
+                verb_ptr, wide = verb_w, True
+            else:
+                wide = False
+        else:
+            wide = False
+        if verb_ptr >> 16:
+            verb = self._read_text(verb_ptr, wide).lower()
+        else:
+            verb = self.SHELL_VERBS[verb_ptr][0] if verb_ptr < len(self.SHELL_VERBS) else ''
+        paths = state['paths']
+        log.info(f"IContextMenu::InvokeCommand(\"{verb}\", {paths})")
+        if verb == 'open':
+            for path in paths:
+                code, _ = self._shell_execute('open', path, '', ntpath.dirname(path), hwnd)
+                if code <= 32:
+                    return self.E_FAIL
+            return self.S_OK
+        if verb == 'link':
+            return self._shell_create_shortcuts(paths)
+        if verb == 'delete':
+            hosts = [self.resolve_c_drive_path(path) for path in paths]
+            if None in hosts or not all(os.path.exists(host) for host in hosts):
+                return self.HRESULT_FILE_NOT_FOUND
+            if not mask & 0x400 and not self._confirm_delete(paths, hosts):  # CMIC_MASK_FLAG_NO_UI
+                return self.S_OK  # Not an error (the host would report one): nothing is done
+            try:
+                for host in hosts:
+                    shutil.rmtree(host) if os.path.isdir(host) else os.remove(host)
+            except OSError as e:
+                log.warning(f"Delete failed: {e}")
+                return self.E_FAIL
+            return self.S_OK
+        if verb == 'properties':
+            for path in paths:
+                self._shell_properties(path)
+            return self.S_OK
+        return self.E_INVALIDARG
+
+    def _shell_create_shortcuts(self, paths):
+        """'Create Shortcut': "Shortcut to <name>.lnk" next to each item"""
+        for path in paths:
+            folder, name = ntpath.split(path.rstrip('\\'))
+            base = f"Shortcut to {ntpath.splitext(name)[0] if os.path.isfile(self.resolve_c_drive_path(path) or '') else name}"
+            target, number = ntpath.join(folder, base + '.lnk'), 2
+            while os.path.exists(self.resolve_c_drive_path(target) or ''):
+                target, number = ntpath.join(folder, f"{base} ({number}).lnk"), number + 1
+            host = self.resolve_c_drive_path(target)
+            state = {'path': path, 'description': '', 'workdir': folder, 'arguments': '',
+                     'relative': '', 'icon': '', 'icon_index': 0, 'show': 1, 'hotkey': 0}
+            try:
+                with open(host, 'wb') as f:
+                    f.write(self._shell_link_data(state))
+            except (OSError, TypeError) as e:
+                log.warning(f"Create Shortcut failed: {e}")
+                return self.E_FAIL
+        return self.S_OK
+
+    def _shell_properties(self, path):
+        """'Properties': the item's type, location, size, times and attributes"""
+        host = self.resolve_c_drive_path(path)
+        try:
+            info = os.stat(host)
+        except (OSError, TypeError):
+            return
+        name = ntpath.basename(path.rstrip('\\')) or path
+        folder = os.path.isdir(host)
+        lines = [f"Type: {'File Folder' if folder else self._shell_type_name(name)}",
+                 f"Location: {ntpath.dirname(path.rstrip(chr(92))) or path}"]
+        if folder:
+            files = dirs = size = 0
+            for root, subdirs, names in os.walk(host):
+                dirs += len(subdirs)
+                files += len(names)
+                for file in names:
+                    try:
+                        size += os.path.getsize(os.path.join(root, file))
+                    except OSError:
+                        pass
+            lines.append(f"Size: {self._shell_size(size)}")
+            lines.append(f"Contains: {files:,} Files, {dirs:,} Folders")
+        else:
+            lines.append(f"Size: {self._shell_size(info.st_size)}")
+        stamp = '%A, %B %d, %Y, %I:%M:%S %p'
+        lines.append('')
+        lines.append(f"Modified: {datetime.datetime.fromtimestamp(info.st_mtime).strftime(stamp)}")
+        lines.append(f"Accessed: {datetime.datetime.fromtimestamp(info.st_atime).strftime(stamp)}")
+        lines.append('')
+        attributes = [label for flag, label in ((not os.access(host, os.W_OK), 'Read-only'),
+                                                (name.startswith('.'), 'Hidden'))
+                      if flag]
+        lines.append(f"Attributes: {', '.join(attributes) or 'None'}")
+        self._message_box('\n'.join(lines), f"{name} Properties", 0x40)  # MB_ICONINFORMATION
+
+    @staticmethod
+    def _shell_size(size):
+        for unit, scale in (('GB', 1 << 30), ('MB', 1 << 20), ('KB', 1 << 10)):
+            if size >= scale:
+                return f"{size / scale:.2f} {unit} ({size:,} bytes)"
+        return f"{size:,} bytes"
+
+    @staticmethod
+    def _shell_type_name(name):
+        extension = ntpath.splitext(name)[1][1:].upper()
+        return {'EXE': 'Application', 'DLL': 'Application Extension', 'TXT': 'Text Document',
+                'LNK': 'Shortcut'}.get(extension, f"{extension} File" if extension else 'File')
 
     def _com_write_text(self, address, size, text, wide):
         """Copy text to a caller buffer of size characters (truncated)"""
@@ -24426,6 +24735,18 @@ class PseudoWindowsGUI:
             if index == st['focus'] and focused:
                 width = columns[0]['width'] if report else text_w
                 pygame.draw.rect(self.screen, (128, 128, 128), (x0, y, width, row_h), 1)
+        if report and st['ex_style'] & 0x1:  # LVS_EX_GRIDLINES
+            # Row lines down the whole body (below the items too), column
+            # lines at the columns' right edges
+            grid = self.COLOR_BUTTON
+            for row in range(1, rows + 2):
+                y = cy + header_h + row * row_h - 1
+                pygame.draw.line(self.screen, grid, (body.left, y), (body.right - 1, y))
+            x = x0
+            for column in columns:
+                x += column['width']
+                if body.left <= x - 1 < body.right:
+                    pygame.draw.line(self.screen, grid, (x - 1, body.top), (x - 1, body.bottom - 1))
         self.screen.set_clip(clip)
         if scrollbar:
             bar = pygame.Rect(cx + cw - 16, cy + header_h, 16, ch - header_h)
