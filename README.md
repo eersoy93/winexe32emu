@@ -33,8 +33,9 @@ Use `-h` parameter for command-line help.
 
 ## Tested Programs
 
+- 7-Zip 4.65 (x86, setup and program)
+- 7-Zip 9.20 (x86, setup and program)
 - 7-Zip 26.06 (x86, setup and program)
-- 7-Zip 9.20 and 4.65 (NSIS setups and programs)
 - Ants (setup and program)
 - Ski32
 
