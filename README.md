@@ -37,32 +37,6 @@ Use `-h` parameter for command-line help.
 - Ants (setup and program)
 - Ski32
 
-## Folder Structure
-
-- `apps/` - App C source codes, one folder per app
-- `c_drive/` - Put your EXE files here (emulation path, `C:\`) and run them with the file manager or the command line.
-- `.github/workflows/ci.yml` - GitHub Actions: lint, unit tests and the test programs
-- `ruff.toml` - Lint settings
-- `scripts/compile_apps.sh` - Script to compile the apps into `c_drive/Windows/`
-- `scripts/compile_tests.sh` - Script to compile the test programs into `c_drive/Windows/Tests/`
-- `scripts/create_c_drive_environment.sh` - Script to create the `c_drive/` folders
-- `scripts/remove_c_drive_environment.sh` - Script to remove the compiled apps, the compiled test programs and the empty `c_drive/` folders
-- `scripts/remove_tests.sh` - Script to remove the compiled test programs
-- `scripts/run_tests.sh` - Script to compile the test programs and run each one in the emulator without the GUI
-- `src/` - The emulator's Python modules (module list in `src/__init__.py`)
-- `src/config.py` - Version, folders, environment and the ANSI code page
-- `src/logger.py` - Logging
-- `src/pe_loader.py` - PE file loading and analysis
-- `src/paths.py`, `src/resources.py`, `src/guest.py` - Helpers (the emulated C: drive, shell links, icons, cursors, guest results)
-- `src/sound.py` - Sound output
-- `src/winapi/` - Win32 API emulation (`WinAPIHandler`), one module per API area
-- `src/windows.py`, `src/gui.py` - Fake Windows desktop (Pygame)
-- `src/cpu.py` - x86 CPU emulation (Unicorn)
-- `src/main.py` - Command line
-- `tests/` - Test program C source codes
-- `tests/python/` - Unit tests of the emulator (Python `unittest`)
-- `winexe32emu.py` - The main script (runs `src/main.py`)
-
 ## Features
 
 - PE file loading and analysis
