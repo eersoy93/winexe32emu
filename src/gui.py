@@ -391,16 +391,24 @@ class PseudoWindowsGUI:
     DOUBLE_CLICK_MS = 500
 
     def _refresh_desktop_icons(self):
-        """Read the desktop icons, (label, path or shortcut) pairs: the file
-        manager (if compiled), then the shortcuts and programs of the user's and
-        the public Desktop folders"""
+        """Read the desktop icons, (label, path or shortcut) pairs: My Computer
+        (the file manager, if compiled), then the shortcuts and programs of the
+        user's (C:\\Users\\User\\Desktop) and the public Desktop folders"""
         self.desktop_icons, self.desktop_icon_paths = [], {}
         if self._file_manager_available():
             self.desktop_icons.append((self._program_label(FILE_MANAGER_PATH), FILE_MANAGER_PATH))
             self.desktop_icon_paths[FILE_MANAGER_PATH] = resolve_c_drive_path(FILE_MANAGER_PATH)
-        _, items = self._shortcut_entries([winapi.WinAPIHandler.SHELL_FOLDERS[0x10],   # DESKTOPDIRECTORY
-                                           winapi.WinAPIHandler.SHELL_FOLDERS[0x19]],  # COMMON_DESKTOP...
-                                          self.desktop_icon_paths)
+        folders = [winapi.WinAPIHandler.SHELL_FOLDERS[0x10],   # CSIDL_DESKTOPDIRECTORY
+                   winapi.WinAPIHandler.SHELL_FOLDERS[0x19]]   # CSIDL_COMMON_DESKTOPDIRECTORY
+        for folder in folders:
+            # Like on a real installation the Desktop folders exist, ready for shortcuts
+            host = resolve_c_drive_path(folder)
+            if host:
+                try:
+                    os.makedirs(host, exist_ok=True)
+                except OSError:
+                    pass
+        _, items = self._shortcut_entries(folders, self.desktop_icon_paths)
         self.desktop_icons += items
         self.selected_icon = None
         self.exe_icon_cache.clear()  # Programs may have been replaced
@@ -578,7 +586,7 @@ class PseudoWindowsGUI:
 
     def _fill_start_menu(self):
         """Build the Start menu: Programs (the Start Menu folders of the user and
-        of all users with their shortcuts, then the File Manager, if compiled, in
+        of all users with their shortcuts, then My Computer, if compiled, in
         its own section) and Exit.
         Rows are ('program', label, path or shortcut), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
@@ -806,7 +814,7 @@ class PseudoWindowsGUI:
     @staticmethod
     def _program_label(path):
         if path.lower() == FILE_MANAGER_PATH.lower():
-            return "File Manager"
+            return "My Computer"
         return os.path.splitext(path.rsplit('\\', 1)[-1])[0]
 
     def _draw_start_menu(self):

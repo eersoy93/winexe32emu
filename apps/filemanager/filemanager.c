@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /*
-File Manager - browses the emulated C drive and runs EXE files.
+My Computer (the file manager) - browses the emulated C drive and runs EXE files.
 
   - Double-click / Enter / Open: enter a folder, or run an EXE
   - Backspace / Up: go to the parent folder
@@ -218,7 +218,7 @@ static void load_folder(const char *select)
         SendMessageA(hList, LB_SETCURSEL, sel, 0);
 
     SetWindowTextA(hPath, current);
-    wsprintfA(title, "File Manager - %s", current);
+    wsprintfA(title, "My Computer - %s", current);
     SetWindowTextA(hMain, title);
     update_status();
 }
@@ -254,7 +254,7 @@ static void run_program(const Entry *e)
         CloseHandle(pi.hProcess);
     } else {
         wsprintfA(message, "Cannot run %s (error %lu).", path, (unsigned long)GetLastError());
-        MessageBoxA(hMain, message, "File Manager", MB_OK | MB_ICONERROR);
+        MessageBoxA(hMain, message, "My Computer", MB_OK | MB_ICONERROR);
     }
 }
 
@@ -278,7 +278,7 @@ static void open_selected(void)
         format_time(date, &e->modified);
         wsprintfA(message, "%s\n\nSize: %s bytes\nModified: %s\n\nOnly EXE files can be opened.",
                   e->name, number, date);
-        MessageBoxA(hMain, message, "File Manager", MB_OK | MB_ICONINFORMATION);
+        MessageBoxA(hMain, message, "My Computer", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -325,7 +325,7 @@ static HMENU create_menu(void)
     AppendMenuA(file, MF_STRING, IDM_REFRESH, "&Refresh\tF5");
     AppendMenuA(file, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file, MF_STRING, IDM_EXIT, "E&xit");
-    AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About File Manager");
+    AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About My Computer");
     AppendMenuA(menu, MF_POPUP, (UINT_PTR)file, "&File");
     AppendMenuA(menu, MF_POPUP, (UINT_PTR)help, "&Help");
     return menu;
@@ -383,9 +383,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hwnd);
             break;
         case IDM_ABOUT:
-            MessageBoxA(hwnd, "File Manager for winexe32emu\n\n"
+            MessageBoxA(hwnd, "My Computer for winexe32emu\n\n"
                         "Double-click a folder to open it, or an EXE file to run it.",
-                        "About File Manager", MB_OK | MB_ICONINFORMATION);
+                        "About My Computer", MB_OK | MB_ICONINFORMATION);
             break;
         }
         return 0;
@@ -455,7 +455,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!RegisterClassA(&wc))
         return 1;
 
-    hwnd = CreateWindowExA(0, wc.lpszClassName, "File Manager", WS_OVERLAPPEDWINDOW,
+    hwnd = CreateWindowExA(0, wc.lpszClassName, "My Computer", WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT, 560, 420,
                            NULL, create_menu(), hInstance, NULL);
     if (!hwnd)
