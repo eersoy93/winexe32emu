@@ -1,0 +1,509 @@
+# Copyright 2025-2026 Erdem Ersoy (eersoy93)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""WinAPIHandler mixin: USER32: system metrics, message boxes, window classes, creating windows"""
+
+import struct
+
+from colorama import Fore, Style
+from unicorn import *
+
+from .. import config, windows
+from ..logger import log
+
+
+class User32WindowsMixin:
+    """USER32: system metrics, message boxes, window classes, creating windows"""
+
+    # USER32.DLL APIs
+    def _screen_size(self):
+        """Size of the fake desktop (fixed 1920x1080 without the GUI)"""
+        if self.gui:
+            return self.gui.width, self.gui.height
+        return 1920, 1080
+
+    def GetSystemMetrics(self, args):
+        """GetSystemMetrics emulation"""
+        nIndex = args[0]
+        width, height = self._screen_size()
+        
+        metrics = {
+            0: width,  # SM_CXSCREEN
+            1: height, # SM_CYSCREEN
+            2: 20,     # SM_CXVSCROLL
+            3: 20,     # SM_CYHSCROLL
+            4: 25,     # SM_CYCAPTION
+            5: 1,      # SM_CXBORDER
+            6: 1,      # SM_CYBORDER
+            16: width,  # SM_CXFULLSCREEN
+            17: height - 30 - 25,  # SM_CYFULLSCREEN: minus taskbar and caption
+            80: 1,     # SM_CMONITORS
+        }
+        
+        result = metrics.get(nIndex, 0)
+        log.debug(f"GetSystemMetrics({nIndex}) -> {result}")
+        return result
+    
+    # MB_OK ... MB_CANCELTRYCONTINUE: (label, result id) of the buttons
+    MESSAGEBOX_BUTTONS = {0: [('OK', 1)], 1: [('OK', 1), ('Cancel', 2)],
+                          2: [('&Abort', 3), ('&Retry', 4), ('&Ignore', 5)],
+                          3: [('&Yes', 6), ('&No', 7), ('Cancel', 2)],
+                          4: [('&Yes', 6), ('&No', 7)], 5: [('&Retry', 4), ('Cancel', 2)],
+                          6: [('Cancel', 2), ('&Try Again', 10), ('&Continue', 11)]}
+
+    @classmethod
+    def messagebox_buttons(cls, utype):
+        """(buttons, index of the default button, result of Esc/close or None)"""
+        buttons = cls.MESSAGEBOX_BUTTONS.get(utype & 0xF, cls.MESSAGEBOX_BUTTONS[0])
+        default = min((utype >> 8) & 0xF, len(buttons) - 1)
+        ids = [result for _, result in buttons]
+        cancel = 2 if 2 in ids else (1 if ids == [1] else None)
+        return buttons, default, cancel
+
+    def _message_box(self, text, caption, utype):
+        """Modal message box: blocks until a button is chosen, returns its id"""
+        log.info(f"{Fore.YELLOW}[MESSAGEBOX]{Style.RESET_ALL} {caption}: {text}")
+        buttons, default, cancel = self.messagebox_buttons(utype)
+        if not (self.gui and self.gui.running):
+            return buttons[default][1]  # Nobody can answer: the default button
+        request = {'result': None}
+        self.gui.show_messagebox(caption, text, utype, request)
+        self.emu.wait_until(lambda: request['result'] is not None or not self.gui.running)
+        if request['result'] is None:
+            return cancel or buttons[default][1]
+        return request['result']
+
+    def MessageBoxA(self, args, wide=False):
+        """MessageBoxA/W emulation"""
+        lpText, lpCaption, uType = args[1], args[2], args[3]
+        text = self._read_text(lpText, wide) if lpText else ""
+        caption = self._read_text(lpCaption, wide) if lpCaption else "Error"
+        return self._message_box(text, caption, uType)
+
+    def MessageBoxW(self, args):
+        return self.MessageBoxA(args, wide=True)
+
+    def RegisterClassA(self, args, wide=False):
+        """RegisterClassA/W emulation"""
+        lpWndClass = args[0]
+        
+        # Read WNDCLASS structure
+        try:
+            wndclass_data = self.emu.uc.mem_read(lpWndClass, 40)
+            style = struct.unpack("<I", wndclass_data[0:4])[0]
+            lpfnWndProc = struct.unpack("<I", wndclass_data[4:8])[0]
+            hInstance = struct.unpack("<I", wndclass_data[16:20])[0]
+            hCursor = struct.unpack("<I", wndclass_data[24:28])[0]
+            hbrBackground = struct.unpack("<I", wndclass_data[28:32])[0]
+            lpszMenuName = struct.unpack("<I", wndclass_data[32:36])[0]
+            lpszClassName = struct.unpack("<I", wndclass_data[36:40])[0]
+            
+            class_name = self._read_text(lpszClassName, wide)
+            
+            atom = self.next_atom
+            self.next_atom += 1
+            
+            self.registered_classes[class_name] = {
+                'atom': atom,
+                'style': style,
+                'wndproc': lpfnWndProc,
+                'hInstance': hInstance,
+                'background': hbrBackground,
+                'cursor': hCursor,
+                'menu': (lpszMenuName if lpszMenuName < 0x10000 else
+                         self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
+            }
+            self.atoms[atom] = class_name
+            
+            log.debug(f"RegisterClassA('{class_name}') -> 0x{atom:x}")
+            return atom
+        except UcError:
+            return 0
+
+    def RegisterClassW(self, args):
+        return self.RegisterClassA(args, wide=True)
+    
+    def RegisterClassExA(self, args, wide=False):
+        """RegisterClassExA/W emulation"""
+        lpwcx = args[0]
+        
+        try:
+            # Read WNDCLASSEX structure
+            wcex_data = self.emu.uc.mem_read(lpwcx, 48)
+            cbSize = struct.unpack("<I", wcex_data[0:4])[0]
+            style = struct.unpack("<I", wcex_data[4:8])[0]
+            lpfnWndProc = struct.unpack("<I", wcex_data[8:12])[0]
+            hInstance = struct.unpack("<I", wcex_data[20:24])[0]
+            hCursor = struct.unpack("<I", wcex_data[28:32])[0]
+            hbrBackground = struct.unpack("<I", wcex_data[32:36])[0]
+            lpszMenuName = struct.unpack("<I", wcex_data[36:40])[0]
+            lpszClassName = struct.unpack("<I", wcex_data[40:44])[0]
+            
+            class_name = self._read_text(lpszClassName, wide)
+            
+            atom = self.next_atom
+            self.next_atom += 1
+            
+            self.registered_classes[class_name] = {
+                'atom': atom,
+                'style': style,
+                'wndproc': lpfnWndProc,
+                'hInstance': hInstance,
+                'background': hbrBackground,
+                'cursor': hCursor,
+                'menu': (lpszMenuName if lpszMenuName < 0x10000 else
+                         self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
+            }
+            self.atoms[atom] = class_name
+            
+            log.debug(f"RegisterClassExA('{class_name}') -> 0x{atom:x}")
+            return atom
+        except UcError:
+            return 0
+
+    def RegisterClassExW(self, args):
+        return self.RegisterClassExA(args, wide=True)
+    
+    def CreateWindowExA(self, args, wide=False):
+        """CreateWindowExA/W emulation"""
+        dwExStyle = args[0]
+        lpClassName = args[1]
+        lpWindowName = args[2]
+        dwStyle = args[3]
+        CW_USEDEFAULT = -0x80000000
+        x, y, nWidth, nHeight = self._read_signed_args(args, 4, 4)
+        x = x if x != CW_USEDEFAULT else 100
+        y = y if y != CW_USEDEFAULT else 100
+        if nWidth == CW_USEDEFAULT and not dwStyle & (self.WS_CHILD | self.WS_POPUP):
+            # Like Windows: a default overlapped window gets 3/4 of the desktop
+            screen_w, screen_h = self._screen_size()
+            nWidth = min(screen_w * 3 // 4, screen_w - x)
+            nHeight = min((screen_h - 30) * 3 // 4, screen_h - 30 - y)
+        nWidth = nWidth if nWidth != CW_USEDEFAULT else 400
+        nHeight = nHeight if nHeight != CW_USEDEFAULT else 300
+        hWndParent = args[8]
+        hMenu = args[9]
+        hInstance = args[10]
+        lpParam = args[11]
+        
+        # Class name can be atom or string
+        if lpClassName < 0x10000:
+            class_name = self.atoms.get(lpClassName, f"ATOM_{lpClassName}")
+        else:
+            class_name = self._read_text(lpClassName, wide)
+        
+        window_name = self._read_text(lpWindowName, wide)
+        
+        log.info(f"{Fore.GREEN}CreateWindowExA{Style.RESET_ALL}('{class_name}', '{window_name}', "
+                f"pos=({x},{y}), size=({nWidth},{nHeight}))")
+        
+        # Create real window if GUI exists
+        if self.gui and self.gui.running:
+            native = self.NATIVE_CLASSES.get(class_name.upper()) if isinstance(class_name, str) \
+                else None
+            if native and (hWndParent in self.gui.windows or not dwStyle & self.WS_CHILD):
+                hwnd = self._create_native(native, class_name, window_name, x, y, nWidth,
+                                           nHeight, dwStyle, dwExStyle, hWndParent, hMenu)
+                win = self.gui.windows[hwnd]
+                if dwStyle & self.WS_VISIBLE and native != 'TOOLTIPS':
+                    win.visible = True
+                if native == 'TOOLBAR' and not dwStyle & 0x4:  # CCS_NORESIZE
+                    self._tb_autosize(win)
+                return hwnd
+            # Create control for top-level controls
+            if class_name.upper() == "MSCTLS_STATUSBAR32" and hWndParent in self.gui.windows:
+                hwnd = self._create_status_bar(hWndParent, window_name, dwStyle, hMenu)
+            elif class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
+                                        "SCROLLBAR", "MSCTLS_PROGRESS32"]:
+                # BUTTON with a checkbox or radio button style is drawn and
+                # clicked as a checkbox
+                control_class = class_name
+                if (class_name.upper() == "BUTTON" and
+                        (dwStyle & 0xF) in self.CHECK_BUTTON_STYLES):
+                    control_class = "CHECKBOX"
+                elif class_name.upper() == "MSCTLS_PROGRESS32":
+                    control_class = "PROGRESSBAR"
+                # For child controls hMenu carries the control ID (used by WM_COMMAND)
+                hwnd = self.gui.create_control(hWndParent, control_class, window_name,
+                                               x, y, nWidth, nHeight, dwStyle,
+                                               control_id=hMenu, ex_style=dwExStyle)
+                self.dirty_controls[hwnd] = True
+            else:
+                parent = hWndParent if dwStyle & self.WS_CHILD else 0
+                hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle,
+                                              owner=self, parent=parent)
+
+            # Save class_name to window (for finding WndProc)
+            if hwnd in self.gui.windows:
+                self.gui.windows[hwnd].class_name = class_name
+                # The client area is erased with the class background brush
+                wndclass = self.registered_classes.get(class_name)
+                if wndclass and wndclass.get('background'):
+                    color = self._brush_color(wndclass['background'])
+                    if color is not None:
+                        self.gui.windows[hwnd].bg_color = color
+                # Top-level windows get their menu bar from hMenu (like SetMenu),
+                # else from the class menu (lpszMenuName)
+                if (not dwStyle & self.WS_CHILD and not hMenu and wndclass and
+                        wndclass.get('menu')):
+                    menu_name = wndclass['menu']
+                    hMenu = self._load_menu_resource(menu_name.upper() if isinstance(
+                        menu_name, str) and not menu_name.startswith('#') else
+                        int(menu_name[1:]) if isinstance(menu_name, str) else menu_name)
+                if not dwStyle & self.WS_CHILD and hMenu in self.menus:
+                    self.gui.windows[hwnd].menu_handle = hMenu
+                    self.gui.windows[hwnd].menu = self._build_menu_tree(hMenu)
+                elif dwStyle & self.WS_CHILD:
+                    self.gui.windows[hwnd].control_id = hMenu
+
+            # Real Windows sends WM_CREATE to the WndProc synchronously, before
+            # CreateWindowEx returns. Apps often create their child controls here.
+            # Controls have no app WndProc, so this only fires for app windows.
+            wndproc = self._find_wndproc_for_hwnd(hwnd)
+            if wndproc:
+                cs_addr = self._build_createstruct(
+                    lpParam, hInstance, hMenu, hWndParent,
+                    nHeight, nWidth, y, x, dwStyle, lpWindowName, lpClassName, dwExStyle)
+                # WM_NCCREATE comes first (many frameworks attach their window
+                # object there), then WM_CREATE
+                self.emu.call_wndproc(wndproc, hwnd, self.WM_NCCREATE, 0, cs_addr)
+                self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
+                if dwStyle & (self.WS_CHILD | self.WS_POPUP):
+                    self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
+            # WS_VISIBLE windows are shown without an explicit ShowWindow call
+            win = self.gui.windows.get(hwnd)
+            if (dwStyle & self.WS_VISIBLE and isinstance(win, windows.FakeWindow)
+                    and not win.visible):
+                self.gui.show_window(hwnd, True)
+                if win.size_state is None:
+                    self._send_size(hwnd)
+        else:
+            hwnd = self.get_next_handle()
+
+        return hwnd
+
+    def CreateWindowExW(self, args):
+        return self.CreateWindowExA(args, wide=True)
+
+    WM_NCCREATE = 0x0081
+    WS_CHILD = 0x40000000
+    WS_POPUP = 0x80000000
+    WS_VISIBLE = 0x10000000
+    WS_BORDER = 0x00800000
+    WS_EX_CLIENTEDGE = 0x00000200
+    WM_SIZE = 0x0005
+    WM_ACTIVATE = 0x0006
+
+    def _send_size(self, hwnd):
+        """Send WM_SIZE now if the window's client size or state changed
+        (window creation, MoveWindow, SetWindowPos)"""
+        if not self.gui or hwnd not in self.gui.windows:
+            return
+        win = self.gui.windows[hwnd]
+        state = self.gui.size_state(win)
+        if state == win.size_state:
+            return
+        win.size_state = state
+        wndproc = self._find_wndproc_for_hwnd(hwnd)
+        if wndproc:
+            kind, width, height = state
+            self.emu.call_wndproc(wndproc, hwnd, self.WM_SIZE, kind,
+                                  ((height & 0xFFFF) << 16) | (width & 0xFFFF))
+
+    def _build_createstruct(self, lpCreateParams, hInstance, hMenu, hwndParent,
+                            cy, cx, y, x, style, lpszName, lpszClass, dwExStyle):
+        """Allocate and fill a CREATESTRUCTA, return its address (for WM_CREATE)."""
+        addr = self.emu.heap_alloc(48)
+        data = struct.pack("<IIIIiiiiIIII",
+                           lpCreateParams & 0xFFFFFFFF,
+                           hInstance & 0xFFFFFFFF,
+                           hMenu & 0xFFFFFFFF,
+                           hwndParent & 0xFFFFFFFF,
+                           cy, cx, y, x,
+                           style & 0xFFFFFFFF,
+                           lpszName & 0xFFFFFFFF,
+                           lpszClass & 0xFFFFFFFF,
+                           dwExStyle & 0xFFFFFFFF)
+        self.emu.uc.mem_write(addr, data)
+        return addr
+    
+    def ShowWindow(self, args):
+        """ShowWindow emulation"""
+        hWnd = args[0]
+        nCmdShow = args[1]
+        
+        show_names = {0: "SW_HIDE", 1: "SW_SHOWNORMAL", 2: "SW_SHOWMINIMIZED",
+                     3: "SW_SHOWMAXIMIZED", 4: "SW_SHOWNOACTIVATE", 5: "SW_SHOW"}
+        show_name = show_names.get(nCmdShow, f"SW_{nCmdShow}")
+        
+        log.debug(f"ShowWindow(0x{hWnd:x}, {show_name})")
+        
+        if self.gui and self.gui.running:
+            show = nCmdShow in [1, 3, 5, 6, 7, 8, 9, 10]
+            self.gui.show_window(hWnd, show)
+            win = self.gui.windows.get(hWnd)
+            if win is not None and win.parent is None and nCmdShow in (3, 9):
+                with self.gui.lock:
+                    if nCmdShow == 3 and not win.maximized:  # SW_SHOWMAXIMIZED
+                        win.minimized = False
+                        win.maximize(self.gui.width, self.gui.height, 30)
+                    elif nCmdShow == 9:  # SW_RESTORE
+                        win.restore()
+                self._send_size(hWnd)
+            elif show and win is not None and win.size_state is None:
+                self._send_size(hWnd)
+        
+        return 1
+    
+    def UpdateWindow(self, args):
+        """UpdateWindow emulation"""
+        hWnd = args[0]
+        log.debug(f"UpdateWindow(0x{hWnd:x})")
+        return 1
+    
+    def DestroyWindow(self, args):
+        """DestroyWindow emulation"""
+        hWnd = args[0]
+        log.debug(f"DestroyWindow(0x{hWnd:x})")
+
+        if self.gui and hWnd in self.gui.controls:
+            self.gui.destroy_control(hWnd)
+        elif self.gui and hWnd in self.dialogs:
+            dialog = self.dialogs[hWnd]
+            if not dialog.get('destroying'):
+                # WM_DESTROY reaches the dialog procedure while its controls still exist
+                dialog['destroying'] = True
+                if dialog['proc']:
+                    self.emu.call_wndproc(dialog['proc'], hWnd, self.WM_DESTROY, 0, 0)
+                self._close_dialog(hWnd)
+        elif self.gui and hWnd in self.gui.windows and self.gui.windows[hWnd].parent:
+            # A child window (control) goes away at once, after its WM_DESTROY
+            wndproc = self._find_wndproc_for_hwnd(hWnd)
+            if wndproc:
+                self._call_proc(wndproc, hWnd, self.WM_DESTROY, 0, 0)
+            with self.gui.lock:
+                self.gui._remove_window(hWnd)
+            self.painted_windows.discard(hWnd)
+            self.window_longs.pop(hWnd, None)
+        elif self.gui and hWnd in self.gui.windows:
+            self.gui._close_window(hWnd, notify_app=False)
+            # Deliver WM_DESTROY via the queue: a synchronous call here would
+            # nest emu_start inside an already-running callback
+            if self._find_wndproc_for_hwnd(hWnd):
+                self.post_window_message(hWnd, self.WM_DESTROY, 0, 0)
+
+        return 1
+    
+    def SetWindowTextA(self, args, wide=False):
+        """SetWindowTextA/W emulation"""
+        hWnd = args[0]
+        lpString = args[1]
+        
+        text = self._read_text(lpString, wide)
+        log.debug(f"SetWindowTextA(0x{hWnd:x}, '{text}')")
+        
+        combo = self._native_window(hWnd, 'COMBOBOXEX') if self.gui else None
+        if combo is not None:
+            self.comboboxex_set_text(combo, text)
+        elif self.gui:
+            self.gui.set_window_text(hWnd, text)
+        
+        return 1
+
+    def SetWindowTextW(self, args):
+        return self.SetWindowTextA(args, wide=True)
+    
+    def GetWindowTextA(self, args, wide=False):
+        """GetWindowTextA/W emulation"""
+        hWnd = args[0]
+        lpString = args[1]
+        nMaxCount = args[2]
+        
+        text = self._window_text(hWnd)
+        self._last_error = 0
+
+        # Always null-terminate the buffer (like real Windows), even when
+        # the text is empty - the caller's buffer is uninitialized memory
+        if lpString and nMaxCount > 0:
+            if wide:
+                text_bytes = text.encode('utf-16-le')[:(nMaxCount - 1) * 2]
+                self.emu.uc.mem_write(lpString, text_bytes + b'\x00\x00')
+                copied = len(text_bytes) // 2
+            else:
+                text_bytes = text.encode(config.ANSI_CODEPAGE, errors='replace')[:nMaxCount - 1]
+                self.emu.uc.mem_write(lpString, text_bytes + b'\x00')
+                copied = len(text_bytes)
+        else:
+            copied = 0
+
+        log.debug(f"GetWindowTextA(0x{hWnd:x}) -> '{text}'")
+        return copied
+
+    def GetWindowTextW(self, args):
+        return self.GetWindowTextA(args, wide=True)
+    
+    def GetClientRect(self, args):
+        """GetClientRect emulation"""
+        hWnd = args[0]
+        lpRect = args[1]
+        
+        # Default rectangle
+        left, top, right, bottom = 0, 0, 400, 300
+
+        if self.gui and hWnd in self.gui.windows:
+            win = self.gui.windows[hWnd]
+            right, bottom = self.gui.client_size(win)
+        elif self.gui and hWnd in self.gui.controls:
+            control = self.gui.controls[hWnd]
+            if control.class_name == 'STATUSBAR':
+                self.gui.layout_statusbar(control)
+            right, bottom = control.width, control.height
+        
+        if lpRect:
+            rect_data = struct.pack("<iiii", left, top, right, bottom)
+            self.emu.uc.mem_write(lpRect, rect_data)
+        
+        log.debug(f"GetClientRect(0x{hWnd:x}) -> ({left}, {top}, {right}, {bottom})")
+        return 1
+    
+    def GetWindowRect(self, args):
+        """GetWindowRect emulation"""
+        hWnd = args[0]
+        lpRect = args[1]
+        
+        left, top, right, bottom = 100, 100, 500, 400
+        
+        if self.gui and hWnd in self.gui.windows:
+            win = self.gui.windows[hWnd]
+            left, top = win.x, win.y
+            if win.parent in self.gui.windows:
+                ox, oy = self.gui.client_origin(self.gui.windows[win.parent])
+                left, top = ox + win.x, oy + win.y
+            right = left + win.width
+            bottom = top + win.height
+        elif self.gui and hWnd in self.gui.controls:
+            control = self.gui.controls[hWnd]
+            parent = self.gui.windows.get(control.parent_hwnd)
+            if control.class_name == 'STATUSBAR':
+                self.gui.layout_statusbar(control)
+            ox, oy = self.gui.client_origin(parent) if parent else (0, 0)
+            left, top = ox + control.x, oy + control.y
+            right, bottom = left + control.width, top + control.height
+        
+        if lpRect:
+            rect_data = struct.pack("<iiii", left, top, right, bottom)
+            self.emu.uc.mem_write(lpRect, rect_data)
+        
+        log.debug(f"GetWindowRect(0x{hWnd:x}) -> ({left}, {top}, {right}, {bottom})")
+        return 1

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests of winexe32emu.py parts that need no emulated program
+"""Unit tests of the winexe32emu parts (src/) that need no emulated program
 (the C test programs in tests/ cover the emulation: scripts/run_tests.sh).
 
 Run from the repository root:
@@ -27,11 +27,16 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
-import winexe32emu as emu  # noqa: E402
+from src import pe_loader  # noqa: E402
+from src.config import C_DRIVE_PATH  # noqa: E402
+from src.cpu import CPUEmulator  # noqa: E402
+from src.logger import DebugLogger  # noqa: E402
+from src.paths import resolve_c_drive_path, strip_win32_path_prefix  # noqa: E402
+from src.pe_loader import PELoader  # noqa: E402
+from src.winapi import WinAPIHandler  # noqa: E402
 
-WinAPIHandler = emu.WinAPIHandler
 # Some tests provoke warnings (blocked paths, a broken registry file)
-emu.DebugLogger.level = emu.DebugLogger.WARNING + 1
+DebugLogger.level = DebugLogger.WARNING + 1
 
 
 def bare_handler():
@@ -88,10 +93,10 @@ class ParseIntegerTest(unittest.TestCase):
 
 class NamesTest(unittest.TestCase):
     def test_ordinal_names(self):
-        self.assertEqual(emu.PELoader.ordinal_name('COMCTL32.dll', 17), 'InitCommonControls')
-        self.assertEqual(emu.PELoader.ordinal_name('comctl32.dll', 9999), 'Ordinal_9999')
-        if emu.ordlookup is not None:
-            self.assertEqual(emu.PELoader.ordinal_name('oleaut32', 6), 'SysFreeString')
+        self.assertEqual(PELoader.ordinal_name('COMCTL32.dll', 17), 'InitCommonControls')
+        self.assertEqual(PELoader.ordinal_name('comctl32.dll', 9999), 'Ordinal_9999')
+        if pe_loader.ordlookup is not None:
+            self.assertEqual(PELoader.ordinal_name('oleaut32', 6), 'SysFreeString')
 
     def test_undecorated_type_names(self):
         undecorate = bare_handler()._undecorate_type_name
@@ -177,25 +182,25 @@ class ApiBindingTest(unittest.TestCase):
 
 class SandboxTest(unittest.TestCase):
     def test_paths_stay_in_c_drive(self):
-        root = os.path.realpath(emu.C_DRIVE_PATH)
+        root = os.path.realpath(C_DRIVE_PATH)
         for name in (r'C:\Windows\..\..\..\etc\passwd', r'..\..\x', '/etc/passwd',
                      r'\\server\share\x', r'\\?\C:\..\..\x', r'D:\..\..\x'):
             with self.subTest(name=name):
-                path = emu.resolve_c_drive_path(name)
+                path = resolve_c_drive_path(name)
                 self.assertTrue(path is None or os.path.realpath(path).startswith(root + os.sep),
                                 path)
 
     def test_win32_prefixes(self):
-        self.assertEqual(emu.strip_win32_path_prefix(r'\\?\C:\x'), r'C:\x')
-        self.assertEqual(emu.strip_win32_path_prefix(r'\\.\C:\x'), r'C:\x')
-        self.assertIsNone(emu.strip_win32_path_prefix(r'\\?\UNC\server\x'))
-        self.assertEqual(emu.strip_win32_path_prefix(r'C:\x'), r'C:\x')
+        self.assertEqual(strip_win32_path_prefix(r'\\?\C:\x'), r'C:\x')
+        self.assertEqual(strip_win32_path_prefix(r'\\.\C:\x'), r'C:\x')
+        self.assertIsNone(strip_win32_path_prefix(r'\\?\UNC\server\x'))
+        self.assertEqual(strip_win32_path_prefix(r'C:\x'), r'C:\x')
 
 
 class CpuExceptionStateTest(unittest.TestCase):
     def test_calibration(self):
         """The field that turns a second #DE into a double fault is found"""
-        offset = emu.CPUEmulator._find_exception_state_offset()
+        offset = CPUEmulator._find_exception_state_offset()
         self.assertIsInstance(offset, int)
 
 

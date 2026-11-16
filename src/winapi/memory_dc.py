@@ -1,0 +1,835 @@
+# Copyright 2025-2026 Erdem Ersoy (eersoy93)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""WinAPIHandler mixin: Memory DC / double buffering, bitmaps, device independent bitmaps"""
+
+import struct
+
+from unicorn import *
+
+from .. import config, gui
+from ..config import PYGAME_AVAILABLE
+from ..logger import log
+
+if PYGAME_AVAILABLE:
+    import pygame
+
+
+class MemoryDCMixin:
+    """Memory DC / double buffering, bitmaps, device independent bitmaps"""
+
+    # ==================== MEMORY DC / DOUBLE BUFFERING ====================
+
+    def CreateCompatibleDC(self, args):
+        """CreateCompatibleDC emulation - off-screen memory DC"""
+        hdc = args[0]
+        mem_dc = self._create_dc(0, memory=True)
+        log.debug(f"CreateCompatibleDC(0x{hdc:x}) -> 0x{mem_dc:x}")
+        return mem_dc
+
+    def CreateCompatibleBitmap(self, args):
+        """CreateCompatibleBitmap emulation"""
+        hdc = args[0]
+        width = args[1]
+        height = args[2]
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height,
+                                    'bpp': 32, 'shapes': []}
+        log.debug(f"CreateCompatibleBitmap(0x{hdc:x}, {width}, {height}) -> 0x{handle:x}")
+        return handle
+
+    def DeleteDC(self, args):
+        """DeleteDC emulation - free a memory DC"""
+        hdc = args[0]
+        log.debug(f"DeleteDC(0x{hdc:x})")
+        self._delete_dc(hdc)
+        return 1
+
+    @staticmethod
+    def _translate_shape(shape, dx, dy):
+        """Copy of a display list entry shifted by (dx, dy)"""
+        moved = dict(shape)
+        if 'rect' in moved:
+            l, t, r, b = moved['rect']
+            moved['rect'] = (l + dx, t + dy, r + dx, b + dy)
+        if 'pos' in moved:
+            x, y = moved['pos']
+            moved['pos'] = (x + dx, y + dy)
+        if 'from' in moved:
+            x, y = moved['from']
+            moved['from'] = (x + dx, y + dy)
+        if 'to' in moved:
+            x, y = moved['to']
+            moved['to'] = (x + dx, y + dy)
+        if 'points' in moved:
+            moved['points'] = [(x + dx, y + dy) for x, y in moved['points']]
+        return moved
+
+    def BitBlt(self, args):
+        """BitBlt emulation - copy a memory DC's display list to the target.
+
+        A blit that covers the whole client area replaces the window's
+        display list, so per-frame game rendering doesn't accumulate shapes.
+        """
+        hdcDest = args[0]
+        x, y, cx, cy = self._read_signed_args(args, 1, 4)
+        hdcSrc = args[5]
+        sx, sy = self._read_signed_args(args, 6, 2)
+        rop = args[8]
+
+        log.debug(f"BitBlt(0x{hdcDest:x}, {x}, {y}, {cx}, {cy}, src=0x{hdcSrc:x}, rop=0x{rop:08x})")
+
+        if rop in (self.BLACKNESS, self.WHITENESS, self.PATCOPY):
+            return self.PatBlt([hdcDest, x, y, cx, cy, rop])
+
+        src_state = self.dc_state.get(hdcSrc)
+        if not src_state or not src_state.get('memory'):
+            return 1  # Only memory DC sources carry shapes
+
+        dx, dy = x - sx, y - sy
+        shapes = []
+        for shape in src_state['shapes']:
+            if shape['type'] == 'image':
+                shape = self._crop_image(shape, sx, sy, cx, cy, rop)
+                if shape is None:
+                    continue
+            else:
+                box = gui.PseudoWindowsGUI.shape_bbox(shape)
+                if box and (box[2] <= sx or box[0] >= sx + cx or
+                            box[3] <= sy or box[1] >= sy + cy):
+                    continue  # Outside the copied area
+                if shape['type'] == 'rect':
+                    l, t, r, b = box
+                    shape = dict(shape, rect=(max(l, sx), max(t, sy),
+                                              min(r, sx + cx), min(b, sy + cy)))
+            shapes.append(self._translate_shape(shape, dx, dy))
+
+        # Shapes under a later one covering the whole copied area are invisible
+        for i in range(len(shapes) - 1, 0, -1):
+            if gui.PseudoWindowsGUI.covers_rect(shapes[i], (x, y, x + cx, y + cy)):
+                shapes = shapes[i:]
+                break
+
+        dest_state = self.dc_state.get(hdcDest)
+        if dest_state and dest_state.get('memory'):
+            bmp = self.gdi_objects.get(dest_state.get('bitmap', 0))
+            if bmp and bmp.get('bpp') == 1:
+                shapes = [self._to_monochrome(s, src_state['bk_color']) for s in shapes]
+            for shape in shapes:
+                self._add_shape(hdcDest, shape)
+            return 1
+
+        hwnd = self._dc_hwnd(hdcDest)
+        if not self.gui or not hwnd or hwnd not in self.gui.windows:
+            return 1
+
+        window = self.gui.windows[hwnd]
+        client_w, client_h = self.gui.client_size(window)
+        if x <= 0 and y <= 0 and x + cx >= client_w and y + cy >= client_h:
+            # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
+            window.drawn_shapes = shapes
+        else:
+            for shape in shapes:
+                self.gui.add_shape(hwnd, shape)
+        return 1
+
+    # Raster operations
+    SRCCOPY = 0x00CC0020
+    SRCPAINT = 0x00EE0086
+    SRCAND = 0x008800C6
+    SRCINVERT = 0x00660046
+    NOTSRCCOPY = 0x00330008
+    PATCOPY = 0x00F00021
+    BLACKNESS = 0x00000042
+    WHITENESS = 0x00FF0062
+
+    def _crop_image(self, shape, sx, sy, cx, cy, rop):
+        """Part of an image shape inside the source rect (sx, sy, cx, cy), or None.
+
+        A non-SRCCOPY blit replaces the raster operation the image is drawn with.
+        """
+        x, y = shape['pos']
+        w, h = shape['dim']
+        if shape['size'] != shape['dim']:
+            cropped = dict(shape)  # Stretched images are not cropped
+        else:
+            left, top = max(x, sx), max(y, sy)
+            right, bottom = min(x + w, sx + cx), min(y + h, sy + cy)
+            if right <= left or bottom <= top:
+                return None
+            if (left, top, right, bottom) == (x, y, x + w, y + h):
+                cropped = dict(shape)
+            else:
+                row = w * 3
+                start = (left - x) * 3
+                end = (right - x) * 3
+                data = b''.join(shape['data'][r * row + start:r * row + end]
+                                for r in range(top - y, bottom - y))
+                cropped = dict(shape, pos=(left, top), dim=(right - left, bottom - top),
+                               size=(right - left, bottom - top), data=data)
+        if rop != self.SRCCOPY:
+            cropped['rop'] = rop
+        cropped.pop('_surface', None)
+        return cropped
+
+    def _to_monochrome(self, shape, bk_color):
+        """Shape blitted into a monochrome bitmap: the background color becomes
+        white, every other color black (how masks are built from sprites)"""
+        def mono(color):
+            return (255, 255, 255) if color == bk_color else (0, 0, 0)
+        shape = dict(shape)
+        shape.pop('_surface', None)
+        if shape['type'] == 'image':
+            bk = bytes(bk_color)
+            data = shape['data']
+            shape['data'] = b''.join(b'\xff\xff\xff' if data[i:i + 3] == bk else b'\x00\x00\x00'
+                                     for i in range(0, len(data), 3))
+        for key in ('fill', 'color'):
+            if shape.get(key) is not None:
+                shape[key] = mono(shape[key])
+        return shape
+
+    def _new_bitmap(self, width, height, bpp, rgb=None):
+        """Create a bitmap GDI object; rgb (top-down RGB bytes) becomes its picture"""
+        handle = self.get_next_handle()
+        shapes = []
+        if rgb is not None and width > 0 and height > 0:
+            shapes.append({'type': 'image', 'pos': (0, 0), 'dim': (width, height),
+                           'size': (width, height), 'data': rgb, 'rop': self.SRCCOPY})
+        self.gdi_objects[handle] = {'type': 'bitmap', 'width': width, 'height': height,
+                                    'bpp': bpp, 'shapes': shapes}
+        return handle
+
+    @staticmethod
+    def _decode_dib(data):
+        """(width, height, top-down RGB bytes) of a packed DIB (BITMAPINFOHEADER,
+        color table, bits), or None for unsupported formats"""
+        if len(data) < 40:
+            return None
+        (hdr_size, width, height, _, bpp, compression, _, _, _,
+         clr_used, _) = struct.unpack_from('<IiiHHIIiiII', data)
+        if hdr_size < 40 or width <= 0 or height == 0 or compression not in (0, 3) or \
+                bpp not in (1, 4, 8, 16, 24, 32):
+            return None
+        bottom_up = height > 0
+        height = abs(height)
+        offset = hdr_size
+        masks = None
+        if compression == 3:  # BI_BITFIELDS
+            if bpp not in (16, 32):
+                return None
+            masks = struct.unpack_from('<III', data, offset)
+            offset += 12
+        elif bpp == 16:
+            masks = (0x7C00, 0x03E0, 0x001F)  # 5-5-5
+        palette = []
+        if bpp <= 8:
+            count = clr_used or (1 << bpp)
+            for i in range(count):
+                b, g, r = data[offset + 4 * i:offset + 4 * i + 3]
+                palette.append(bytes((r, g, b)))
+            offset += 4 * count
+        stride = ((width * bpp + 31) // 32) * 4
+        if len(data) < offset + stride * height:
+            return None
+
+        def channel(value, mask):
+            if not mask:
+                return 0
+            shift = (mask & -mask).bit_length() - 1
+            top = mask >> shift
+            return ((value & mask) >> shift) * 255 // top
+
+        if bpp <= 8:
+            # Indexed: unpack pixels to one index byte each, then map every
+            # channel through a 256-entry translate table
+            padded = palette + [b'\x00\x00\x00'] * (256 - len(palette))
+            tables = [bytes(p[c] for p in padded[:256]) for c in range(3)]
+            per_byte = 8 // bpp
+            mask = (1 << bpp) - 1
+            unpack = [bytes((b >> (8 - bpp * (k + 1))) & mask for b in range(256))
+                      for k in range(per_byte)] if bpp < 8 else None
+
+        rows = []
+        for r in range(height):
+            src_row = (height - 1 - r) if bottom_up else r
+            line = data[offset + src_row * stride:offset + (src_row + 1) * stride]
+            if bpp == 24:
+                out = bytearray(width * 3)
+                out[0::3] = line[2:width * 3:3]
+                out[1::3] = line[1:width * 3:3]
+                out[2::3] = line[0:width * 3:3]
+            elif bpp == 32 and masks is None:
+                out = bytearray(width * 3)
+                out[0::3] = line[2:width * 4:4]
+                out[1::3] = line[1:width * 4:4]
+                out[2::3] = line[0:width * 4:4]
+            elif bpp in (16, 32):
+                fmt = '<H' if bpp == 16 else '<I'
+                step = bpp // 8
+                out = bytearray()
+                for i in range(width):
+                    value = struct.unpack_from(fmt, line, i * step)[0]
+                    out += bytes(channel(value, m) for m in masks)
+            else:
+                line = bytes(line)
+                if unpack is None:
+                    indices = line[:width]
+                else:
+                    expanded = bytearray(len(line) * per_byte)
+                    for k in range(per_byte):
+                        expanded[k::per_byte] = line.translate(unpack[k])
+                    indices = bytes(expanded[:width])
+                out = bytearray(width * 3)
+                for c in range(3):
+                    out[c::3] = indices.translate(tables[c])
+            rows.append(bytes(out))
+        return width, height, b''.join(rows)
+
+    def LoadBitmapA(self, args):
+        """LoadBitmapA emulation - a bitmap resource of the program"""
+        hInstance, lpBitmapName = args[0], args[1]
+        name = self._resource_key(lpBitmapName)
+        if not hInstance:
+            log.warning(f"LoadBitmapA: system bitmap {name} is not available")
+            return 0
+        resource = self._find_resource(2, name)  # RT_BITMAP
+        decoded = None
+        if resource:
+            try:
+                decoded = self._decode_dib(bytes(self.emu.uc.mem_read(*resource)))
+            except UcError:
+                decoded = None
+        if decoded is None:
+            log.warning(f"LoadBitmapA({name!r}): bitmap not found or unsupported")
+            self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
+            return 0
+        width, height, rgb = decoded
+        handle = self._new_bitmap(width, height, 32, rgb)
+        log.debug(f"LoadBitmapA({name!r}) -> 0x{handle:x} ({width}x{height})")
+        return handle
+
+    BITS_CACHE_SIZE = 8
+    DIB_CACHE_SIZE = 64        # Entries of at most DIB_CACHE_MAX_BYTES each
+    DIB_CACHE_MAX_BYTES = 65536
+
+    # b'0'/b'1' bit characters -> black/white channel bytes
+    _BIT_TO_GRAY = bytes.maketrans(b'01', b'\x00\xff')
+    # Palette index bytes -> hex digit characters (for 4 bpp packing)
+    _INDEX_TO_HEX = bytes.maketrans(bytes(range(16)), b'0123456789abcdef')
+
+    def CreateBitmap(self, args):
+        """CreateBitmap emulation - monochrome (1 bpp) or 24/32 bpp bits"""
+        width, height = self._read_signed_args(args, 0, 2)
+        planes, bit_count, lpBits = args[2], args[3], args[4]
+        bpp = planes * bit_count
+        if width <= 0 or height <= 0:
+            return 0
+        rgb = None
+        if lpBits and bpp in (1, 24, 32):
+            stride = ((width * bpp + 15) // 16) * 2  # DDB rows are WORD aligned
+            try:
+                bits = bytes(self.emu.uc.mem_read(lpBits, stride * height))
+            except UcError:
+                return 0
+            # Shared picture for equal bits, so GetDIBits' cache can recognize it
+            key = (width, height, bpp, bits)
+            rgb = self._bits_cache.get(key)
+            if rgb is not None:
+                handle = self._new_bitmap(width, height, 1 if bpp == 1 else 32, rgb)
+                log.debug(f"CreateBitmap({width}, {height}, {bpp} bpp) -> 0x{handle:x}")
+                return handle
+            out = bytearray(width * height * 3)
+            if bpp == 1:
+                digits = format(int.from_bytes(bits, 'big'), f'0{len(bits) * 8}b')
+                if stride * 8 != width:
+                    digits = ''.join(digits[r * stride * 8:r * stride * 8 + width]
+                                     for r in range(height))
+                gray = digits.encode().translate(self._BIT_TO_GRAY)
+                out[0::3] = out[1::3] = out[2::3] = gray
+            else:
+                row = width * 3
+                step = bpp // 8
+                end = width * step
+                for r in range(height):
+                    line = bits[r * stride:(r + 1) * stride]
+                    base = r * row
+                    out[base:base + row:3] = line[2:end:step]
+                    out[base + 1:base + row:3] = line[1:end:step]
+                    out[base + 2:base + row:3] = line[0:end:step]
+            rgb = bytes(out)
+            if len(self._bits_cache) >= self.BITS_CACHE_SIZE:
+                del self._bits_cache[next(iter(self._bits_cache))]
+            self._bits_cache[key] = rgb
+        handle = self._new_bitmap(width, height, 1 if bpp == 1 else 32, rgb)
+        log.debug(f"CreateBitmap({width}, {height}, {bpp} bpp) -> 0x{handle:x}")
+        return handle
+
+    def GetObjectA(self, args):
+        """GetObjectA emulation - BITMAP, LOGPEN, LOGBRUSH and LOGFONTA"""
+        hObject, cbBuffer, lpvObject = args[0], args[1], args[2]
+        obj = self.gdi_objects.get(hObject)
+        if obj is None:
+            return 0
+        kind = obj['type']
+        if kind == 'bitmap':
+            bpp = obj.get('bpp', 32)
+            width, height = obj['width'], obj['height']
+            data = struct.pack('<iiiiHHI', 0, width, height,
+                               ((width * bpp + 15) // 16) * 2, 1, bpp, 0)
+        elif kind == 'pen':
+            r, g, b = obj['color']
+            data = struct.pack('<IiiI', obj.get('style', 0), obj['width'], 0,
+                               r | (g << 8) | (b << 16))
+        elif kind == 'brush':
+            color = obj.get('color')
+            if color is None:
+                data = struct.pack('<III', 1, 0, 0)  # BS_NULL
+            else:
+                r, g, b = color
+                data = struct.pack('<III', 0, r | (g << 8) | (b << 16), 0)
+        elif kind == 'font':
+            face = obj.get('face', '').encode(config.ANSI_CODEPAGE, errors='replace')[:31]
+            data = struct.pack('<iiiii8B32s', -obj['height'], 0, 0, 0,
+                               700 if obj.get('bold') else 400,
+                               1 if obj.get('italic') else 0,
+                               1 if obj.get('underline') else 0, 0, 0, 0, 0, 0, 0, face)
+        elif kind == 'palette':
+            data = struct.pack('<H', len(obj['entries']))
+        else:
+            return 0
+        if not lpvObject:
+            return len(data)
+        data = data[:cbBuffer]
+        return len(data) if self._mem_write(lpvObject, data) else 0
+
+    @staticmethod
+    def _scale_shape(shape, sx_src, sy_src, xd, yd, scale_x, scale_y):
+        """Copy of a display list entry mapped through a StretchBlt transform"""
+        def tx(x):
+            return int(round(xd + (x - sx_src) * scale_x))
+
+        def ty(y):
+            return int(round(yd + (y - sy_src) * scale_y))
+
+        scaled = dict(shape)
+        if 'rect' in scaled:
+            l, t, r, b = scaled['rect']
+            x1, x2 = tx(l), tx(r)
+            y1, y2 = ty(t), ty(b)
+            # Normalize so mirrored blits keep left < right, top < bottom
+            scaled['rect'] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        if 'pos' in scaled:
+            x, y = scaled['pos']
+            scaled['pos'] = (tx(x), ty(y))
+        if 'from' in scaled:
+            x, y = scaled['from']
+            scaled['from'] = (tx(x), ty(y))
+        if 'to' in scaled:
+            x, y = scaled['to']
+            scaled['to'] = (tx(x), ty(y))
+        if 'points' in scaled:
+            scaled['points'] = [(tx(x), ty(y)) for x, y in scaled['points']]
+        if 'radius' in scaled:
+            scale_avg = (abs(scale_x) + abs(scale_y)) / 2.0
+            scaled['radius'] = max(0, int(round(scaled['radius'] * scale_avg)))
+        if scaled['type'] == 'image':
+            w, h = scaled['size']
+            x, y = scaled['pos']
+            x2, y2 = tx(shape['pos'][0] + w), ty(shape['pos'][1] + h)
+            scaled['pos'] = (min(x, x2), min(y, y2))
+            scaled['size'] = (abs(x2 - x), abs(y2 - y))
+            scaled.pop('_surface', None)
+        return scaled
+
+    def StretchBlt(self, args):
+        """StretchBlt emulation - copy a memory DC's display list scaled.
+
+        Like BitBlt, but the source rectangle is mapped onto the destination
+        rectangle; shape coordinates are transformed accordingly (pen widths
+        and font sizes are kept as-is).
+        """
+        hdcDest = args[0]
+        xd, yd, wd, hd = self._read_signed_args(args, 1, 4)
+        hdcSrc = args[5]
+        xs, ys, ws, hs = self._read_signed_args(args, 6, 4)
+        rop = args[10]
+
+        log.debug(f"StretchBlt(0x{hdcDest:x}, dst=({xd},{yd},{wd},{hd}), "
+                  f"src=0x{hdcSrc:x} ({xs},{ys},{ws},{hs}), rop=0x{rop:08x})")
+
+        if ws == 0 or hs == 0:
+            return 0
+
+        src_state = self.dc_state.get(hdcSrc)
+        if not src_state or not src_state.get('memory'):
+            return 1  # Only memory DC sources carry shapes
+
+        scale_x = wd / ws
+        scale_y = hd / hs
+        shapes = []
+        for shape in src_state['shapes']:
+            if shape['type'] == 'image':
+                shape = self._crop_image(shape, min(xs, xs + ws), min(ys, ys + hs),
+                                         abs(ws), abs(hs), rop)
+                if shape is None:
+                    continue
+            shapes.append(self._scale_shape(shape, xs, ys, xd, yd, scale_x, scale_y))
+
+        dest_state = self.dc_state.get(hdcDest)
+        if dest_state and dest_state.get('memory'):
+            dest_state['shapes'].extend(shapes)
+            return 1
+
+        hwnd = self._dc_hwnd(hdcDest)
+        if not self.gui or not hwnd or hwnd not in self.gui.windows:
+            return 1
+
+        window = self.gui.windows[hwnd]
+        client_w, client_h = self.gui.client_size(window)
+        if xd <= 0 and yd <= 0 and xd + wd >= client_w and yd + hd >= client_h:
+            # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
+            window.drawn_shapes = shapes
+        else:
+            window.drawn_shapes = window.drawn_shapes + shapes
+        return 1
+
+    # ---------- Device independent bitmaps ----------
+
+    def _dc_palette_colors(self, hdc):
+        """RGB entries of the palette selected into a DC (DIB_PAL_COLORS)"""
+        state = self.dc_state.get(hdc) or {}
+        palette = self.gdi_objects.get(state.get('palette', 0))
+        if palette and palette['type'] == 'palette':
+            return [entry[:3] for entry in palette['entries']]
+        return []
+
+    def _read_dib(self, hdc, lpbmi, lpBits, usage):
+        """(width, height, top-down RGB, bottom_up) of a DIB given as BITMAPINFO
+        and bits, or None for unsupported formats"""
+        try:
+            header = bytes(self.emu.uc.mem_read(lpbmi, 40))
+            (hdr_size, width, height, _, bpp, compression, _, _, _,
+             clr_used, _) = struct.unpack('<IiiHHIIiiII', header)
+            if bpp <= 8:
+                count = clr_used or (1 << bpp)
+                if usage == 1:  # DIB_PAL_COLORS: WORD indices into the DC's palette
+                    indices = struct.unpack(f'<{count}H',
+                                            self.emu.uc.mem_read(lpbmi + hdr_size, 2 * count))
+                    colors = self._dc_palette_colors(hdc)
+                    table = b''.join(bytes((b, g, r, 0)) for r, g, b in
+                                     (colors[i] if i < len(colors) else (0, 0, 0)
+                                      for i in indices))
+                else:
+                    table = bytes(self.emu.uc.mem_read(lpbmi + hdr_size, 4 * count))
+            elif compression == 3:  # BI_BITFIELDS (masks in V4/V5 headers too)
+                count = 0
+                table = bytes(self.emu.uc.mem_read(lpbmi + 40, 12))
+            else:
+                count, table = 0, b''
+            stride = ((abs(width) * bpp + 31) // 32) * 4
+            bits = bytes(self.emu.uc.mem_read(lpBits, stride * abs(height)))
+        except (UcError, struct.error, OverflowError):
+            return None
+        packed = struct.pack('<IiiHHIIiiII', 40, width, height, 1, bpp, compression,
+                             0, 0, 0, count, 0) + table + bits
+        decoded = self._decode_dib(packed)
+        if decoded is None:
+            log.warning(f"Unsupported DIB: {width}x{height}, {bpp} bpp, "
+                        f"compression {compression}")
+            return None
+        return decoded + (height > 0,)
+
+    @staticmethod
+    def _flip_rgb(data, width, height, flip_x, flip_y):
+        """Mirror top-down RGB pixel data horizontally and/or vertically"""
+        row = width * 3
+        rows = [data[r * row:(r + 1) * row] for r in range(height)]
+        if flip_y:
+            rows.reverse()
+        if flip_x:
+            flipped = []
+            for line in rows:
+                reverse = line[::-1]  # Pixels reversed, channels as B, G, R
+                out = bytearray(row)
+                out[0::3], out[1::3], out[2::3] = reverse[2::3], reverse[1::3], reverse[0::3]
+                flipped.append(bytes(out))
+            rows = flipped
+        return b''.join(rows)
+
+    def StretchDIBits(self, args):
+        """StretchDIBits emulation - a DIB (or part of it) scaled onto a DC"""
+        hdc = args[0]
+        xd, yd, wd, hd, xs, ys, ws, hs = self._read_signed_args(args, 1, 8)
+        lpBits, lpbmi, usage, rop = args[9], args[10], args[11], args[12]
+        log.debug(f"StretchDIBits(0x{hdc:x}, dst=({xd},{yd},{wd},{hd}), "
+                  f"src=({xs},{ys},{ws},{hs}), rop=0x{rop:08x})")
+        if rop in (self.BLACKNESS, self.WHITENESS, self.PATCOPY):
+            self.PatBlt([hdc, xd, yd, wd, hd, rop])
+            return abs(hs)
+        if not wd or not hd or not ws or not hs or not lpBits or not lpbmi:
+            return 0
+        decoded = self._read_dib(hdc, lpbmi, lpBits, usage)
+        if decoded is None:
+            return 0
+        width, height, rgb, bottom_up = decoded
+
+        # Source rectangle in top-down image rows (ySrc counts from the bottom
+        # of a bottom-up DIB)
+        left, src_w = min(xs, xs + ws), abs(ws)
+        low, src_h = min(ys, ys + hs), abs(hs)
+        top = height - (low + src_h) if bottom_up else low
+        scale_x, scale_y = abs(wd) / src_w, abs(hd) / src_h
+        dst_x, dst_y = min(xd, xd + wd), min(yd, yd + hd)
+        flip_x, flip_y = (ws < 0) != (wd < 0), (hs < 0) != (hd < 0)
+
+        # Clip the source rectangle to the image
+        c_left, c_top = max(left, 0), max(top, 0)
+        c_right, c_bottom = min(left + src_w, width), min(top + src_h, height)
+        if c_right <= c_left or c_bottom <= c_top:
+            return 0
+        if flip_x:
+            dst_x += round((left + src_w - c_right) * scale_x)
+        else:
+            dst_x += round((c_left - left) * scale_x)
+        if flip_y:
+            dst_y += round((top + src_h - c_bottom) * scale_y)
+        else:
+            dst_y += round((c_top - top) * scale_y)
+        cw, ch = c_right - c_left, c_bottom - c_top
+        if (cw, ch) != (width, height):
+            row = width * 3
+            rgb = b''.join(rgb[r * row + c_left * 3:r * row + c_right * 3]
+                           for r in range(c_top, c_bottom))
+        if flip_x or flip_y:
+            rgb = self._flip_rgb(rgb, cw, ch, flip_x, flip_y)
+        size = (max(1, round(cw * scale_x)), max(1, round(ch * scale_y)))
+        self._add_shape(hdc, {'type': 'image', 'pos': (dst_x, dst_y), 'dim': (cw, ch),
+                              'size': size, 'data': rgb, 'rop': rop})
+        return abs(hs)
+
+    def SetStretchBltMode(self, args):
+        """SetStretchBltMode emulation - returns the previous mode"""
+        state = self.dc_state.get(args[0])
+        if state is None or not 1 <= args[1] <= 4:
+            return 0
+        previous = state.get('stretch_mode', 1)  # BLACKONWHITE
+        state['stretch_mode'] = args[1]
+        return previous
+
+    def _bitmap_shapes(self, hbm, bmp):
+        """Display list of a bitmap; when selected, the DC has the live drawing"""
+        for state in self.dc_state.values():
+            if state.get('memory') and state.get('bitmap') == hbm:
+                return state['shapes']
+        return bmp['shapes']
+
+    @staticmethod
+    def _shapes_key(shapes):
+        """(hashable key, image data objects) of a display list. Image data is
+        keyed by identity, so the caller must keep the data objects alive."""
+        parts, refs = [], []
+        for shape in shapes:
+            items = []
+            for name, value in shape.items():
+                if name == '_surface':
+                    continue
+                if name == 'data':
+                    refs.append(value)
+                    value = id(value)
+                items.append((name, value))
+            parts.append(repr(items))
+        return '\n'.join(parts), refs
+
+    def _bitmap_rgb(self, hbm):
+        """Top-down RGB pixels of a bitmap object, rendered from its display list"""
+        bmp = self.gdi_objects.get(hbm)
+        if not bmp or bmp['type'] != 'bitmap':
+            return None
+        width, height = bmp['width'], bmp['height']
+        shapes = self._bitmap_shapes(hbm, bmp)
+        if (len(shapes) == 1 and shapes[0]['type'] == 'image' and shapes[0]['pos'] == (0, 0)
+                and shapes[0]['dim'] == shapes[0]['size'] == (width, height)
+                and shapes[0].get('rop') == self.SRCCOPY):
+            return shapes[0]['data']
+        if not PYGAME_AVAILABLE or not self.gui:
+            return None
+        surface = pygame.Surface((width, height))
+        surface.fill((255, 255, 255) if bmp.get('bpp') == 1 else (0, 0, 0))
+        for shape in shapes:
+            self.gui._draw_shape(shape, 0, 0, target=surface)
+        to_bytes = getattr(pygame.image, 'tobytes', None) or pygame.image.tostring
+        return to_bytes(surface, 'RGB')
+
+    def GetDIBits(self, args):
+        """GetDIBits emulation - bitmap info (lpvBits NULL) or 24/32 bpp pixels"""
+        hdc, hbm, start, lines, lpvBits, lpbmi, usage = args[:7]
+        bmp = self.gdi_objects.get(hbm)
+        if not bmp or bmp['type'] != 'bitmap' or not lpbmi:
+            return 0
+        width, height = bmp['width'], bmp['height']
+        try:
+            hdr_size, _, req_height, _, bpp = struct.unpack(
+                '<IiiHH', self.emu.uc.mem_read(lpbmi, 16))
+        except UcError:
+            return 0
+        if not lpvBits:
+            if bpp == 0:
+                bpp = 1 if bmp.get('bpp') == 1 else 32
+                stride = ((width * bpp + 31) // 32) * 4
+                header = struct.pack('<IiiHHIIiiII', max(hdr_size, 40), width, height, 1,
+                                     bpp, 0, stride * height, 0, 0, 0, 0)
+                if not self._mem_write(lpbmi, header):
+                    return 0
+            return height
+        if bpp not in (1, 4, 8, 24, 32):
+            log.warning(f"GetDIBits: {bpp} bpp output is not supported")
+            return 0
+        stride = ((width * bpp + 31) // 32) * 4
+        step = bpp // 8
+        bottom_up = req_height >= 0
+        lines = min(lines, max(0, height - start))
+        out = bytearray(stride * lines)
+        palette = None
+        if bpp <= 8:
+            if bpp == 1:
+                palette = [(0, 0, 0), (255, 255, 255)]
+            elif bpp == 4:
+                palette = [(0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128),
+                           (128, 0, 128), (0, 128, 128), (192, 192, 192), (128, 128, 128),
+                           (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255),
+                           (255, 0, 255), (0, 255, 255), (255, 255, 255)]
+            else:
+                palette = self._dc_palette_colors(hdc)[:256] or [
+                    (r * 255 // 7, g * 255 // 7, b * 255 // 3)
+                    for r in range(8) for g in range(8) for b in range(4)]
+            if usage == 1:  # DIB_PAL_COLORS
+                table = struct.pack(f'<{len(palette)}H', *range(len(palette)))
+            else:
+                table = b''.join(bytes((b, g, r, 0)) for r, g, b in palette)
+            self._mem_write(lpbmi + hdr_size, table)
+            self._mem_write(lpbmi + 32, struct.pack('<I', len(palette)))  # biClrUsed
+
+        # Programs often re-read the same picture (e.g. text drawn into a bitmap)
+        shapes_key, refs = self._shapes_key(self._bitmap_shapes(hbm, bmp))
+        key = (width, height, bmp.get('bpp'), bpp, bottom_up, start, lines,
+               tuple(map(tuple, palette)) if palette else None, shapes_key)
+        cached = self._dib_cache.get(key)
+        if cached is not None:
+            return lines if self._mem_write(lpvBits, cached[0]) else 0
+        rgb = self._bitmap_rgb(hbm)
+        if rgb is None:
+            return 0
+        if palette is not None:
+            class Nearest(dict):
+                def __missing__(cache, color):
+                    index = min(range(len(palette)), key=lambda i: sum(
+                        (a - b) ** 2 for a, b in zip(palette[i], color)))
+                    cache[color] = index
+                    return index
+            index_of = Nearest().__getitem__
+            reds = rgb[0::3]
+            if reds == rgb[1::3] == rgb[2::3]:
+                # Gray image (e.g. monochrome bitmaps): map the levels with one table
+                gray = bytearray(256)
+                for level in set(reds):
+                    gray[level] = index_of((level, level, level))
+                indices = reds.translate(gray)
+            else:
+                indices = bytes(map(index_of, zip(reds, rgb[1::3], rgb[2::3])))
+            row_bytes = (width * bpp + 7) // 8
+
+            def pack(row_indices, nbytes):
+                if bpp == 8:
+                    return row_indices
+                digits = row_indices.translate(self._INDEX_TO_HEX).ljust(
+                    nbytes * 8 // bpp, b'0')
+                if bpp == 1:
+                    return int(digits, 2).to_bytes(nbytes, 'big')
+                return bytes.fromhex(digits.decode())
+
+            packed = None
+            if width * bpp % 8 == 0:
+                packed = pack(indices, row_bytes * height)
+        for i in range(lines):
+            scan = start + i  # Scan lines count from the bottom of a bottom-up DIB
+            src_row = height - 1 - scan if bottom_up else scan
+            base = i * stride
+            if palette is not None:
+                if packed is not None:
+                    row = packed[src_row * row_bytes:(src_row + 1) * row_bytes]
+                else:
+                    row = pack(indices[src_row * width:(src_row + 1) * width], row_bytes)
+                out[base:base + row_bytes] = row
+                continue
+            line = rgb[src_row * width * 3:(src_row + 1) * width * 3]
+            out[base + 2:base + width * step:step] = line[0::3]
+            out[base + 1:base + width * step:step] = line[1::3]
+            out[base:base + width * step:step] = line[2::3]
+        if len(out) <= self.DIB_CACHE_MAX_BYTES:
+            if len(self._dib_cache) >= self.DIB_CACHE_SIZE:
+                del self._dib_cache[next(iter(self._dib_cache))]
+            self._dib_cache[key] = (bytes(out), refs)
+        return lines if self._mem_write(lpvBits, out) else 0
+
+    def CreateDCA(self, args):
+        """CreateDCA emulation - "DISPLAY" gives a screen DC"""
+        driver = self.read_string(args[0]).upper() if args[0] else ''
+        device = self.read_string(args[1]).upper() if args[1] else ''
+        if driver.strip('\\.') == 'DISPLAY' or device.strip('\\.') == 'DISPLAY1':
+            return self._create_dc(0)
+        log.warning(f"CreateDCA({driver!r}, {device!r}): only the display is available")
+        return 0
+
+    FONT_FAMILIES = [('Arial', 0x22, 4), ('Courier New', 0x31, 4),
+                     ('Times New Roman', 0x12, 4), ('MS Sans Serif', 0x22, 1),
+                     ('System', 0x22, 1)]
+
+    def EnumFontFamiliesA(self, args):
+        """EnumFontFamiliesA emulation - a fixed set of common font families"""
+        hdc, lpszFamily, lpProc, lParam = args[:4]
+        family = self.read_string(lpszFamily) if lpszFamily else None
+        fonts = [f for f in self.FONT_FAMILIES
+                 if family is None or f[0].lower() == family.lower()]
+        if not fonts:
+            return 1
+        buffer = self.emu.heap_alloc(156 + 72)
+        if not buffer:
+            return 0
+        result = 1
+        try:
+            for name, pitch_family, font_type in fonts:
+                face = name.encode('ascii')
+                logfont = (struct.pack('<5i8B', -13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0,
+                                       2 if font_type == 4 else 0, pitch_family)
+                           + face.ljust(32, b'\x00'))
+                enum_logfont = logfont + face.ljust(64, b'\x00') + b'Regular'.ljust(32, b'\x00')
+                metrics = (struct.pack('<11i9B', 13, 10, 3, 0, 0, 6, 12, 400, 0, 96, 96,
+                                       0x20, 0xFF, 0x1F, 0x20, 0, 0, 0, pitch_family, 0)
+                           + b'\x00' * 3 + struct.pack('<4I', 0x40 if font_type == 4 else 0,
+                                                       2048 if font_type == 4 else 0, 16, 6))
+                self._mem_write(buffer, enum_logfont + metrics)
+                result = self.emu.call_callback(lpProc, [buffer, buffer + 156, font_type,
+                                                         lParam])
+                if not result:
+                    break
+        finally:
+            self.emu.heap_free(buffer)
+        return result
+
+    def ValidateRect(self, args):
+        """ValidateRect emulation - mark the window as painted"""
+        hWnd = args[0]
+        self.painted_windows.add(hWnd)
+        return 1
