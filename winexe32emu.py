@@ -8463,6 +8463,7 @@ class WinAPIHandler:
     # ---------- Cursors, icons ----------
 
     IDC_ARROW = 32512
+    IDC_SIZEWE = 32644
     # Standard cursors (LoadCursor with hInstance NULL): IDC_ARROW, IDC_IBEAM,
     # IDC_WAIT, IDC_CROSS, IDC_UPARROW, IDC_SIZE, IDC_ICON, IDC_SIZENWSE,
     # IDC_SIZENESW, IDC_SIZEWE, IDC_SIZENS, IDC_SIZEALL, IDC_NO, IDC_HAND,
@@ -8580,10 +8581,13 @@ class WinAPIHandler:
         return 1
 
     def _class_cursor(self, hwnd):
-        """hCursor of a window's class (0 if it has none)"""
+        """hCursor of a window's class (0 if it has none); the emulated common
+        controls' classes have the arrow"""
         win = self.gui.windows.get(hwnd) if self.gui else None
         wndclass = self.registered_classes.get(getattr(win, 'class_name', None) or '')
-        return wndclass.get('cursor', 0) if wndclass else 0
+        if wndclass:
+            return wndclass.get('cursor', 0)
+        return self._system_cursor(self.IDC_ARROW) if getattr(win, 'native', None) else 0
 
     def displayed_cursor(self, hwnd):
         """Cursor shown over the client area of hwnd (called by the GUI thread):
@@ -8600,7 +8604,9 @@ class WinAPIHandler:
 
     def _default_set_cursor(self, hwnd, wParam, lParam):
         """DefWindowProc's WM_SETCURSOR: a child window asks its parent first,
-        then the client area gets the class cursor, the rest the arrow"""
+        then the client area gets the class cursor, the rest the arrow. A parent
+        asked about a child's client area (wParam is the child) leaves it to the
+        child, like Windows: the child's class cursor wins, not the parent's"""
         win = self.gui.windows.get(hwnd) if self.gui else None
         if win is not None and win.parent:
             parent_proc = self._find_wndproc_for_hwnd(win.parent)
@@ -8608,6 +8614,8 @@ class WinAPIHandler:
                                                      self.WM_SETCURSOR, wParam, lParam):
                 return 1
         if lParam & 0xFFFF == self.HTCLIENT:
+            if wParam and wParam != hwnd:
+                return 0
             cursor = self._class_cursor(hwnd)
             if cursor:
                 self.current_cursor = cursor
@@ -15725,6 +15733,42 @@ class WinAPIHandler:
             left += column['width']
         return -1
 
+    LV_DIVIDER_GRIP = 4  # Pixels on each side of a header divider that grab it
+
+    def _lv_divider_hit(self, win, x, y):
+        """Column whose right header divider is at client point (x, y), or -1
+        (report view only; the rightmost of overlapping dividers, so a column
+        narrowed to zero can be widened again)"""
+        if self._lv_view(win) != 1 or not 0 <= y < self.lv_header_height(win):
+            return -1
+        left, found = -win.nstate['hscroll'], -1
+        for column in self._lv_ordered_columns(win):
+            left += column['width']
+            if abs(x - left) <= self.LV_DIVIDER_GRIP:
+                found = win.nstate['columns'].index(column)
+        return found
+
+    def _lv_set_width(self, win, index, width):
+        columns = [dict(c) for c in win.nstate['columns']]  # Copy: the GUI thread reads it
+        columns[index]['width'] = max(0, width)
+        win.nstate['columns'] = columns
+
+    def _lv_track(self, win, msg, wParam, lParam):
+        """Dragging a header divider (begun by WM_LBUTTONDOWN, with the mouse
+        captured): the column follows the mouse until the button is released"""
+        st = win.nstate
+        index, start_x, start_width = st['track']
+        x = lParam & 0xFFFF
+        x = x - 0x10000 if x & 0x8000 else x
+        if 0 <= index < len(st['columns']):
+            self._lv_set_width(win, index, start_width + x - start_x)
+        if msg == self.WM_LBUTTONUP or not wParam & self.MK_LBUTTON or \
+                self.capture_hwnd != win.hwnd:
+            st.pop('track', None)
+            if self.capture_hwnd == win.hwnd:
+                self.capture_hwnd = 0
+        return 0
+
     LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW = -175, -176
 
     def _lv_begin_edit(self, win, index):
@@ -15828,6 +15872,14 @@ class WinAPIHandler:
                 track = max(1, height - header - 32)
                 thumb = header + 16 + int(track * st['top'] / max(1, len(st['items'])))
                 self._lv_scroll_lines(win, lines if y > thumb else -lines)
+            return 0
+        divider = self._lv_divider_hit(win, x, y)
+        if divider >= 0 and msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK):
+            if msg == self.WM_LBUTTONDBLCLK:  # Fit the column to its contents
+                self._listview_message(win, 0x101E, divider, 0xFFFF)  # LVSCW_AUTOSIZE
+            else:
+                st['track'] = (divider, x, st['columns'][divider]['width'])
+                self.capture_hwnd = win.hwnd
             return 0
         if msg == self.WM_LBUTTONDOWN and y < self.lv_header_height(win):
             column = self._lv_header_hit(win, x)
@@ -15998,6 +16050,14 @@ class WinAPIHandler:
         msg = wide_msgs.get(msg, msg)
         signed_w = wParam - (1 << 32) if wParam & 0x80000000 else wParam
 
+        if msg in (self.WM_MOUSEMOVE, self.WM_LBUTTONUP) and st.get('track'):
+            return self._lv_track(win, msg, wParam, lParam)
+        if msg == self.WM_SETCURSOR and lParam & 0xFFFF == self.HTCLIENT and self.gui:
+            # The header shows the sizing cursor over its dividers
+            x, y = self.gui._client_point(win, *self.gui.mouse_pos)
+            if self._lv_divider_hit(win, x, y) >= 0:
+                self.current_cursor = self._system_cursor(self.IDC_SIZEWE)
+                return 1
         if msg in (self.WM_LBUTTONDOWN, self.WM_RBUTTONDOWN, self.WM_LBUTTONDBLCLK):
             return self._lv_mouse(win, msg, wParam, lParam)
         if msg == self.WM_KEYDOWN:
@@ -26068,15 +26128,20 @@ class PseudoWindowsGUI:
                 return
             target, cx, cy = self._mouse_target(win, x, y)
             child = self.windows.get(self.child_at(win.hwnd, x, y))
-            if child is not None and child is not win and self._is_app_window(child.hwnd):
+            if not (child is not None and child is not win and self._is_app_window(child.hwnd)):
+                child = None
+            # Without capture the (deepest) window under the mouse chooses the
+            # cursor first: WM_SETCURSOR goes to it, its DefWindowProc asks the
+            # parents, then its own class cursor is shown
+            cursor_hwnd = child.hwnd if child is not None else win.hwnd
+            self.winapi.post_window_message(
+                cursor_hwnd, self.winapi.WM_SETCURSOR, cursor_hwnd,
+                (self.winapi.WM_MOUSEMOVE << 16) | self.winapi.HTCLIENT)
+            if child is not None:
                 if child.native:
-                    return  # Emulated controls don't track the mouse
+                    return  # Emulated controls don't track the mouse without capture
                 target = child.hwnd
                 cx, cy = self._client_point(child, x, y)
-            # Without capture the window under the mouse chooses the cursor first
-            self.winapi.post_window_message(
-                win.hwnd, self.winapi.WM_SETCURSOR, win.hwnd,
-                (self.winapi.WM_MOUSEMOVE << 16) | self.winapi.HTCLIENT)
         self.winapi.post_window_message(target, self.winapi.WM_MOUSEMOVE,
                                         wparam, self._make_lparam(cx, cy))
 
