@@ -41,13 +41,21 @@ class PseudoWindowsGUI:
     COLOR_WINDOW_BG = (212, 208, 200)  # Classic Windows gray (COLOR_BTNFACE)
     COLOR_TITLE_BAR = (0, 0, 128)  # Classic blue
     COLOR_TITLE_BAR_INACTIVE = (128, 128, 128)
+    # Right ends of the caption gradients (COLOR_GRADIENT[IN]ACTIVECAPTION)
+    COLOR_TITLE_BAR_GRADIENT = (16, 132, 208)
+    COLOR_TITLE_BAR_INACTIVE_GRADIENT = (192, 192, 192)
     COLOR_TITLE_TEXT = (255, 255, 255)
+    COLOR_TITLE_TEXT_INACTIVE = (212, 208, 200)
     COLOR_BUTTON = (212, 208, 200)
     COLOR_BUTTON_BORDER_LIGHT = (255, 255, 255)
     COLOR_BUTTON_BORDER_DARK = (64, 64, 64)
+    COLOR_BUTTON_SHADOW = (128, 128, 128)  # COLOR_BTNSHADOW, inner dark edge of 3D frames
     COLOR_TEXT = (0, 0, 0)
     COLOR_EDIT_BG = (255, 255, 255)
-    COLOR_TASKBAR = (192, 192, 192)
+    COLOR_TASKBAR = (212, 208, 200)
+    # Start menu side strip: a vertical gradient, dark at the bottom
+    COLOR_START_STRIP_TOP = (16, 132, 208)
+    COLOR_START_STRIP_BOTTOM = (0, 0, 96)
 
     # Resize settings
     RESIZE_BORDER = 6      # Edge grab margin (pixels)
@@ -134,6 +142,7 @@ class PseudoWindowsGUI:
         # When the mouse started hovering the clock (date tooltip), or None
         self.tray_hover_since = None
         self._checker_cache = {}  # Pressed taskbar button face per size
+        self._gradient_cache = {}  # (size, colors, horizontal) -> gradient surface
 
         # Keyboard state for GetAsyncKeyState (vk -> bool, GUI thread writes)
         self.key_states = {}
@@ -535,11 +544,7 @@ class PseudoWindowsGUI:
         mouse_pos = pygame.mouse.get_pos()
         for item, rect in zip(items, rects):
             if item is None:
-                y = rect.centery
-                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                                 (rect.x + 2, y - 1), (rect.right - 2, y - 1))
-                pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
-                                 (rect.x + 2, y), (rect.right - 2, y))
+                self._draw_menu_separator(rect)
             else:
                 self._draw_menu_row(rect, item[0], rect.collidepoint(mouse_pos))
 
@@ -557,12 +562,14 @@ class PseudoWindowsGUI:
     # ==================== START MENU ====================
 
     START_ITEM_H = 22
+    START_TOP_ITEM_H = 36  # Rows of the Start menu itself (32x32 icons)
+    START_TOP_ICON_SIZE = 32
     START_SEP_H = 8
     START_MENU_W = 200
-    START_STRIP_W = 22
+    START_STRIP_W = 24
 
     def _start_button_rect(self):
-        return pygame.Rect(2, self.height - 28, 60, 26)
+        return pygame.Rect(2, self.height - self.TASKBAR_H + 3, 66, self.TASKBAR_H - 6)
 
     @staticmethod
     def _file_manager_available():
@@ -655,32 +662,36 @@ class PseudoWindowsGUI:
             command_line = f'"{target}"' + (f' {arguments}' if arguments else '')
             self.launcher(target, command_line, workdir or ntpath.dirname(target))
 
-    def _menu_row_rects(self, menu, rows, strip=False):
+    def _menu_row_rects(self, menu, rows, strip=False, item_h=None):
         """Row rects inside a menu panel rect (right of the blue strip if strip)"""
         rects = []
         y = menu.y + 3
         left = menu.x + (self.START_STRIP_W + 2 if strip else 3)
         for kind, _, _ in rows:
-            h = self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
+            h = self.START_SEP_H if kind == 'separator' else (item_h or self.START_ITEM_H)
             rects.append(pygame.Rect(left, y, menu.right - 3 - left, h))
             y += h
         return rects
 
+    def _menu_rows_height(self, rows, item_h):
+        """Height of a menu panel holding these rows (with its 3-pixel edges)"""
+        return sum(self.START_SEP_H if kind == 'separator' else item_h
+                   for kind, _, _ in rows) + 6
+
     def _start_menu_levels(self):
         """[(menu rect, rows, row rects)] of the Start menu and its open submenus"""
         rows = self.start_menu_rows
-        height = sum(self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
-                     for kind, _, _ in rows) + 6
+        height = self._menu_rows_height(rows, self.START_TOP_ITEM_H)
         menu = pygame.Rect(0, self.height - self.TASKBAR_H - height, self.START_MENU_W, height)
-        levels = [(menu, rows, self._menu_row_rects(menu, rows, strip=True))]
+        levels = [(menu, rows, self._menu_row_rects(menu, rows, strip=True,
+                                                    item_h=self.START_TOP_ITEM_H))]
         for index in self.start_open_path:
             menu, rows, rects = levels[-1]
             if not (0 <= index < len(rows)) or rows[index][0] != 'submenu':
                 break
             parent_row = rects[index]
             sub_rows = rows[index][2]
-            height = sum(self.START_SEP_H if kind == 'separator' else self.START_ITEM_H
-                         for kind, _, _ in sub_rows) + 6
+            height = self._menu_rows_height(sub_rows, self.START_ITEM_H)
             width = max([self.START_MENU_W] + [self.font.size(label)[0] + 60
                                                for kind, label, _ in sub_rows if label])
             top = max(0, min(parent_row.y - 3, self.height - self.TASKBAR_H - height))
@@ -701,26 +712,65 @@ class PseudoWindowsGUI:
         return None
 
     def _draw_menu_panel(self, rect):
-        """Raised 3D panel behind a menu"""
+        """Raised 3D panel behind a menu, with a soft shadow"""
+        self._draw_shadow(rect)
         pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, rect.topleft, rect.topright)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, rect.topleft, rect.bottomleft)
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                         (rect.right - 1, rect.top), (rect.right - 1, rect.bottom))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                         (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1))
+        self._draw_raised(rect)
+
+    def _draw_menu_separator(self, rect):
+        """Etched horizontal line across a menu row"""
+        y = rect.centery
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_SHADOW,
+                         (rect.x + 2, y - 1), (rect.right - 3, y - 1))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                         (rect.x + 2, y), (rect.right - 3, y))
 
     def _draw_menu_row(self, rect, label, highlighted, icon=None):
-        """Menu row: an optional 16x16 icon, then the label"""
+        """Menu row: an optional icon (16x16 or 32x32), then the label"""
         if highlighted:
             pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
         color = self.COLOR_TITLE_TEXT if highlighted else self.COLOR_TEXT
+        text_x = rect.x + 6
         if icon is not None:
             self.screen.blit(icon, (rect.x + 4, rect.y + (rect.height - icon.get_height()) // 2))
-        text_x = rect.x + (8 + self.CAPTION_ICON_SIZE + 4 if icon is not None else 6)
+            text_x = rect.x + 4 + icon.get_width() + (10 if icon.get_width() > 16 else 8)
         text = self.font.render(label, True, color)
         self.screen.blit(text, (text_x, rect.y + (rect.height - text.get_height()) // 2))
         return color
+
+    def _scaled_icon(self, name, icon, size):
+        """A 16x16 drawn icon doubled to size (cached), keeping its crisp pixels"""
+        if size == icon.get_width():
+            return icon
+        key = (name, size)
+        scaled = self.exe_icon_cache.get(key)
+        if scaled is None:
+            scaled = pygame.transform.scale(icon, (size, size))
+            self.exe_icon_cache[key] = scaled
+        return scaled
+
+    def _draw_start_strip(self, menu):
+        """Gradient strip at the left of the Start menu with the emulator's name
+        written upwards at its bottom"""
+        strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3, menu.height - 6)
+        self.screen.blit(self._gradient(strip.size, self.COLOR_START_STRIP_TOP,
+                                        self.COLOR_START_STRIP_BOTTOM, horizontal=False),
+                         strip.topleft)
+        for bold, regular in ((self.font_bold, self.font), (self.font_small_bold, self.font_small)):
+            first = bold.render("winexe", True, self.COLOR_TITLE_TEXT)
+            second = regular.render("32emu", True, (200, 220, 255))
+            width = first.get_width() + second.get_width()
+            if width <= strip.height - 8:
+                break
+        else:
+            return  # Too short a menu for the name
+        label = pygame.Surface((width, max(first.get_height(), second.get_height())),
+                               pygame.SRCALPHA)
+        label.blit(first, (0, 0))
+        label.blit(second, (first.get_width(), label.get_height() - second.get_height()))
+        label = pygame.transform.rotate(label, 90)  # Reads bottom to top
+        self.screen.blit(label, (strip.centerx - label.get_width() // 2,
+                                 strip.bottom - 6 - label.get_height()))
 
     def _folder_icon(self):
         """16x16 yellow folder icon of the Start menu's submenus (cached)"""
@@ -774,35 +824,31 @@ class PseudoWindowsGUI:
 
         for level, (menu, rows, rects) in enumerate(self._start_menu_levels()):
             self._draw_menu_panel(menu)
+            # The Start menu itself has the side strip and 32x32 icons
+            icon_size = self.CAPTION_ICON_SIZE
             if level == 0:
-                strip = pygame.Rect(menu.x + 3, menu.y + 3, self.START_STRIP_W - 3,
-                                    menu.height - 6)
-                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, strip)
+                self._draw_start_strip(menu)
+                icon_size = self.START_TOP_ICON_SIZE
             open_index = (self.start_open_path[level]
                           if level < len(self.start_open_path) else None)
             for i, ((kind, label, data), rect) in enumerate(zip(rows, rects)):
                 if kind == 'separator':
-                    y = rect.centery
-                    pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK,
-                                     (rect.x + 2, y - 1), (rect.right - 2, y - 1))
-                    pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
-                                     (rect.x + 2, y), (rect.right - 2, y))
+                    self._draw_menu_separator(rect)
                 elif kind == 'empty':
                     text = self.font.render(label, True, (128, 128, 128))
                     self.screen.blit(text, (rect.x + 6, rect.y + 3))
                 elif kind == 'submenu':
-                    color = self._draw_menu_row(rect, label, i == open_index,
-                                                icon=self._folder_icon())
+                    icon = self._scaled_icon('folder', self._folder_icon(), icon_size)
+                    color = self._draw_menu_row(rect, label, i == open_index, icon=icon)
                     ax, ay = rect.right - 12, rect.centery
                     pygame.draw.polygon(self.screen, color,
                                         [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
                 elif kind == 'program':
-                    icon = self._exe_icon(self.start_icon_paths.get(data),
-                                          self.CAPTION_ICON_SIZE)[0]
+                    icon = self._exe_icon(self.start_icon_paths.get(data), icon_size)[0]
                     self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
                 elif kind == 'exit':
-                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos),
-                                        icon=self._exit_icon())
+                    icon = self._scaled_icon('exit', self._exit_icon(), icon_size)
+                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
 
     def _handle_start_menu_click(self, pos, button):
         """Start button toggles the menu; returns True if the click was consumed"""
@@ -950,20 +996,17 @@ class PseudoWindowsGUI:
         top = self.height - self.TASKBAR_H
         pygame.draw.rect(self.screen, self.COLOR_TASKBAR,
                          pygame.Rect(0, top, self.width, self.TASKBAR_H))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, (0, top), (self.width, top))
+        # Raised top edge
+        pygame.draw.line(self.screen, self.COLOR_BUTTON, (0, top), (self.width, top))
+        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
+                         (0, top + 1), (self.width, top + 1))
 
-        self._draw_button_3d(self._start_button_rect(), "Start",
-                             pressed=self.start_menu_open, bold=True)
+        self._draw_start_button()
 
         # System tray with the clock (sunken)
         tray = self._tray_rect()
         pygame.draw.rect(self.screen, self.COLOR_TASKBAR, tray)
-        pygame.draw.line(self.screen, (128, 128, 128), tray.topleft, (tray.right - 1, tray.top))
-        pygame.draw.line(self.screen, (128, 128, 128), tray.topleft, (tray.left, tray.bottom - 1))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
-                         (tray.right - 1, tray.top), (tray.right - 1, tray.bottom - 1))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT,
-                         (tray.left, tray.bottom - 1), (tray.right - 1, tray.bottom - 1))
+        self._draw_edge(tray, self.COLOR_BUTTON_SHADOW, self.COLOR_BUTTON_BORDER_LIGHT)
         time_text = self.font_small.render(time.strftime("%H:%M"), True, self.COLOR_TEXT)
         self.screen.blit(time_text, time_text.get_rect(center=tray.center))
 
@@ -971,20 +1014,60 @@ class PseudoWindowsGUI:
             is_active = (hwnd == self.active_window) and not win.minimized
             self._draw_taskbar_button(rect, win, is_active)
 
+    def _draw_start_button(self):
+        """Start button: a computer icon and a bold "Start", pressed while the
+        Start menu is open"""
+        rect = self._start_button_rect()
+        pressed = self.start_menu_open
+        pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
+        if pressed:
+            self._draw_sunken(rect)
+        else:
+            self._draw_raised(rect)
+        offset = 1 if pressed else 0
+        icon = self._start_icon()
+        text = self.font_bold.render("Start", True, self.COLOR_TEXT)
+        width = icon.get_width() + 4 + text.get_width()
+        x = rect.x + (rect.width - width) // 2 + offset
+        self.screen.blit(icon, (x, rect.centery - icon.get_height() // 2 + offset))
+        self.screen.blit(text, (x + icon.get_width() + 4,
+                                rect.centery - text.get_height() // 2 + offset))
+        if pressed:
+            # Dotted focus rectangle like the classic pressed Start button
+            focus = rect.inflate(-6, -6)
+            for px in range(focus.x, focus.right, 2):
+                self.screen.set_at((px, focus.y), self.COLOR_TEXT)
+                self.screen.set_at((px, focus.bottom - 1), self.COLOR_TEXT)
+            for py in range(focus.y, focus.bottom, 2):
+                self.screen.set_at((focus.x, py), self.COLOR_TEXT)
+                self.screen.set_at((focus.right - 1, py), self.COLOR_TEXT)
+
+    def _start_icon(self):
+        """16x16 icon of the Start button: a small computer (cached)"""
+        icon = self.exe_icon_cache.get(('start', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            case = pygame.Rect(1, 1, 14, 11)
+            pygame.draw.rect(icon, (192, 192, 192), case)
+            pygame.draw.rect(icon, (64, 64, 64), case, 1)
+            screen = pygame.Rect(3, 3, 10, 7)
+            icon.blit(self._gradient(screen.size, (0, 0, 128), (16, 132, 208)), screen.topleft)
+            pygame.draw.line(icon, (255, 255, 255), (4, 4), (6, 4))
+            pygame.draw.rect(icon, (128, 128, 128), pygame.Rect(6, 12, 4, 2))
+            pygame.draw.rect(icon, (64, 64, 64), pygame.Rect(3, 14, 10, 2))
+            self.exe_icon_cache[('start', 16)] = icon
+        return icon
+
     def _draw_taskbar_button(self, rect, win, is_active):
         """Draw a taskbar button with the program icon and the window title; the
         active window's one is pressed with bold text"""
         if is_active:
             # Classic checkered face of a pressed taskbar button
             self.screen.blit(self._checker_surface(rect.size), rect.topleft)
-            light, dark = self.COLOR_BUTTON_BORDER_DARK, self.COLOR_BUTTON_BORDER_LIGHT
+            self._draw_sunken(rect)
         else:
             pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
-            light, dark = self.COLOR_BUTTON_BORDER_LIGHT, self.COLOR_BUTTON_BORDER_DARK
-        pygame.draw.line(self.screen, light, rect.topleft, (rect.right - 1, rect.top))
-        pygame.draw.line(self.screen, light, rect.topleft, (rect.left, rect.bottom - 1))
-        pygame.draw.line(self.screen, dark, (rect.right - 1, rect.top), (rect.right - 1, rect.bottom - 1))
-        pygame.draw.line(self.screen, dark, (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1))
+            self._draw_raised(rect)
 
         offset = 1 if is_active else 0
         size = self.CAPTION_ICON_SIZE
@@ -1062,6 +1145,18 @@ class PseudoWindowsGUI:
                 self.active_window = h
                 return
     
+    def _draw_window_frame(self, window, border):
+        """Soft shadow, face and the classic raised frame of a top-level window
+        (a 1-pixel border is a plain dark line)"""
+        frame_rect = pygame.Rect(window.x, window.y, window.width, window.height)
+        if not window.maximized:
+            self._draw_shadow(frame_rect)
+        pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, frame_rect)
+        if border > 1:
+            self._draw_raised(frame_rect)
+        else:
+            pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame_rect, 1)
+
     def _draw_window(self, window):
         """Draw window"""
         if not window.visible or window.minimized:
@@ -1071,27 +1166,7 @@ class PseudoWindowsGUI:
         border, caption = self.window_frame(window)
 
         if border:
-            # Window shadow
-            shadow_rect = pygame.Rect(window.x + 3, window.y + 3, window.width, window.height)
-            pygame.draw.rect(self.screen, (64, 64, 64), shadow_rect)
-
-            # Window frame
-            frame_rect = pygame.Rect(window.x, window.y, window.width, window.height)
-            pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, frame_rect)
-            pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame_rect, 1)
-
-        if border > 1:
-            # 3D edge effect
-            pygame.draw.line(self.screen, (255, 255, 255),
-                            (window.x, window.y), (window.x + window.width - 1, window.y))
-            pygame.draw.line(self.screen, (255, 255, 255),
-                            (window.x, window.y), (window.x, window.y + window.height - 1))
-            pygame.draw.line(self.screen, (64, 64, 64),
-                            (window.x + window.width - 1, window.y),
-                            (window.x + window.width - 1, window.y + window.height - 1))
-            pygame.draw.line(self.screen, (64, 64, 64),
-                            (window.x, window.y + window.height - 1),
-                            (window.x + window.width - 1, window.y + window.height - 1))
+            self._draw_window_frame(window, border)
 
         if caption:
             self._draw_title_bar(window, is_active)
@@ -1124,49 +1199,68 @@ class PseudoWindowsGUI:
 
         self.screen.set_clip(None)
 
+    CAPTION_BTN_W = 18
+    CAPTION_BTN_H = 16
+
+    def _title_rect(self, window):
+        """Screen rect of a window's title bar (inside the frame, a 1-pixel gap
+        above the menu bar or the client area)"""
+        border, caption = (self.BORDER, self.TITLE_BAR_H) if window.hwnd in self.consoles \
+            else self.window_frame(window)
+        return pygame.Rect(window.x + border, window.y + border,
+                           window.width - 2 * border, caption - 1)
+
+    def _caption_button_rects(self, window):
+        """{'close' / 'max' / 'min': screen rect} of a window's caption buttons;
+        dialogs only have the close button. Drawing and clicks both use these."""
+        bar = self._title_rect(window)
+        w, h = self.CAPTION_BTN_W, self.CAPTION_BTN_H
+        y = bar.y + (bar.height - h) // 2
+        close = pygame.Rect(bar.right - 2 - w, y, w, h)
+        rects = {'close': close}
+        if not window.is_dialog:
+            # Maximize and minimize sit together, two pixels left of close
+            rects['max'] = pygame.Rect(close.x - 2 - w, y, w, h)
+            rects['min'] = pygame.Rect(close.x - 2 - 2 * w, y, w, h)
+        return rects
+
     def _draw_title_bar(self, window, is_active):
-        """Draw a window's caption: title and the caption buttons"""
-        title_color = self.COLOR_TITLE_BAR if is_active else self.COLOR_TITLE_BAR_INACTIVE
-        title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
-        pygame.draw.rect(self.screen, title_color, title_rect)
-        
+        """Draw a window's caption: a gradient bar, the program icon, the title
+        and the caption buttons"""
+        bar = self._title_rect(window)
+        if is_active:
+            colors = (self.COLOR_TITLE_BAR, self.COLOR_TITLE_BAR_GRADIENT)
+            text_color = self.COLOR_TITLE_TEXT
+        else:
+            colors = (self.COLOR_TITLE_BAR_INACTIVE, self.COLOR_TITLE_BAR_INACTIVE_GRADIENT)
+            text_color = self.COLOR_TITLE_TEXT_INACTIVE
+        self.screen.blit(self._gradient(bar.size, *colors), bar.topleft)
+
+        buttons = self._caption_button_rects(window)
+
         # Program icon (not on dialogs), then the title cut with "..." before the caption buttons
         text_x = self._draw_caption_icon(window)
-        buttons_w = 18 * (1 if window.is_dialog else 3) + 5
-        max_title_w = window.x + window.width - buttons_w - 8 - text_x
+        max_title_w = min(r.x for r in buttons.values()) - 4 - text_x
         title = self._fit_text(self.font_bold, window.title, max_title_w)
-        title_text = self.font_bold.render(title, True, self.COLOR_TITLE_TEXT)
-        self.screen.blit(title_text, (text_x, window.y + 6))
-        
-        # Window buttons (Minimize, Maximize, Close)
-        btn_size = 16
-        btn_y = window.y + 5
-        
-        # Close button (X) - special for red hover effect
-        close_rect = pygame.Rect(window.x + window.width - btn_size - 5, btn_y, btn_size, btn_size)
-        self._draw_window_button(close_rect, "×", "close")
-        
-        # Show minimize and maximize buttons if not a dialog
-        if not window.is_dialog:
-            # Maximize/Restore butonu
-            max_rect = pygame.Rect(window.x + window.width - btn_size * 2 - 7, btn_y, btn_size, btn_size)
-            max_symbol = "❐" if window.maximized else "□"  # Restore vs Maximize
-            self._draw_window_button(max_rect, max_symbol, "max")
-            
-            # Minimize butonu
-            min_rect = pygame.Rect(window.x + window.width - btn_size * 3 - 9, btn_y, btn_size, btn_size)
-            self._draw_window_button(min_rect, "─", "min")
+        title_text = self.font_bold.render(title, True, text_color)
+        self.screen.blit(title_text, (text_x, bar.centery - title_text.get_height() // 2))
+
+        self._draw_window_button(buttons['close'], "×", "close")
+        if 'max' in buttons:
+            self._draw_window_button(buttons['max'], "❐" if window.maximized else "□", "max")
+            self._draw_window_button(buttons['min'], "─", "min")
 
     CAPTION_ICON_SIZE = 16
 
     def _draw_caption_icon(self, window):
         """Draw the small program icon at the left of a title bar (dialogs have
         none); returns the x where the title text starts"""
+        bar = self._title_rect(window)
         if window.is_dialog:
-            return window.x + 8
+            return bar.x + 4
         icon = self._exe_icon(window.icon_path, self.CAPTION_ICON_SIZE)[0]
-        self.screen.blit(icon, (window.x + 6, window.y + 3 + (22 - self.CAPTION_ICON_SIZE) // 2))
-        return window.x + 8 + self.CAPTION_ICON_SIZE + 2
+        self.screen.blit(icon, (bar.x + 2, bar.centery - self.CAPTION_ICON_SIZE // 2))
+        return bar.x + 2 + self.CAPTION_ICON_SIZE + 4
 
     def _draw_shape(self, shape, ox, oy, target=None):
         """Render one GDI display list entry at client origin (ox, oy) on target
@@ -1921,9 +2015,7 @@ class PseudoWindowsGUI:
     def _draw_menu_panels(self, panels):
         mouse = self.mouse_pos
         for items, panel, rects in panels:
-            pygame.draw.rect(self.screen, (64, 64, 64), panel.move(3, 3))
-            pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, panel)
-            pygame.draw.rect(self.screen, (128, 128, 128), panel, 1)
+            self._draw_menu_panel(panel)
             for index, (sub, rect) in enumerate(zip(items, rects)):
                 if index and sub.get('break') == 'bar':
                     # Etched vertical line between the columns
@@ -2449,6 +2541,63 @@ class PseudoWindowsGUI:
             pygame.draw.rect(self.screen, self.COLOR_BUTTON, label)
             self.screen.blit(text, (label.x + 2, label.y))
 
+    def _draw_edge(self, rect, top_left, bottom_right):
+        """One-pixel 3D edge around rect: top and left lines in one color,
+        bottom and right lines in the other"""
+        if rect.width <= 0 or rect.height <= 0:
+            return
+        x, y, r, b = rect.x, rect.y, rect.right - 1, rect.bottom - 1
+        pygame.draw.line(self.screen, top_left, (x, y), (r, y))
+        pygame.draw.line(self.screen, top_left, (x, y), (x, b))
+        pygame.draw.line(self.screen, bottom_right, (r, y), (r, b))
+        pygame.draw.line(self.screen, bottom_right, (x, b), (r, b))
+
+    def _draw_raised(self, rect):
+        """Classic 2-pixel raised edge (window frames, buttons, menus)"""
+        self._draw_edge(rect, self.COLOR_BUTTON, self.COLOR_BUTTON_BORDER_DARK)
+        self._draw_edge(rect.inflate(-2, -2), self.COLOR_BUTTON_BORDER_LIGHT,
+                        self.COLOR_BUTTON_SHADOW)
+
+    def _draw_sunken(self, rect):
+        """Classic 2-pixel sunken edge of a pressed button"""
+        self._draw_edge(rect, self.COLOR_BUTTON_BORDER_DARK, self.COLOR_BUTTON_BORDER_LIGHT)
+        self._draw_edge(rect.inflate(-2, -2), self.COLOR_BUTTON_SHADOW, self.COLOR_BUTTON)
+
+    def _gradient(self, size, start, end, horizontal=True):
+        """Surface of this size shading from start to end, left to right (or
+        top to bottom); cached"""
+        key = (size, start, end, horizontal)
+        surface = self._gradient_cache.get(key)
+        if surface is None:
+            width, height = size
+            surface = pygame.Surface((max(1, width), max(1, height)))
+            steps = width if horizontal else height
+            for i in range(steps):
+                t = i / max(1, steps - 1)
+                color = tuple(round(a + (b - a) * t) for a, b in zip(start, end))
+                if horizontal:
+                    pygame.draw.line(surface, color, (i, 0), (i, height - 1))
+                else:
+                    pygame.draw.line(surface, color, (0, i), (width - 1, i))
+            if len(self._gradient_cache) > 64:
+                self._gradient_cache.clear()  # Old window sizes
+            self._gradient_cache[key] = surface
+        return surface
+
+    SHADOW_SIZE = 4
+
+    def _draw_shadow(self, rect):
+        """Soft drop shadow at the right and the bottom of a window or menu"""
+        size = self.SHADOW_SIZE
+        for i in range(size):
+            alpha = 56 - i * 12
+            right = pygame.Surface((1, rect.height - size + 1 + i), pygame.SRCALPHA)
+            right.fill((0, 0, 0, alpha))
+            self.screen.blit(right, (rect.right + i, rect.y + size - i))
+            bottom = pygame.Surface((rect.width - size + 1 + i, 1), pygame.SRCALPHA)
+            bottom.fill((0, 0, 0, alpha))
+            self.screen.blit(bottom, (rect.x + size - i, rect.bottom + i))
+
     def _draw_button_3d(self, rect, text, pressed=False, small=False, arrow=None, bold=False,
                         disabled=False):
         """Draw 3D-style button.
@@ -2458,26 +2607,11 @@ class PseudoWindowsGUI:
         don't depend on the system font carrying Unicode arrow glyphs.
         """
         pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
-        
-        if not pressed:
-            # Raised effect
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x, rect.y), (rect.x + rect.width - 1, rect.y))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                           (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x + rect.width - 1, rect.y), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y + rect.height - 1), 
-                           (rect.x + rect.width - 1, rect.y + rect.height - 1))
+        if pressed:
+            self._draw_sunken(rect)
         else:
-            # Sunken effect
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y), (rect.x + rect.width - 1, rect.y))
-            pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                           (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
-        
+            self._draw_raised(rect)
+
         if arrow:
             self._draw_arrow(rect, arrow, pressed=pressed)
             return
@@ -2492,6 +2626,8 @@ class PseudoWindowsGUI:
                                                             rect.centery + 1)))
         text_surface = font.render(text, True, (128, 128, 128) if disabled else self.COLOR_TEXT)
         text_rect = text_surface.get_rect(center=rect.center)
+        if pressed:
+            text_rect.move_ip(1, 1)  # The face moves in with the press
         self.screen.blit(text_surface, text_rect)
 
     def _draw_arrow(self, rect, direction, pressed=False):
@@ -2517,50 +2653,35 @@ class PseudoWindowsGUI:
         pygame.draw.polygon(self.screen, self.COLOR_TEXT, points)
 
     def _draw_window_button(self, rect, symbol, btn_type):
-        """Draw window control button (minimize, maximize, close)"""
-        # Background
+        """Draw a caption button (minimize, maximize / restore, close) with a
+        classic raised face and a crisp black glyph"""
         pygame.draw.rect(self.screen, self.COLOR_BUTTON, rect)
-        
-        # 3D borders
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                       (rect.x, rect.y), (rect.x + rect.width - 1, rect.y))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_LIGHT, 
-                       (rect.x, rect.y), (rect.x, rect.y + rect.height - 1))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                       (rect.x + rect.width - 1, rect.y), 
-                       (rect.x + rect.width - 1, rect.y + rect.height - 1))
-        pygame.draw.line(self.screen, self.COLOR_BUTTON_BORDER_DARK, 
-                       (rect.x, rect.y + rect.height - 1), 
-                       (rect.x + rect.width - 1, rect.y + rect.height - 1))
-        
-        # Draw symbol
+        self._draw_raised(rect)
+        black = self.COLOR_TEXT
+        cx, cy = rect.centerx, rect.centery
         if btn_type == "close":
-            # X mark
-            pygame.draw.line(self.screen, (0, 0, 0), 
-                           (rect.x + 4, rect.y + 4), (rect.x + rect.width - 5, rect.y + rect.height - 5), 2)
-            pygame.draw.line(self.screen, (0, 0, 0), 
-                           (rect.x + rect.width - 5, rect.y + 4), (rect.x + 4, rect.y + rect.height - 5), 2)
+            # 8x7 "x" drawn two pixels thick
+            x0, y0 = cx - 4, cy - 4
+            for dx in (0, 1):
+                pygame.draw.line(self.screen, black, (x0 + dx, y0), (x0 + dx + 6, y0 + 6))
+                pygame.draw.line(self.screen, black, (x0 + dx + 6, y0), (x0 + dx, y0 + 6))
+        elif btn_type == "max" and symbol == "❐":
+            # Restore: two overlapping windows, the front one lower left
+            back = pygame.Rect(cx - 2, cy - 5, 6, 6)
+            front = pygame.Rect(cx - 5, cy - 2, 6, 6)
+            for box in (back, front):
+                pygame.draw.rect(self.screen, self.COLOR_BUTTON, box)
+                pygame.draw.rect(self.screen, black, box, 1)
+                pygame.draw.line(self.screen, black, (box.x, box.y + 1), (box.right - 1, box.y + 1))
         elif btn_type == "max":
-            # Square (maximize) or double square (restore)
-            if symbol == "❐":  # Restore
-                # Two overlapping squares
-                pygame.draw.rect(self.screen, (0, 0, 0), 
-                               pygame.Rect(rect.x + 5, rect.y + 3, 8, 8), 1)
-                pygame.draw.rect(self.screen, self.COLOR_BUTTON, 
-                               pygame.Rect(rect.x + 3, rect.y + 5, 8, 8))
-                pygame.draw.rect(self.screen, (0, 0, 0), 
-                               pygame.Rect(rect.x + 3, rect.y + 5, 8, 8), 1)
-            else:  # Maximize
-                pygame.draw.rect(self.screen, (0, 0, 0), 
-                               pygame.Rect(rect.x + 3, rect.y + 3, 10, 10), 1)
-                pygame.draw.line(self.screen, (0, 0, 0), 
-                               (rect.x + 3, rect.y + 5), (rect.x + 12, rect.y + 5), 1)
+            # Maximize: a window with a thick caption
+            box = pygame.Rect(cx - 5, cy - 5, 9, 9)
+            pygame.draw.rect(self.screen, black, box, 1)
+            pygame.draw.line(self.screen, black, (box.x, box.y + 1), (box.right - 1, box.y + 1))
         elif btn_type == "min":
-            # Underline (minimize)
-            pygame.draw.line(self.screen, (0, 0, 0), 
-                           (rect.x + 4, rect.y + rect.height - 5), 
-                           (rect.x + rect.width - 5, rect.y + rect.height - 5), 2)
-    
+            # Minimize: a short thick bar at the bottom
+            pygame.draw.rect(self.screen, black, pygame.Rect(cx - 4, cy + 2, 6, 2))
+
     def _get_resize_edge(self, win, x, y):
         """Return which edge/corner the point is on, or None.
 
@@ -3468,33 +3589,19 @@ class PseudoWindowsGUI:
                     self.z_order.append(hwnd)
                     border, caption = self.window_frame(win)
                     
-                    # Title bar buttons (right to left: close, max, min)
-                    btn_size = 16
-                    btn_y_start = win.y + 5
-                    btn_y_end = win.y + 5 + btn_size
-                    
-                    # Close butonu (X)
-                    close_x = win.x + win.width - btn_size - 5
-                    if (caption and close_x <= x <= close_x + btn_size
-                            and btn_y_start <= y <= btn_y_end):
+                    # Caption buttons (the rects they are drawn at; dialogs only have close)
+                    buttons = self._caption_button_rects(win) if caption else {}
+                    if 'close' in buttons and buttons['close'].collidepoint(x, y):
                         self._close_window(hwnd)
                         return
-                    
-                    # Minimize and maximize buttons if not a dialog
-                    if caption and not win.is_dialog:
-                        # Maximize butonu (□)
-                        max_x = win.x + win.width - btn_size * 2 - 7
-                        if max_x <= x <= max_x + btn_size and btn_y_start <= y <= btn_y_end:
-                            win.maximize(self.width, self.height, 30)
-                            return
-                        
-                        # Minimize butonu (_)
-                        min_x = win.x + win.width - btn_size * 3 - 9
-                        if min_x <= x <= min_x + btn_size and btn_y_start <= y <= btn_y_end:
-                            win.minimize()
-                            self._activate_next_window()
-                            return
-                    
+                    if 'max' in buttons and buttons['max'].collidepoint(x, y):
+                        win.maximize(self.width, self.height, self.TASKBAR_H)
+                        return
+                    if 'min' in buttons and buttons['min'].collidepoint(x, y):
+                        win.minimize()
+                        self._activate_next_window()
+                        return
+
                     # Edge/corner resizing (left button only)
                     if button == 1:
                         edge = self._get_resize_edge(win, x, y)
@@ -4336,53 +4443,11 @@ class PseudoWindowsGUI:
         """Draw console window"""
         if not window.visible or window.minimized:
             return
-        
+
         is_active = (window.hwnd == self.active_window)
-        
-        # Window shadow
-        shadow_rect = pygame.Rect(window.x + 3, window.y + 3, window.width, window.height)
-        pygame.draw.rect(self.screen, (64, 64, 64), shadow_rect)
-        
-        # Window frame
-        frame_rect = pygame.Rect(window.x, window.y, window.width, window.height)
-        pygame.draw.rect(self.screen, (12, 12, 12), frame_rect)  # Black background
-        pygame.draw.rect(self.screen, self.COLOR_BUTTON_BORDER_DARK, frame_rect, 1)
-        
-        # 3D edge effect
-        pygame.draw.line(self.screen, (64, 64, 64), 
-                        (window.x, window.y), (window.x + window.width - 1, window.y))
-        pygame.draw.line(self.screen, (64, 64, 64), 
-                        (window.x, window.y), (window.x, window.y + window.height - 1))
-        
-        # Title bar
-        title_color = self.COLOR_TITLE_BAR if is_active else self.COLOR_TITLE_BAR_INACTIVE
-        title_rect = pygame.Rect(window.x + 3, window.y + 3, window.width - 6, 22)
-        pygame.draw.rect(self.screen, title_color, title_rect)
-        
-        # Program icon and title text
-        text_x = self._draw_caption_icon(window)
-        title = self._fit_text(self.font_bold, window.title,
-                               window.x + window.width - 18 * 3 - 13 - text_x)
-        title_text = self.font_bold.render(title, True, self.COLOR_TITLE_TEXT)
-        self.screen.blit(title_text, (text_x, window.y + 6))
-        
-        # Window buttons
-        btn_size = 16
-        btn_y = window.y + 5
-        
-        # Close butonu (X)
-        close_rect = pygame.Rect(window.x + window.width - btn_size - 5, btn_y, btn_size, btn_size)
-        self._draw_window_button(close_rect, "×", "close")
-        
-        # Maximize butonu
-        max_rect = pygame.Rect(window.x + window.width - btn_size * 2 - 7, btn_y, btn_size, btn_size)
-        max_symbol = "❐" if window.maximized else "□"
-        self._draw_window_button(max_rect, max_symbol, "max")
-        
-        # Minimize butonu
-        min_rect = pygame.Rect(window.x + window.width - btn_size * 3 - 9, btn_y, btn_size, btn_size)
-        self._draw_window_button(min_rect, "─", "min")
-        
+        self._draw_window_frame(window, self.BORDER)
+        self._draw_title_bar(window, is_active)
+
         # Content area (console output, the line being typed continues it)
         content_x = window.x + 5
         content_y = window.y + 30
@@ -4391,6 +4456,8 @@ class PseudoWindowsGUI:
         
         # Content background
         content_rect = pygame.Rect(content_x, content_y, content_width, content_height)
+        self._draw_edge(content_rect.inflate(2, 2), self.COLOR_BUTTON_SHADOW,
+                        self.COLOR_BUTTON_BORDER_LIGHT)
         pygame.draw.rect(self.screen, (12, 12, 12), content_rect)
 
         rows = list(console.lines)
