@@ -78,7 +78,7 @@ class User32WindowsMixin:
         if not (self.gui and self.gui.running):
             return buttons[default][1]  # Nobody can answer: the default button
         request = {'result': None}
-        self.gui.show_messagebox(caption, text, utype, request)
+        self.gui.show_messagebox(caption, text, utype, request, process=self)
         self.emu.wait_until(lambda: request['result'] is not None or not self.gui.running)
         if request['result'] is None:
             return cancel or buttons[default][1]

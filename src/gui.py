@@ -853,6 +853,11 @@ class PseudoWindowsGUI:
         if self.display_mode_owner is process:
             # Like Windows, a CDS_FULLSCREEN mode ends with its program
             self.set_display_mode(self.desktop_width, self.desktop_height)
+        # Its message boxes go too (one shown by a thread when another one ends
+        # the program, e.g. the main window closed while the box is up)
+        for hwnd, box in list(self.messageboxes.items()):
+            if box.get('process') is process:
+                self._messagebox_done(hwnd, box['cancel'] or box['buttons'][box['focus']].mb_result)
         for hwnd, win in list(self.windows.items()):
             if win.owner is not process:
                 continue
@@ -4015,11 +4020,15 @@ class PseudoWindowsGUI:
         """Check MessageBox requests"""
         try:
             msg = self.messagebox_queue.get_nowait()
-            self._show_messagebox(msg['caption'], msg['text'], msg['type'], msg.get('request'))
         except queue.Empty:
-            pass
-    
-    def _show_messagebox(self, caption, text, msg_type, request=None):
+            return
+        process = msg.get('process')
+        if process is not None and process.process_exited:
+            return  # Its program ended before the box was shown
+        self._show_messagebox(msg['caption'], msg['text'], msg['type'], msg.get('request'),
+                              process)
+
+    def _show_messagebox(self, caption, text, msg_type, request=None, process=None):
         """Show MessageBox; each line of text gets its own row, the buttons of
         its MB_* type below. request (if any) gets the chosen button's id."""
         buttons, default, cancel = winapi.WinAPIHandler.messagebox_buttons(msg_type)
@@ -4058,7 +4067,7 @@ class PseudoWindowsGUI:
             win.controls.append(button)
             controls.append(button)
         self.messageboxes[hwnd] = {'request': request, 'buttons': controls,
-                                   'focus': default, 'cancel': cancel}
+                                   'focus': default, 'cancel': cancel, 'process': process}
         
         self.show_window(hwnd)
 
@@ -4281,14 +4290,16 @@ class PseudoWindowsGUI:
             return self.controls[hwnd].text
         return ""
     
-    def show_messagebox(self, caption, text, msg_type=0, request=None):
+    def show_messagebox(self, caption, text, msg_type=0, request=None, process=None):
         """Show MessageBox (thread-safe); the chosen button's id is stored in
-        request['result'] when it closes"""
+        request['result'] when it closes. process (if any) owns it: the box
+        closes when that program ends."""
         self.messagebox_queue.put({
             'caption': caption,
             'text': text,
             'type': msg_type,
             'request': request,
+            'process': process,
         })
         return 1  # IDOK
     
