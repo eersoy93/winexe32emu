@@ -55,10 +55,10 @@ class CursorsMixin:
         self.cursors[handle] = {'hotspot': hotspot, 'size': (width, height), 'rgba': rgba}
         return handle
 
-    def _load_resource_cursor(self, key):
+    def _load_resource_cursor(self, key, hModule=0):
         """Cursor from an RT_GROUP_CURSOR resource of the EXE (its 32x32 image,
         else the first one), or 0"""
-        group = self._find_resource(12, key)  # RT_GROUP_CURSOR
+        group = self._find_resource(12, key, hModule)  # RT_GROUP_CURSOR
         if group is None:
             return 0
         try:
@@ -71,7 +71,7 @@ class CursorsMixin:
         if not entries:
             return 0
         entry = max(entries, key=lambda e: (e[0] == 32, e[3]))
-        found = self._find_resource(1, entry[5])  # RT_CURSOR
+        found = self._find_resource(1, entry[5], hModule)  # RT_CURSOR
         if found is None:
             return 0
         try:

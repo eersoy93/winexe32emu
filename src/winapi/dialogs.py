@@ -201,7 +201,7 @@ class DialogsMixin:
                     (int(item['text'][1:]) if item['text'][1:].isdigit() and
                      item['text'][:1] == '#' else item['text'].upper())
                 control.text = ''
-                control.icon = self._load_icon_image(key)
+                control.icon = self._load_icon_image(key, hModule=template.get('module', 0))
                 if control.icon and not style & 0x40:  # SS_REALSIZECONTROL
                     control.width, control.height = control.icon[0], control.icon[1]
             control.visible = bool(style & self.WS_VISIBLE)
@@ -280,10 +280,62 @@ class DialogsMixin:
             self._delete_dc(hdc)
         return 0
 
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORBTN = 0x0133, 0x0134, 0x0135
+    WM_CTLCOLORDLG, WM_CTLCOLORSTATIC = 0x0136, 0x0138
+
+    def _ctl_color_message(self, control):
+        """WM_CTLCOLOR* message a control sends its parent before drawing"""
+        cls = control.class_name
+        if cls == 'EDIT':
+            # Read-only and disabled edit controls draw like statics
+            return self.WM_CTLCOLORSTATIC if control.style & 0x800 or not control.enabled \
+                else self.WM_CTLCOLOREDIT
+        if cls == 'LISTBOX':
+            return self.WM_CTLCOLORLISTBOX
+        if cls in ('STATIC', 'CHECKBOX') or (cls == 'BUTTON' and control.style & 0xF == 7):
+            return self.WM_CTLCOLORSTATIC  # Statics, check boxes, radios, group boxes
+        if cls == 'BUTTON':
+            return self.WM_CTLCOLORBTN
+        return None
+
+    def _ask_ctl_colors(self, parent, message, hwnd):
+        """Send a WM_CTLCOLOR* message to parent with a fresh DC of hwnd:
+        {'text', 'bk_mode', 'bk_color', 'brush'} the program chose, or None
+        if it left the defaults (returned no brush)"""
+        hdc = self._create_dc(hwnd)
+        try:
+            if self._dialog_of(parent) == parent:
+                brush = self._dialog_message(parent, message, hdc, hwnd)
+            else:
+                wndproc = self._find_wndproc_for_hwnd(parent)
+                brush = self.emu.call_wndproc(wndproc, parent, message, hdc, hwnd) \
+                    if wndproc else 0
+            state = self.dc_state.get(hdc)
+            if not brush or state is None:
+                return None
+            # A hollow brush (NULL_BRUSH) has no color: the parent shows through
+            return {'text': state['text_color'], 'bk_mode': state['bk_mode'],
+                    'bk_color': state['bk_color'], 'brush': self._brush_color(brush)}
+        finally:
+            self._delete_dc(hdc)
+
+    def _update_ctl_colors(self, control):
+        """Colors of a control from its parent's WM_CTLCOLOR* answer"""
+        message = self._ctl_color_message(control)
+        if message is not None and control.parent_hwnd:
+            control.ctl_colors = self._ask_ctl_colors(control.parent_hwnd, message,
+                                                      control.hwnd)
+
     def _dispatch(self, hwnd, message, wParam, lParam):
         """DispatchMessage for a message already read from the queue"""
         if message == self.WM_PAINT and hwnd in self.gui.controls:
             return self._paint_control(hwnd)
+        if message == self.WM_PAINT and hwnd in self.dialogs:
+            # The dialog's background: WM_CTLCOLORDLG to its own procedure
+            colors = self._ask_ctl_colors(hwnd, self.WM_CTLCOLORDLG, hwnd)
+            win = self.gui.windows.get(hwnd)
+            if win is not None:
+                win.dialog_brush = colors['brush'] if colors else None
         if message == self.WM_TIMER and lParam:
             tick = int(time.time() * 1000) & 0xFFFFFFFF
             return self.emu.call_callback(lParam, [hwnd, message, wParam, tick])
@@ -389,7 +441,7 @@ class DialogsMixin:
         else:
             name = self._read_text(lpTemplateName, wide)
             key = int(name[1:]) if name.startswith('#') and name[1:].isdigit() else name.upper()
-        found = self._find_resource(5, key) if self._is_own_module(hInstance) else None
+        found = self._find_resource(5, key, hInstance)
         log.info(f"{api_name}({key!r})")
         if found is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
@@ -397,7 +449,9 @@ class DialogsMixin:
         if not self.gui or not self.gui.running:
             return None
         try:
-            return self._parse_dialog_template(bytes(self.emu.uc.mem_read(*found)))
+            template = self._parse_dialog_template(bytes(self.emu.uc.mem_read(*found)))
+            template['module'] = hInstance  # Its SS_ICON controls name icons of this module
+            return template
         except (struct.error, UcError) as e:
             log.error(f"{api_name}: bad dialog template ({e})")
             return None
@@ -429,7 +483,17 @@ class DialogsMixin:
             'CreateDialogParamW' if wide else 'CreateDialogParamA')
         if template is None:
             return 0
-        dlg = self._create_dialog(template, self._owner_window(hWndParent), proc=lpDialogFunc)
+        if template['style'] & self.WS_CHILD and hWndParent in self.gui.windows:
+            # A child dialog (DS_CONTROL pages of wizards) inside its parent's client area
+            bx, by = self._dialog_units(template)
+            dlg = self._create_dialog(template, hWndParent, proc=lpDialogFunc,
+                                      parent=hWndParent,
+                                      pos=(round(template['x'] * bx), round(template['y'] * by)))
+            self.gui.windows[dlg].style = template['style'] & ~self.WS_VISIBLE
+            self.gui.windows[dlg].ex_style = template['ex_style']
+        else:
+            dlg = self._create_dialog(template, self._owner_window(hWndParent),
+                                      proc=lpDialogFunc)
         self._show_dialog(dlg, dwInitParam, show=bool(template['style'] & self.WS_VISIBLE))
         return dlg if dlg in self.dialogs else 0
 
@@ -498,7 +562,7 @@ class DialogsMixin:
         if flags & 0x1:  # PSP_DLGINDIRECT
             return self._parse_dialog_template(bytes(self.emu.uc.mem_read(template_ref, 0x4000)))
         key = template_ref if template_ref < 0x10000 else self._resource_name_key(template_ref, True)
-        resource = self._find_resource(5, key)
+        resource = self._find_resource(5, key, hinst)
         if resource is None:
             return None
         return self._parse_dialog_template(bytes(self.emu.uc.mem_read(*resource)))

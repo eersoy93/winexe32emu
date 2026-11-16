@@ -42,6 +42,10 @@ class MessagesMixin:
 
         log.debug(f"SendMessageA(0x{hWnd:x}, {msg_name}, 0x{wParam:x}, 0x{lParam:x})")
 
+        target_thread = self._window_thread(hWnd)
+        if target_thread not in (None, self.emu.current_thread.tid):
+            return self._send_to_thread(target_thread, [hWnd, Msg, wParam, lParam], wide)
+
         # Text messages are handled directly (also work for controls)
         WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH = 0x000C, 0x000D, 0x000E
         if Msg in (WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH) and self.gui and \
@@ -71,6 +75,66 @@ class MessagesMixin:
         if wndproc:
             return self._call_proc(wndproc, hWnd, Msg, wParam, lParam)
         return 0
+
+    SS_BITMAP, SS_REALSIZECONTROL, SS_CENTERIMAGE = 0xE, 0x40, 0x200
+
+    def _set_static_bitmap(self, control, hbm):
+        """Show a bitmap in an SS_BITMAP static; the control takes the
+        bitmap's size (unless SS_CENTERIMAGE or SS_REALSIZECONTROL)"""
+        bmp = self.gdi_objects.get(hbm) if hbm else None
+        if bmp is not None and bmp['type'] != 'bitmap':
+            bmp = None
+        control.bitmap_handle = hbm if bmp is not None else 0
+        control.bitmap = bmp
+        if bmp is not None and control.style & 0x1F == self.SS_BITMAP and \
+                not control.style & (self.SS_REALSIZECONTROL | self.SS_CENTERIMAGE):
+            control.width, control.height = bmp['width'], bmp['height']
+
+    def _window_thread(self, hwnd):
+        """Guest thread that created a window of this process (a control: its
+        parent's); None if unknown, another process's, or the thread is gone"""
+        if not self.gui:
+            return None
+        win = self.gui.windows.get(hwnd)
+        if win is None:
+            control = self.gui.controls.get(hwnd)
+            win = self.gui.windows.get(control.parent_hwnd) if control is not None else None
+        if win is None or win.owner is not self:
+            return None
+        thread = win.thread_id
+        return thread if thread in self.emu.threads else None
+
+    def _send_to_thread(self, thread, args, wide):
+        """SendMessage to a window of another thread: that thread runs the
+        window procedure when it next waits for messages; the sender waits
+        (and handles the messages sent to its own windows meanwhile)"""
+        request = {'args': args, 'wide': wide, 'done': False, 'result': 0}
+        with self.message_lock:
+            self.sent_messages.setdefault(thread, []).append(request)
+        self.emu.wake_threads()
+
+        def finished():
+            if not request['done']:
+                self._process_sent_messages()
+            return request['done'] or thread not in self.emu.threads
+        self.emu.wait_until(finished)
+        return request['result']
+
+    def _process_sent_messages(self):
+        """Run the window procedures for the messages other threads sent to
+        the calling thread's windows"""
+        thread = self.emu.current_thread.tid
+        while True:
+            with self.message_lock:
+                queue = self.sent_messages.get(thread)
+                if not queue:
+                    return
+                request = queue.pop(0)
+            try:
+                request['result'] = self.SendMessageA(request['args'], request['wide'])
+            finally:
+                request['done'] = True
+                self.emu.wake_threads()
 
     def SendMessageW(self, args):
         return self.SendMessageA(args, wide=True)
@@ -174,6 +238,12 @@ class MessagesMixin:
                 control.icon_handle = handle
                 control.icon = self.icons.get(handle)
                 return previous
+            if Msg == 0x0172 and wParam == 0:  # IMAGE_BITMAP
+                previous = control.bitmap_handle
+                self._set_static_bitmap(control, lParam)
+                return previous
+            if Msg == 0x0173 and wParam == 0:
+                return control.bitmap_handle
             return previous if Msg == 0x0171 or wParam == 1 else 0
 
         # ----- Checkbox / button messages -----
@@ -492,6 +562,7 @@ class MessagesMixin:
             'elapse': elapse,
             'callback': lpTimerFunc,
             'next_fire': time.time() + elapse,
+            'thread': self.emu.current_thread.tid,  # Gets the WM_TIMER of hWnd NULL
         }
 
         log.debug(f"SetTimer(0x{hWnd:x}, id={nIDEvent}, {uElapse}ms) -> {nIDEvent}")
@@ -507,7 +578,10 @@ class MessagesMixin:
     def _pop_due_timer(self, matches=lambda hwnd, message: True):
         """Return (hwnd, id, callback) of a due timer and schedule its next fire"""
         now = time.time()
+        thread = self.emu.current_thread.tid
         for (hwnd, timer_id), timer in self.timers.items():
+            if not hwnd and timer.get('thread', thread) != thread:
+                continue
             if now >= timer['next_fire'] and matches(hwnd, self.WM_TIMER):
                 # Keep the period on its grid so polling delays don't slow the timer
                 timer['next_fire'] += timer['elapse']
@@ -519,7 +593,10 @@ class MessagesMixin:
     def _write_msg(self, lpMsg, hwnd, message, wParam, lParam):
         """Fill a MSG structure in emulated memory"""
         if lpMsg:
-            msg_data = struct.pack("<IIIIIii", hwnd, message, wParam, lParam, 0, 0, 0)
+            # time and pt: when the message is retrieved (GetMessageTime/Pos)
+            self.last_message_pos = x, y = self.gui.mouse_pos if self.gui else (0, 0)
+            msg_data = struct.pack("<IIIIIii", hwnd, message, wParam, lParam,
+                                   int(time.time() * 1000) & 0xFFFFFFFF, x, y)
             self.emu.uc.mem_write(lpMsg, msg_data)
 
     def _next_message(self, remove=True, hwnd_filter=0, msg_min=0, msg_max=0):
@@ -529,14 +606,22 @@ class MessagesMixin:
         GetMessageA: synthesized WM_PAINT, then the input queue, then timers.
         hwnd_filter/msg_min/msg_max follow GetMessage's hWnd and filter range.
         """
+        thread = self.emu.current_thread.tid
+
         def matches(hwnd, message):
             if hwnd_filter == 0xFFFFFFFF:  # (HWND)-1: thread messages only
                 if hwnd != 0:
                     return False
             elif hwnd_filter and hwnd != hwnd_filter:
                 return False
+            # Each thread gets the messages of the windows it created
+            if hwnd and self._window_thread(hwnd) not in (None, thread):
+                return False
             return (msg_min == 0 and msg_max == 0) or msg_min <= message <= msg_max
 
+        # Messages other threads sent to this thread's windows are handled
+        # first, inside the message function (like Windows)
+        self._process_sent_messages()
         self._audio_pump()
         self._deliver_set_cursor()
         if remove:
@@ -557,13 +642,22 @@ class MessagesMixin:
         # Owner-draw controls paint after their (painted, visible) parent
         for hwnd in list(self.dirty_controls):
             control = self.gui.controls.get(hwnd) if self.gui else None
-            if control is None or not self._owner_draw_type(control):
+            if control is None:
                 self.dirty_controls.pop(hwnd, None)
                 continue
             parent = self.gui.windows.get(control.parent_hwnd)
-            if (parent is not None and parent.visible and control.visible
-                    and control.parent_hwnd in self.painted_windows
-                    and matches(hwnd, self.WM_PAINT)):
+            ready = (parent is not None and parent.visible and control.visible
+                     and control.parent_hwnd in self.painted_windows)
+            if not self._owner_draw_type(control):
+                # Drawn by the GUI: while painting it the system asks the
+                # parent for its colors (WM_CTLCOLOR*)
+                if ready and remove and matches(hwnd, self.WM_PAINT):
+                    del self.dirty_controls[hwnd]
+                    self._update_ctl_colors(control)
+                elif parent is None:
+                    self.dirty_controls.pop(hwnd, None)
+                continue
+            if ready and matches(hwnd, self.WM_PAINT):
                 if remove:
                     del self.dirty_controls[hwnd]
                 return (hwnd, self.WM_PAINT, 0, 0)

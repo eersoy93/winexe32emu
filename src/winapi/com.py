@@ -238,6 +238,10 @@ class ComMixin:
             ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('QueryContextMenu', 6),
             ('InvokeCommand', 2), ('GetCommandString', 6), ('HandleMenuMsg', 4),
             ('HandleMenuMsg2', 5)],
+        'malloc': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('Alloc', 2),
+            ('Realloc', 3), ('Free', 2), ('GetSize', 2), ('DidAlloc', 2),
+            ('HeapMinimize', 1)],
     })
 
     # SFGAO_CANCOPY | CANMOVE | CANLINK | CANDELETE | HASPROPSHEET | FILESYSTEM;

@@ -387,6 +387,18 @@ class RegistryMixin:
     def RegEnumKeyExW(self, args):
         return self.RegEnumKeyExA(args, wide=True)
 
+    def RegEnumKeyA(self, args, wide=False):
+        """RegEnumKeyA/W emulation (cchName is a value: RegEnumKeyEx's count)"""
+        size = self.emu.heap_alloc(4)
+        try:
+            self.emu.uc.mem_write(size, struct.pack('<I', args[3]))
+            return self.RegEnumKeyExA([args[0], args[1], args[2], size, 0, 0, 0, 0], wide)
+        finally:
+            self.emu.heap_free(size)
+
+    def RegEnumKeyW(self, args):
+        return self.RegEnumKeyA(args, wide=True)
+
     @registry_locked
     def RegEnumValueA(self, args, wide=False):
         """RegEnumValueA/W emulation - values in creation order"""

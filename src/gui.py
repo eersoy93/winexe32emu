@@ -1235,7 +1235,7 @@ class PseudoWindowsGUI:
         client_x, client_y = self.client_origin(window)
         client_w, client_h = self.client_size(window)
         content_rect = pygame.Rect(client_x, client_y, client_w, client_h)
-        pygame.draw.rect(self.screen, window.bg_color, content_rect)
+        pygame.draw.rect(self.screen, window.dialog_brush or window.bg_color, content_rect)
 
         # Clip client-area drawing to the window (GDI shapes may overflow)
         self.screen.set_clip(content_rect)
@@ -2221,7 +2221,7 @@ class PseudoWindowsGUI:
     def _wrap_text(self, text, width):
         """Split text into lines that fit width pixels (word wrap)"""
         lines = []
-        for paragraph in text.split('\n'):
+        for paragraph in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
             line = ''
             for word in paragraph.split(' '):
                 candidate = f"{line} {word}" if line else word
@@ -2306,6 +2306,21 @@ class PseudoWindowsGUI:
         Windows), "&&" is a literal "&"""
         return re.sub(r'&(.)', r'\1', text or '')
 
+    def _fill_ctl_background(self, control, rect):
+        """Background brush the parent chose with WM_CTLCOLOR* (none: the
+        parent's background shows)"""
+        colors = control.ctl_colors
+        if colors and colors['brush'] is not None:
+            pygame.draw.rect(self.screen, colors['brush'], rect)
+
+    def _ctl_text_colors(self, control):
+        """(text color, text background or None) of a control's DC after
+        WM_CTLCOLOR* (SetTextColor, SetBkMode OPAQUE with SetBkColor)"""
+        colors = control.ctl_colors
+        if not colors:
+            return self.COLOR_TEXT, None
+        return colors['text'], colors['bk_color'] if colors['bk_mode'] == 2 else None
+
     def _draw_static(self, control, rect):
         """Draw a STATIC control by its SS_* type"""
         kind = control.style & 0x1F
@@ -2327,15 +2342,30 @@ class PseudoWindowsGUI:
                     self.screen.blit(surface, surface.get_rect(center=rect.center))
                 else:
                     self.screen.blit(surface, (x, y))
+        elif kind == 0xE:  # SS_BITMAP
+            bitmap = control.bitmap
+            if bitmap:
+                bx, by = x, y
+                if control.style & 0x200:  # SS_CENTERIMAGE
+                    bx = x + (w - bitmap['width']) // 2
+                    by = y + (h - bitmap['height']) // 2
+                prev_clip = self.screen.get_clip()
+                self.screen.set_clip(rect.clip(prev_clip) if prev_clip else rect)
+                for shape in list(bitmap['shapes']):
+                    self._draw_shape(shape, bx, by)
+                self.screen.set_clip(prev_clip)
         elif kind in (4, 5, 6):  # SS_BLACKRECT, SS_GRAYRECT, SS_WHITERECT
             pygame.draw.rect(self.screen, ((0, 0, 0), dark, light)[kind - 4], rect)
         elif kind in (7, 8, 9):  # SS_BLACKFRAME, SS_GRAYFRAME, SS_WHITEFRAME
             pygame.draw.rect(self.screen, ((0, 0, 0), dark, light)[kind - 7], rect, 1)
         elif kind in (0, 1, 2, 0xB, 0xC):  # Text: left, center, right, simple, no wrap
+            self._fill_ctl_background(control, rect)
+            text_color, text_bg = self._ctl_text_colors(control)
             text = control.text
             if not control.style & self.SS_NOPREFIX:
                 text = self._mnemonic_text(text)
-            lines = self._wrap_text(text, w) if kind <= 2 else text.split('\n')
+            lines = self._wrap_text(text, w) if kind <= 2 else \
+                text.replace('\r\n', '\n').split('\n')
             prev_clip = self.screen.get_clip()
             # The first line is never cut: the font may be taller than the
             # one-line height the dialog template gives the control
@@ -2343,13 +2373,20 @@ class PseudoWindowsGUI:
             self.screen.set_clip(text_rect.clip(prev_clip) if prev_clip else text_rect)
             line_y = y
             for line in lines:
-                surface = self.font.render(line, True, self.COLOR_TEXT)
+                if control.enabled:
+                    surface = self.font.render(line, True, text_color, text_bg)
+                else:
+                    # Disabled: embossed gray text whatever the DC's colors (DSS_DISABLED)
+                    surface = self.font.render(line, True, light, text_bg)
                 if kind == 1:
                     line_x = x + (w - surface.get_width()) // 2
                 elif kind == 2:
                     line_x = x + w - surface.get_width()
                 else:
                     line_x = x
+                if not control.enabled:
+                    self.screen.blit(surface, (line_x + 1, line_y + 1))
+                    surface = self.font.render(line, True, dark)
                 self.screen.blit(surface, (line_x, line_y))
                 line_y += self.font.get_linesize()
                 if line_y >= y + h:
@@ -2510,6 +2547,8 @@ class PseudoWindowsGUI:
             self._draw_button_3d(arrow_rect, "", small=True, arrow='down')
             
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
+            self._fill_ctl_background(control, pygame.Rect(abs_x, abs_y, control.width,
+                                                           control.height))
             if (control.style & 0xF) in (0x4, 0x9):  # Radio button
                 center = (abs_x + 6, abs_y + 8)
                 pygame.draw.circle(self.screen, self.COLOR_EDIT_BG, center, 6)
@@ -2517,7 +2556,7 @@ class PseudoWindowsGUI:
                 if control.checked:
                     pygame.draw.circle(self.screen, self.COLOR_TEXT, center, 2)
                 text = self.font.render(self._mnemonic_text(control.text), True,
-                                        self.COLOR_TEXT)
+                                        *self._ctl_text_colors(control))
                 self.screen.blit(text, (abs_x + 18, abs_y))
                 return
             # Checkbox box
@@ -2530,7 +2569,8 @@ class PseudoWindowsGUI:
                 pygame.draw.line(self.screen, self.COLOR_TEXT, 
                                (abs_x + 5, abs_y + 11), (abs_x + 11, abs_y + 4), 2)
             # Label
-            text = self.font.render(self._mnemonic_text(control.text), True, self.COLOR_TEXT)
+            text = self.font.render(self._mnemonic_text(control.text), True,
+                                    *self._ctl_text_colors(control))
             self.screen.blit(text, (abs_x + 18, abs_y))
             
         elif control.class_name == "PROGRESSBAR":
@@ -3018,7 +3058,7 @@ class PseudoWindowsGUI:
             if border:
                 pygame.draw.rect(self.screen, (0, 0, 0), frame, border)
             content = pygame.Rect(cx, cy, cw, ch)
-            pygame.draw.rect(self.screen, child.bg_color, content)
+            pygame.draw.rect(self.screen, child.dialog_brush or child.bg_color, content)
             self.screen.set_clip(content.clip(parent_clip))
             if child.native:
                 self._draw_native(child, cx, cy, cw, ch)
@@ -3125,7 +3165,7 @@ class PseudoWindowsGUI:
         if width <= 0 or height <= 0:
             return None
         surface = pygame.Surface((width, height))
-        surface.fill(win.bg_color)
+        surface.fill(win.dialog_brush or win.bg_color)
         for shape in shapes:
             self._draw_shape(shape, 0, 0, surface)
         to_bytes = getattr(pygame.image, 'tobytes', None) or pygame.image.tostring
@@ -4374,6 +4414,9 @@ class PseudoWindowsGUI:
         hwnd = self.get_next_hwnd()
         window = FakeWindow(hwnd, title, x, y, width, height, style)
         window.owner = owner
+        emu = getattr(owner, 'emu', None)
+        if emu is not None:
+            window.thread_id = emu.current_thread.tid
         # The title bar shows the owning program's EXE icon
         loader = getattr(getattr(owner, 'emu', None), 'pe_loader', None)
         window.icon_path = getattr(loader, 'filepath', None)

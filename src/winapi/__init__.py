@@ -55,6 +55,7 @@ from .msvcrt import MsvcrtMixin
 from .crt import CrtMixin
 from .crt_stdio import CrtStdioMixin
 from .crt_misc import CrtMiscMixin
+from .version_info import VersionInfoMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -69,5 +70,5 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     ControlsMixin, ListViewMixin, ToolbarMixin,
                     ComboBoxExMixin, RegistryMixin, ComMixin,
                     ExceptionsMixin, CrtBasicMixin, MsvcrtMixin,
-                    CrtMixin, CrtStdioMixin, CrtMiscMixin):
+                    CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin):
     """Windows API emulation"""

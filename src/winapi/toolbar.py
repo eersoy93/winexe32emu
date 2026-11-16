@@ -444,11 +444,22 @@ class ToolbarMixin:
         return None
 
     def _rebar_resize(self, win, notify=True):
-        """Size the bar to its bands (CCS_NORESIZE: keep the height) and lay them out"""
+        """Size the bar to its bands (CCS_NORESIZE: keep the height) and lay them out;
+        unless CCS_NOPARENTALIGN it spans its parent's client area (top or bottom)"""
         old = win.height
+        parent = self.gui.windows.get(win.parent)
+        align = not win.style & 0xC  # Neither CCS_NORESIZE nor CCS_NOPARENTALIGN
+        if align and parent is not None:
+            win.x, win.width = 0, self.gui.client_size(parent)[0]
         height = self.rebar_layout(win)
         border = 2 if win.style & 0x00800000 else 0
         if not win.style & 0x4:  # CCS_NORESIZE
             win.height = height + border
+        if align and parent is not None:
+            layout = win.style & 0x3
+            if layout in (0, 1):  # CCS_TOP
+                win.y = 0
+            elif layout == 3:  # CCS_BOTTOM
+                win.y = self.gui.client_size(parent)[1] - win.height
         if notify and win.height != old and win.parent:
             self._notify_simple(win, -831)  # RBN_HEIGHTCHANGE

@@ -879,6 +879,12 @@ class Kernel32MiscMixin:
         if full is None:
             self._last_error = 123  # ERROR_INVALID_NAME
             return 0
+        return self._write_path_out(full, nBufferLength, lpBuffer, lpFilePart, wide)
+
+    def _write_path_out(self, full, nBufferLength, lpBuffer, lpFilePart, wide):
+        """Copy a full path into a caller buffer like GetFullPathName: its
+        length, or the needed size (with the terminator) if it does not fit;
+        lpFilePart gets the address of its last component"""
         units = self._text_units(full, wide)  # lengths are in TCHARs
         if not lpBuffer or nBufferLength <= len(units):
             return len(units) + 1
@@ -892,6 +898,69 @@ class Kernel32MiscMixin:
 
     def GetFullPathNameW(self, args):
         return self.GetFullPathNameA(args, wide=True)
+
+    def _search_path_dirs(self):
+        """SearchPath's default order: the program's folder, the current
+        folder, System32, the Windows folder, then the PATH folders"""
+        exe_dir = self.windows_exe_path().rsplit('\\', 1)[0]
+        dirs = [exe_dir, self.current_directory, "C:\\Windows\\System32", "C:\\Windows"]
+        path = self.environment.get('PATH', '')
+        return dirs + [d for d in path.split(';') if d]
+
+    def SearchPathA(self, args, wide=False):
+        """SearchPathA/W emulation - finds a file in the sandbox"""
+        lpPath, lpFileName, lpExtension, nBufferLength, lpBuffer, lpFilePart = args[:6]
+        name = self._read_text(lpFileName, wide) if lpFileName else ''
+        if not name:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        candidates = [name]
+        if lpExtension and '.' not in name.replace('/', '\\').rsplit('\\', 1)[-1]:
+            candidates.insert(0, name + self._read_text(lpExtension, wide))
+        if name[1:2] == ':' or name.startswith(('\\', '/')):
+            dirs = ['']
+        elif lpPath:
+            dirs = [d for d in self._read_text(lpPath, wide).split(';') if d]
+        else:
+            dirs = self._search_path_dirs()
+        for folder in dirs:
+            for candidate in candidates:
+                full = self.full_windows_path(
+                    candidate if not folder else folder.rstrip('\\/') + '\\' + candidate)
+                host = self.resolve_c_drive_path(full) if full else None
+                if host and os.path.exists(host):
+                    log.debug(f"SearchPath(\"{name}\") -> \"{full}\"")
+                    return self._write_path_out(full, nBufferLength, lpBuffer, lpFilePart,
+                                                wide)
+        log.debug(f"SearchPath(\"{name}\") -> not found")
+        self._last_error = 2  # ERROR_FILE_NOT_FOUND
+        return 0
+
+    def SearchPathW(self, args):
+        return self.SearchPathA(args, wide=True)
+
+    def GetShortPathNameA(self, args, wide=False):
+        """GetShortPathNameA/W emulation - the sandbox has no 8.3 names (like an
+        NTFS volume with short names turned off): the path itself, if it exists"""
+        lpszLongPath, lpszShortPath, cchBuffer = args[0], args[1], args[2]
+        name = self._read_text(lpszLongPath, wide) if lpszLongPath else ''
+        full = self.full_windows_path(name) if name else None
+        host = self.resolve_c_drive_path(full) if full else None
+        if not host or not os.path.exists(host):
+            self._last_error = 2 if full else 123  # FILE_NOT_FOUND / INVALID_NAME
+            return 0
+        log.debug(f"GetShortPathName(\"{name}\")")
+        return self._return_text(lpszShortPath, cchBuffer, name, wide)
+
+    def GetShortPathNameW(self, args):
+        return self.GetShortPathNameA(args, wide=True)
+
+    def GetLongPathNameA(self, args, wide=False):
+        """GetLongPathNameA/W emulation (see GetShortPathName)"""
+        return self.GetShortPathNameA(args, wide)
+
+    def GetLongPathNameW(self, args):
+        return self.GetShortPathNameA(args, wide=True)
 
     def GetDiskFreeSpaceA(self, args):
         """GetDiskFreeSpaceA emulation - space of the host disk holding c_drive/"""

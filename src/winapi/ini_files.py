@@ -67,6 +67,42 @@ class IniFilesMixin:
                 start = i
         return None if start is None else (start, len(lines))
 
+    def _ini_value(self, lines, section, key):
+        """Value of a key in INI lines (enclosing quotes removed), or None"""
+        bounds = self._ini_section_range(lines, section)
+        if bounds:
+            for line in lines[bounds[0] + 1:bounds[1]]:
+                pair = self._ini_key_value(line)
+                if pair and pair[0].lower() == key.lower():
+                    value = pair[1]
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+                        value = value[1:-1]
+                    return value
+        return None
+
+    def GetPrivateProfileIntA(self, args, wide=False):
+        """GetPrivateProfileIntA/W emulation - the leading integer of a value
+        (decimal, or hexadecimal with 0x); nDefault if the key is missing"""
+        lpAppName, lpKeyName, nDefault, lpFileName = args[:4]
+        section = self._read_text(lpAppName, wide) if lpAppName else ''
+        key = self._read_text(lpKeyName, wide) if lpKeyName else ''
+        filename = self._read_text(lpFileName, wide) if lpFileName else ''
+        path = self._profile_path(filename) if filename else None
+        lines = (self._ini_read_lines(path) if path else None) or []
+        value = self._ini_value(lines, section, key) if lpAppName and lpKeyName else None
+        log.debug(f"GetPrivateProfileInt({section!r}, {key!r}, \"{filename}\") -> {value!r}")
+        if value is None:
+            return nDefault
+        match = re.match(r'\s*([-+]?)(0[xX][0-9a-fA-F]+|\d+)', value)
+        if not match:
+            return 0
+        digits = match.group(2)
+        number = int(digits, 16) if digits[:2].lower() == '0x' else int(digits)
+        return (-number if match.group(1) == '-' else number) & 0xFFFFFFFF
+
+    def GetPrivateProfileIntW(self, args):
+        return self.GetPrivateProfileIntA(args, wide=True)
+
     def GetPrivateProfileStringA(self, args):
         """GetPrivateProfileStringA emulation (INI files inside c_drive/)"""
         lpAppName, lpKeyName, lpDefault = args[0], args[1], args[2]
@@ -103,18 +139,9 @@ class IniFilesMixin:
             self.emu.uc.mem_write(lpReturnedString, data + b'\x00')
             return len(data)
 
-        value = None
-        bounds = self._ini_section_range(lines, section)
-        if bounds:
-            for line in lines[bounds[0] + 1:bounds[1]]:
-                pair = self._ini_key_value(line)
-                if pair and pair[0].lower() == key.lower():
-                    value = pair[1]
-                    break
+        value = self._ini_value(lines, section, key)
         if value is None:
             value = default
-        elif len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
-            value = value[1:-1]
 
         data = value.encode(config.ANSI_CODEPAGE, errors='replace')[:nSize - 1]
         self.emu.uc.mem_write(lpReturnedString, data + b'\x00')

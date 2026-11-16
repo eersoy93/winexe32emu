@@ -224,7 +224,7 @@ class MenusMixin:
         """LoadMenuA/W emulation - an RT_MENU resource of the EXE"""
         hInstance, lpMenuName = args[0], args[1]
         key = self._resource_name_key(lpMenuName, wide)
-        resource = self._find_resource(4, key) if self._is_own_module(hInstance) else None
+        resource = self._find_resource(4, key, hInstance)
         if resource is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
             return 0
@@ -542,7 +542,9 @@ class MenusMixin:
                  'owner': self, 'hwnd': hwnd, 'result': None, 'done': False, 'open': []}
         with self.gui.lock:
             self.gui.popup_menu = popup
-        self.emu.wait_until(lambda: popup['done'] or not self.gui.running)
+        # A modal loop: messages other threads send are handled meanwhile
+        self.emu.wait_until(lambda: self._process_sent_messages() or popup['done'] or
+                            not self.gui.running)
         with self.gui.lock:
             if self.gui.popup_menu is popup:
                 self.gui.popup_menu = None
@@ -561,7 +563,7 @@ class MenusMixin:
     def LoadAcceleratorsA(self, args, wide=False):
         """LoadAcceleratorsA/W emulation - an RT_ACCELERATOR table of the EXE"""
         key = self._resource_name_key(args[1], wide)
-        resource = self._find_resource(9, key) if self._is_own_module(args[0]) else None
+        resource = self._find_resource(9, key, args[0])
         if resource is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
             return 0

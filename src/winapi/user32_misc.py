@@ -18,7 +18,8 @@ import struct
 
 from unicorn import *
 
-from .. import config, winapi
+from .. import config, resources, winapi
+from ..logger import log
 
 
 class User32MiscMixin:
@@ -29,8 +30,7 @@ class User32MiscMixin:
     def LoadStringW(self, args):
         """LoadStringW emulation (cchBufferMax 0: a pointer to the resource string)"""
         hInstance, uID, lpBuffer, cchBufferMax = args[0], args[1] & 0xFFFF, args[2], args[3]
-        resource = self._find_resource(6, uID // 16 + 1) if self._is_own_module(hInstance) \
-            else None
+        resource = self._find_resource(6, uID // 16 + 1, hInstance)
         text, address = None, 0
         if resource:
             try:
@@ -68,6 +68,91 @@ class User32MiscMixin:
                 self.emu.heap_free(temp)
                 return result
         return self.LoadBitmapA([args[0], name])
+
+    IMAGE_BITMAP, IMAGE_ICON, IMAGE_CURSOR = 0, 1, 2
+    LR_LOADFROMFILE = 0x10
+
+    def _load_image_file(self, path, image_type):
+        """LoadImage(LR_LOADFROMFILE): a .bmp bitmap or a .ico icon"""
+        host = self.resolve_c_drive_path(path)
+        try:
+            with open(host, 'rb') as f:
+                data = f.read()
+        except (OSError, TypeError):
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return 0
+        if image_type == self.IMAGE_BITMAP:
+            decoded = self._decode_dib(data[14:]) if data[:2] == b'BM' else None
+            if decoded is None:
+                self._last_error = 13  # ERROR_INVALID_DATA
+                return 0
+            return self._new_bitmap(decoded[0], decoded[1], 32, decoded[2])
+        if image_type == self.IMAGE_ICON:
+            image = None
+            try:
+                count = struct.unpack_from('<H', data, 4)[0]
+                if count:
+                    size, offset = struct.unpack_from('<II', data, 6 + 8)
+                    image = resources._icon_image_rgba(data[offset:offset + size])
+            except struct.error:
+                image = None
+            if image is None:
+                self._last_error = 13  # ERROR_INVALID_DATA
+                return 0
+            handle = self.get_next_handle()
+            self.icons[handle] = image
+            return handle
+        self._last_error = 120  # ERROR_CALL_NOT_IMPLEMENTED (.cur files)
+        return 0
+
+    def _stretch_bitmap(self, handle, cx, cy):
+        """Stretch a new bitmap to cx x cy (LoadImage; 0 keeps that side)"""
+        bmp = self.gdi_objects[handle]
+        width, height = cx or bmp['width'], cy or bmp['height']
+        if (width, height) == (bmp['width'], bmp['height']):
+            return
+        sx, sy = width / bmp['width'], height / bmp['height']
+        for shape in bmp['shapes']:
+            x, y = shape['pos']
+            shape['pos'] = (round(x * sx), round(y * sy))
+            shape['size'] = (round(shape['size'][0] * sx), round(shape['size'][1] * sy))
+        bmp['width'], bmp['height'] = width, height
+
+    def LoadImageA(self, args, wide=False):
+        """LoadImageA/W emulation - a bitmap, icon or cursor of the program's
+        resources (or a system one with hInst NULL), or one of a file"""
+        hInst, name, image_type, cx, cy, fuLoad = args[:6]
+        log_name = (self._read_text(name, wide) if name >= 0x10000 else name)
+        log.debug(f"LoadImage(0x{hInst:x}, {log_name!r}, {image_type}, "
+                  f"{cx}, 0x{fuLoad:x})")
+        if fuLoad & self.LR_LOADFROMFILE:
+            handle = self._load_image_file(self._read_text(name, wide), image_type)
+        elif image_type == self.IMAGE_BITMAP:
+            handle = (self.LoadBitmapW if wide else self.LoadBitmapA)([hInst, name])
+        else:
+            handle = None
+        if handle is not None:
+            if handle and image_type == self.IMAGE_BITMAP:
+                self._stretch_bitmap(handle, cx, cy)
+            return handle
+        if image_type == self.IMAGE_CURSOR:
+            return self.LoadCursorA([hInst, name], wide)
+        if image_type == self.IMAGE_ICON:
+            if not hInst or not self._is_own_module(hInst) or not cx:
+                return self.LoadIconA([hInst, name], wide)
+            image = self._load_icon_image(self._resource_name_key(name, wide), cx, hInst)
+            if image is None:
+                self._last_error = 1813  # ERROR_RESOURCE_TYPE_NOT_FOUND
+                return 0
+            handle = self.get_next_handle()
+            self.icons[handle] = image
+            return handle
+        self._last_error = 87  # ERROR_INVALID_PARAMETER
+        return 0
+
+    def LoadImageW(self, args):
+        """LoadImageW emulation"""
+        return self.LoadImageA(args, wide=True)
 
     def GetDialogBaseUnits(self, args):
         """GetDialogBaseUnits emulation (system font: 8 x 16)"""
@@ -217,6 +302,167 @@ class User32MiscMixin:
 
     def GetClassInfoExA(self, args):
         return self.GetClassInfoA(args, ex=True)
+
+    # GCL_* index -> class field (registered_classes entry key)
+    CLASS_LONG_FIELDS = {-8: 'menu', -10: 'background', -12: 'cursor', -14: 'icon',
+                         -16: 'hInstance', -24: 'wndproc', -26: 'style', -34: 'icon_small'}
+
+    def _class_entry(self, hwnd):
+        """Class data of a window (a dict changed by SetClassLong), or None"""
+        name = self._window_class_name(hwnd) if self.gui else None
+        if name is None:
+            return None
+        wndclass = self.registered_classes.get(name)
+        if wndclass is None:
+            # The system classes: SetClassLong changes them for this process
+            wndclass = self.system_class_data.setdefault(name.upper(), {'style': 0x8})
+        return wndclass
+
+    def _class_long(self, args, set_value=False):
+        hwnd, index = args[0], args[1] - (1 << 32 if args[1] & 0x80000000 else 0)
+        wndclass = self._class_entry(hwnd)
+        if wndclass is None:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        if index == -32:  # GCW_ATOM
+            return wndclass.get('atom', 0)
+        field = self.CLASS_LONG_FIELDS.get(index, index)
+        old = wndclass.get(field, 0)
+        if isinstance(old, str):
+            old = 0  # A menu name string is not handed back
+        if set_value:
+            wndclass[field] = args[2]
+        self._last_error = 0
+        return old & 0xFFFFFFFF
+
+    def GetClassLongA(self, args):
+        """GetClassLongA/W emulation"""
+        return self._class_long(args)
+
+    def GetClassLongW(self, args):
+        return self._class_long(args)
+
+    def SetClassLongA(self, args):
+        """SetClassLongA/W emulation - changes the window's class; returns the
+        previous value"""
+        log.debug(f"SetClassLong(0x{args[0]:x}, {args[1]:#x}, 0x{args[2]:x})")
+        return self._class_long(args, set_value=True)
+
+    def SetClassLongW(self, args):
+        return self.SetClassLongA(args)
+
+    SC_SIZE, SC_MOVE, SC_MINIMIZE, SC_MAXIMIZE = 0xF000, 0xF010, 0xF020, 0xF030
+    SC_CLOSE, SC_RESTORE = 0xF060, 0xF120
+
+    def GetSystemMenu(self, args):
+        """GetSystemMenu emulation - the window menu of a window (its copy
+        bRevert TRUE resets to the standard one)"""
+        hwnd, bRevert = args[0], args[1]
+        if not self.gui or hwnd not in self.gui.windows:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        handle = self.system_menus.get(hwnd)
+        if bRevert:
+            if handle:
+                self.menus[handle] = self._standard_system_menu()
+            return 0
+        if handle is None:
+            handle = self.get_next_handle()
+            self.menus[handle] = self._standard_system_menu()
+            self.system_menus[hwnd] = handle
+        return handle
+
+    def _standard_system_menu(self):
+        items = [('&Restore', self.SC_RESTORE), ('&Move', self.SC_MOVE),
+                 ('&Size', self.SC_SIZE), ('Mi&nimize', self.SC_MINIMIZE),
+                 ('Ma&ximize', self.SC_MAXIMIZE), (None, 0), ('&Close\tAlt+F4', self.SC_CLOSE)]
+        return [{'flags': self.MF_SEPARATOR if text is None else 0, 'id': cmd,
+                 'text': text or '', 'submenu': 0} for text, cmd in items]
+
+    def GetMessagePos(self, args):
+        """GetMessagePos emulation - cursor position of the last message
+        retrieved (screen coordinates, x in the low word)"""
+        x, y = self.last_message_pos
+        return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+    def MessageBoxIndirectA(self, args, wide=False):
+        """MessageBoxIndirectA/W emulation (MSGBOXPARAMS)"""
+        try:
+            (_, _, _, lpszText, lpszCaption, dwStyle) = struct.unpack(
+                '<6I', self.emu.uc.mem_read(args[0], 24))
+        except UcError:
+            return 0
+        text = self._read_text(lpszText, wide) if lpszText else ""
+        caption = self._read_text(lpszCaption, wide) if lpszCaption else "Error"
+        return self._message_box(text, caption, dwStyle)
+
+    def MessageBoxIndirectW(self, args):
+        return self.MessageBoxIndirectA(args, wide=True)
+
+    HWND_BROADCAST = 0xFFFF
+
+    def SendMessageTimeoutA(self, args, wide=False):
+        """SendMessageTimeoutA/W emulation - messages are delivered at once (no
+        window of the emulator hangs); broadcasts reach the top-level windows
+        of this process"""
+        hwnd, msg, wParam, lParam, _, _, lpdwResult = args[:7]
+        if hwnd == self.HWND_BROADCAST:
+            targets = [h for h, w in list(self.gui.windows.items())
+                       if not w.parent and w.owner is self] if self.gui else []
+            for target in targets:
+                self.SendMessageA([target, msg, wParam, lParam], wide)
+            result = 0
+        elif self.gui and (hwnd in self.gui.windows or hwnd in self.gui.controls):
+            result = self.SendMessageA([hwnd, msg, wParam, lParam], wide)
+        else:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        if lpdwResult:
+            self._mem_write(lpdwResult, struct.pack('<I', result & 0xFFFFFFFF))
+        return 1
+
+    def SendMessageTimeoutW(self, args):
+        return self.SendMessageTimeoutA(args, wide=True)
+
+    def FindWindowExA(self, args, wide=False):
+        """FindWindowExA/W emulation - a child of hwndParent (the desktop's
+        top-level windows if NULL) after hwndChildAfter, by class and/or title"""
+        hwndParent, hwndChildAfter, lpszClass, lpszWindow = args[:4]
+        if lpszClass and lpszClass < 0x10000:
+            class_name = self.atoms.get(lpszClass)
+            if class_name is None:
+                self._last_error = 1411  # ERROR_CLASS_DOES_NOT_EXIST
+                return 0
+        else:
+            class_name = self._read_text(lpszClass, wide) if lpszClass else None
+        title = self._read_text(lpszWindow, wide) if lpszWindow else None
+        if not self.gui:
+            return 0
+        with self.gui.lock:
+            if hwndParent in (0, self.GetDesktopWindow([])):
+                order = list(reversed(self.gui.z_order))
+                order += [h for h in self.gui.windows if h not in order]
+                candidates = [h for h in order
+                              if h in self.gui.windows and not self.gui.windows[h].parent]
+            else:
+                candidates = self._child_handles(hwndParent)
+            if hwndChildAfter:
+                if hwndChildAfter not in candidates:
+                    return 0
+                candidates = candidates[candidates.index(hwndChildAfter) + 1:]
+            for hwnd in candidates:
+                if class_name is not None and \
+                        (self._window_class_name(hwnd) or '').lower() != class_name.lower():
+                    continue
+                if title is not None and self._window_text(hwnd) != title:
+                    continue
+                log.debug(f"FindWindowEx({class_name!r}, {title!r}) -> 0x{hwnd:x}")
+                return hwnd
+        self._last_error = 0
+        return 0
+
+    def FindWindowExW(self, args):
+        return self.FindWindowExA(args, wide=True)
 
     def GetClassNameW(self, args):
         """GetClassNameW emulation"""

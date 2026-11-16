@@ -52,7 +52,7 @@ class CoreMixin:
         'LsaOpenPolicy': 4, 'OpenProcessToken': 3, 'RegCloseKey': 1, 'RegCreateKeyExA': 9,
         'RegCreateKeyExW': 9, 'RegDeleteKeyA': 2, 'RegDeleteKeyW': 2, 'RegDeleteValueA': 2,
         'RegDeleteValueW': 2, 'RegEnumKeyExA': 8, 'RegEnumKeyExW': 8, 'RegEnumValueA': 8,
-        'RegEnumValueW': 8, 'RegFlushKey': 1,
+        'RegEnumValueW': 8, 'RegFlushKey': 1, 'RegEnumKeyA': 4, 'RegEnumKeyW': 4,
         'RegOpenKeyExA': 5, 'RegOpenKeyExW': 5, 'RegQueryValueExA': 6, 'RegQueryValueExW': 6,
         'RegSetValueExA': 6, 'RegSetValueExW': 6, 'SetFileSecurityW': 3,
         # comctl32
@@ -67,6 +67,7 @@ class CoreMixin:
         'CommDlgExtendedError': 0, 'FindTextA': 1, 'GetOpenFileNameA': 1,
         'GetOpenFileNameW': 1, 'GetSaveFileNameA': 1, 'GetSaveFileNameW': 1,
         # gdi32
+        'CombineRgn': 4, 'CreateRectRgn': 4, 'CreateRectRgnIndirect': 1, 'GetRgnBox': 2,
         'Arc': 9, 'BitBlt': 9, 'Chord': 9, 'CreateBitmap': 5, 'CreateBrushIndirect': 1,
         'CreateCompatibleBitmap': 3, 'CreateCompatibleDC': 1, 'CreateDCA': 4,
         'CreateFontA': 14, 'CreateFontIndirectA': 1, 'CreateHatchBrush': 2,
@@ -197,6 +198,7 @@ class CoreMixin:
         'acmStreamPrepareHeader': 3, 'acmStreamSize': 4, 'acmStreamUnprepareHeader': 3,
         # ole32
         'CoCreateInstance': 5, 'CoInitialize': 1, 'CoTaskMemAlloc': 1, 'CoTaskMemFree': 1,
+        'CoTaskMemRealloc': 2,
         'CoUninitialize': 0, 'DoDragDrop': 4, 'OleInitialize': 1, 'OleUninitialize': 0,
         'RegisterDragDrop': 2, 'ReleaseStgMedium': 1, 'RevokeDragDrop': 1,
         # oleaut32
@@ -210,6 +212,7 @@ class CoreMixin:
         'ShellExecuteExA': 1, 'ShellExecuteExW': 1, 'ShellExecuteW': 6, 'SHFileOperationA': 1,
         'SHFileOperationW': 1, 'SHGetDesktopFolder': 1, 'SHGetFileInfoA': 5,
         'SHGetFileInfoW': 5, 'SHGetFolderPathA': 5, 'SHGetFolderPathW': 5,
+        'SHGetMalloc': 1,
         'SHGetPathFromIDListA': 2, 'SHGetPathFromIDListW': 2, 'SHGetSpecialFolderLocation': 3,
         'SHGetSpecialFolderPathA': 4, 'SHGetSpecialFolderPathW': 4,
         # user32
@@ -274,6 +277,20 @@ class CoreMixin:
         'SetMenuItemInfoA': 4, 'SetMenuItemInfoW': 4, 'SetParent': 2,
         'SystemParametersInfoW': 4, 'TrackPopupMenu': 7, 'TrackPopupMenuEx': 6,
         'TranslateAcceleratorA': 3, 'TranslateAcceleratorW': 3, 'WindowFromPoint': 2,
+        # user32: window classes, messages, images, regions (NSIS installers)
+        'DrawFocusRect': 2, 'FindWindowExA': 4, 'FindWindowExW': 4, 'GetClassLongA': 2,
+        'GetClassLongW': 2, 'GetMessagePos': 0, 'GetSystemMenu': 2, 'LoadImageA': 6,
+        'LoadImageW': 6, 'MapWindowPoints': 4, 'MessageBoxIndirectA': 1,
+        'MessageBoxIndirectW': 1, 'SendMessageTimeoutA': 7, 'SendMessageTimeoutW': 7,
+        'SetClassLongA': 3, 'SetClassLongW': 3, 'SetWindowRgn': 3,
+        # kernel32: paths and INI files
+        'GetLongPathNameA': 3, 'GetLongPathNameW': 3, 'GetPrivateProfileIntA': 4,
+        'GetPrivateProfileIntW': 4, 'GetShortPathNameA': 3, 'GetShortPathNameW': 3,
+        'SearchPathA': 6, 'SearchPathW': 6,
+        # version
+        'GetFileVersionInfoA': 4, 'GetFileVersionInfoSizeA': 2,
+        'GetFileVersionInfoSizeW': 2, 'GetFileVersionInfoW': 4, 'VerQueryValueA': 4,
+        'VerQueryValueW': 4,
         # winmm
         'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciSendCommandA': 4, 'PlaySoundA': 3,
         'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2, 'timeBeginPeriod': 1,
@@ -401,12 +418,17 @@ class CoreMixin:
         self.file_streams = {}
         self.next_file_ptr = 0x0F000000  # dedicated range for fake FILE* pointers
         self.registered_classes = {}  # Registered window classes
+        self.system_class_data = {}  # System class name -> fields changed by SetClassLong
+        self.system_menus = {}  # hwnd -> window menu (GetSystemMenu)
+        self.shell_malloc = 0  # IMalloc of SHGetMalloc
+        self.last_message_pos = (0, 0)  # Cursor position of the last message (GetMessagePos)
         self.atoms = {}  # RegisterClass atoms
         self.next_atom = 0xC000
 
         # Message queue system
         self.message_queue = []
         self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
+        self.sent_messages = {}  # Guest thread id -> SendMessage requests from other threads
         self.painted_windows = set()  # Windows that received WM_PAINT
         self.dirty_controls = {}  # Owner-draw controls waiting for WM_DRAWITEM (ordered)
         self._drawitem_buf = 0

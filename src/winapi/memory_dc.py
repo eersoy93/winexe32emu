@@ -304,7 +304,7 @@ class MemoryDCMixin:
         if not hInstance:
             log.warning(f"LoadBitmapA: system bitmap {name} is not available")
             return 0
-        resource = self._find_resource(2, name)  # RT_BITMAP
+        resource = self._find_resource(2, name, hInstance)  # RT_BITMAP
         decoded = None
         if resource:
             try:

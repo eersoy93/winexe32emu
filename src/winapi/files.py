@@ -323,7 +323,8 @@ class FilesMixin:
                 name = self._read_text(lpCursorName, wide)
                 key = (int(name[1:]) if name.startswith('#') and name[1:].isdigit()
                        else name.upper())
-            cursor = self._load_resource_cursor(key) if self._is_own_module(hInstance) else 0
+            cursor = (self._load_resource_cursor(key, hInstance)
+                      if self._is_own_module(hInstance) else 0)
         log.debug(f"LoadCursor(0x{hInstance:x}, 0x{lpCursorName:x}) -> 0x{cursor:x}")
         if not cursor:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
@@ -333,10 +334,10 @@ class FilesMixin:
         """LoadCursorW emulation"""
         return self.LoadCursorA(args, wide=True)
 
-    def _load_icon_image(self, key, size=32):
+    def _load_icon_image(self, key, size=32, hModule=0):
         """(width, height, RGBA) of the EXE's RT_GROUP_ICON key: its image
         closest to size x size with the most colors; None if there is none"""
-        group = self._find_resource(14, key)
+        group = self._find_resource(14, key, hModule)
         if group is None:
             return None
         try:
@@ -348,7 +349,7 @@ class FilesMixin:
                                                                      6 + 14 * i)
                 images.append((abs((w or 256) - size), -bits, icon_id))
             for _, _, icon_id in sorted(images):
-                icon = self._find_resource(3, icon_id)
+                icon = self._find_resource(3, icon_id, hModule)
                 decoded = resources._icon_image_rgba(bytes(self.emu.uc.mem_read(*icon))) if icon else None
                 if decoded:
                     return decoded
@@ -362,7 +363,7 @@ class FilesMixin:
         log.debug(f"LoadIcon(0x{args[0]:x}, 0x{args[1]:x})")
         handle = self.get_next_handle()
         if args[0] and self._is_own_module(args[0]):
-            image = self._load_icon_image(self._resource_name_key(args[1], wide))
+            image = self._load_icon_image(self._resource_name_key(args[1], wide), hModule=args[0])
             if image is None:
                 self._last_error = 1813  # ERROR_RESOURCE_TYPE_NOT_FOUND
                 return 0

@@ -47,8 +47,11 @@ class FakeWindow:
         self.controls = []  # Buttons, text boxes, etc.
         self.wndproc = 0
         self.owner = None  # WinAPIHandler of the process that created it (None: emulator's own)
+        self.thread_id = None  # Guest thread that created it (gets its messages)
         self.bg_color = (212, 208, 200)  # Classic Windows gray (COLOR_BTNFACE)
         self.text = title
+        self.region = None  # SetWindowRgn rectangles (window coordinates)
+        self.dialog_brush = None  # Dialog background chosen by WM_CTLCOLORDLG (RGB)
 
         # Retained drawing list (GDI display list, redrawn every frame):
         # Rectangle/Ellipse/LineTo/SetPixel/Polygon/TextOut... items
@@ -142,6 +145,7 @@ class FakeControl:
         self.control_id = 0  # Control ID (hMenu in CreateWindowEx) for WM_COMMAND
         self.checked = False  # For Checkbox/Radio
         self.drawn_shapes = []  # GDI drawing on the control's DC (owner-draw)
+        self.region = None  # SetWindowRgn rectangles (window coordinates)
         self.items = []       # For Listbox/Combobox (LB_ADDSTRING, CB_ADDSTRING)
         self.sel_index = -1   # Selected item index (-1 = none)
         self.top_index = 0    # First visible LISTBOX item (mouse wheel scrolling)
@@ -170,6 +174,11 @@ class FakeControl:
         self.text_limit = 0  # EM_LIMITTEXT (0: no limit)
         self.icon = None  # SS_ICON static: (width, height, RGBA) of its icon
         self.icon_handle = 0
+        self.bitmap = None  # SS_BITMAP static: its bitmap GDI object (dict)
+        self.bitmap_handle = 0
+        # Colors the parent chose with WM_CTLCOLOR*: {'text', 'bk_mode', 'bk_color',
+        # 'brush'} or None for the defaults
+        self.ctl_colors = None
         self.modified = False  # EM_GETMODIFY
         # ES_PASSWORD shows this character instead of the text ('' : plain text)
         self.password_char = '*' if self.class_name == 'EDIT' and style & 0x20 else ''

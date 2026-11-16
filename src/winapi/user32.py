@@ -410,6 +410,14 @@ class User32Mixin:
                     win.wndproc = new_value
                 store[nIndex] = new_value
             return old & 0xFFFFFFFF
+        DWL_DLGPROC = 4
+        dialog = self.dialogs.get(hWnd)
+        if nIndex == DWL_DLGPROC and dialog is not None and not dialog['handler']:
+            # The dialog procedure (subclassing a dialog replaces it)
+            old = dialog['proc']
+            if set_value:
+                dialog['proc'] = new_value
+            return old & 0xFFFFFFFF
         if nIndex == -12:  # GWL_ID
             if win is not None:
                 old = win.control_id
@@ -630,6 +638,32 @@ class User32Mixin:
         except UcError:
             return 0
         return 1
+
+    def MapWindowPoints(self, args):
+        """MapWindowPoints emulation - points (or a RECT: 2 points) from the
+        client area of one window to another's (NULL: the screen); returns
+        the offset, x in the low word and y in the high word"""
+        hWndFrom, hWndTo, lpPoints, cPoints = args[:4]
+        if not self.gui:
+            return 0
+        origins = []
+        for hwnd in (hWndFrom, hWndTo):
+            origin = (0, 0) if hwnd in (0, self.DESKTOP_HWND) else self._client_origin_of(hwnd)
+            if origin is None:
+                self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+                return 0
+            origins.append(origin)
+        dx, dy = origins[0][0] - origins[1][0], origins[0][1] - origins[1][1]
+        if lpPoints and cPoints:
+            try:
+                count = min(cPoints, 0x10000)
+                values = struct.unpack(f"<{2 * count}i", self.emu.uc.mem_read(lpPoints, 8 * count))
+                moved = [v + (dx if i % 2 == 0 else dy) for i, v in enumerate(values)]
+                self.emu.uc.mem_write(lpPoints, struct.pack(f"<{2 * count}i", *moved))
+            except UcError:
+                return 0
+        self._last_error = 0
+        return ((dy & 0xFFFF) << 16) | (dx & 0xFFFF)
 
     def SetCapture(self, args):
         """SetCapture emulation - route mouse input to one window"""

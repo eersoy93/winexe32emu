@@ -534,6 +534,119 @@ class GdiMixin:
                               'fill': None, 'pen': (color, 1)})
         return 1
 
+    def DrawFocusRect(self, args):
+        """DrawFocusRect emulation - the focus rectangle (drawn solid, not with
+        XOR: owner-drawn items repaint their background before drawing it)"""
+        hdc, lprc = args[0], args[1]
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None:
+            return 0
+        self._add_shape(hdc, {'type': 'rect', 'rect': rect, 'fill': None,
+                              'pen': ((0, 0, 0), 1)})
+        return 1
+
+    # ---------- Regions (unions of rectangles) ----------
+
+    NULLREGION, SIMPLEREGION, COMPLEXREGION = 1, 2, 3
+    RGN_AND, RGN_OR, RGN_XOR, RGN_DIFF, RGN_COPY = 1, 2, 3, 4, 5
+
+    def _new_region(self, rects):
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {'type': 'region', 'rects': rects}
+        return handle
+
+    def _region_kind(self, rects):
+        return (self.NULLREGION if not rects else
+                self.SIMPLEREGION if len(rects) == 1 else self.COMPLEXREGION)
+
+    @staticmethod
+    def _combine_rects(first, second, test):
+        """Rectangles covering the points p for which test(p in first, p in
+        second) holds (row bands merged like Windows' region data)"""
+        xs = sorted({v for r in first + second for v in (r[0], r[2])})
+        ys = sorted({v for r in first + second for v in (r[1], r[3])})
+
+        def inside(rects, x, y):
+            return any(r[0] <= x < r[2] and r[1] <= y < r[3] for r in rects)
+        bands = []
+        for top, bottom in zip(ys, ys[1:]):
+            row = []
+            for left, right in zip(xs, xs[1:]):
+                if test(inside(first, left, top), inside(second, left, top)):
+                    if row and row[-1][2] == left:
+                        row[-1] = (row[-1][0], top, right, bottom)
+                    else:
+                        row.append((left, top, right, bottom))
+            if bands and [(r[0], r[2]) for r in bands[-1]] == [(r[0], r[2]) for r in row] \
+                    and bands[-1] and bands[-1][0][3] == top:
+                bands[-1] = [(r[0], r[1], r[2], bottom) for r in bands[-1]]
+            elif row:
+                bands.append(row)
+        return [r for band in bands for r in band]
+
+    def CreateRectRgn(self, args):
+        """CreateRectRgn emulation"""
+        left, top, right, bottom = self._read_signed_args(args, 0, 4)
+        left, right = min(left, right), max(left, right)
+        top, bottom = min(top, bottom), max(top, bottom)
+        rects = [(left, top, right, bottom)] if left < right and top < bottom else []
+        return self._new_region(rects)
+
+    def CreateRectRgnIndirect(self, args):
+        """CreateRectRgnIndirect emulation"""
+        rect = self._read_rect(args[0]) if args[0] else None
+        if rect is None:
+            return 0
+        return self.CreateRectRgn([v & 0xFFFFFFFF for v in rect])
+
+    def CombineRgn(self, args):
+        """CombineRgn emulation - returns the kind of the new region"""
+        dest, src1, src2, mode = args[:4]
+        regions = [self.gdi_objects.get(h) for h in (dest, src1, src2)]
+        if regions[0] is None or regions[0]['type'] != 'region' or \
+                regions[1] is None or regions[1]['type'] != 'region':
+            return 0  # ERROR
+        first = list(regions[1]['rects'])
+        if mode == self.RGN_COPY:
+            rects = first
+        else:
+            if regions[2] is None or regions[2]['type'] != 'region':
+                return 0
+            second = list(regions[2]['rects'])
+            test = {self.RGN_AND: lambda a, b: a and b, self.RGN_OR: lambda a, b: a or b,
+                    self.RGN_XOR: lambda a, b: a != b,
+                    self.RGN_DIFF: lambda a, b: a and not b}.get(mode)
+            if test is None:
+                return 0
+            rects = self._combine_rects(first, second, test)
+        regions[0]['rects'] = rects
+        return self._region_kind(rects)
+
+    def GetRgnBox(self, args):
+        """GetRgnBox emulation - the bounding rectangle; returns the kind"""
+        region = self.gdi_objects.get(args[0])
+        if region is None or region['type'] != 'region':
+            return 0
+        rects = region['rects']
+        box = (min(r[0] for r in rects), min(r[1] for r in rects),
+               max(r[2] for r in rects), max(r[3] for r in rects)) if rects else (0, 0, 0, 0)
+        if args[1]:
+            self._mem_write(args[1], struct.pack('<4i', *box))
+        return self._region_kind(rects)
+
+    def SetWindowRgn(self, args):
+        """SetWindowRgn emulation - the system owns the region afterwards (it is
+        kept with the window; drawing is not clipped to it)"""
+        hwnd, hrgn = args[0], args[1]
+        if not self.gui or (hwnd not in self.gui.windows and hwnd not in self.gui.controls):
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        target = self.gui.windows.get(hwnd) or self.gui.controls.get(hwnd)
+        region = self.gdi_objects.pop(hrgn, None) if hrgn else None
+        target.region = list(region['rects']) if region and region['type'] == 'region' \
+            else None
+        return 1
+
     def PatBlt(self, args):
         """PatBlt emulation - BLACKNESS/WHITENESS/PATCOPY fills"""
         hdc = args[0]

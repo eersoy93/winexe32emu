@@ -151,6 +151,60 @@ class ShellFoldersMixin:
             self.emu.heap_free(args[0])
         return 0
 
+    IID_IMALLOC = '00000002-0000-0000-c000-000000000046'
+
+    def SHGetMalloc(self, args):
+        """SHGetMalloc emulation - the shell's task allocator (IMalloc over
+        CoTaskMemAlloc/CoTaskMemFree)"""
+        if not args[0]:
+            return 0x80070057  # E_INVALIDARG
+        if not self.shell_malloc:
+            pointers = self._com_new_object(
+                [((self.IID_IMALLOC, self.IID_IUNKNOWN),
+                  self._com_vtable('IMalloc', 'malloc'))], {})
+            self.shell_malloc = pointers[self.IID_IUNKNOWN]
+        else:
+            self.com_objects[self.shell_malloc]['refs'] += 1
+        self._mem_write(args[0], struct.pack('<I', self.shell_malloc))
+        return 0  # S_OK
+
+    def _com_malloc(self, method, wide, args):
+        """IMalloc methods of SHGetMalloc's allocator (it is never freed)"""
+        if method in ('AddRef', 'Release'):
+            return 1
+        if method == 'QueryInterface':
+            return self._com_unknown(method, args)
+        if method == 'Alloc':
+            return self.CoTaskMemAlloc([args[1]])
+        if method == 'Free':
+            self.CoTaskMemFree([args[1]])
+            return 0
+        if method == 'Realloc':
+            return self.CoTaskMemRealloc([args[1], args[2]])
+        if method == 'GetSize':
+            size = self.emu.heap_block_size(args[1])
+            return 0xFFFFFFFF if size is None else size
+        if method == 'DidAlloc':
+            return 1 if self.emu.heap_block_size(args[1]) is not None else 0
+        return 0  # HeapMinimize
+
+    def CoTaskMemRealloc(self, args):
+        """CoTaskMemRealloc emulation"""
+        pv, cb = args[0], args[1]
+        if not pv:
+            return self.CoTaskMemAlloc([cb])
+        if not cb:
+            self.CoTaskMemFree([pv])
+            return 0
+        old = self.emu.heap_block_size(pv)
+        if old is None:
+            return 0
+        new = self.emu.heap_alloc(cb)
+        if new:
+            self._mem_write(new, bytes(self.emu.uc.mem_read(pv, min(old, cb))))
+            self.CoTaskMemFree([pv])
+        return new
+
     BFFM_INITIALIZED, BFFM_SELCHANGED = 1, 2
     BFFM_SETSTATUSTEXTA, BFFM_ENABLEOK, BFFM_SETSELECTIONA = 0x464, 0x465, 0x466
     BFFM_SETSELECTIONW, BFFM_SETSTATUSTEXTW, BFFM_SETOKTEXT = 0x467, 0x468, 0x469

@@ -40,11 +40,29 @@ class ExeResourcesMixin:
             return int(name[1:])
         return name.upper()
 
-    def _find_resource(self, res_type, name):
-        """(address, size) of a resource of the EXE (first language), or None"""
+    def _resource_module(self, hModule):
+        """(base, pefile.PE) of a module whose resources can be read: the EXE
+        (hModule 0 or its base) or one of the program's own loaded DLLs"""
+        if hModule in (0, self.emu.pe_loader.image_base):
+            return self.emu.pe_loader.image_base, self.emu.pe_loader.pe
+        module = self.emu.dlls.get(hModule)
+        if module is not None:
+            return module['base'], module['pe']
+        return None
+
+    def _find_resource(self, res_type, name, hModule=0):
+        """(address, size) of a resource of the EXE or of the loaded DLL
+        hModule (first language), or None"""
+        found_module = self._resource_module(hModule)
+        if found_module is None:
+            return None
+        base, pe = found_module
         if self._resource_index is None:
             self._resource_index = {}
-            root = getattr(self.emu.pe_loader.pe, 'DIRECTORY_ENTRY_RESOURCE', None)
+        index = self._resource_index.get(base)
+        if index is None:
+            index = self._resource_index[base] = {}
+            root = getattr(pe, 'DIRECTORY_ENTRY_RESOURCE', None)
             for type_entry in (root.entries if root else []):
                 tkey = str(type_entry.name).upper() if type_entry.name else type_entry.id
                 for name_entry in getattr(type_entry, 'directory', None).entries:
@@ -52,20 +70,22 @@ class ExeResourcesMixin:
                     languages = getattr(name_entry, 'directory', None)
                     if languages and languages.entries:
                         data = languages.entries[0].data.struct
-                        self._resource_index[(tkey, nkey)] = (data.OffsetToData, data.Size)
-        found = self._resource_index.get((res_type, name))
+                        index[(tkey, nkey)] = (data.OffsetToData, data.Size)
+        found = index.get((res_type, name))
         if found is None:
             return None
-        return (self.emu.pe_loader.image_base + found[0], found[1])
+        return (base + found[0], found[1])
 
     def _is_own_module(self, hModule):
-        return hModule in (0, self.emu.pe_loader.image_base)
+        """Is hModule the EXE or one of its loaded DLLs (modules whose
+        resources are emulated)?"""
+        return self._resource_module(hModule) is not None
 
     def FindResourceA(self, args):
-        """FindResourceA emulation (resources of the EXE only)"""
+        """FindResourceA emulation (resources of the EXE and its loaded DLLs)"""
         hModule, lpName, lpType = args[0], args[1], args[2]
         name, res_type = self._resource_key(lpName), self._resource_key(lpType)
-        resource = self._find_resource(res_type, name) if self._is_own_module(hModule) else None
+        resource = self._find_resource(res_type, name, hModule)
         log.debug(f"FindResourceA({name!r}, type {res_type!r}) -> {resource}")
         if resource is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
@@ -99,8 +119,7 @@ class ExeResourcesMixin:
         """LoadStringA emulation - RT_STRING blocks hold 16 counted UTF-16 strings"""
         hInstance, uID, lpBuffer, cchBufferMax = args[0], args[1] & 0xFFFF, args[2], args[3]
         text = None
-        resource = self._find_resource(6, uID // 16 + 1) if self._is_own_module(hInstance) \
-            else None
+        resource = self._find_resource(6, uID // 16 + 1, hInstance)
         if resource:
             try:
                 block = bytes(self.emu.uc.mem_read(*resource))
