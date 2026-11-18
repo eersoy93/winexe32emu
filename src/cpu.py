@@ -33,6 +33,74 @@ from .pe_loader import PELoader
 from .winapi import WinAPIHandler
 
 
+try:
+    from unicorn.unicorn_py3.unicorn import uclib as _uclib
+except ImportError:  # another Unicorn binding layout: use the Uc methods
+    _uclib = None
+
+
+class ApiCallRegs:
+    """Buffers of one Unicorn instance for the API call path, which goes to
+    the Unicorn library directly: the Python reg_read/reg_write wrappers cost
+    most of an API call's time, and programs such as 7-Zip's File Manager call
+    malloc and free about a million times at startup"""
+
+    STACK_BYTES = 4 * 33  # Return address and 32 argument slots
+
+    def __init__(self, uc):
+        self.handle = uc._uch
+        self.esp = ctypes.c_uint32()
+        self.esp_ref = ctypes.byref(self.esp)
+        self.eip = ctypes.c_uint32()
+        self.eip_ref = ctypes.byref(self.eip)
+        self.stack = ctypes.create_string_buffer(self.STACK_BYTES)
+        self.return_ids = (ctypes.c_int32 * 2)(UC_X86_REG_EAX, UC_X86_REG_ESP)
+        self.return_values = (ctypes.c_uint32 * 2)()
+        base = ctypes.addressof(self.return_values)
+        self.return_ptrs = (ctypes.c_void_p * 2)(base, base + 4)
+
+    @classmethod
+    def of(cls, uc):
+        """The buffers of uc (None without direct library access); each
+        Unicorn instance runs on one host thread, so they are not shared"""
+        if _uclib is None:
+            return None
+        regs = getattr(uc, '_api_call_regs', None)
+        if regs is None:
+            try:
+                regs = cls(uc)
+                uc._api_call_regs = regs
+            except (AttributeError, TypeError):
+                return None
+        return regs
+
+    def read_esp(self):
+        status = _uclib.uc_reg_read(self.handle, UC_X86_REG_ESP, self.esp_ref)
+        if status != UC_ERR_OK:
+            raise UcError(status)
+        return self.esp.value
+
+    def read_stack(self, esp):
+        """Return address and 32 argument slots at esp (None if unmapped)"""
+        if _uclib.uc_mem_read(self.handle, esp, self.stack, self.STACK_BYTES) != UC_ERR_OK:
+            return None
+        return struct.unpack_from('<33I', self.stack)
+
+    def write_return(self, eax, eip, esp):
+        values = self.return_values
+        values[0] = eax
+        values[1] = esp
+        status = _uclib.uc_reg_write_batch(self.handle, self.return_ids,
+                                           self.return_ptrs, 2)
+        if status == UC_ERR_OK:
+            # EIP on its own: only uc_reg_write makes Unicorn leave the
+            # stub's translation block for the new address
+            self.eip.value = eip
+            status = _uclib.uc_reg_write(self.handle, UC_X86_REG_EIP, self.eip_ref)
+        if status != UC_ERR_OK:
+            raise UcError(status)
+
+
 class GuestThread:
     """One thread of an emulated process: its own Unicorn instance (registers,
     FS/TEB) on the process's shared memory, and per-thread API state"""
@@ -88,7 +156,18 @@ class CPUEmulator:
     }
     NATIVE_ROUTINES['memcpy'] = NATIVE_ROUTINES['memmove']
     NATIVE_ROUTINE_DLLS = ('msvcrt.dll', 'ntdll.dll', 'ucrtbase.dll',
-                           'api-ms-win-crt-string-l1-1-0.dll', 'vcruntime140.dll')
+                           'api-ms-win-crt-string-l1-1-0.dll', 'vcruntime140.dll',
+                           'api-ms-win-crt-heap-l1-1-0.dll')
+    # malloc and free of small blocks run as guest code too: freed blocks of
+    # up to SMALL_BLOCK_MAX bytes wait in per-size free lists (heads at
+    # NATIVE_DATA_ADDR) for the next malloc of their size; other calls go to
+    # the Python heap. A byte per 16-byte heap granule (the size class map,
+    # after the heap) gives each malloc block's size class, with
+    # SMALL_BLOCK_CACHED set while it is in a free list. 7-Zip's File Manager
+    # calls malloc and free a million times at startup.
+    NATIVE_DATA_ADDR = CALLBACK_RETURN_ADDR + 0x2000
+    SMALL_BLOCK_MAX = 256
+    SMALL_BLOCK_CACHED = 0x80
     # A thread that runs this long without blocking lets the others run
     THREAD_TIME_SLICE = 0.02
     
@@ -120,6 +199,7 @@ class CPUEmulator:
         # Memory management
         self.heap_current = self.HEAP_BASE
         self.heap_blocks = {}  # addr -> requested size (for realloc)
+        self.heap_class_map = None  # mmap of the size class map (see NATIVE_DATA_ADDR)
         self.heap_free_bins = {}  # aligned size -> set of free block addrs
         self.heap_free_ends = {}  # free block end addr -> start addr
         self.mapped_regions = []
@@ -449,7 +529,7 @@ class CPUEmulator:
     def _reserved_regions(self):
         """Address ranges the emulator itself uses (start, end)"""
         return [(0, 0x10000),
-                (self.HEAP_BASE, self.HEAP_BASE + self.HEAP_SIZE),
+                (self.HEAP_BASE, self.heap_class_map_addr + self.heap_class_map_size),
                 (self.CALLBACK_RETURN_ADDR, self.API_HOOK_BASE + self.API_HOOK_SIZE),
                 (self.STACK_BASE, self.STACK_BASE + self.STACK_SIZE)]
 
@@ -513,6 +593,9 @@ class CPUEmulator:
             self.map_shared(self.HEAP_BASE, self.HEAP_SIZE, UC_PROT_ALL)
             self.mapped_regions.append((self.HEAP_BASE, self.HEAP_BASE + self.HEAP_SIZE))
             log.info(f"Heap allocated: 0x{self.HEAP_BASE:08x} - 0x{self.HEAP_BASE + self.HEAP_SIZE:08x}")
+            self.map_shared(self.heap_class_map_addr, self.heap_class_map_size,
+                            UC_PROT_READ | UC_PROT_WRITE)
+            self.heap_class_map = self.shared_regions[self.heap_class_map_addr][2]
         except UcError as e:
             log.error(f"Heap allocation error: {e}")
             return False
@@ -620,11 +703,50 @@ class CPUEmulator:
         self.heap_blocks[addr] = size
         return addr
 
+    @property
+    def heap_class_map_addr(self):
+        return self.HEAP_BASE + self.HEAP_SIZE
+
+    @property
+    def heap_class_map_size(self):
+        return self._align_size(self.HEAP_SIZE // 16)
+
+    def _heap_granule(self, addr):
+        """Index of addr in the size class map (None outside the heap)"""
+        offset = addr - self.HEAP_BASE
+        return offset >> 4 if 0 <= offset < self.HEAP_SIZE else None
+
+    def heap_alloc_small(self, size):
+        """malloc: a heap block that the guest-code free and malloc may cache
+        when it is small (its size is rounded up to its size class then)"""
+        if not 0 < size <= self.SMALL_BLOCK_MAX or self.heap_class_map is None:
+            return self.heap_alloc(size)
+        span = self._align_size(size, 16)
+        addr = self.heap_alloc(span)
+        if addr:
+            self.heap_class_map[self._heap_granule(addr)] = span >> 4
+        return addr
+
+    def _forget_small_block(self, addr):
+        """Keep the guest-code free from caching the block at addr. Returns
+        False if the block waits in a free list (freed already)"""
+        if self.heap_class_map is None:
+            return True
+        granule = self._heap_granule(addr)
+        if granule is None:
+            return True
+        size_class = self.heap_class_map[granule]
+        if size_class & self.SMALL_BLOCK_CACHED:
+            return False
+        if size_class:
+            self.heap_class_map[granule] = 0
+        return True
+
     def heap_free(self, addr):
         """Release a heap_alloc() block. Returns False if addr is not a live block."""
-        size = self.heap_blocks.pop(addr, None)
-        if size is None:
+        if addr not in self.heap_blocks or not self._forget_small_block(addr):
             return False
+        size = self.heap_blocks.pop(addr)
         end = addr + self._align_size(max(size, 1), 16)
         if end != self.heap_current:
             self.heap_free_bins.setdefault(end - addr, set()).add(addr)
@@ -654,6 +776,8 @@ class CPUEmulator:
             return False
         new_end = addr + self._align_size(max(new_size, 1), 16)
         if new_end > self.HEAP_BASE + self.HEAP_SIZE:
+            return False
+        if not self._forget_small_block(addr):
             return False
         if new_end < self.heap_current:
             self.uc.mem_write(new_end, b'\x00' * (self.heap_current - new_end))
@@ -851,8 +975,86 @@ class CPUEmulator:
                     placed[code] = address
                     address = (address + len(code) + 15) & ~15
                 self.native_routines[name] = placed[code]
+            if self.heap_class_map is not None:
+                self._place_small_block_cache(address)
         except UcError as e:
             log.warning(f"Could not setup callback return hook: {e}")
+
+    def _small_block_cache_code(self, malloc_addr, free_addr, malloc_slow, free_slow):
+        """Guest code of malloc and free (see NATIVE_DATA_ADDR); the slow
+        paths jump to the Python API stubs with the caller's stack intact"""
+        heads = struct.pack('<I', self.NATIVE_DATA_ADDR)  # dword per size class 1..16
+        class_map = struct.pack('<I', self.heap_class_map_addr)
+        heap_base = struct.pack('<I', self.HEAP_BASE)
+        heap_size = struct.pack('<I', self.HEAP_SIZE)
+        cached = bytes([self.SMALL_BLOCK_CACHED])
+        not_cached = bytes([~self.SMALL_BLOCK_CACHED & 0xFF])
+
+        def jmp(code, base, target):
+            return code + b'\xE9' + struct.pack('<i', target - (base + len(code) + 5))
+
+        malloc = (
+            b'\x8B\x44\x24\x04'                     # mov eax, [esp+4]      size
+            b'\x48'                                 # dec eax
+            b'\x3D' + struct.pack('<I', self.SMALL_BLOCK_MAX - 1) +  # cmp eax, MAX-1
+            b'\x77\x2D'                             # ja slow               (0 or big)
+            b'\xC1\xE8\x04'                         # shr eax, 4
+            b'\x40'                                 # inc eax               size class
+            b'\x89\xC2'                             # mov edx, eax
+            b'\x8B\x04\x95' + heads +               # mov eax, [heads+edx*4]
+            b'\x85\xC0'                             # test eax, eax
+            b'\x74\x1C'                             # jz slow               list empty
+            b'\x8B\x08'                             # mov ecx, [eax]        next block
+            b'\x89\x0C\x95' + heads +               # mov [heads+edx*4], ecx
+            b'\x89\xC1'                             # mov ecx, eax
+            b'\x81\xE9' + heap_base +               # sub ecx, HEAP_BASE
+            b'\xC1\xE9\x04'                         # shr ecx, 4
+            b'\x80\xA1' + class_map + not_cached +  # and byte [map+ecx], ~CACHED
+            b'\xC3'                                 # ret
+        )
+        malloc = jmp(malloc, malloc_addr, malloc_slow)
+
+        free = (
+            b'\x8B\x44\x24\x04'                     # mov eax, [esp+4]      ptr
+            b'\x89\xC1'                             # mov ecx, eax
+            b'\x81\xE9' + heap_base +               # sub ecx, HEAP_BASE
+            b'\x81\xF9' + heap_size +               # cmp ecx, HEAP_SIZE
+            b'\x73\x2D'                             # jae slow              not heap (or NULL)
+            b'\xF6\xC1\x0F'                         # test cl, 15
+            b'\x75\x28'                             # jnz slow
+            b'\xC1\xE9\x04'                         # shr ecx, 4
+            b'\x0F\xB6\x91' + class_map +           # movzx edx, byte [map+ecx]
+            b'\x84\xD2'                             # test dl, dl
+            b'\x74\x1A'                             # jz slow               not a small malloc block
+            b'\x78\x17'                             # js done               freed already
+            b'\x80\x89' + class_map + cached +      # or byte [map+ecx], CACHED
+            b'\x8B\x0C\x95' + heads +               # mov ecx, [heads+edx*4]
+            b'\x89\x08'                             # mov [eax], ecx
+            b'\x89\x04\x95' + heads +               # mov [heads+edx*4], eax
+            b'\xC3'                                 # done: ret
+        )
+        free = jmp(free, free_addr, free_slow)
+        return malloc, free
+
+    def _place_small_block_cache(self, address):
+        """Write the guest-code malloc and free after the other native routines"""
+        self.map_shared(self.NATIVE_DATA_ADDR, 0x1000, UC_PROT_READ | UC_PROT_WRITE)
+        malloc_slow = self._create_api_stub('msvcrt.dll', 'malloc')
+        free_slow = self._create_api_stub('msvcrt.dll', 'free')
+        if not malloc_slow or not free_slow:
+            return
+        malloc_addr = address
+        malloc, _ = self._small_block_cache_code(malloc_addr, 0, malloc_slow, free_slow)
+        free_addr = (malloc_addr + len(malloc) + 15) & ~15
+        malloc, free = self._small_block_cache_code(malloc_addr, free_addr,
+                                                    malloc_slow, free_slow)
+        if free_addr + len(free) > self.NATIVE_CODE_ADDR + 0x1000:
+            log.warning("No room for the guest-code malloc and free")
+            return
+        self.uc.mem_write(malloc_addr, malloc)
+        self.uc.mem_write(free_addr, free)
+        self.native_routines['malloc'] = malloc_addr
+        self.native_routines['free'] = free_addr
     
     @property
     def pending_unwind(self):
@@ -1069,41 +1271,69 @@ class CPUEmulator:
 
         hook_info = self.api_hooks.get(address)
         if hook_info:
+            thread = self.current_thread
             self.maybe_yield()
-            self.sync_regions()
-            self._handle_api_call(hook_info)
-            if self.stop_emulation or self.current_thread.stop:
+            if thread.region_gen != self.region_gen:
+                self.sync_regions(thread)
+            self._handle_api_call(hook_info, uc, thread)
+            if self.stop_emulation or thread.stop:
                 uc.emu_stop()
-    
-    def _handle_api_call(self, hook_info):
-        """Handle API call"""
+
+    _UNRESOLVED = object()
+
+    def _resolve_api(self, hook_info):
+        """Handler and stack cleanup of an API stub, looked up once: programs
+        such as 7-Zip's File Manager call malloc and free a million times"""
         dll_name = hook_info['dll'].lower()
         func_name = hook_info['name']
-        
-        log.debug(f"API Call: {dll_name}!{func_name}")
-        
-        # Read arguments from stack
-        esp = self.uc.reg_read(UC_X86_REG_ESP)
-        
-        # Return address
-        ret_addr = struct.unpack('<I', self.uc.mem_read(esp, 4))[0]
-        
-        # Up to 32 argument slots (varargs functions such as printf may use
-        # many); slots beyond the top of the stack read as zero.
-        try:
-            args = list(struct.unpack('<32I', self.uc.mem_read(esp + 4, 128)))
-        except UcError:
+        handler = hook_info.get('handler', self._UNRESOLVED)
+        if handler is self._UNRESOLVED:
+            handler = self.api_handler.get_api_handler(func_name, dll_name)
+            if handler is not None:
+                hook_info['handler'] = handler
+        cleanup = hook_info.get('cleanup')
+        if cleanup is None:
+            # None (unknown stdcall argument count) is not kept: a COM
+            # interface created later may still define it
+            cleanup = self.api_handler.stack_cleanup_bytes(dll_name, func_name)
+            if cleanup is not None:
+                hook_info['cleanup'] = cleanup
+        return dll_name, func_name, handler, cleanup
+
+    def _handle_api_call(self, hook_info, uc=None, thread=None):
+        """Handle API call"""
+        uc = uc or self.uc
+        thread = thread or self.current_thread
+        dll_name, func_name, handler, cleanup = self._resolve_api(hook_info)
+
+        if DebugLogger.level <= DebugLogger.DEBUG:
+            log.debug(f"API Call: {dll_name}!{func_name}")
+
+        # Return address and up to 32 argument slots (varargs functions such
+        # as printf may use many); slots beyond the top of the stack read as zero.
+        regs = ApiCallRegs.of(uc)
+        if regs is not None:
+            esp = regs.read_esp()
+            stack = regs.read_stack(esp)
+        else:
+            esp = uc.reg_read(UC_X86_REG_ESP)
+            try:
+                stack = struct.unpack('<33I', uc.mem_read(esp, 132))
+            except UcError:
+                stack = None
+        if stack is not None:
+            ret_addr, *args = stack
+        else:
+            ret_addr = struct.unpack('<I', uc.mem_read(esp, 4))[0]
             args = []
             for i in range(32):
                 try:
-                    args.append(struct.unpack('<I', self.uc.mem_read(esp + 4 + i * 4, 4))[0])
+                    args.append(struct.unpack('<I', uc.mem_read(esp + 4 + i * 4, 4))[0])
                 except UcError:
                     args.append(0)
-        
-        # Find and call handler
-        handler = self.api_handler.get_api_handler(func_name, dll_name)
-        self.api_call_esp = esp
-        
+
+        thread.api_call_esp = esp
+
         if handler:
             try:
                 result = handler(args)
@@ -1112,7 +1342,7 @@ class CPUEmulator:
                 result = unwind.jump
                 if not self.jump_belongs_here(result):
                     self.pending_unwind = result
-                    self.uc.emu_stop()
+                    uc.emu_stop()
                     return
             except Exception as e:
                 log.error(f"Emulator error in {dll_name}!{func_name}: "
@@ -1128,25 +1358,23 @@ class CPUEmulator:
         if isinstance(result, ApiJump):
             if not self.jump_belongs_here(result):
                 self.pending_unwind = result
-                self.uc.emu_stop()
+                uc.emu_stop()
                 return
             self.apply_jump(self.uc, result)
             return
 
         x87_result = isinstance(result, X87Result)
         if x87_result:
-            self.uc.mem_write(self.X87_RESULT_ADDR, struct.pack('<d', result.value))
+            uc.mem_write(self.X87_RESULT_ADDR, struct.pack('<d', result.value))
             result = 0
         elif isinstance(result, QWordResult):
-            self.uc.reg_write(UC_X86_REG_EDX, result.value >> 32)
+            uc.reg_write(UC_X86_REG_EDX, result.value >> 32)
             result = result.value
-        
-        # Write result to EAX
-        self.uc.reg_write(UC_X86_REG_EAX, result & 0xFFFFFFFF)
         
         # Return to caller. stdcall APIs (kernel32, user32, gdi32, ...) pop
         # their own arguments; cdecl CRT functions leave them to the caller.
-        cleanup = self.api_handler.stack_cleanup_bytes(dll_name, func_name)
+        if cleanup is None:
+            cleanup = self._resolve_api(hook_info)[3]
         if cleanup is None:
             # Unknown stdcall argument count: continuing would corrupt ESP
             log.error(f"Unemulated stdcall API {dll_name}!{func_name}: "
@@ -1154,13 +1382,18 @@ class CPUEmulator:
             self.crashed = True
             self.stop_emulation = True
             cleanup = 0
+        # Result in EAX
         if x87_result and cleanup == 0:
             # Leave the return address on the stack: the stub loads ST(0) and RETs
-            self.uc.reg_write(UC_X86_REG_EIP, self.X87_RETURN_STUB)
-            self.uc.reg_write(UC_X86_REG_ESP, esp)
-            return
-        self.uc.reg_write(UC_X86_REG_EIP, ret_addr)
-        self.uc.reg_write(UC_X86_REG_ESP, esp + 4 + cleanup)
+            eip, new_esp = self.X87_RETURN_STUB, esp
+        else:
+            eip, new_esp = ret_addr, esp + 4 + cleanup
+        if regs is not None:
+            regs.write_return(result & 0xFFFFFFFF, eip, new_esp & 0xFFFFFFFF)
+        else:
+            uc.reg_write(UC_X86_REG_EAX, result & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EIP, eip)
+            uc.reg_write(UC_X86_REG_ESP, new_esp)
     
     def _hook_mem_invalid(self, uc, access, address, size, value, user_data):
         """Invalid memory access hook"""

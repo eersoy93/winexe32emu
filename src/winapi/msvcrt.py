@@ -1242,7 +1242,7 @@ class MsvcrtMixin:
     def malloc(self, args):
         """malloc emulation"""
         size = args[0]
-        addr = self.emu.heap_alloc(size)
+        addr = self.emu.heap_alloc_small(size)
         log.debug(f"malloc({size}) -> 0x{addr:08x}")
         return addr
     
