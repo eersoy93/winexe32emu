@@ -417,6 +417,35 @@ static void test_shell(void)
               strcmp(info.szTypeName, "System Folder") == 0 &&
               info.dwAttributes & SFGAO_FOLDER,
               "SHGetFileInfoA (My Computer PIDL)");
+        {
+            /* My Computer's items are the drives: only C:\ */
+            IShellFolder *desktop = NULL, *computer = NULL;
+            IEnumIDList *items = NULL;
+            LPITEMIDLIST item[2] = {NULL, NULL};
+            ULONG fetched = 0;
+            STRRET name;
+            int ok = drives && SHGetDesktopFolder(&desktop) == S_OK &&
+                     desktop->lpVtbl->BindToObject(desktop, drives, NULL, &IID_IShellFolder,
+                                                   (void **)&computer) == S_OK &&
+                     computer->lpVtbl->EnumObjects(computer, NULL, SHCONTF_FOLDERS,
+                                                   &items) == S_OK &&
+                     items->lpVtbl->Next(items, 2, item, &fetched) == S_FALSE &&
+                     fetched == 1 && SHGetPathFromIDListA(item[0], buf) &&
+                     strcmp(buf, "C:\\") == 0;
+            check(ok, "IShellFolder::EnumObjects (My Computer holds only C:)");
+            check(ok && computer->lpVtbl->GetDisplayNameOf(computer, item[0], SHGDN_NORMAL,
+                                                           &name) == S_OK &&
+                  name.uType == STRRET_WSTR && wcsstr(name.pOleStr, L"(C:)") != NULL,
+                  "IShellFolder::GetDisplayNameOf (Local Disk (C:))");
+            if (item[0])
+                CoTaskMemFree(item[0]);
+            if (items)
+                items->lpVtbl->Release(items);
+            if (computer)
+                computer->lpVtbl->Release(computer);
+            if (desktop)
+                desktop->lpVtbl->Release(desktop);
+        }
         CoTaskMemFree(drives);
     }
     check(GetEnvironmentVariableA("APPDATA", buf, sizeof(buf)) &&

@@ -38,19 +38,22 @@ class DrivesTimeMixin:
     # ---------- Drives and volumes (only C: exists) ----------
 
     volume_label = ''
+    # Drive letters of the machine (GetLogicalDrives, My Computer's items):
+    # only C: (c_drive/) for now
+    LOGICAL_DRIVES = ('C',)
 
     def _drive_root_ok(self, address, wide=False):
-        """True if a root path argument (NULL: current drive) names drive C:"""
+        """True if a root path argument (NULL: current drive) names an existing drive"""
         if not address:
             return True
         root = strip_win32_path_prefix(self._read_text(address, wide))
         return root is not None and not (len(root) >= 2 and root[1] == ':'
-                                         and root[0].upper() != 'C')
+                                         and root[0].upper() not in self.LOGICAL_DRIVES)
 
     def GetLogicalDriveStringsA(self, args, wide=False):
-        """GetLogicalDriveStringsA/W emulation - only C:\\"""
+        """GetLogicalDriveStringsA/W emulation (LOGICAL_DRIVES)"""
         size, buffer = args[0], args[1]
-        data = "C:\\\x00\x00"
+        data = ''.join(f"{letter}:\\\x00" for letter in self.LOGICAL_DRIVES) + "\x00"
         if size < len(data) or not buffer:
             return len(data)
         self._mem_write(buffer, data.encode('utf-16-le' if wide else 'ascii'))
@@ -114,8 +117,11 @@ class DrivesTimeMixin:
         return self.GetDiskFreeSpaceExA(args, wide=True)
 
     def GetLogicalDrives(self, args):
-        """GetLogicalDrives emulation - only C:"""
-        return 1 << 2
+        """GetLogicalDrives emulation (LOGICAL_DRIVES)"""
+        mask = 0
+        for letter in self.LOGICAL_DRIVES:
+            mask |= 1 << (ord(letter) - ord('A'))
+        return mask
 
     def GetDriveTypeA(self, args):
         """GetDriveTypeA emulation - C: is a fixed disk"""

@@ -231,8 +231,10 @@ class ShellFoldersMixin:
             return 0
         title = self._read_text(lpszTitle, wide) if lpszTitle else ''
         root = self.pidls.get(pidlRoot, 'C:\\').rstrip('\\') if pidlRoot else 'C:'
+        # Rooted at My Computer, the top level lists the drives (LOGICAL_DRIVES)
+        computer = self.MY_COMPUTER_PATH
         if self._is_my_computer(root):
-            root = 'C:'  # The drives: the only one is C:
+            root = computer
         log.info(f"SHBrowseForFolder{'W' if wide else 'A'}(\"{title}\")")
 
         ID_TITLE, ID_PATH, ID_LIST, ID_STATUS = 0x3742, 0x3743, 0x3744, 0x3745
@@ -248,30 +250,42 @@ class ShellFoldersMixin:
         def at_root():
             return state['dir'].rstrip('\\').lower() == root.lower()
 
+        def in_computer():
+            return state['dir'] == computer
+
         def selected():
             """Folder chosen now: the selected list entry or the current folder"""
             listbox = self._dialog_control(dlg, ID_LIST)
             if 0 <= listbox.sel_index < len(listbox.items):
                 item = listbox.items[listbox.sel_index]
+                if in_computer():
+                    return item + '\\'  # A drive: "C:" -> C:\\
                 if item != '..':
                     return state['dir'].rstrip('\\') + '\\' + item
+            if in_computer():
+                return computer
             return state['dir'] if len(state['dir']) > 2 else state['dir'] + '\\'
 
         def notify_selection():
             path = selected()
-            self._dialog_control(dlg, ID_PATH).text = path
+            self._dialog_control(dlg, ID_PATH).text = \
+                self.MY_COMPUTER_NAME if path == computer else path
             if lpfn:
                 pidl = self._make_pidl(path)
                 self.emu.call_callback(lpfn, [dlg, self.BFFM_SELCHANGED, pidl, lParam])
                 self.CoTaskMemFree([pidl])
 
         def fill(select=None):
-            host_dir = self.resolve_c_drive_path(state['dir'] + '\\')
-            try:
-                entries = sorted((e for e in os.listdir(host_dir)
-                                  if os.path.isdir(os.path.join(host_dir, e))), key=str.lower)
-            except (OSError, TypeError):
-                entries = []
+            if in_computer():
+                entries = [f"{letter}:" for letter in self.LOGICAL_DRIVES]
+            else:
+                host_dir = self.resolve_c_drive_path(state['dir'] + '\\')
+                try:
+                    entries = sorted((e for e in os.listdir(host_dir)
+                                      if os.path.isdir(os.path.join(host_dir, e))),
+                                     key=str.lower)
+                except (OSError, TypeError):
+                    entries = []
             listbox = self._dialog_control(dlg, ID_LIST)
             listbox.items = ([] if at_root() else ['..']) + entries
             listbox.top_index = 0
@@ -285,13 +299,19 @@ class ShellFoldersMixin:
             notify_selection()
 
         def navigate(path, select=None):
+            if path == computer:
+                if root != computer:
+                    return False
+                state['dir'] = computer
+                fill(select)
+                return True
             # The trailing backslash keeps "C:" from meaning the current directory
             full = self.full_windows_path(path.rstrip('\\') + '\\', clamp=True)
             host = self.resolve_c_drive_path(full) if full else None
             if host is None or not os.path.isdir(host):
                 return False
             full = full.rstrip('\\')
-            if not full.lower().startswith(root.lower()):
+            if root != computer and not full.lower().startswith(root.lower()):
                 return False
             state['dir'] = full
             fill(select)
@@ -307,6 +327,8 @@ class ShellFoldersMixin:
                 if host is not None and os.path.isdir(host):
                     if name and full.lower() != root.lower():
                         navigate(parent, select=name)
+                    elif not name and root == computer:
+                        navigate(computer, select=full)  # A drive root: "C:"
                     else:
                         navigate(full)
                     return 1
@@ -348,7 +370,12 @@ class ShellFoldersMixin:
                         item = listbox.items[listbox.sel_index]
                         if item == '..':
                             parent, name = ntpath.split(state['dir'])
-                            navigate(parent, select=name)
+                            if not name:  # A drive root: up to My Computer
+                                navigate(computer, select=state['dir'])
+                            else:
+                                navigate(parent, select=name)
+                        elif in_computer():
+                            navigate(item)
                         else:
                             navigate(state['dir'] + '\\' + item)
                 elif control_id == 1:
@@ -368,7 +395,8 @@ class ShellFoldersMixin:
             return 0
         path = state['result']
         if pszDisplayName:
-            name = ntpath.basename(path.rstrip('\\')) or path
+            name = self.MY_COMPUTER_NAME if path == computer else \
+                (self._drive_display_name(path) or ntpath.basename(path.rstrip('\\')) or path)
             self._write_units(pszDisplayName, self._text_units(name, wide)[:259], wide)
         return self._make_pidl(path)
 

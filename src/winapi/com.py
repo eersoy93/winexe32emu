@@ -238,6 +238,9 @@ class ComMixin:
             ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('QueryContextMenu', 6),
             ('InvokeCommand', 2), ('GetCommandString', 6), ('HandleMenuMsg', 4),
             ('HandleMenuMsg2', 5)],
+        'enum_idlist': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('Next', 4),
+            ('Skip', 2), ('Reset', 1), ('Clone', 2)],
         'malloc': [
             ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('Alloc', 2),
             ('Realloc', 3), ('Free', 2), ('GetSize', 2), ('DidAlloc', 2),
@@ -272,7 +275,86 @@ class ComMixin:
         self._mem_write(args[0], struct.pack('<I', self._shell_folder_object('')))
         return self.S_OK
 
+    IID_IENUMIDLIST = '000214f2-0000-0000-c000-000000000046'
+    SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SHCONTF_INCLUDEHIDDEN = 0x20, 0x40, 0x80
+
+    def _shell_folder_items(self, path, flags):
+        """Full paths of the items of a shell folder for EnumObjects: My
+        Computer holds the drives, the desktop My Computer and the Desktop
+        folder's items"""
+        folders, files = flags & self.SHCONTF_FOLDERS, flags & self.SHCONTF_NONFOLDERS
+        if self._is_my_computer(path):
+            return [f"{letter}:\\" for letter in self.LOGICAL_DRIVES] if folders else []
+        items = []
+        if not path:
+            if folders:
+                items.append(self.MY_COMPUTER_PATH)
+            path = self._shell_folder(0x10)  # CSIDL_DESKTOPDIRECTORY
+        host = self.resolve_c_drive_path(path.rstrip('\\') + '\\') if path else None
+        try:
+            names = sorted(os.listdir(host), key=str.lower) if host else []
+        except OSError:
+            names = []
+        for name in names:
+            if name.startswith('.') and not flags & self.SHCONTF_INCLUDEHIDDEN:
+                continue
+            is_dir = os.path.isdir(os.path.join(host, name))
+            if folders if is_dir else files:
+                items.append(ntpath.join(path, name))
+        return items
+
+    def _enum_idlist_object(self, paths):
+        """New IEnumIDList over PIDLs of paths; returns its pointer"""
+        pointers = self._com_new_object(
+            [((self.IID_IENUMIDLIST, self.IID_IUNKNOWN),
+              self._com_vtable('IEnumIDList', 'enum_idlist'))],
+            {'paths': list(paths), 'next': 0})
+        return pointers[self.IID_IUNKNOWN]
+
+    def _com_enum_idlist(self, method, wide, args):
+        """IEnumIDList of EnumObjects: each Next hands out new PIDLs"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        paths = state['paths']
+        if method == 'Next':
+            _, count, rgelt, fetched = args[:4]
+            if not rgelt:
+                return self.E_POINTER
+            taken = paths[state['next']:state['next'] + count]
+            state['next'] += len(taken)
+            for index, path in enumerate(taken):
+                self._mem_write(rgelt + 4 * index, struct.pack('<I', self._make_pidl(path)))
+            if fetched:
+                self._mem_write(fetched, struct.pack('<I', len(taken)))
+            return self.S_OK if len(taken) == count else 1  # S_FALSE
+        if method == 'Skip':
+            skipped = min(args[1], len(paths) - state['next'])
+            state['next'] += skipped
+            return self.S_OK if skipped == args[1] else 1
+        if method == 'Reset':
+            state['next'] = 0
+            return self.S_OK
+        if method == 'Clone':
+            if not args[1]:
+                return self.E_POINTER
+            clone = self._enum_idlist_object(paths)
+            self.com_objects[clone]['next'] = state['next']
+            self._mem_write(args[1], struct.pack('<I', clone))
+            return self.S_OK
+        return self.E_NOTIMPL
+
+    def _drive_display_name(self, path):
+        """Explorer's name of a drive root like C:\\ ("Local Disk (C:)"), or None"""
+        if len(path) <= 3 and path[1:2] == ':' and path.rstrip('\\')[2:] == '':
+            label = self.volume_label or 'Local Disk'
+            return f"{label} ({path[0].upper()}:)"
+        return None
+
     def _shell_item_attributes(self, path):
+        if self._is_my_computer(path):
+            return self.SFGAO_DIRECTORY  # A folder, not in the file system
         host = self.resolve_c_drive_path(path)
         if host is None or not os.path.exists(host):
             return 0
@@ -291,6 +373,14 @@ class ComMixin:
                 return self.E_INVALIDARG
             self._mem_write(ppidl, struct.pack('<I', 0))
             name = self._read_text(name_ptr, True)
+            if self._is_my_computer(name):
+                if eaten:
+                    self._mem_write(eaten, struct.pack('<I', len(name)))
+                if attributes:
+                    wanted = struct.unpack('<I', self.emu.uc.mem_read(attributes, 4))[0]
+                    self._mem_write(attributes, struct.pack('<I', wanted & self.SFGAO_DIRECTORY))
+                self._mem_write(ppidl, struct.pack('<I', self._make_pidl(self.MY_COMPUTER_PATH)))
+                return self.S_OK
             full = self.full_windows_path(ntpath.join(state['path'], name) if state['path']
                                           else name)
             host = self.resolve_c_drive_path(full) if full else None
@@ -312,10 +402,20 @@ class ComMixin:
                 return self.E_POINTER
             self._mem_write(ppv, struct.pack('<I', 0))
             path = self.pidls.get(pidl)
+            if self._is_my_computer(path):
+                return self._com_query_new(self._shell_folder_object(self.MY_COMPUTER_PATH),
+                                           riid, ppv)
             host = self.resolve_c_drive_path(path) if path else None
             if host is None or not os.path.isdir(host):
                 return self.E_INVALIDARG
             return self._com_query_new(self._shell_folder_object(path), riid, ppv)
+        if method == 'EnumObjects':
+            _, _, flags, ppenum = args[:4]
+            if not ppenum:
+                return self.E_POINTER
+            enum = self._enum_idlist_object(self._shell_folder_items(state['path'], flags))
+            self._mem_write(ppenum, struct.pack('<I', enum))
+            return self.S_OK
         if method == 'CompareIDs':
             first = self.pidls.get(args[2], '').lower()
             second = self.pidls.get(args[3], '').lower()
@@ -356,13 +456,15 @@ class ComMixin:
                 name = path
             elif self._is_my_computer(path):
                 name = self.MY_COMPUTER_NAME
+            elif self._drive_display_name(path):
+                name = self._drive_display_name(path)
             else:
                 name = ntpath.basename(path.rstrip('\\')) or path
             text = self.emu.heap_alloc((len(name) + 1) * 2)
             self._write_text(text, name, True)
             self._mem_write(strret, struct.pack('<II', 0, text))  # STRRET_WSTR
             return self.S_OK
-        return self.E_NOTIMPL  # EnumObjects, BindToStorage, CreateViewObject, SetNameOf
+        return self.E_NOTIMPL  # BindToStorage, CreateViewObject, SetNameOf
 
     # The shell's own verbs of files: (verb, menu text, help text); the offset
     # of a command is its index here
