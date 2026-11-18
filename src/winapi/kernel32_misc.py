@@ -456,11 +456,10 @@ class Kernel32MiscMixin:
         path = self.resolve_drive_path(filename)
         if path is None or not os.path.exists(path):
             return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
+        read_only = 0x01 if self._host_read_only(path) else 0  # FILE_ATTRIBUTE_READONLY
         if os.path.isdir(path):
-            return 0x10  # FILE_ATTRIBUTE_DIRECTORY
-        if not os.access(path, os.W_OK):
-            return 0x01  # FILE_ATTRIBUTE_READONLY
-        return 0x80  # FILE_ATTRIBUTE_NORMAL
+            return 0x10 | read_only  # FILE_ATTRIBUTE_DIRECTORY
+        return read_only or 0x80  # FILE_ATTRIBUTE_NORMAL
 
     def CreateFileA(self, args):
         """CreateFileA emulation - opens a real file inside the drives/ sandbox"""

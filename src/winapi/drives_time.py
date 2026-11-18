@@ -241,7 +241,7 @@ class DrivesTimeMixin:
             self._last_error = 5
             return 0
         attributes = 0x10 if os.path.isdir(info['path']) else 0x20  # DIRECTORY / ARCHIVE
-        if not os.access(info['path'], os.W_OK):
+        if self._host_read_only(info['path']):
             attributes |= 0x1  # READONLY
         size = 0 if attributes & 0x10 else st.st_size
         data = struct.pack('<I3QIIIIII', attributes, self._filetime(st.st_ctime),

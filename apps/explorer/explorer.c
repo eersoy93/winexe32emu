@@ -15,14 +15,17 @@ limitations under the License.
 */
 
 /*
-Explorer (the desktop's My Computer) - browses the emulated C drive and runs EXE files.
+Explorer (the desktop's My Computer) - browses the emulated drives (A:, C:, D:)
+and runs EXE files.
 
-  - Double-click / Enter / Open: enter a folder, or run an EXE
-  - Backspace / Up: go to the parent folder
+  - It starts in My Computer, the list of the drives
+  - Double-click / Enter / Open: enter a drive or a folder, or run an EXE
+  - Backspace / Up: go to the parent folder (from a drive's root: My Computer)
   - F5 / Refresh: read the folder again
-  - The status line shows the size and date of the selected entry
+  - The status line shows the size and date of the selected entry, or the
+    free space of the selected drive
 
-Usage: explorer.exe [folder]  (default: C:\)
+Usage: explorer.exe [folder]  (default: My Computer)
 */
 
 #include <windows.h>
@@ -47,14 +50,15 @@ Usage: explorer.exe [folder]  (default: C:\)
 #define STATUS_H 22
 
 typedef struct {
-    char name[MAX_PATH];
+    char name[MAX_PATH];   /* A drive's root ("C:\\") in My Computer */
+    char label[MAX_PATH];  /* What the list shows */
     DWORD attributes;
     DWORD size;
     FILETIME modified;
 } Entry;
 
 static HWND hMain, hPath, hList, hStatus;
-static char current[MAX_PATH] = "C:\\";
+static char current[MAX_PATH] = "";  /* "": My Computer, the drives */
 static Entry *entries;
 static int entry_count, entry_capacity;
 static int has_parent;  /* entries[0] is ".." */
@@ -70,9 +74,14 @@ static int is_exe(const char *name)
     return n > 4 && lstrcmpiA(name + n - 4, ".exe") == 0;
 }
 
+static int is_computer(const char *path)
+{
+    return path[0] == '\0';  /* My Computer */
+}
+
 static int is_root(const char *path)
 {
-    return lstrlenA(path) <= 3;  /* "C:\" */
+    return lstrlenA(path) <= 3;  /* "C:\" (or My Computer) */
 }
 
 /* Folders first, then files; both by name, case-insensitive */
@@ -131,6 +140,10 @@ static int add_entry(const WIN32_FIND_DATAA *fd)
         entry_capacity = capacity;
     }
     lstrcpynA(entries[entry_count].name, fd->cFileName, MAX_PATH);
+    if (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        wsprintfA(entries[entry_count].label, "[%s]", fd->cFileName);
+    else
+        lstrcpynA(entries[entry_count].label, fd->cFileName, MAX_PATH);
     entries[entry_count].attributes = fd->dwFileAttributes;
     entries[entry_count].size = fd->nFileSizeLow;
     entries[entry_count].modified = fd->ftLastWriteTime;
@@ -138,11 +151,68 @@ static int add_entry(const WIN32_FIND_DATAA *fd)
     return 1;
 }
 
+/* "3\xBD Floppy (A:)", "Local Disk (C:)", "CD Drive (D:)": the volume label
+   or the drive type, like Windows Explorer */
+static void drive_label(char *out, const char *root)
+{
+    char volume[MAX_PATH] = "";
+    const char *type;
+    switch (GetDriveTypeA(root)) {
+    case DRIVE_REMOVABLE: type = "3\xBD Floppy"; break;
+    case DRIVE_CDROM:     type = "CD Drive"; break;
+    default:              type = "Local Disk"; break;
+    }
+    if (!GetVolumeInformationA(root, volume, sizeof(volume), NULL, NULL, NULL, NULL, 0))
+        volume[0] = '\0';
+    wsprintfA(out, "%s (%c:)", volume[0] ? volume : type, root[0]);
+}
+
+/* The drives of My Computer */
+static void load_drives(void)
+{
+    char roots[256], *root;
+    WIN32_FIND_DATAA fd;
+    DWORD length = GetLogicalDriveStringsA(sizeof(roots), roots);
+    if (length == 0 || length >= sizeof(roots))
+        return;
+    for (root = roots; *root; root += lstrlenA(root) + 1) {
+        memset(&fd, 0, sizeof(fd));
+        lstrcpynA(fd.cFileName, root, MAX_PATH);
+        fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        if (!add_entry(&fd))
+            break;
+        drive_label(entries[entry_count - 1].label, root);
+    }
+}
+
+/* Free space of a drive in My Computer's status line */
+static void drive_status(char *text, const Entry *e)
+{
+    ULARGE_INTEGER free_bytes, total_bytes;
+    char free_text[32], total_text[32];
+    if (GetDiskFreeSpaceExA(e->name, &free_bytes, &total_bytes, NULL)) {
+        format_number(free_text, (DWORD)(free_bytes.QuadPart / 1024));
+        format_number(total_text, (DWORD)(total_bytes.QuadPart / 1024));
+        wsprintfA(text, "%s - %s KB free of %s KB%s", e->label, free_text, total_text,
+                  GetDriveTypeA(e->name) == DRIVE_CDROM ? " (read-only)" : "");
+    } else {
+        wsprintfA(text, "%s - not ready", e->label);
+    }
+}
+
 /* Summary of the folder, or the details of the selected entry */
 static void update_status(void)
 {
     char text[MAX_PATH + 96], number[32], date[32];
     int sel = (int)SendMessageA(hList, LB_GETCURSEL, 0, 0);
+    if (is_computer(current)) {
+        if (sel == LB_ERR || sel >= entry_count)
+            wsprintfA(text, "%d drive(s)", entry_count);
+        else
+            drive_status(text, &entries[sel]);
+        SetWindowTextA(hStatus, text);
+        return;
+    }
     if (sel == LB_ERR || sel >= entry_count || (has_parent && sel == 0)) {
         int i, folders = 0, files = 0;
         DWORD total = 0;
@@ -175,13 +245,13 @@ static void update_status(void)
 /* Read the current folder into the list; select is a name to select or NULL */
 static void load_folder(const char *select)
 {
-    char pattern[MAX_PATH], title[MAX_PATH + 32], label[MAX_PATH + 4];
+    char pattern[MAX_PATH], title[MAX_PATH + 32];
     WIN32_FIND_DATAA fd;
     HANDLE hFind;
     int i, sel = -1;
 
     entry_count = 0;
-    has_parent = !is_root(current);
+    has_parent = !is_computer(current);  /* A drive's root: up to My Computer */
     if (has_parent) {
         memset(&fd, 0, sizeof(fd));
         lstrcpyA(fd.cFileName, "..");
@@ -189,8 +259,13 @@ static void load_folder(const char *select)
         add_entry(&fd);
     }
 
-    join_path(pattern, current, "*");
-    hFind = FindFirstFileA(pattern, &fd);
+    if (is_computer(current)) {
+        load_drives();
+        hFind = INVALID_HANDLE_VALUE;
+    } else {
+        join_path(pattern, current, "*");
+        hFind = FindFirstFileA(pattern, &fd);
+    }
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (lstrcmpA(fd.cFileName, ".") == 0 || lstrcmpA(fd.cFileName, "..") == 0)
@@ -200,15 +275,12 @@ static void load_folder(const char *select)
         } while (FindNextFileA(hFind, &fd));
         FindClose(hFind);
     }
-    qsort(entries + has_parent, entry_count - has_parent, sizeof(Entry), compare_entries);
+    if (!is_computer(current))  /* The drives stay in letter order */
+        qsort(entries + has_parent, entry_count - has_parent, sizeof(Entry), compare_entries);
 
     SendMessageA(hList, LB_RESETCONTENT, 0, 0);
     for (i = 0; i < entry_count; i++) {
-        if (is_dir(&entries[i]))
-            wsprintfA(label, "[%s]", entries[i].name);
-        else
-            lstrcpyA(label, entries[i].name);
-        SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)label);
+        SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)entries[i].label);
         if (select && lstrcmpiA(entries[i].name, select) == 0)
             sel = i;
     }
@@ -217,17 +289,29 @@ static void load_folder(const char *select)
     if (sel >= 0)
         SendMessageA(hList, LB_SETCURSEL, sel, 0);
 
-    SetWindowTextA(hPath, current);
-    wsprintfA(title, "My Computer - %s", current);
-    SetWindowTextA(hMain, title);
+    if (is_computer(current)) {
+        SetWindowTextA(hPath, "My Computer");
+        SetWindowTextA(hMain, "My Computer");
+    } else {
+        SetWindowTextA(hPath, current);
+        wsprintfA(title, "My Computer - %s", current);
+        SetWindowTextA(hMain, title);
+    }
     update_status();
 }
 
 static void go_up(void)
 {
     char *slash, child[MAX_PATH];
-    if (is_root(current))
+    if (is_computer(current))
         return;
+    if (is_root(current)) {
+        /* A drive's root: back to My Computer with that drive selected */
+        lstrcpyA(child, current);
+        current[0] = '\0';
+        load_folder(child);
+        return;
+    }
     slash = strrchr(current, '\\');
     if (!slash)
         return;
@@ -268,6 +352,9 @@ static void open_selected(void)
     e = &entries[sel];
     if (has_parent && sel == 0) {
         go_up();
+    } else if (is_computer(current)) {
+        lstrcpyA(current, e->name);  /* A drive's root */
+        load_folder(NULL);
     } else if (is_dir(e)) {
         join_path(current, current, e->name);
         load_folder(NULL);
@@ -384,7 +471,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case IDM_ABOUT:
             MessageBoxA(hwnd, "My Computer for winexe32emu\n\n"
-                        "Double-click a folder to open it, or an EXE file to run it.",
+                        "Double-click a drive or a folder to open it, or an EXE file "
+                        "to run it.",
                         "About My Computer", MB_OK | MB_ICONINFORMATION);
             break;
         }

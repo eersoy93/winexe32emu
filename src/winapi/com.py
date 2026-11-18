@@ -635,7 +635,7 @@ class ComMixin:
         lines.append(f"Modified: {datetime.datetime.fromtimestamp(info.st_mtime).strftime(stamp)}")
         lines.append(f"Accessed: {datetime.datetime.fromtimestamp(info.st_atime).strftime(stamp)}")
         lines.append('')
-        attributes = [label for flag, label in ((not os.access(host, os.W_OK), 'Read-only'),
+        attributes = [label for flag, label in ((self._host_read_only(host), 'Read-only'),
                                                 (name.startswith('.'), 'Hidden'))
                       if flag]
         lines.append(f"Attributes: {', '.join(attributes) or 'None'}")

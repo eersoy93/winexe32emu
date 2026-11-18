@@ -561,6 +561,9 @@ static void test_drives(void)
     check(!CreateDirectoryA("D:\\api_test_dir", NULL) && GetLastError() == ERROR_ACCESS_DENIED,
           "CreateDirectoryA cannot write on the CD-ROM D:");
     check(fopen("D:\\api_test.tmp", "w") == NULL, "fopen cannot write on the CD-ROM D:");
+    check(GetFileAttributesA("D:\\") == (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY) &&
+          !(GetFileAttributesA("C:\\Windows") & FILE_ATTRIBUTE_READONLY),
+          "GetFileAttributesA (everything on the CD-ROM D: is read-only)");
 
     file = CreateFileA("A:\\api_test.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     check(file != INVALID_HANDLE_VALUE, "CreateFileA writes on the floppy disk A:");

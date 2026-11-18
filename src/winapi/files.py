@@ -51,6 +51,13 @@ class FilesMixin:
                 return True
         return False
 
+    @staticmethod
+    def _host_read_only(path):
+        """FILE_ATTRIBUTE_READONLY of a host path: a read-only host file, or
+        any file or folder on a read-only drive (the CD-ROM D:)"""
+        return (drive_letter_of_host(path) in READ_ONLY_DRIVES or
+                (not os.path.isdir(path) and not os.access(path, os.W_OK)))
+
     def full_windows_path(self, filename, clamp=False):
         """Absolute, normalized "X:\\..." form of filename (X: its drive).
 
