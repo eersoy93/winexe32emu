@@ -18,7 +18,7 @@ import os
 
 
 # Version info
-WINEXE32EMU_VERSION = "0.2.0"
+WINEXE32EMU_VERSION = "0.3.0"
 
 # The emulated drives: one folder per drive letter in drives/ (in the
 # repository root, the parent of src/); drives/C is C:\, the default EXE folder

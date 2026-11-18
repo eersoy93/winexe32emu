@@ -2,7 +2,7 @@
 
 32-bit Windows EXE emulator in Python. Written with GitHub Copilot and Claude AI.
 
-![winexe32emu 0.2.0 Fake Desktop Image](doc/winexe32emu_0_2_0.png)
+![winexe32emu 0.3.0 Fake Desktop Image](doc/winexe32emu_0_3_0.png)
 
 ## Installation
 
@@ -23,7 +23,7 @@ The apps (like Explorer) and the test programs are compiled with the 32-bit MinG
 
 ## Usage
 
-Put your EXE files in drives/A (virtual floppy disk), or drives/C (virtual hard disk) or drvies/D (virtual CD-ROM), and then:
+Put your EXE files in drives/A (virtual floppy disk), or drives/C (virtual hard disk) or drives/D (virtual CD-ROM), and then:
 
 ```bash
 python3 winexe32emu.py
