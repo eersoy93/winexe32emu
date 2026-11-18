@@ -400,6 +400,25 @@ static void test_shell(void)
           strncmp(buf, "C:\\Users\\User\\", 14) == 0 &&
           GetFileAttributesA(buf) & FILE_ATTRIBUTE_DIRECTORY,
           "SHGetFolderPathA (Programs exists in the user profile)");
+    {
+        /* My Computer (CSIDL_DRIVES) is a virtual folder: a PIDL without a path */
+        LPITEMIDLIST drives = NULL;
+        SHFILEINFOA info;
+        check(SHGetFolderPathA(NULL, CSIDL_DRIVES, NULL, 0, buf) != S_OK,
+              "SHGetFolderPathA (My Computer has no path)");
+        check(SHGetSpecialFolderLocation(NULL, CSIDL_DRIVES, &drives) == S_OK && drives &&
+              !SHGetPathFromIDListA(drives, buf),
+              "SHGetSpecialFolderLocation (My Computer)");
+        memset(&info, 0, sizeof(info));
+        check(drives && SHGetFileInfoA((LPCSTR)drives, 0, &info, sizeof(info),
+                                       SHGFI_PIDL | SHGFI_DISPLAYNAME | SHGFI_TYPENAME |
+                                       SHGFI_ATTRIBUTES) &&
+              strcmp(info.szDisplayName, "My Computer") == 0 &&
+              strcmp(info.szTypeName, "System Folder") == 0 &&
+              info.dwAttributes & SFGAO_FOLDER,
+              "SHGetFileInfoA (My Computer PIDL)");
+        CoTaskMemFree(drives);
+    }
     check(GetEnvironmentVariableA("APPDATA", buf, sizeof(buf)) &&
           strcmp(buf, "C:\\Users\\User\\AppData\\Roaming") == 0, "APPDATA is in C:\\Users");
 

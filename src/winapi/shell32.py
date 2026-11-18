@@ -28,7 +28,8 @@ class Shell32Mixin:
 
     # ---------- shell32 ----------
 
-    SYS_ICON_FILE, SYS_ICON_FOLDER, SYS_ICON_DRIVE, SYS_ICON_ARCHIVE, SYS_ICON_EXE = range(5)
+    (SYS_ICON_FILE, SYS_ICON_FOLDER, SYS_ICON_DRIVE, SYS_ICON_ARCHIVE, SYS_ICON_EXE,
+     SYS_ICON_COMPUTER) = range(6)
     ARCHIVE_EXTENSIONS = {'7z', 'zip', 'rar', 'gz', 'tgz', 'bz2', 'tbz2', 'xz', 'txz', 'tar',
                           'cab', 'arj', 'lzh', 'lzma', 'z', 'taz', 'iso', 'wim', 'zst', '001',
                           'cpio', 'rpm', 'deb', 'dmg', 'jar', 'apk', 'msi', 'squashfs'}
@@ -41,7 +42,7 @@ class Shell32Mixin:
             size = 32 if large else 16
             handle = self.get_next_handle()
             self.imagelists[handle] = {'cx': size, 'cy': size, 'flags': 0x21,
-                                       'images': [('system', i) for i in range(5)]}
+                                       'images': [('system', i) for i in range(6)]}
             self._sys_imagelists[key] = handle
         return handle
 
@@ -61,12 +62,13 @@ class Shell32Mixin:
         """SHGetFileInfoA/W emulation - type names, display names and indexes into
         the (fake) system image list"""
         pszPath, attributes, psfi, cbFileInfo, flags = args[:5]
-        SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGFI_PIDL = 0x4000, 0x10, 0x8
-        SHGFI_SMALLICON, SHGFI_ICON = 0x1, 0x100
+        SHGFI_USEFILEATTRIBUTES, SHGFI_PIDL = 0x10, 0x8
         if flags & SHGFI_PIDL:
             path = self.pidls.get(pszPath, '')
         else:
             path = self._read_text(pszPath, wide) if pszPath else ''
+        if self._is_my_computer(path):
+            return self._my_computer_file_info(psfi, cbFileInfo, flags, wide)
         name = ntpath.basename(path.rstrip('\\')) or path
         if not flags & SHGFI_USEFILEATTRIBUTES and path:
             host = self.resolve_c_drive_path(path)
@@ -79,9 +81,15 @@ class Shell32Mixin:
         else:
             ext = name.rsplit('.', 1)[-1].upper() if '.' in name else ''
             type_name = f"{ext} File" if ext else 'File'
+        return self._write_file_info(psfi, cbFileInfo, flags, wide, index,
+                                     0x40000000 if attributes & 0x10 else 0, name, type_name)
+
+    def _write_file_info(self, psfi, cbFileInfo, flags, wide, index, sfgao, name, type_name):
+        """Fill SHFILEINFO; SHGetFileInfo's result"""
+        SHGFI_SYSICONINDEX, SHGFI_SMALLICON, SHGFI_ICON = 0x4000, 0x1, 0x100
         if psfi:
             data = struct.pack('<IiI', self.get_next_handle() if flags & SHGFI_ICON else 0,
-                               index, 0x40000000 if attributes & 0x10 else 0)
+                               index, sfgao)
             if wide:
                 data += name.encode('utf-16-le')[:518].ljust(520, b'\x00')
                 data += type_name.encode('utf-16-le')[:158].ljust(160, b'\x00')
@@ -93,13 +101,24 @@ class Shell32Mixin:
             return self._system_imagelist(not flags & SHGFI_SMALLICON)
         return 1
 
+    def _my_computer_file_info(self, psfi, cbFileInfo, flags, wide):
+        """SHGetFileInfo of My Computer (CSIDL_DRIVES): a system folder with
+        the computer icon, like the desktop's My Computer"""
+        SFGAO_FOLDER, SFGAO_HASSUBFOLDER = 0x20000000, 0x80000000
+        return self._write_file_info(psfi, cbFileInfo, flags, wide, self.SYS_ICON_COMPUTER,
+                                     SFGAO_FOLDER | SFGAO_HASSUBFOLDER,
+                                     self.MY_COMPUTER_NAME, 'System Folder')
+
     def SHGetFileInfoW(self, args):
         return self.SHGetFileInfoA(args, wide=True)
 
     def SHGetSpecialFolderLocation(self, args):
         """SHGetSpecialFolderLocation emulation - a PIDL of the folder path"""
         csidl, ppidl = args[1], args[2]
-        folder = self._shell_folder(csidl & 0xFF)
+        if csidl & 0xFF == self.CSIDL_DRIVES:
+            folder = self.MY_COMPUTER_PATH
+        else:
+            folder = self._shell_folder(csidl & 0xFF)
         if folder is None:
             if ppidl:
                 self._mem_write(ppidl, struct.pack('<I', 0))

@@ -352,8 +352,12 @@ class ComMixin:
             if path is None or not strret:
                 return self.E_INVALIDARG
             # SHGDN_FORPARSING without SHGDN_INFOLDER: the full path
-            name = path if flags & 0x8000 and not flags & 0x1 else \
-                (ntpath.basename(path.rstrip('\\')) or path)
+            if flags & 0x8000 and not flags & 0x1:
+                name = path
+            elif self._is_my_computer(path):
+                name = self.MY_COMPUTER_NAME
+            else:
+                name = ntpath.basename(path.rstrip('\\')) or path
             text = self.emu.heap_alloc((len(name) + 1) * 2)
             self._write_text(text, name, True)
             self._mem_write(strret, struct.pack('<II', 0, text))  # STRRET_WSTR

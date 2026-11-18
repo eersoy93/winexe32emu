@@ -76,6 +76,15 @@ class ShellFoldersMixin:
         0x37: PUBLIC_FOLDER + '\\Videos',                            # CSIDL_COMMON_VIDEO
     }
 
+    # CSIDL_DRIVES: My Computer, the virtual folder of the drives, has no
+    # path (SHGetFolderPath fails); its PIDL holds the parsing name
+    CSIDL_DRIVES = 0x11
+    MY_COMPUTER_PATH = '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
+    MY_COMPUTER_NAME = 'My Computer'
+
+    def _is_my_computer(self, path):
+        return path is not None and path.upper() == self.MY_COMPUTER_PATH
+
     def _shell_folder(self, csidl):
         """Windows path of a CSIDL special folder (created like on a real
         installation, where they exist), or None if unknown"""
@@ -131,7 +140,7 @@ class ShellFoldersMixin:
         """SHGetPathFromIDListA/W emulation (PIDLs of SHBrowseForFolder)"""
         pidl, pszPath = args[0], args[1]
         path = self.pidls.get(pidl)
-        if path is None or not pszPath:
+        if path is None or self._is_my_computer(path) or not pszPath:
             if pszPath:
                 self._write_units(pszPath, [], wide)
             return 0
@@ -222,6 +231,8 @@ class ShellFoldersMixin:
             return 0
         title = self._read_text(lpszTitle, wide) if lpszTitle else ''
         root = self.pidls.get(pidlRoot, 'C:\\').rstrip('\\') if pidlRoot else 'C:'
+        if self._is_my_computer(root):
+            root = 'C:'  # The drives: the only one is C:
         log.info(f"SHBrowseForFolder{'W' if wide else 'A'}(\"{title}\")")
 
         ID_TITLE, ID_PATH, ID_LIST, ID_STATUS = 0x3742, 0x3743, 0x3744, 0x3745

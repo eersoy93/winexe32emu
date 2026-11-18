@@ -1580,6 +1580,9 @@ class PseudoWindowsGUI:
 
     def _draw_system_icon(self, index, x, y, size=16):
         """Draw one of the fake system image list icons"""
+        if index == 5:  # My Computer: the desktop icon's computer
+            self.screen.blit(self._computer_icon(size)[0], (x, y))
+            return
         fill, line = self.SYS_ICON_COLORS.get(index, self.SYS_ICON_COLORS[0])
         s = size / 16
         if index == 1:  # Folder
