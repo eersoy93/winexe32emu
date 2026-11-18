@@ -242,6 +242,19 @@ class ShlwapiTest(unittest.TestCase):
         self.assertFalse(match('a.txt', 'a?.txt'))
 
 
+class KnownFoldersTest(unittest.TestCase):
+    def test_known_folder_paths(self):
+        folders = WinAPIHandler.known_folder_paths()
+        lowered = [f.lower() for f in folders]
+        self.assertEqual(len(lowered), len(set(lowered)))  # No duplicates
+        for folder in folders:
+            self.assertTrue(folder.startswith('C:\\'), folder)
+            self.assertIsNotNone(resolve_drive_path(folder), folder)
+        self.assertIn(r'C:\Program Files\Common Files', folders)
+        self.assertTrue(any(f.endswith(r'\Downloads') for f in folders))
+        self.assertFalse(any('(x86)' in f or 'syswow64' in f.lower() for f in folders))
+
+
 class SecurityAndNetworkTest(unittest.TestCase):
     def test_sid_bytes(self):
         data = WinAPIHandler._sid_bytes('S-1-5-32-544')

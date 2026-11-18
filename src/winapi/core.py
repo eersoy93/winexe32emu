@@ -419,7 +419,7 @@ class CoreMixin:
         'SetProcessWorkingSetSizeEx': 4, 'SetThreadExecutionState': 1, 'SetThreadLocale': 1,
         'SetThreadUILanguage': 1, 'SleepEx': 2, 'UnlockFile': 5, 'UnlockFileEx': 5,
         'VerSetConditionMask': 4, 'VerifyVersionInfoA': 4, 'VerifyVersionInfoW': 4,
-        'VirtualLock': 2, 'VirtualUnlock': 2, 'Wow64DisableWow64FsRedirection': 1,
+        'VirtualLock': 2, 'VirtualUnlock': 2, 'Wow64DisableWow64FsRedirection': 1, 'Wow64EnableWow64FsRedirection': 1,
         'Wow64RevertWow64FsRedirection': 1, 'WritePrivateProfileSectionA': 3,
         'WritePrivateProfileSectionW': 3, 'WritePrivateProfileStringW': 4,
         'WritePrivateProfileStructA': 5, 'WritePrivateProfileStructW': 5,

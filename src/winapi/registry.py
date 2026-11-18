@@ -625,7 +625,8 @@ class RegistryMixin:
         return self.RegGetValueA(args, wide=True)
 
     def RegDeleteKeyExA(self, args):
-        """RegDeleteKeyExA/W(hkey, subkey, WOW64 view, reserved)"""
+        """RegDeleteKeyExA/W(hkey, subkey, WOW64 view, reserved) - 32-bit
+        Windows has one registry view: KEY_WOW64_32KEY/64KEY are ignored"""
         return self.RegDeleteKeyA(args)
 
     def RegDeleteKeyExW(self, args):
