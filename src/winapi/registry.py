@@ -19,6 +19,7 @@ import struct
 import threading
 import time
 import json
+import re
 from functools import wraps
 
 from unicorn import *
@@ -419,3 +420,277 @@ class RegistryMixin:
     def RegEnumValueW(self, args):
         return self.RegEnumValueA(args, wide=True)
     
+
+    # ---------- Key trees and the older and newer registry APIs ----------
+
+    def _registry_walk(self, hkey, subkey, create=False):
+        """(key node, error) of hkey\\subkey, created if create is True"""
+        node, error = self._registry_key(hkey)
+        if node is None:
+            return None, error
+        created = False
+        for part in self._registry_path(subkey):
+            child = node['keys'].get(part.lower())
+            if child is None:
+                if not create:
+                    return None, self.ERROR_FILE_NOT_FOUND
+                child = self._new_registry_key(part, node.get('volatile', False))
+                node['keys'][part.lower()] = child
+                created = True
+            node = child
+        if created and not node['volatile']:
+            self._save_registry()
+        return node, self.ERROR_SUCCESS
+
+    @staticmethod
+    def _mark_deleted(node):
+        """A deleted key and its subkeys: their open handles now fail"""
+        node['deleted'] = True
+        for child in node['keys'].values():
+            RegistryMixin._mark_deleted(child)
+
+    @registry_locked
+    def _registry_delete_tree(self, hkey, subkey, only_if_empty=False):
+        """Delete hkey\\subkey with its subkeys (only an empty key if only_if_empty)"""
+        path = self._registry_path(subkey)
+        if not path:
+            return self.ERROR_ACCESS_DENIED
+        parent, error = self._registry_walk(hkey, '\\'.join(path[:-1]))
+        if parent is None:
+            return error
+        target = parent['keys'].get(path[-1].lower())
+        if target is None:
+            return self.ERROR_FILE_NOT_FOUND
+        if only_if_empty and (target['keys'] or target['values']):
+            return self.ERROR_ACCESS_DENIED
+        del parent['keys'][path[-1].lower()]
+        self._mark_deleted(target)
+        if not target['volatile']:
+            self._save_registry()
+        return self.ERROR_SUCCESS
+
+    def _temporary_hkey(self, node):
+        handle = self.get_next_handle()
+        self.registry_handles[handle] = node
+        return handle
+
+    @registry_locked
+    def RegOpenKeyA(self, args, wide=False):
+        """RegOpenKeyA/W(hkey, subkey, &result) - no subkey: the same handle"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        if not self._registry_path(subkey):
+            node, error = self._registry_key(args[0])
+            if node is not None:
+                self._mem_write(args[2], struct.pack('<I', args[0]))
+            return error
+        return self._registry_open_common(args[0], subkey, args[2], create=False)
+
+    def RegOpenKeyW(self, args):
+        return self.RegOpenKeyA(args, wide=True)
+
+    @registry_locked
+    def RegCreateKeyA(self, args, wide=False):
+        """RegCreateKeyA/W(hkey, subkey, &result)"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        return self._registry_open_common(args[0], subkey, args[2], create=True)
+
+    def RegCreateKeyW(self, args):
+        return self.RegCreateKeyA(args, wide=True)
+
+    def RegOpenCurrentUser(self, args):
+        """RegOpenCurrentUser(access, &result) - HKEY_CURRENT_USER"""
+        return self.ERROR_SUCCESS if self._mem_write(args[1], struct.pack('<I', 0x80000001)) \
+            else self.ERROR_INVALID_PARAMETER
+
+    def RegConnectRegistryA(self, args, wide=False):
+        """RegConnectRegistryA/W(machine, hkey, &result) - only this computer"""
+        machine = self._read_text(args[0], wide).strip('\\') if args[0] else ''
+        if machine and machine.upper() != self.COMPUTER_NAME:
+            return 53  # ERROR_BAD_NETPATH
+        if args[1] not in self.registry_roots:
+            return self.ERROR_INVALID_HANDLE
+        self._mem_write(args[2], struct.pack('<I', args[1]))
+        return self.ERROR_SUCCESS
+
+    def RegConnectRegistryW(self, args):
+        return self.RegConnectRegistryA(args, wide=True)
+
+    @registry_locked
+    def RegQueryValueA(self, args, wide=False):
+        """RegQueryValueA/W(hkey, subkey, data, &size) - the default value of a
+        subkey (an empty string if it has none)"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        node, error = self._registry_walk(args[0], subkey)
+        if node is None:
+            return error
+        value = node['values'].get('')
+        if value is None or value['type'] not in self.REG_STRING_TYPES:
+            value = {'type': 1, 'data': '\x00'}
+        return self._registry_store_data(value, wide, 0, args[2], args[3])
+
+    def RegQueryValueW(self, args):
+        return self.RegQueryValueA(args, wide=True)
+
+    @registry_locked
+    def RegSetValueA(self, args, wide=False):
+        """RegSetValueA/W(hkey, subkey, REG_SZ, text, size) - sets a subkey's
+        default value (the size is ignored)"""
+        if args[2] != 1:  # REG_SZ
+            return self.ERROR_INVALID_PARAMETER
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        node, error = self._registry_walk(args[0], subkey, create=True)
+        if node is None:
+            return error
+        text = self._read_text(args[3], wide) if args[3] else ''
+        node['values'][''] = {'name': '', 'type': 1, 'data': text + '\x00'}
+        node['time'] = int((time.time() + 11644473600) * 10000000)
+        if not node['volatile']:
+            self._save_registry()
+        return self.ERROR_SUCCESS
+
+    def RegSetValueW(self, args):
+        return self.RegSetValueA(args, wide=True)
+
+    @registry_locked
+    def RegQueryInfoKeyA(self, args, wide=False):
+        """RegQueryInfoKeyA/W(hkey, class, &class size, reserved, &subkeys,
+        &longest subkey, &longest class, &values, &longest value name,
+        &largest value, &security descriptor size, &last write time)"""
+        node, error = self._registry_key(args[0])
+        if node is None:
+            return error
+        if args[1] and args[2]:
+            if self._read_u32(args[2]) < 1:
+                return self.ERROR_MORE_DATA
+            self._write_text(args[1], '', wide)
+        if args[2]:
+            self._mem_write(args[2], struct.pack('<I', 0))
+        keys = list(node['keys'].values())
+        values = list(node['values'].values())
+        counts = (len(keys), max((len(self._text_units(k['name'], wide)) for k in keys),
+                                 default=0), 0,
+                  len(values), max((len(self._text_units(v['name'], wide)) for v in values),
+                                   default=0),
+                  max((len(self._registry_value_bytes(v, wide)) for v in values), default=0),
+                  0)
+        for address, count in zip(args[4:11], counts):
+            if address:
+                self._mem_write(address, struct.pack('<I', count))
+        if args[11]:
+            self._mem_write(args[11], struct.pack('<Q', node['time']))
+        return self.ERROR_SUCCESS
+
+    def RegQueryInfoKeyW(self, args):
+        return self.RegQueryInfoKeyA(args, wide=True)
+
+    # RRF_RT_* flag of each value type (RegGetValue)
+    RRF_TYPE_FLAGS = {0: 0x1, 1: 0x2, 2: 0x4, 3: 0x8, 4: 0x10, 7: 0x20, 11: 0x40}
+
+    def _expand_registry_text(self, text):
+        return re.sub(r'%([^%]+)%',
+                      lambda m: self.environment.get(m.group(1).upper(), m.group(0)), text)
+
+    @registry_locked
+    def RegGetValueA(self, args, wide=False):
+        """RegGetValueA/W(hkey, subkey, value, flags, &type, data, &size) -
+        RRF_RT_* type filters; REG_EXPAND_SZ is expanded unless RRF_NOEXPAND"""
+        hkey, flags, type_addr, data_addr, size_addr = args[0], args[3], args[4], args[5], args[6]
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        name = self._read_text(args[2], wide) if args[2] else ""
+        if data_addr and not size_addr:
+            return self.ERROR_INVALID_PARAMETER
+        node, error = self._registry_walk(hkey, subkey)
+        value = node['values'].get(name.lower()) if node is not None else None
+        if node is not None and value is None:
+            error = self.ERROR_FILE_NOT_FOUND
+        if value is not None:
+            value_type, data = value['type'], value['data']
+            if value_type == 2 and not flags & 0x10000000:  # RRF_NOEXPAND
+                data = self._expand_registry_text(data)
+                value_type = 1  # Returned as REG_SZ
+                if not flags & 0x2:  # RRF_RT_REG_SZ is needed for an expanded string
+                    error = 1630  # ERROR_UNSUPPORTED_TYPE
+            if not flags & self.RRF_TYPE_FLAGS.get(value_type, 0) and error == 0:
+                error = 1630
+            if error == 0:
+                if isinstance(data, str) and not data.endswith('\x00'):
+                    data += '\x00'
+                error = self._registry_store_data({'type': value_type, 'data': data}, wide,
+                                                  type_addr, data_addr, size_addr)
+        if error and flags & 0x20000000 and data_addr and size_addr:  # RRF_ZEROONFAILURE
+            self._mem_write(data_addr, b'\x00' * self._read_u32(size_addr))
+        return error
+
+    def RegGetValueW(self, args):
+        return self.RegGetValueA(args, wide=True)
+
+    def RegDeleteKeyExA(self, args):
+        """RegDeleteKeyExA/W(hkey, subkey, WOW64 view, reserved)"""
+        return self.RegDeleteKeyA(args)
+
+    def RegDeleteKeyExW(self, args):
+        return self.RegDeleteKeyW(args)
+
+    @registry_locked
+    def RegDeleteTreeA(self, args, wide=False):
+        """RegDeleteTreeA/W(hkey, subkey) - the subkey and its subkeys; with
+        no subkey, the key's own subkeys and values"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        if self._registry_path(subkey):
+            return self._registry_delete_tree(args[0], subkey)
+        node, error = self._registry_key(args[0])
+        if node is None:
+            return error
+        for child in node['keys'].values():
+            self._mark_deleted(child)
+        node['keys'].clear()
+        node['values'].clear()
+        if not node['volatile']:
+            self._save_registry()
+        return self.ERROR_SUCCESS
+
+    def RegDeleteTreeW(self, args):
+        return self.RegDeleteTreeA(args, wide=True)
+
+    @registry_locked
+    def RegDeleteKeyValueA(self, args, wide=False):
+        """RegDeleteKeyValueA/W(hkey, subkey, value)"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        node, error = self._registry_walk(args[0], subkey)
+        if node is None:
+            return error
+        handle = self._temporary_hkey(node)
+        try:
+            return self.RegDeleteValueA([handle, args[2]], wide)
+        finally:
+            del self.registry_handles[handle]
+
+    def RegDeleteKeyValueW(self, args):
+        return self.RegDeleteKeyValueA(args, wide=True)
+
+    @registry_locked
+    def RegSetKeyValueA(self, args, wide=False):
+        """RegSetKeyValueA/W(hkey, subkey, value, type, data, size) - creates the subkey"""
+        subkey = self._read_text(args[1], wide) if args[1] else ""
+        node, error = self._registry_walk(args[0], subkey, create=True)
+        if node is None:
+            return error
+        handle = self._temporary_hkey(node)
+        try:
+            return self.RegSetValueExA([handle, args[2], 0, args[3], args[4], args[5]], wide)
+        finally:
+            del self.registry_handles[handle]
+
+    def RegSetKeyValueW(self, args):
+        return self.RegSetKeyValueA(args, wide=True)
+
+    def RegNotifyChangeKeyValue(self, args):
+        """RegNotifyChangeKeyValue - changes are never signaled"""
+        node, error = self._registry_key(args[0])
+        return error
+
+    def RegDisablePredefinedCache(self, args):
+        return self.ERROR_SUCCESS
+
+    def RegDisablePredefinedCacheEx(self, args):
+        return self.ERROR_SUCCESS

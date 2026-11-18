@@ -75,6 +75,13 @@ for src in tests/*.c; do
             # Console application - kernel32/user32/gdi32/advapi32/shell32/ole32/oleaut32 API tests
             LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid -mconsole"
             ;;
+        ext_api_test)
+            # Console application - the extended API groups (shlwapi, security,
+            # crypto, psapi, sockets, themes, ...)
+            LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lshlwapi -lole32 -loleaut32"
+            LIBS="$LIBS -luuid -lrpcrt4 -lpsapi -lws2_32 -lbcrypt -lversion -lsecur32"
+            LIBS="$LIBS -luxtheme -ldwmapi -lcomctl32 -mconsole"
+            ;;
         *)
             # Default: console application - C runtime (msvcrt) and kernel32
             LIBS="-lkernel32 -mconsole"

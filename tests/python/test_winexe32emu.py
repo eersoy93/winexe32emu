@@ -211,6 +211,63 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(strip_win32_path_prefix(r'C:\x'), r'C:\x')
 
 
+class ShlwapiTest(unittest.TestCase):
+    """Path and size text helpers of the shlwapi emulation"""
+
+    def test_canonicalize(self):
+        canonicalize = WinAPIHandler._canonicalize
+        self.assertEqual(canonicalize(r'C:\a\.\b\..\c'), r'C:\a\c')
+        self.assertEqual(canonicalize(r'C:\a\..\..'), 'C:\\')
+        self.assertEqual(canonicalize(r'\\server\share\x\..\y'), r'\\server\share\y')
+
+    def test_remove_file_spec(self):
+        remove = WinAPIHandler._remove_file_spec
+        self.assertEqual(remove(r'C:\dir\file.txt'), (r'C:\dir', True))
+        self.assertEqual(remove(r'C:\file.txt'), ('C:\\', True))
+        self.assertEqual(remove('C:\\'), ('C:\\', False))
+        self.assertEqual(remove(r'\\server\share'), (r'\\server', True))
+
+    def test_byte_sizes(self):
+        size = WinAPIHandler._byte_size_text
+        self.assertEqual(size(532), '532 bytes')
+        self.assertEqual(size(1536), '1.50 KB')
+        self.assertEqual(size(2047), '1.99 KB')  # Truncated, not rounded
+        self.assertEqual(size(12 * 1024 * 1024 + 300 * 1024), '12.2 MB')
+        self.assertEqual(size(123 * 1024 ** 3), '123 GB')
+
+    def test_spec_match(self):
+        match = WinAPIHandler._spec_matches
+        self.assertTrue(match('Read.Me', '*.me'))
+        self.assertTrue(match('noext', '*.*'))
+        self.assertFalse(match('a.txt', 'a?.txt'))
+
+
+class SecurityAndNetworkTest(unittest.TestCase):
+    def test_sid_bytes(self):
+        data = WinAPIHandler._sid_bytes('S-1-5-32-544')
+        self.assertEqual(data, bytes([1, 2, 0, 0, 0, 0, 0, 5]) + bytes([32, 0, 0, 0, 0x20, 2, 0, 0]))
+        self.assertIsNone(WinAPIHandler._sid_bytes('S-2-5'))
+        self.assertIsNone(WinAPIHandler._sid_bytes('not a SID'))
+
+    def test_inet_addr_forms(self):
+        parse = WinAPIHandler._parse_ipv4
+        self.assertEqual(parse('127.0.0.1'), bytes([127, 0, 0, 1]))
+        self.assertEqual(parse('10.258'), bytes([10, 0, 1, 2]))  # "a.b": b is 24 bits
+        self.assertEqual(parse('0x7f.1'), bytes([127, 0, 0, 1]))
+        self.assertIsNone(parse('1.2.3.256'))
+        self.assertIsNone(parse('1..2'))
+
+    def test_new_calling_conventions(self):
+        handler = bare_handler()
+        self.assertEqual(handler.stack_cleanup_bytes('shlwapi.dll', 'PathCombineA'), 12)
+        self.assertEqual(handler.stack_cleanup_bytes('shlwapi.dll', 'wnsprintfA'), 0)
+        self.assertEqual(handler.stack_cleanup_bytes('ws2_32.dll', 'getaddrinfo'), 16)
+        self.assertEqual(handler.stack_cleanup_bytes('kernel32.dll', 'VerSetConditionMask'), 16)
+        self.assertIn('__WSAFDIsSet', WinAPIHandler._api_method_names())
+        for helper in ('_no_service', '_no_theme', '_not_a_socket', '_wsa_fd_is_set'):
+            self.assertNotIn(helper, WinAPIHandler._api_method_names())
+
+
 class CpuExceptionStateTest(unittest.TestCase):
     def test_calibration(self):
         """The field that turns a second #DE into a double fault is found"""

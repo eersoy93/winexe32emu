@@ -275,7 +275,7 @@ class Shell32Mixin:
             if not text:
                 break
             names.append(text)
-            address += (len(text) + 1) * (2 if wide else 1)
+            address += (len(self._text_units(text, wide)) + 1) * (2 if wide else 1)
         return names
 
     FOF_NOCONFIRMATION = 0x10
@@ -401,7 +401,3 @@ class Shell32Mixin:
 
     def LsaAddAccountRights(self, args):
         return 0xC0000022
-
-    def LookupAccountNameW(self, args):
-        self._last_error = 1332  # ERROR_NONE_MAPPED
-        return 0

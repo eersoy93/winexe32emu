@@ -44,7 +44,9 @@ Use `-h` parameter for command-line help.
 - PE file loading and analysis
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
-- Basic Win32 API support
+- Basic Win32 API support, and also shlwapi paths and strings, advapi32 security, CryptoAPI/BCrypt
+  hashes, atom tables, window properties and subclassing, psapi, COM GUIDs and rpcrt4 UUIDs
+- An offline network: Windows Sockets resolve only localhost and create no sockets
 - Loading the programs' own DLLs
 - Structured exception handling
 - A registry shared by the emulated programs

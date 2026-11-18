@@ -16,6 +16,8 @@
 
 import re
 
+from unicorn import UcError
+
 from .. import config
 from ..logger import log
 
@@ -103,61 +105,91 @@ class IniFilesMixin:
     def GetPrivateProfileIntW(self, args):
         return self.GetPrivateProfileIntA(args, wide=True)
 
-    def GetPrivateProfileStringA(self, args):
-        """GetPrivateProfileStringA emulation (INI files inside drives/)"""
+    def _ini_lines_of(self, filename):
+        path = self._profile_path(filename) if filename else None
+        return (self._ini_read_lines(path) if path else None) or []
+
+    def _ini_section_lines(self, lines, section):
+        """The key=value (and other non-blank) lines of a section"""
+        bounds = self._ini_section_range(lines, section)
+        if not bounds:
+            return []
+        return [line.strip() for line in lines[bounds[0] + 1:bounds[1]]
+                if line.strip() and not line.lstrip().startswith(';')]
+
+    def _write_name_list(self, names, buffer, size, wide):
+        """Copy NUL-separated names ending with an extra NUL (truncated to
+        size, the last name still ends with two NULs); returns the length
+        without the final NUL (size - 2 if truncated)"""
+        units = []
+        for name in names:
+            units += self._text_units(name, wide) + [0]
+        if len(units) + 1 > size:
+            units = units[:max(0, size - 2)]
+            self._write_units(buffer, (units + [0, 0])[:size], wide, terminate=False)
+            return len(units)
+        self._write_units(buffer, units, wide)
+        return len(units)
+
+    def GetPrivateProfileStringA(self, args, wide=False):
+        """GetPrivateProfileStringA/W emulation (INI files inside drives/)"""
         lpAppName, lpKeyName, lpDefault = args[0], args[1], args[2]
         lpReturnedString, nSize, lpFileName = args[3], args[4], args[5]
-        section = self.read_string(lpAppName) if lpAppName else None
-        key = self.read_string(lpKeyName) if lpKeyName else None
-        default = self.read_string(lpDefault).rstrip(' ') if lpDefault else ''
-        filename = self.read_string(lpFileName)
-        log.debug(f"GetPrivateProfileStringA({section!r}, {key!r}, {default!r}, \"{filename}\")")
+        section = self._read_text(lpAppName, wide) if lpAppName else None
+        key = self._read_text(lpKeyName, wide) if lpKeyName else None
+        default = self._read_text(lpDefault, wide).rstrip(' ') if lpDefault else ''
+        filename = self._read_text(lpFileName, wide) if lpFileName else 'win.ini'
+        log.debug(f"GetPrivateProfileString({section!r}, {key!r}, {default!r}, \"{filename}\")")
 
         if not lpReturnedString or nSize == 0:
             return 0
-        path = self._profile_path(filename)
-        lines = (self._ini_read_lines(path) if path else None) or []
+        lines = self._ini_lines_of(filename)
 
         if section is None or key is None:
             # Name lists: every name NUL-terminated, the list ends with an extra NUL
             if section is None:
                 names = [n for n in map(self._ini_section_name, lines) if n is not None]
             else:
-                bounds = self._ini_section_range(lines, section)
-                names = []
-                if bounds:
-                    for line in lines[bounds[0] + 1:bounds[1]]:
-                        pair = self._ini_key_value(line)
-                        if pair:
-                            names.append(pair[0])
-            data = b''.join(n.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00' for n in names)
-            if len(data) + 1 > nSize:
-                # Truncated: the last name still ends with two NULs
-                data = data[:max(0, nSize - 2)]
-                self.emu.uc.mem_write(lpReturnedString, (data + b'\x00\x00')[:nSize])
-                return len(data)
-            self.emu.uc.mem_write(lpReturnedString, data + b'\x00')
-            return len(data)
+                names = [pair[0] for pair in map(self._ini_key_value,
+                                                 self._ini_section_lines(lines, section))
+                         if pair]
+            return self._write_name_list(names, lpReturnedString, nSize, wide)
 
         value = self._ini_value(lines, section, key)
         if value is None:
             value = default
 
-        data = value.encode(config.ANSI_CODEPAGE, errors='replace')[:nSize - 1]
-        self.emu.uc.mem_write(lpReturnedString, data + b'\x00')
-        return len(data)
+        units = self._text_units(value, wide)[:nSize - 1]
+        self._write_units(lpReturnedString, units, wide)
+        return len(units)
 
-    def WritePrivateProfileStringA(self, args):
-        """WritePrivateProfileStringA emulation (NULL key deletes the section,
+    def GetPrivateProfileStringW(self, args):
+        return self.GetPrivateProfileStringA(args, wide=True)
+
+    def _ini_save(self, path, lines, filename):
+        if self._write_protected(path):
+            return 0
+        try:
+            with open(path, 'wb') as fp:
+                fp.write(''.join(line + '\r\n' for line in lines)
+                         .encode(config.ANSI_CODEPAGE, errors='replace'))
+        except OSError as e:
+            log.error(f"WritePrivateProfile(\"{filename}\") failed: {e}")
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        return 1
+
+    def WritePrivateProfileStringA(self, args, wide=False):
+        """WritePrivateProfileStringA/W emulation (NULL key deletes the section,
         NULL string deletes the key)"""
         lpAppName, lpKeyName, lpString, lpFileName = args[0], args[1], args[2], args[3]
         if not lpAppName:
             return 0  # Only flushes the (nonexistent) cache
-        section = self.read_string(lpAppName)
-        key = self.read_string(lpKeyName) if lpKeyName else None
-        value = self.read_string(lpString) if lpString else None
-        filename = self.read_string(lpFileName)
-        log.debug(f"WritePrivateProfileStringA({section!r}, {key!r}, {value!r}, \"{filename}\")")
+        section = self._read_text(lpAppName, wide)
+        key = self._read_text(lpKeyName, wide) if lpKeyName else None
+        value = self._read_text(lpString, wide) if lpString else None
+        filename = self._read_text(lpFileName, wide) if lpFileName else 'win.ini'
+        log.debug(f"WritePrivateProfileString({section!r}, {key!r}, {value!r}, \"{filename}\")")
 
         path = self._profile_path(filename)
         if path is None:
@@ -189,19 +221,137 @@ class IniFilesMixin:
                 lines.insert(end, f"{key}={value}")
         elif value is not None:
             lines += [f"[{section}]", f"{key}={value}"]
+        return self._ini_save(path, lines, filename)
 
-        if self._write_protected(path):
+    def WritePrivateProfileStringW(self, args):
+        return self.WritePrivateProfileStringA(args, wide=True)
+
+    def GetPrivateProfileSectionA(self, args, wide=False):
+        """GetPrivateProfileSectionA/W(section, buffer, size, file) - its
+        "key=value" lines, each NUL-terminated, and a final NUL"""
+        if not args[1] or not args[2]:
             return 0
+        section = self._read_text(args[0], wide) if args[0] else ''
+        filename = self._read_text(args[3], wide) if args[3] else 'win.ini'
+        lines = self._ini_section_lines(self._ini_lines_of(filename), section)
+        return self._write_name_list(lines, args[1], args[2], wide)
+
+    def GetPrivateProfileSectionW(self, args):
+        return self.GetPrivateProfileSectionA(args, wide=True)
+
+    def GetPrivateProfileSectionNamesA(self, args, wide=False):
+        """GetPrivateProfileSectionNamesA/W(buffer, size, file)"""
+        if not args[0] or not args[1]:
+            return 0
+        filename = self._read_text(args[2], wide) if args[2] else 'win.ini'
+        names = [n for n in map(self._ini_section_name, self._ini_lines_of(filename))
+                 if n is not None]
+        return self._write_name_list(names, args[0], args[1], wide)
+
+    def GetPrivateProfileSectionNamesW(self, args):
+        return self.GetPrivateProfileSectionNamesA(args, wide=True)
+
+    def WritePrivateProfileSectionA(self, args, wide=False):
+        """WritePrivateProfileSectionA/W(section, "k=v\0k=v\0\0", file) - replaces
+        the section (NULL data deletes it)"""
+        if not args[0]:
+            return 0
+        section = self._read_text(args[0], wide)
+        filename = self._read_text(args[2], wide) if args[2] else 'win.ini'
+        path = self._profile_path(filename)
+        if path is None:
+            self._last_error = 5
+            return 0
+        lines = self._ini_read_lines(path) or []
+        bounds = self._ini_section_range(lines, section)
+        new = [] if not args[1] else \
+            [f"[{section}]"] + self._read_multi_string(args[1], wide)
+        if bounds:
+            lines[bounds[0]:bounds[1]] = new
+        else:
+            lines += new
+        return self._ini_save(path, lines, filename)
+
+    def WritePrivateProfileSectionW(self, args):
+        return self.WritePrivateProfileSectionA(args, wide=True)
+
+    # win.ini (C:\Windows\win.ini): the Profile APIs
+
+    def GetProfileStringA(self, args, wide=False):
+        """GetProfileStringA/W(section, key, default, buffer, size)"""
+        return self.GetPrivateProfileStringA(list(args[:5]) + [0], wide)
+
+    def GetProfileStringW(self, args):
+        return self.GetProfileStringA(args, wide=True)
+
+    def GetProfileIntA(self, args, wide=False):
+        """GetProfileIntA/W(section, key, default)"""
+        name = self._alloc_units(self._text_units('win.ini', wide), wide)
         try:
-            with open(path, 'wb') as fp:
-                fp.write(''.join(line + '\r\n' for line in lines)
-                         .encode(config.ANSI_CODEPAGE, errors='replace'))
-        except OSError as e:
-            log.error(f"WritePrivateProfileStringA(\"{filename}\") failed: {e}")
-            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return self.GetPrivateProfileIntA([args[0], args[1], args[2], name], wide)
+        finally:
+            self.emu.heap_free(name)
+
+    def GetProfileIntW(self, args):
+        return self.GetProfileIntA(args, wide=True)
+
+    def WriteProfileStringA(self, args, wide=False):
+        """WriteProfileStringA/W(section, key, value)"""
+        return self.WritePrivateProfileStringA(list(args[:3]) + [0], wide)
+
+    def WriteProfileStringW(self, args):
+        return self.WriteProfileStringA(args, wide=True)
+
+    def GetProfileSectionA(self, args, wide=False):
+        return self.GetPrivateProfileSectionA(list(args[:3]) + [0], wide)
+
+    def GetProfileSectionW(self, args):
+        return self.GetProfileSectionA(args, wide=True)
+
+    def WriteProfileSectionA(self, args, wide=False):
+        return self.WritePrivateProfileSectionA(list(args[:2]) + [0], wide)
+
+    def WriteProfileSectionW(self, args):
+        return self.WriteProfileSectionA(args, wide=True)
+
+    def GetPrivateProfileStructA(self, args, wide=False):
+        """GetPrivateProfileStructA/W(section, key, struct, size, file) - the
+        value is the bytes in hex and a checksum byte"""
+        section = self._read_text(args[0], wide) if args[0] else ''
+        key = self._read_text(args[1], wide) if args[1] else ''
+        filename = self._read_text(args[4], wide) if args[4] else 'win.ini'
+        value = self._ini_value(self._ini_lines_of(filename), section, key)
+        try:
+            data = bytes.fromhex(value or '')
+        except ValueError:
+            data = b''
+        if not value or len(data) != args[3] + 1 or sum(data[:-1]) & 0xFF != data[-1]:
+            self._last_error = 13  # ERROR_INVALID_DATA
             return 0
-        return 1
-    
+        return 1 if self._mem_write(args[2], data[:-1]) else 0
+
+    def GetPrivateProfileStructW(self, args):
+        return self.GetPrivateProfileStructA(args, wide=True)
+
+    def WritePrivateProfileStructA(self, args, wide=False):
+        """WritePrivateProfileStructA/W(section, key, struct, size, file)"""
+        if not args[2]:
+            return self.WritePrivateProfileStringA([args[0], args[1], 0, args[4]], wide)
+        try:
+            data = bytes(self.emu.uc.mem_read(args[2], args[3]))
+        except UcError:
+            self._last_error = 998
+            return 0
+        text = (data + bytes([sum(data) & 0xFF])).hex().upper()
+        value = self._alloc_units(self._text_units(text, wide), wide)
+        try:
+            return self.WritePrivateProfileStringA([args[0], args[1], value, args[4]], wide)
+        finally:
+            self.emu.heap_free(value)
+
+    def WritePrivateProfileStructW(self, args):
+        return self.WritePrivateProfileStructA(args, wide=True)
+
     def ExpandEnvironmentStringsA(self, args, wide=False):
         """ExpandEnvironmentStringsA/W emulation - %NAME% from the process
         environment (unknown names stay as they are)"""
