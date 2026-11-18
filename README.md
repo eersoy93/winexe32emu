@@ -45,7 +45,7 @@ Use `-h` parameter for command-line help.
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support
-- An offline network: Windows Sockets resolve only localhost and create no sockets
+- An offline network: Windows Sockets resolve only localhost and create no sockets (currently)
 - Loading the programs' own DLLs
 - Structured exception handling
 - A registry shared by the emulated programs
