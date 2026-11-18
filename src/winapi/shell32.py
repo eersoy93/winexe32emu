@@ -20,6 +20,7 @@ import struct
 import ntpath
 
 from .. import config, winapi
+from ..resources import parse_shell_link
 from ..logger import log
 
 
@@ -35,22 +36,72 @@ class Shell32Mixin:
                           'cpio', 'rpm', 'deb', 'dmg', 'jar', 'apk', 'msi', 'squashfs'}
 
     def _system_imagelist(self, large):
-        """The (fake) system image list: generic file, folder, drive, archive, program"""
+        """The (fake) system image list: generic file, folder, drive, archive,
+        program and computer icons, then the icons added for files (an EXE's
+        own icon, a shortcut's target icon)"""
         key = 'large' if large else 'small'
         handle = self._sys_imagelists.get(key)
         if handle is None:
             size = 32 if large else 16
             handle = self.get_next_handle()
             self.imagelists[handle] = {'cx': size, 'cy': size, 'flags': 0x21,
-                                       'images': [('system', i) for i in range(6)]}
+                                       'images': [('system', i) for i in range(6)] +
+                                       list(self._sys_file_icons)}
             self._sys_imagelists[key] = handle
         return handle
 
+    def _sys_file_icon(self, image):
+        """Index of a file's own icon in the system image lists (added once):
+        image is ('shell', base icon, host path of the EXE whose icon it is or None)"""
+        index = self._sys_file_icon_indexes.get(image)
+        if index is None:
+            index = 6 + len(self._sys_file_icons)
+            self._sys_file_icons.append(image)
+            self._sys_file_icon_indexes[image] = index
+            for handle in self._sys_imagelists.values():
+                if handle in self.imagelists:
+                    self.imagelists[handle]['images'].append(image)
+        return index
+
+    def _shortcut_icon(self, host):
+        """System image index of a shortcut (.lnk): its icon location's or its
+        target's icon (the program's own icon, a folder, a document); None if
+        the file is not a shell link"""
+        try:
+            with open(host, 'rb') as f:
+                link = parse_shell_link(f.read(65536))
+        except OSError:
+            link = None
+        if link is None:
+            return None
+        icon = link['icon'] or link['path']
+        icon_host = self.resolve_drive_path(icon) if icon else None
+        if icon_host and os.path.isdir(icon_host):
+            return self._sys_file_icon(('shell', self.SYS_ICON_FOLDER, None))
+        if icon_host and os.path.isfile(icon_host) and icon.lower().endswith(('.exe', '.dll')):
+            return self._sys_file_icon(('shell', self.SYS_ICON_EXE, icon_host))
+        target = link['path'] or icon
+        base = self._sys_icon_index(ntpath.basename(target), 0) if target else self.SYS_ICON_FILE
+        return self._sys_file_icon(('shell', base, None))
+
+    def _file_icon_index(self, name, attributes, host):
+        """System image index of an existing file: shortcuts and programs get
+        their own icons, other files their type's icon"""
+        ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+        if host and not attributes & 0x10:
+            if ext == 'lnk':
+                index = self._shortcut_icon(host)
+                if index is not None:
+                    return index
+            elif ext == 'exe':
+                return self._sys_file_icon(('shell', self.SYS_ICON_EXE, host))
+        return self._sys_icon_index(name, attributes)
+
     def _sys_icon_index(self, name, attributes):
+        if len(name) <= 3 and name[1:2] == ':':
+            return self.SYS_ICON_DRIVE  # A drive's root ("C:\\") is a folder too
         if attributes & 0x10:
             return self.SYS_ICON_FOLDER
-        if len(name) <= 3 and name[1:2] == ':':
-            return self.SYS_ICON_DRIVE
         ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
         if ext in self.ARCHIVE_EXTENSIONS:
             return self.SYS_ICON_ARCHIVE
@@ -70,14 +121,21 @@ class Shell32Mixin:
         if self._is_my_computer(path):
             return self._my_computer_file_info(psfi, cbFileInfo, flags, wide)
         name = ntpath.basename(path.rstrip('\\')) or path
+        host = None
         if not flags & SHGFI_USEFILEATTRIBUTES and path:
             host = self.resolve_drive_path(path)
             if host is None or not os.path.exists(host):
                 return 0
             attributes = 0x10 if os.path.isdir(host) else 0x80
-        index = self._sys_icon_index(path if len(path) <= 3 else name, attributes)
+        if len(path) <= 3:
+            index = self._sys_icon_index(path, attributes)
+        else:
+            # Without SHGFI_USEFILEATTRIBUTES the file itself gives its icon
+            index = self._file_icon_index(name, attributes, host)
         if attributes & 0x10:
             type_name = 'File folder' if len(path) > 3 else self._drive_type_name(path)
+        elif name.lower().endswith('.lnk'):
+            type_name = 'Shortcut'
         else:
             ext = name.rsplit('.', 1)[-1].upper() if '.' in name else ''
             type_name = f"{ext} File" if ext else 'File'

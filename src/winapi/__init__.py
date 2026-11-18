@@ -45,6 +45,7 @@ from .user32_misc import User32MiscMixin
 from .shell32 import Shell32Mixin
 from .controls import ControlsMixin
 from .listview import ListViewMixin
+from .treeview import TreeViewMixin
 from .toolbar import ToolbarMixin
 from .comboboxex import ComboBoxExMixin
 from .registry import RegistryMixin
@@ -67,7 +68,7 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     WinmmMixin, ScrollbarsMixin, MessagesMixin,
                     DeviceContextMixin, GdiMixin, MemoryDCMixin,
                     MenusMixin, User32MiscMixin, Shell32Mixin,
-                    ControlsMixin, ListViewMixin, ToolbarMixin,
+                    ControlsMixin, ListViewMixin, TreeViewMixin, ToolbarMixin,
                     ComboBoxExMixin, RegistryMixin, ComMixin,
                     ExceptionsMixin, CrtBasicMixin, MsvcrtMixin,
                     CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin):

@@ -49,6 +49,7 @@ Use `-h` parameter for command-line help.
 - Structured exception handling
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
+- My Computer (C:\Windows\explorer.exe): a folder tree and a details view of the drives and folders, Back/Forward/Up and an address bar, New Folder, Rename, Delete, Cut/Copy/Paste, context menus and Properties
 
 ## Versioning
 

@@ -514,6 +514,9 @@ class CoreMixin:
         # the system image lists, icons, accelerator tables
         self.imagelists = {}
         self._sys_imagelists = {}
+        # Icons added to the system image lists for files (see _sys_file_icon)
+        self._sys_file_icons = []
+        self._sys_file_icon_indexes = {}
         self.icons = {}
         self._dialog_fonts = {}  # (face, size) of a dialog template -> GDI font handle
         self.accelerators = {}

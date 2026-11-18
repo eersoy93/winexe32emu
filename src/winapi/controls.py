@@ -144,6 +144,9 @@ class ControlsMixin:
             state.update(buttons=[], bitmaps=[], imagelist=0, bitmap_size=(16, 15),
                          button_size=None, strings=[], pressed=-1, ex_style=0,
                          notify=parent, struct_size=20, max_text_rows=1)
+        elif kind == 'TREEVIEW':
+            win.bg_color = (255, 255, 255)
+            state.update(self._tv_new_state())
         elif kind == 'REBAR':
             state.update(bands=[], notify=parent)
         elif kind == 'COMBOBOXEX':
@@ -183,7 +186,8 @@ class ControlsMixin:
             return 6
         if msg == 0x2008:  # CCM_SETVERSION
             return 6
-        handler = {'LISTVIEW': self._listview_message, 'TOOLBAR': self._toolbar_message,
+        handler = {'LISTVIEW': self._listview_message, 'TREEVIEW': self._treeview_message,
+                   'TOOLBAR': self._toolbar_message,
                    'REBAR': self._rebar_message, 'COMBOBOXEX': self._comboboxex_message,
                    'HEADER': self._header_message}.get(win.native)
         result = handler(win, msg, wParam, lParam) if handler else None

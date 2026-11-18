@@ -57,7 +57,8 @@ for dir in apps/*/; do
     # GUI applications
     # shellcheck disable=SC2086
     if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "$exe" \
-        "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -mwindows; then
+        "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -lcomctl32 -lshell32 -lole32 \
+        -mwindows; then
         echo "OK: ${name}.exe"
     else
         echo "ERROR: ${name}.exe compilation failed!"

@@ -1626,6 +1626,15 @@ class PseudoWindowsGUI:
         if image[0] == 'system':
             self._draw_system_icon(image[1], x, y, imagelist['cx'])
             return True
+        if image[0] == 'shell':
+            # A file's own icon (an EXE's icon, a shortcut's target icon) or a type icon
+            _, base, host = image
+            size = imagelist['cx']
+            if host:
+                self.screen.blit(self._exe_icon(host, size)[0], (x, y))
+            else:
+                self._draw_system_icon(base, x, y, size)
+            return True
         surface = self._image_surface_rgba(image)
         if disabled:
             surface = surface.copy()
@@ -1637,6 +1646,13 @@ class PseudoWindowsGUI:
         """Draw an emulated common control's client area"""
         if win.native == 'LISTVIEW':
             self._draw_listview(win, cx, cy, cw, ch)
+        elif win.native == 'TREEVIEW':
+            gui_font = self.font
+            self.font = self.font_list or self.font
+            try:
+                self._draw_treeview(win, cx, cy, cw, ch)
+            finally:
+                self.font = gui_font
         elif win.native == 'TOOLBAR':
             self._draw_toolbar(win, cx, cy, cw, ch)
         elif win.native == 'REBAR':
@@ -1659,6 +1675,104 @@ class PseudoWindowsGUI:
             button = pygame.Rect(cx + cw - 18, cy + 2, 16, ch - 4)
             self._draw_button_3d(button, '', pressed=st.get('dropped', False))
             self._draw_arrow(button, 'down')
+
+    def _draw_dotted(self, start, end, color=(128, 128, 128)):
+        """Dotted horizontal or vertical line (tree view lines)"""
+        (x1, y1), (x2, y2) = start, end
+        if y1 == y2:
+            for x in range(min(x1, x2), max(x1, x2) + 1, 2):
+                self.screen.set_at((x, y1), color)
+        else:
+            for y in range(min(y1, y2), max(y1, y2) + 1, 2):
+                self.screen.set_at((x1, y), color)
+
+    def _draw_treeview(self, win, cx, cy, cw, ch):
+        """SysTreeView32: the visible rows with their lines, +/- boxes, icons
+        and labels, and a vertical scroll bar when they don't fit"""
+        st = win.nstate
+        owner = win.owner
+        pygame.draw.rect(self.screen, (255, 255, 255), (cx, cy, cw, ch))
+        if owner is None:
+            return
+        row_h, indent = owner.TV_ROW_H, owner.TV_INDENT
+        rows = owner.tv_rows(win)
+        lines = max(1, ch // row_h)
+        scrollbar = len(rows) > lines
+        body_w = cw - (16 if scrollbar else 0)
+        focused = self.focused_window == win.hwnd and self.top_level_of(win.hwnd) == \
+            self.active_window
+        has_lines = win.style & owner.TVS_HASLINES
+        has_buttons = win.style & owner.TVS_HASBUTTONS
+        himl = st['imagelist']
+        clip = self.screen.get_clip()
+        body = pygame.Rect(cx, cy, body_w, ch)
+        self.screen.set_clip(body.clip(clip) if clip else body)
+        top = st['top']
+        for index in range(top, min(len(rows), top + lines + 1)):
+            handle, item, depth = rows[index]
+            y = cy + (index - top) * row_h
+            mid = y + row_h // 2
+            bx = cx + owner.tv_button_left(win, depth)
+            center = bx + indent // 2 - 2
+            if has_lines and (depth or win.style & owner.TVS_LINESATROOT):
+                # Line to the item, and down to its next sibling
+                siblings = owner._tv_children(st, item['parent'])
+                last = siblings and siblings[-1] == handle
+                first_root = not item['parent'] and siblings and siblings[0] == handle
+                self._draw_dotted((center, mid), (center + indent // 2, mid))
+                self._draw_dotted((center, y if not first_root else mid),
+                                  (center, mid if last else y + row_h))
+                # Lines of the ancestors that have later siblings
+                parent, level = item['parent'], depth - 1
+                while parent:
+                    parent_item = st['items'][parent]
+                    parent_siblings = owner._tv_children(st, parent_item['parent'])
+                    if parent_siblings and parent_siblings[-1] != parent and \
+                            (level or win.style & owner.TVS_LINESATROOT):
+                        px = cx + owner.tv_button_left(win, level) + indent // 2 - 2
+                        self._draw_dotted((px, y), (px, y + row_h))
+                    parent, level = parent_item['parent'], level - 1
+            if has_buttons and owner.tv_has_buttons(item) and \
+                    (depth or win.style & owner.TVS_LINESATROOT):
+                box = pygame.Rect(center - 4, mid - 4, 9, 9)
+                pygame.draw.rect(self.screen, (255, 255, 255), box)
+                pygame.draw.rect(self.screen, (128, 128, 128), box, 1)
+                pygame.draw.line(self.screen, (0, 0, 0), (box.x + 2, mid), (box.right - 3, mid))
+                if not item['state'] & owner.TVIS_EXPANDED:
+                    pygame.draw.line(self.screen, (0, 0, 0), (center, box.y + 2),
+                                     (center, box.bottom - 3))
+            tx = cx + owner.tv_text_left(win, depth)
+            selected = handle == st['selected']
+            if himl:
+                image = item['selimage'] if selected else item['image']
+                self._draw_imagelist_image(owner, himl, image, tx - 18, y + 1)
+            label = item['text'] or ''
+            surface = self.font.render(label, True, (255, 255, 255) if selected and focused
+                                       else self.COLOR_TEXT)
+            label_rect = pygame.Rect(tx, y + 1, surface.get_width() + 4, row_h - 2)
+            if selected or st.get('drophilite') == handle:
+                pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR if selected and focused
+                                 else (192, 192, 192), label_rect)
+                if not focused and selected:
+                    surface = self.font.render(label, True, self.COLOR_TEXT)
+            self.screen.blit(surface, (tx + 2, y + (row_h - surface.get_height()) // 2))
+            if selected and focused:
+                pygame.draw.rect(self.screen, (128, 128, 128), label_rect, 1)
+        self.screen.set_clip(clip)
+        if scrollbar:
+            bar = pygame.Rect(cx + cw - 16, cy, 16, ch)
+            pygame.draw.rect(self.screen, (230, 228, 222), bar)
+            up = pygame.Rect(bar.x, bar.y, 16, 16)
+            down = pygame.Rect(bar.x, bar.bottom - 16, 16, 16)
+            self._draw_button_3d(up, '')
+            self._draw_arrow(up, 'up')
+            self._draw_button_3d(down, '')
+            self._draw_arrow(down, 'down')
+            track = bar.height - 32
+            if track > 8:
+                thumb_h = max(10, track * lines // max(1, len(rows)))
+                thumb_y = bar.y + 16 + (track - thumb_h) * top // max(1, len(rows) - lines)
+                self._draw_button_3d(pygame.Rect(bar.x, thumb_y, 16, thumb_h), '')
 
     def _draw_listview(self, win, cx, cy, cw, ch):
         gui_font = self.font

@@ -1,2 +1,50 @@
-/* Explorer (My Computer) resources: the program icon (the first icon is the EXE icon) */
+/* Explorer (My Computer) resources: the program icon (the first icon is the
+   EXE icon), the keyboard shortcuts and the Properties dialog */
+
+#include <windows.h>
+#include "resource.h"
+
 1 ICON "explorer.ico"
+
+IDA_EXPLORER ACCELERATORS
+BEGIN
+    VK_DELETE, IDM_DELETE,     VIRTKEY
+    VK_F2,     IDM_RENAME,     VIRTKEY
+    VK_F5,     IDM_REFRESH,    VIRTKEY
+    VK_BACK,   IDM_UP,         VIRTKEY
+    VK_LEFT,   IDM_BACK,       VIRTKEY, ALT
+    VK_RIGHT,  IDM_FORWARD,    VIRTKEY, ALT
+    VK_RETURN, IDM_PROPERTIES, VIRTKEY, ALT
+    "X",       IDM_CUT,        VIRTKEY, CONTROL
+    "C",       IDM_COPY,       VIRTKEY, CONTROL
+    "V",       IDM_PASTE,      VIRTKEY, CONTROL
+    "A",       IDM_SELECTALL,  VIRTKEY, CONTROL
+    "N",       IDM_NEWFOLDER,  VIRTKEY, CONTROL, SHIFT
+    "D",       IDM_ADDRESS,    VIRTKEY, ALT
+END
+
+IDD_PROPERTIES DIALOG 0, 0, 220, 186
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Properties"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "", IDC_PROP_NAME, 10, 10, 200, 10
+    LTEXT "", IDC_PROP_LABEL1, 10, 28, 60, 9
+    LTEXT "", IDC_PROP_VALUE1, 72, 28, 138, 9
+    LTEXT "", IDC_PROP_LABEL2, 10, 42, 60, 9
+    LTEXT "", IDC_PROP_VALUE2, 72, 42, 138, 9
+    LTEXT "", IDC_PROP_LABEL3, 10, 56, 60, 9
+    LTEXT "", IDC_PROP_VALUE3, 72, 56, 138, 9
+    LTEXT "", IDC_PROP_LABEL4, 10, 70, 60, 9
+    LTEXT "", IDC_PROP_VALUE4, 72, 70, 138, 9
+    LTEXT "", IDC_PROP_LABEL5, 10, 84, 60, 9
+    LTEXT "", IDC_PROP_VALUE5, 72, 84, 138, 9
+    LTEXT "", IDC_PROP_LABEL6, 10, 98, 60, 9
+    LTEXT "", IDC_PROP_VALUE6, 72, 98, 138, 9
+    LTEXT "", IDC_PROP_LABEL7, 10, 112, 60, 9
+    LTEXT "", IDC_PROP_VALUE7, 72, 112, 138, 9
+    LTEXT "Attributes:", IDC_PROP_ATTR_LABEL, 10, 132, 60, 9
+    AUTOCHECKBOX "&Read-only", IDC_PROP_READONLY, 72, 131, 60, 10, WS_DISABLED
+    AUTOCHECKBOX "&Hidden", IDC_PROP_HIDDEN, 136, 131, 60, 10, WS_DISABLED
+    DEFPUSHBUTTON "OK", IDOK, 160, 162, 50, 14
+END
