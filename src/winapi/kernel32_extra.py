@@ -265,6 +265,9 @@ class Kernel32ExtraMixin:
                 self._mem_write(address, struct.pack('<I', value))
         return 0
 
+    # The emulated Windows is 32-bit: there is no WOW64 (no 64-bit system,
+    # no SysWOW64 folder, no file system or registry redirection)
+
     def IsWow64Process(self, args):
         """IsWow64Process - a 32-bit Windows: FALSE"""
         return 1 if self._mem_write(args[1], struct.pack('<I', 0)) else 0
@@ -284,10 +287,12 @@ class Kernel32ExtraMixin:
     GetSystemWow64DirectoryW = GetSystemWow64DirectoryA
 
     def Wow64DisableWow64FsRedirection(self, args):
-        self._last_error = 120
+        """Wow64Disable/RevertWow64FsRedirection - FALSE on 32-bit Windows"""
+        self._last_error = 1  # ERROR_INVALID_FUNCTION
         return 0
 
-    Wow64RevertWow64FsRedirection = Wow64DisableWow64FsRedirection
+    Wow64RevertWow64FsRedirection = Wow64EnableWow64FsRedirection = \
+        Wow64DisableWow64FsRedirection
 
     def GetSystemWindowsDirectoryA(self, args, wide=False):
         """GetSystemWindowsDirectoryA/W(buffer, size)"""

@@ -25,6 +25,7 @@ from unicorn import *
 
 from ..config import USER_PROFILE_FOLDER
 from ..logger import log
+from ..paths import resolve_drive_path
 
 
 class ShellExtraMixin:
@@ -66,7 +67,9 @@ class ShellExtraMixin:
         'f1b32785-6fba-4fcf-9d55-7b8e7f157091': 0x1C,  # LocalAppData
         '62ab5d82-fdc1-4dc3-a9dd-070d1d495d97': 0x23,  # ProgramData
         '905e63b6-c1bf-494e-b29c-65b732d3d21a': 0x26,  # ProgramFiles
-        '7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e': 0x26,  # ProgramFilesX86 (32-bit Windows)
+        # On 32-bit Windows the x86 folders are the normal ones (there is no
+        # WOW64); FOLDERID_ProgramFilesX64 and the like don't exist
+        '7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e': 0x26,  # ProgramFilesX86
         'f7f1ed05-9f6d-47a2-aaae-29d317c6f066': 0x2B,  # ProgramFilesCommon
         'de974d24-d9c6-4d3e-bf91-f4455120b917': 0x2B,  # ProgramFilesCommonX86
         'f38bf404-1d43-42f2-9305-67de0b28fc23': 0x24,  # Windows
@@ -92,6 +95,28 @@ class ShellExtraMixin:
         'a520a1a4-1780-4ff6-bd18-167343c5af16': USER_PROFILE_FOLDER + '\\AppData\\LocalLow',
         '4c5c32ff-bb9d-43b0-b5b4-2d72e54eaaa4': USER_PROFILE_FOLDER + '\\Saved Games',
     }
+
+    @classmethod
+    def known_folder_paths(cls):
+        """Windows paths of the CSIDL and FOLDERID folders (no duplicates)"""
+        folders = []
+        for folder in list(cls.SHELL_FOLDERS.values()) + list(cls.KNOWN_FOLDERS.values()):
+            if isinstance(folder, str) and folder.lower() not in (f.lower() for f in folders):
+                folders.append(folder)
+        return folders
+
+    @classmethod
+    def create_known_folders(cls):
+        """Create every known folder in drives/ (at each start, like the
+        folders of a Windows installation)"""
+        for folder in cls.known_folder_paths():
+            path = resolve_drive_path(folder)
+            if path is None:
+                continue
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                log.warning(f"Cannot create known folder {folder}: {e}")
 
     def _known_folder_path(self, guid_addr):
         """Windows path of a FOLDERID, or None"""

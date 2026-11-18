@@ -386,6 +386,19 @@ static void test_kernel32(void)
     check(!VerifyVersionInfoA(&vi, VER_MAJORVERSION | VER_MINORVERSION, mask) &&
           GetLastError() == ERROR_OLD_WIN_VERSION, "VerifyVersionInfoA (not Windows 10)");
     check(IsWow64Process(GetCurrentProcess(), &wow64) && !wow64, "IsWow64Process");
+    {
+        /* A 32-bit Windows: no WOW64 */
+        PVOID old_redirection = NULL;
+        check(GetSystemWow64DirectoryA(buf, sizeof(buf)) == 0 &&
+              GetLastError() == ERROR_CALL_NOT_IMPLEMENTED, "GetSystemWow64DirectoryA (none)");
+        check(!Wow64DisableWow64FsRedirection(&old_redirection) &&
+              GetLastError() == ERROR_INVALID_FUNCTION, "Wow64DisableWow64FsRedirection (none)");
+        check(GetEnvironmentVariableA("PROCESSOR_ARCHITECTURE", buf, sizeof(buf)) == 3 &&
+              strcmp(buf, "x86") == 0 &&
+              GetEnvironmentVariableA("PROCESSOR_ARCHITEW6432", buf, sizeof(buf)) == 0 &&
+              GetEnvironmentVariableA("ProgramFiles(x86)", buf, sizeof(buf)) == 0,
+              "Environment of a 32-bit Windows");
+    }
     check(GetSystemWindowsDirectoryA(buf, sizeof(buf)) == 10 && strcmp(buf, "C:\\Windows") == 0,
           "GetSystemWindowsDirectoryA");
     size = sizeof(buf);
@@ -552,6 +565,21 @@ static void test_shell_and_guids(void)
     RPC_STATUS status;
 
     printf("\n--- shell32 ---\n");
+    {
+        /* The known folders exist from the start (created at every start) */
+        static const char *const folders[] = {
+            "\\Documents", "\\Downloads", "\\Saved Games", "\\AppData\\LocalLow",
+            "\\AppData\\Roaming\\Microsoft\\Windows\\SendTo"};
+        char profile[MAX_PATH], path[MAX_PATH];
+        size_t i;
+        int all = GetEnvironmentVariableA("USERPROFILE", profile, sizeof(profile)) > 0;
+        for (i = 0; i < sizeof(folders) / sizeof(folders[0]); i++) {
+            snprintf(path, sizeof(path), "%s%s", profile, folders[i]);
+            all = all && PathIsDirectoryA(path);
+        }
+        check(all && PathIsDirectoryA("C:\\Program Files\\Common Files") &&
+              PathIsDirectoryA("C:\\Users\\Public\\Music"), "Known folders exist");
+    }
     argv = CommandLineToArgvW(L"prog.exe \"two words\" last", &argc);
     check(argv && argc == 3 && wcscmp(argv[1], L"two words") == 0 && wcscmp(argv[2], L"last") == 0,
           "CommandLineToArgvW");

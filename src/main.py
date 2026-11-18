@@ -149,6 +149,7 @@ def main():
     if not args.no_apps:
         run_setup_script(COMPILE_APPS_SCRIPT, "Compiling Apps")
     create_environment_folders()
+    WinAPIHandler.create_known_folders()
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
         log.error("An EXE name is required when the GUI is not available")
