@@ -13,27 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Undoes create_c_drive_environment.sh, compile_apps.sh and compile_tests.sh. Other files
-# in c_drive/ are kept (folders holding them stay); --all deletes the whole
-# c_drive/ after a confirmation.
+# Undoes create_drives_environment.sh, compile_apps.sh and compile_tests.sh. Other files
+# in drives/ are kept (folders holding them stay); --all deletes the whole
+# drives/ (every drive: A:, C:, D:) after a confirmation.
 
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-C_DRIVE=c_drive
+DRIVES=drives
+C_DRIVE=${DRIVES}/C
 
-if [ ! -d "$C_DRIVE" ]; then
-    echo "OK: ${C_DRIVE}/ does not exist"
+if [ ! -d "$DRIVES" ]; then
+    echo "OK: ${DRIVES}/ does not exist"
     exit 0
 fi
 
 if [ "$1" = "--all" ]; then
-    printf "Delete %s/ and everything in it? [y/N] " "$C_DRIVE"
+    printf "Delete %s/ (drives A:, C:, D:) and everything in it? [y/N] " "$DRIVES"
     read -r answer
     case "$answer" in
         y|Y|yes|YES)
-            rm -rf "$C_DRIVE" || exit 1
-            echo "OK: ${C_DRIVE}/ removed"
+            rm -rf "$DRIVES" || exit 1
+            echo "OK: ${DRIVES}/ removed"
             ;;
         *)
             echo "Cancelled"
@@ -58,10 +59,13 @@ for dir in Windows/Temp Windows/System32 Windows "Program Files" \
            ProgramData ""; do
     rmdir "${C_DRIVE}/${dir}" 2>/dev/null
 done
+for drive in A D ""; do
+    rmdir "${DRIVES}/${drive}" 2>/dev/null
+done
 
-if [ -d "$C_DRIVE" ]; then
-    echo "OK: environment removed; ${C_DRIVE}/ kept because of these files:"
-    find "$C_DRIVE" -type f
+if [ -d "$DRIVES" ]; then
+    echo "OK: environment removed; ${DRIVES}/ kept because of these files:"
+    find "$DRIVES" -type f
 else
-    echo "OK: ${C_DRIVE}/ removed"
+    echo "OK: ${DRIVES}/ removed"
 fi

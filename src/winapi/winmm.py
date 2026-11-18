@@ -675,7 +675,7 @@ class WinmmMixin:
             return 263  # MCIERR_INVALID_DEVICE_NAME
         path = None
         if element:
-            path = self.resolve_c_drive_path(element)
+            path = self.resolve_drive_path(element)
             if path is None or not os.path.isfile(path):
                 return 275  # MCIERR_FILE_NOT_FOUND
         device_id = self.next_mci_id
@@ -857,10 +857,10 @@ class WinmmMixin:
                 SoundPlayer.play_tone(frequency, duration, owner=self)
                 length = duration / 1000.0
             elif not (flags & self.SND_ALIAS):
-                path = self.resolve_c_drive_path(name)
+                path = self.resolve_drive_path(name)
                 if path is None or not os.path.isfile(path):
                     # Windows also tries the name with a .wav extension
-                    path = self.resolve_c_drive_path(name + '.wav')
+                    path = self.resolve_drive_path(name + '.wav')
                 if path is not None and os.path.isfile(path):
                     length = SoundPlayer.play(path, loop, owner=self)
 
@@ -875,7 +875,7 @@ class WinmmMixin:
         return 1
 
     def PlaySoundA(self, args, wide=False):
-        """PlaySoundA/W emulation (winmm) - WAV files in c_drive/, memory
+        """PlaySoundA/W emulation (winmm) - WAV files on the drives (drives/), memory
         images and system sound aliases"""
         return self._play_sound_common(args[0], args[2], wide)
 

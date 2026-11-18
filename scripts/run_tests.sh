@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.." || exit 1
 PYTHON=${PYTHON:-python3}
 TIMEOUT=${TIMEOUT:-120}
 
-sh scripts/create_c_drive_environment.sh || exit 1
+sh scripts/create_drives_environment.sh || exit 1
 sh scripts/compile_tests.sh
 
 # No sound card needed for sound_test

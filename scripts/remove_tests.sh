@@ -19,7 +19,7 @@
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-OUT_DIR=c_drive/Windows/Tests
+OUT_DIR=drives/C/Windows/Tests
 
 for src in tests/*.c; do
     name=$(basename "$src" .c)

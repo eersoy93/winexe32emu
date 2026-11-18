@@ -74,7 +74,7 @@ class User32MiscMixin:
 
     def _load_image_file(self, path, image_type):
         """LoadImage(LR_LOADFROMFILE): a .bmp bitmap or a .ico icon"""
-        host = self.resolve_c_drive_path(path)
+        host = self.resolve_drive_path(path)
         try:
             with open(host, 'rb') as f:
                 data = f.read()

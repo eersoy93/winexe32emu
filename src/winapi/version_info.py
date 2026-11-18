@@ -41,7 +41,7 @@ class VersionInfoMixin:
             names = [d.rstrip('\\') + '\\' + name for d in self._search_path_dirs()]
         for candidate in names:
             full = self.full_windows_path(candidate)
-            host = self.resolve_c_drive_path(full) if full else None
+            host = self.resolve_drive_path(full) if full else None
             if host and os.path.isfile(host):
                 return host
         return None

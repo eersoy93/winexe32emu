@@ -225,7 +225,7 @@ class ExeResourcesMixin:
                 self.console_output.append(text)
                 self.console_write(text, 'stderr')
             else:
-                # Real file handle (opened via CreateFile, inside c_drive/)
+                # Real file handle (opened via CreateFile, inside drives/)
                 info = self.handles.get(hFile)
                 if info and info.get('fp'):
                     written = info['fp'].write(bytes(data))

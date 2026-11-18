@@ -418,8 +418,8 @@ class CrtStdioMixin:
         """_wfopen emulation - fopen with wide file name and mode"""
         filename = self.read_wide_string(args[0])
         mode = self.read_wide_string(args[1])
-        path = self.resolve_c_drive_path(filename)
-        if path is None:
+        path = self.resolve_drive_path(filename)
+        if path is None or (self._crt_mode_writes(mode) and self._write_protected(path)):
             self._store_errno(self.EACCES)
             return 0
         try:
@@ -445,13 +445,19 @@ class CrtStdioMixin:
         self.std_streams[2].write(text.encode(config.ANSI_CODEPAGE, errors='replace'))
         return 0
 
-    # ---- File system (sandboxed in c_drive/) ----
+    # ---- File system (sandboxed in drives/) ----
 
-    def _sandbox_op(self, name_addr, op, wide=False):
-        """Run op(host_path) for a program path; returns 0 or -1 with errno."""
+    @staticmethod
+    def _crt_mode_writes(mode):
+        """Does an fopen mode ("w", "a", "r+"...) change the file?"""
+        return any(c in (mode or '') for c in 'wa+')
+
+    def _sandbox_op(self, name_addr, op, wide=False, writes=True):
+        """Run op(host_path) for a program path; returns 0 or -1 with errno.
+        An op that writes fails with EACCES on the read-only CD-ROM D:."""
         filename = self._read_text(name_addr, wide)
-        path = self.resolve_c_drive_path(filename)
-        if path is None:
+        path = self.resolve_drive_path(filename)
+        if path is None or (writes and self._write_protected(path)):
             self._store_errno(self.EACCES)
             return 0xFFFFFFFF
         try:
@@ -476,8 +482,8 @@ class CrtStdioMixin:
 
     def rename(self, args):
         """rename emulation (fails if the target exists, like Windows)"""
-        new_path = self.resolve_c_drive_path(self.read_string(args[1]))
-        if new_path is None:
+        new_path = self.resolve_drive_path(self.read_string(args[1]))
+        if new_path is None or self._write_protected(new_path):
             self._store_errno(self.EACCES)
             return 0xFFFFFFFF
 
@@ -494,9 +500,9 @@ class CrtStdioMixin:
         def check(path):
             if not os.path.exists(path):
                 raise FileNotFoundError(__import__('errno').ENOENT, "missing")
-            if mode & 2 and not os.access(path, os.W_OK):
+            if mode & 2 and (not os.access(path, os.W_OK) or self._write_protected(path)):
                 raise PermissionError(__import__('errno').EACCES, "read-only")
-        return self._sandbox_op(args[0], check)
+        return self._sandbox_op(args[0], check, writes=False)
 
     def access(self, args):
         return self._access(args)

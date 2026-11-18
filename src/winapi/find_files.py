@@ -72,18 +72,18 @@ class FindFilesMixin:
         self.emu.uc.mem_write(address, header + names)
 
     def FindFirstFileA(self, args, wide=False):
-        """FindFirstFileA/W emulation - lists a c_drive/ directory"""
+        """FindFirstFileA/W emulation - lists a directory of a drive (drives/)"""
         INVALID_HANDLE_VALUE = 0xFFFFFFFF
         spec = self._read_text(args[0], wide)
         lpFindFileData = args[1]
         log.debug(f"FindFirstFile{'W' if wide else 'A'}(\"{spec}\")")
 
         full = self.full_windows_path(spec)
-        if full is None or full == "C:\\":
+        if full is None or len(full) == 3:  # A drive root itself ("C:\\")
             self._last_error = 5 if full is None else 2
             return INVALID_HANDLE_VALUE
         folder, _, pattern = full.rpartition('\\')
-        folder_path = self.resolve_c_drive_path(folder + '\\')
+        folder_path = self.resolve_drive_path(folder + '\\')
         if folder_path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return INVALID_HANDLE_VALUE
@@ -97,7 +97,7 @@ class FindFilesMixin:
         except OSError:
             self._last_error = 5
             return INVALID_HANDLE_VALUE
-        if folder != "C:":
+        if len(folder) > 2:  # Not a drive root ("C:")
             names = ['.', '..'] + names  # Every directory but the root has them
         entries = []
         for name in names:

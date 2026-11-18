@@ -23,7 +23,7 @@ import time
 from unicorn import *
 
 from .. import config, winapi
-from ..config import C_DRIVE_PATH
+from ..config import DRIVES
 from ..logger import log
 
 
@@ -449,11 +449,11 @@ class Kernel32MiscMixin:
         return 0
 
     def GetFileAttributesA(self, args, wide=False):
-        """GetFileAttributesA/W emulation (sandboxed to c_drive/)"""
+        """GetFileAttributesA/W emulation (sandboxed to drives/)"""
         filename = self._read_text(args[0], wide)
         log.debug(f"GetFileAttributes{'W' if wide else 'A'}(\"{filename}\")")
 
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None or not os.path.exists(path):
             return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
         if os.path.isdir(path):
@@ -463,7 +463,7 @@ class Kernel32MiscMixin:
         return 0x80  # FILE_ATTRIBUTE_NORMAL
 
     def CreateFileA(self, args):
-        """CreateFileA emulation - opens a real file inside the c_drive/ sandbox"""
+        """CreateFileA emulation - opens a real file inside the drives/ sandbox"""
         filename = self.read_string(args[0])
         dwDesiredAccess = args[1]
         dwCreationDisposition = args[4]
@@ -483,11 +483,12 @@ class Kernel32MiscMixin:
     def _create_file_common(self, filename, dwDesiredAccess, dwCreationDisposition):
         """Shared CreateFile opener used by the A/W variants.
 
-        Honours the sandbox: names that escape c_drive/ get
-        INVALID_HANDLE_VALUE and ERROR_ACCESS_DENIED.
+        Honours the sandbox: names that escape their drive's folder get
+        INVALID_HANDLE_VALUE and ERROR_ACCESS_DENIED, like changes on the
+        read-only CD-ROM D:.
         """
         INVALID_HANDLE_VALUE = 0xFFFFFFFF
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return INVALID_HANDLE_VALUE
@@ -508,6 +509,12 @@ class Kernel32MiscMixin:
 
         # CreationDisposition: CREATE_NEW=1, CREATE_ALWAYS=2, OPEN_EXISTING=3,
         # OPEN_ALWAYS=4, TRUNCATE_EXISTING=5
+        if (want_write or dwCreationDisposition in (1, 2, 5) or
+                (dwCreationDisposition == 4 and not exists)):
+            if dwCreationDisposition in (3, 5) and not exists:
+                pass  # ERROR_FILE_NOT_FOUND below
+            elif self._write_protected(path):
+                return INVALID_HANDLE_VALUE
         try:
             if dwCreationDisposition == 1:      # CREATE_NEW
                 if exists:
@@ -650,10 +657,12 @@ class Kernel32MiscMixin:
         """DeleteFileA/W emulation (sandboxed)"""
         filename = self._read_text(args[0], wide)
         log.debug(f"DeleteFileA(\"{filename}\")")
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None or not os.path.isfile(path):
             self._last_error = 2
             return 0  # FALSE
+        if self._write_protected(path):
+            return 0
         try:
             os.remove(path)
             return 1
@@ -666,9 +675,14 @@ class Kernel32MiscMixin:
         """CreateDirectoryA/W emulation (sandboxed)"""
         dirname = self._read_text(args[0], wide)
         log.debug(f"CreateDirectoryA(\"{dirname}\")")
-        path = self.resolve_c_drive_path(dirname)
+        path = self.resolve_drive_path(dirname)
         if path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if os.path.exists(path):
+            self._last_error = 183  # ERROR_ALREADY_EXISTS
+            return 0
+        if self._write_protected(path):
             return 0
         try:
             os.mkdir(path)
@@ -686,9 +700,11 @@ class Kernel32MiscMixin:
         """RemoveDirectoryA/W emulation (sandboxed, directory must be empty)"""
         dirname = self._read_text(args[0], wide)
         log.debug(f"RemoveDirectoryA(\"{dirname}\")")
-        path = self.resolve_c_drive_path(dirname)
+        path = self.resolve_drive_path(dirname)
         if path is None or not os.path.isdir(path):
             self._last_error = 3 if path else 5
+            return 0
+        if self._write_protected(path):
             return 0
         try:
             os.rmdir(path)
@@ -715,8 +731,8 @@ class Kernel32MiscMixin:
         dst = self._read_text(args[1], wide)
         fail_if_exists = args[2]
         log.debug(f"CopyFile(\"{src}\", \"{dst}\", {fail_if_exists})")
-        src_path = self.resolve_c_drive_path(src)
-        dst_path = self.resolve_c_drive_path(dst)
+        src_path = self.resolve_drive_path(src)
+        dst_path = self.resolve_drive_path(dst)
         if src_path is None or dst_path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return 0
@@ -728,6 +744,8 @@ class Kernel32MiscMixin:
             return 0
         if fail_if_exists and os.path.exists(dst_path):
             self._last_error = 80  # ERROR_FILE_EXISTS
+            return 0
+        if self._write_protected(dst_path):
             return 0
         try:
             shutil.copyfile(src_path, dst_path)
@@ -748,8 +766,8 @@ class Kernel32MiscMixin:
         src = self._read_text(args[0], wide)
         dst = self._read_text(args[1], wide)
         log.debug(f"MoveFile(\"{src}\", \"{dst}\")")
-        src_path = self.resolve_c_drive_path(src)
-        dst_path = self.resolve_c_drive_path(dst)
+        src_path = self.resolve_drive_path(src)
+        dst_path = self.resolve_drive_path(dst)
         if src_path is None or dst_path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return 0
@@ -758,6 +776,8 @@ class Kernel32MiscMixin:
             return 0
         if os.path.exists(dst_path):
             self._last_error = 183  # ERROR_ALREADY_EXISTS
+            return 0
+        if self._write_protected(src_path, dst_path):
             return 0
         try:
             os.rename(src_path, dst_path)
@@ -783,10 +803,12 @@ class Kernel32MiscMixin:
         src = self._read_text(lpExisting, wide)
         dst = self._read_text(lpNew, wide) if lpNew else None
         log.debug(f"MoveFileEx(\"{src}\", \"{dst}\", 0x{flags:x})")
-        src_path = self.resolve_c_drive_path(src)
-        dst_path = self.resolve_c_drive_path(dst) if dst else None
+        src_path = self.resolve_drive_path(src)
+        dst_path = self.resolve_drive_path(dst) if dst else None
         if src_path is None or (dst is not None and dst_path is None):
             self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if self._write_protected(src_path, dst_path):
             return 0
         if flags & self.MOVEFILE_DELAY_UNTIL_REBOOT:
             self.pending_file_operations.append((src_path, dst_path, flags))
@@ -853,11 +875,11 @@ class Kernel32MiscMixin:
         return self.GetCurrentDirectoryA(args, wide=True)
 
     def SetCurrentDirectoryA(self, args, wide=False):
-        """SetCurrentDirectoryA/W emulation (the directory must exist in c_drive/)"""
+        """SetCurrentDirectoryA/W emulation (the directory must exist on a drive)"""
         name = self._read_text(args[0], wide)
         log.debug(f"SetCurrentDirectory(\"{name}\")")
         full = self.full_windows_path(name)
-        path = self.resolve_c_drive_path(name)
+        path = self.resolve_drive_path(name)
         if full is None or path is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return 0
@@ -927,7 +949,7 @@ class Kernel32MiscMixin:
             for candidate in candidates:
                 full = self.full_windows_path(
                     candidate if not folder else folder.rstrip('\\/') + '\\' + candidate)
-                host = self.resolve_c_drive_path(full) if full else None
+                host = self.resolve_drive_path(full) if full else None
                 if host and os.path.exists(host):
                     log.debug(f"SearchPath(\"{name}\") -> \"{full}\"")
                     return self._write_path_out(full, nBufferLength, lpBuffer, lpFilePart,
@@ -945,7 +967,7 @@ class Kernel32MiscMixin:
         lpszLongPath, lpszShortPath, cchBuffer = args[0], args[1], args[2]
         name = self._read_text(lpszLongPath, wide) if lpszLongPath else ''
         full = self.full_windows_path(name) if name else None
-        host = self.resolve_c_drive_path(full) if full else None
+        host = self.resolve_drive_path(full) if full else None
         if not host or not os.path.exists(host):
             self._last_error = 2 if full else 123  # FILE_NOT_FOUND / INVALID_NAME
             return 0
@@ -963,23 +985,15 @@ class Kernel32MiscMixin:
         return self.GetShortPathNameA(args, wide=True)
 
     def GetDiskFreeSpaceA(self, args):
-        """GetDiskFreeSpaceA emulation - space of the host disk holding c_drive/"""
-        root = self.read_string(args[0]) if args[0] else "C:\\"
-        log.debug(f"GetDiskFreeSpaceA(\"{root}\")")
-        if root[1:2] == ':' and root[0].upper() != 'C':
+        """GetDiskFreeSpaceA emulation (see GetDiskFreeSpaceW)"""
+        letter = self._drive_letter(args[0])
+        if letter is None:
             self._last_error = 3  # ERROR_PATH_NOT_FOUND
             return 0
-        usage = shutil.disk_usage(C_DRIVE_PATH)
-        sectors, sector_size = 8, 512
-        cluster = sectors * sector_size
         # Old programs compute bytes in 32 bits: report at most 2 GB like Windows 9x
-        limit = 0x7FFFFFFF // cluster
-        values = (sectors, sector_size, min(usage.free // cluster, limit),
-                  min(usage.total // cluster, limit))
-        for ptr, value in zip(args[1:5], values):
-            if ptr:
-                self.emu.uc.mem_write(ptr, struct.pack('<I', value))
-        return 1
+        sector_size, sectors = self.DRIVE_GEOMETRY[DRIVES[letter][0]]
+        return self._disk_free_space(letter, args[1:5],
+                                     limit=0x7FFFFFFF // (sector_size * sectors))
 
     def GetTempFileNameA(self, args):
         """GetTempFileNameA emulation - <path>\\<pre><hex>.TMP (created if uUnique is 0)"""
@@ -989,7 +1003,7 @@ class Kernel32MiscMixin:
         lpTempFileName = args[3]
         log.debug(f"GetTempFileNameA(\"{path_name}\", \"{prefix}\", {uUnique})")
 
-        directory = self.resolve_c_drive_path(path_name)
+        directory = self.resolve_drive_path(path_name)
         if directory is None or not os.path.isdir(directory):
             self._last_error = 267  # ERROR_DIRECTORY
             return 0
@@ -1003,8 +1017,9 @@ class Kernel32MiscMixin:
             for i in range(0xFFFF):
                 uUnique = (start + i - 1) % 0xFFFF + 1
                 name = f"{base}{uUnique:X}.TMP"
-                path = self.resolve_c_drive_path(name)
-                if path is None:
+                path = self.resolve_drive_path(name)
+                if path is None or self._write_protected(path):
+                    path = None
                     break
                 try:
                     with open(path, 'xb'):

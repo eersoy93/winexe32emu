@@ -25,7 +25,7 @@ import warnings
 from . import winapi
 from .config import EXPLORER_PATH, PYGAME_AVAILABLE, WINEXE32EMU_VERSION
 from .logger import log
-from .paths import _program_subfolders, resolve_c_drive_path
+from .paths import _program_subfolders, resolve_drive_path
 from .resources import parse_shell_link, read_exe_icon, standard_cursor_image
 from .windows import FakeConsole, FakeControl, FakeWindow, gui_locked, _ProcessRouter
 
@@ -397,12 +397,12 @@ class PseudoWindowsGUI:
         self.desktop_icons, self.desktop_icon_paths = [], {}
         if self._explorer_available():
             self.desktop_icons.append((self._program_label(EXPLORER_PATH), EXPLORER_PATH))
-            self.desktop_icon_paths[EXPLORER_PATH] = resolve_c_drive_path(EXPLORER_PATH)
+            self.desktop_icon_paths[EXPLORER_PATH] = resolve_drive_path(EXPLORER_PATH)
         folders = [winapi.WinAPIHandler.SHELL_FOLDERS[0x10],   # CSIDL_DESKTOPDIRECTORY
                    winapi.WinAPIHandler.SHELL_FOLDERS[0x19]]   # CSIDL_COMMON_DESKTOPDIRECTORY
         for folder in folders:
             # Like on a real installation the Desktop folders exist, ready for shortcuts
-            host = resolve_c_drive_path(folder)
+            host = resolve_drive_path(folder)
             if host:
                 try:
                     os.makedirs(host, exist_ok=True)
@@ -629,7 +629,7 @@ class PseudoWindowsGUI:
 
     @staticmethod
     def _explorer_available():
-        path = resolve_c_drive_path(EXPLORER_PATH)
+        path = resolve_drive_path(EXPLORER_PATH)
         return bool(path) and os.path.isfile(path)
 
     def _fill_start_menu(self):
@@ -644,7 +644,7 @@ class PseudoWindowsGUI:
         rows = []
         if self._explorer_available():
             rows = [('program', self._program_label(EXPLORER_PATH), EXPLORER_PATH)]
-            self.start_icon_paths[EXPLORER_PATH] = resolve_c_drive_path(EXPLORER_PATH)
+            self.start_icon_paths[EXPLORER_PATH] = resolve_drive_path(EXPLORER_PATH)
         if shortcut_rows:
             rows = shortcut_rows + ([('separator', None, None)] + rows if rows else [])
         self.start_menu_rows = [
@@ -663,7 +663,7 @@ class PseudoWindowsGUI:
         targets are added to icon_paths."""
         subfolders, items = {}, {}
         for folder in folders:
-            host = resolve_c_drive_path(folder)
+            host = resolve_drive_path(folder)
             if not host or not os.path.isdir(host):
                 continue
             for name in _program_subfolders(host):
@@ -687,7 +687,7 @@ class PseudoWindowsGUI:
                 if label.lower() not in items:
                     items[label.lower()] = (label, data)
                     if data[1].lower().endswith('.exe'):
-                        icon_paths[data] = resolve_c_drive_path(data[1])
+                        icon_paths[data] = resolve_drive_path(data[1])
         return subfolders, [item for _, item in sorted(items.items())]
 
     def _shortcut_rows(self, folders, depth=0):
@@ -706,7 +706,7 @@ class PseudoWindowsGUI:
         """Run the target of a Start menu shortcut (only programs can be run)"""
         _, target, arguments, workdir = data
         name = ntpath.basename(target)
-        host = resolve_c_drive_path(target) if target else None
+        host = resolve_drive_path(target) if target else None
         if not host or not os.path.isfile(host):
             self._show_messagebox("Problem with Shortcut",
                                   f"The item '{name}' that this shortcut refers to has "

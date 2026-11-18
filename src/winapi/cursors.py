@@ -221,7 +221,7 @@ class CursorsMixin:
         """ExtractIconA emulation - icon count (nIconIndex -1) or an opaque icon handle"""
         filename = self.read_string(args[1])
         index = args[2]
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None or not os.path.isfile(path):
             return 0
         count = 0

@@ -18,9 +18,8 @@ import os
 import struct
 
 from .. import winapi
-from ..config import C_DRIVE_PATH
 from ..logger import log
-from ..paths import find_program
+from ..paths import find_program, windows_path_of_host
 
 
 class ProcessesMixin:
@@ -54,15 +53,14 @@ class ProcessesMixin:
             for candidate in candidates:
                 full = self.full_windows_path(
                     candidate if folder is None else folder.rstrip('\\') + '\\' + candidate)
-                path = self.resolve_c_drive_path(full) if full else None
+                path = self.resolve_drive_path(full) if full else None
                 if path and os.path.isfile(path):
                     return full
         if folders != [None]:
             for candidate in candidates:
                 path = find_program(candidate)
                 if path:
-                    rel = os.path.relpath(path, os.path.realpath(C_DRIVE_PATH))
-                    return "C:\\" + rel.replace('/', '\\')
+                    return windows_path_of_host(path)
         return None
 
     def CreateProcessW(self, args):

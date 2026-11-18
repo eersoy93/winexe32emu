@@ -22,7 +22,7 @@
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-APPS_DIR=c_drive/Windows
+APPS_DIR=drives/C/Windows
 mkdir -p "$APPS_DIR" || exit 1
 
 CFLAGS="-Wall -Wextra -Wno-unused-parameter"

@@ -774,13 +774,13 @@ class MsvcrtMixin:
         return ptr
 
     def fopen(self, args):
-        """fopen emulation - opens a real file inside the c_drive/ sandbox"""
+        """fopen emulation - opens a real file inside the drives/ sandbox"""
         filename = self.read_string(args[0])
         mode = self.read_string(args[1])
         log.debug(f"fopen(\"{filename}\", \"{mode}\")")
 
-        path = self.resolve_c_drive_path(filename)
-        if path is None:
+        path = self.resolve_drive_path(filename)
+        if path is None or (self._crt_mode_writes(mode) and self._write_protected(path)):
             self._last_error = 13  # EACCES
             self._store_errno(13)
             return 0  # NULL

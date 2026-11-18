@@ -16,12 +16,28 @@
 # Paths are relative to the repository root
 cd "$(dirname "$0")/.." || exit 1
 
-# Emulated C drive and the folders the default environment names
-# (WINDIR/SYSTEMROOT, PATH, TEMP/TMP, PROGRAMFILES, USERPROFILE, APPDATA,
-# LOCALAPPDATA, PUBLIC, PROGRAMDATA); user files are in Users/, not in Windows/
-C_DRIVE=c_drive
+# Emulated drives: a folder per drive letter in drives/ (A: floppy disk,
+# C: hard disk, D: CD-ROM). c_drive/ of the versions before drives/ becomes
+# drives/C once.
+DRIVES=drives
+C_DRIVE=${DRIVES}/C
+# (an empty drives/C is replaced)
+if [ -d c_drive ]; then
+    rmdir "$C_DRIVE" 2>/dev/null
+fi
+if [ -d c_drive ] && [ ! -e "$C_DRIVE" ]; then
+    mkdir -p "$DRIVES" && mv c_drive "$C_DRIVE" || exit 1
+    echo "OK: c_drive/ moved to ${C_DRIVE}/"
+fi
+for drive in A C D; do
+    mkdir -p "${DRIVES}/${drive}" || exit 1
+done
+
+# The folders the default environment names on C: (WINDIR/SYSTEMROOT, PATH,
+# TEMP/TMP, PROGRAMFILES, USERPROFILE, APPDATA, LOCALAPPDATA, PUBLIC,
+# PROGRAMDATA); user files are in Users/, not in Windows/
 for dir in Windows Windows/System32 Windows/Temp "Program Files" \
            Users/User/AppData/Roaming Users/User/AppData/Local Users/Public ProgramData; do
     mkdir -p "${C_DRIVE}/${dir}" || exit 1
 done
-echo "OK: ${C_DRIVE}/ directory tree"
+echo "OK: ${DRIVES}/ directory tree"

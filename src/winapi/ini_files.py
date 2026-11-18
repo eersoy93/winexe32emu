@@ -29,7 +29,7 @@ class IniFilesMixin:
         """Host path of an INI file; a bare name lives in the Windows directory"""
         if '\\' not in filename and '/' not in filename:
             filename = "C:\\Windows\\" + filename
-        return self.resolve_c_drive_path(filename)
+        return self.resolve_drive_path(filename)
 
     @staticmethod
     def _ini_section_name(line):
@@ -104,7 +104,7 @@ class IniFilesMixin:
         return self.GetPrivateProfileIntA(args, wide=True)
 
     def GetPrivateProfileStringA(self, args):
-        """GetPrivateProfileStringA emulation (INI files inside c_drive/)"""
+        """GetPrivateProfileStringA emulation (INI files inside drives/)"""
         lpAppName, lpKeyName, lpDefault = args[0], args[1], args[2]
         lpReturnedString, nSize, lpFileName = args[3], args[4], args[5]
         section = self.read_string(lpAppName) if lpAppName else None
@@ -190,6 +190,8 @@ class IniFilesMixin:
         elif value is not None:
             lines += [f"[{section}]", f"{key}={value}"]
 
+        if self._write_protected(path):
+            return 0
         try:
             with open(path, 'wb') as fp:
                 fp.write(''.join(line + '\r\n' for line in lines)

@@ -21,7 +21,8 @@ import subprocess
 import time
 import inspect
 
-from ..config import C_DRIVE_PATH, DEFAULT_ENVIRONMENT
+from ..config import DEFAULT_ENVIRONMENT
+from ..paths import windows_path_of_host
 from ..guest import ConsoleStream
 
 
@@ -125,7 +126,7 @@ class CoreMixin:
         'SetEndOfFile': 1, 'SetEnvironmentVariableA': 2, 'SetEnvironmentVariableW': 2,
         'SetErrorMode': 1, 'SetFileAttributesA': 2, 'SetFileAttributesW': 2,
         'SetFilePointer': 4, 'SetFileTime': 4, 'SetHandleCount': 1, 'SetLastError': 1,
-        'SetLocalTime': 1, 'SetUnhandledExceptionFilter': 1, 'SetVolumeLabelA': 2,
+        'SetLocalTime': 1, 'SetUnhandledExceptionFilter': 1, 'SetVolumeLabelA': 2, 'SetVolumeLabelW': 2,
         'SizeofResource': 2, 'Sleep': 1, 'SystemTimeToFileTime': 2, 'TerminateProcess': 2,
         'TryEnterCriticalSection': 1, 'UnhandledExceptionFilter': 1, 'VirtualAlloc': 4,
         'VirtualFree': 3, 'WaitForSingleObject': 2, 'WideCharToMultiByte': 8,
@@ -492,7 +493,7 @@ class CoreMixin:
         # Current directory (SetCurrentDirectory); relative paths resolve against it.
         # Programs start in their EXE's folder, like when launched from Explorer.
         exe_dir = self.windows_exe_path().rsplit('\\', 1)[0]
-        self.current_directory = exe_dir if len(exe_dir) > 2 else "C:\\"
+        self.current_directory = exe_dir if len(exe_dir) > 2 else exe_dir + "\\"
 
         # (type, name) -> (RVA, size) of the EXE's resources, built on first use
         self._resource_index = None
@@ -742,12 +743,9 @@ class CoreMixin:
                                 struct.pack('<I', self._environ_array(wide)))
 
     def windows_exe_path(self):
-        """Path of the main EXE as the program sees it (C:\\...)."""
-        rel = os.path.relpath(os.path.realpath(self.emu.pe_loader.filepath),
-                              os.path.realpath(C_DRIVE_PATH))
-        if rel.startswith('..'):
-            rel = os.path.basename(self.emu.pe_loader.filepath)
-        return "C:\\" + rel.replace('/', '\\')
+        """Path of the main EXE as the program sees it (C:\\..., D:\\...)."""
+        path = windows_path_of_host(self.emu.pe_loader.filepath)
+        return path or "C:\\" + os.path.basename(self.emu.pe_loader.filepath)
 
     def windows_command_line(self):
         command_line = getattr(self.emu, 'command_line', None)

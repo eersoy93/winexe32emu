@@ -28,8 +28,9 @@ from .config import PYGAME_AVAILABLE, SCRIPT_DIR, WINEXE32EMU_VERSION
 from .cpu import CPUEmulator
 from .gui import PseudoWindowsGUI
 from .logger import DebugLogger, log, LogFileTee
-from .paths import (COMPILE_APPS_SCRIPT, CREATE_C_DRIVE_SCRIPT, create_environment_folders,
-                    find_program, REMOVE_C_DRIVE_SCRIPT, run_setup_script, RUN_TESTS_SCRIPT)
+from .paths import (COMPILE_APPS_SCRIPT, CREATE_DRIVES_SCRIPT, create_drive_folders,
+                    create_environment_folders, find_program, REMOVE_DRIVES_SCRIPT,
+                    run_setup_script, RUN_TESTS_SCRIPT)
 from .pe_loader import PELoader
 from .sound import SoundPlayer
 from .winapi import WinAPIHandler
@@ -41,14 +42,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Windows 32-bit EXE Emulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="EXE files are searched in c_drive/ (C:\\) and then in c_drive/Windows/Tests/ "
+        epilog="The drives A: (floppy disk), C: and D: (CD-ROM) are the folders drives/A, "
+               "drives/C and drives/D.\n"
+               "EXE files are searched in drives/C (C:\\) and then in drives/C/Windows/Tests/ "
                "(C:\\Windows\\Tests).\nExample: python3 winexe32emu.py api_test.exe\n"
                "Example: python3 winexe32emu.py --no-gui \"C:\\Program Files\\7-Zip\\7z.exe\" "
                "l \"C:\\Windows\\Temp\\test.7z\""
     )
     parser.add_argument("exe", nargs="?",
                         help="PE file to run: a name in C:\\ or C:\\Windows\\Tests, or a "
-                             "Windows path inside c_drive/; optional with the GUI, "
+                             "Windows path on a drive (drives/); optional with the GUI, "
                              "programs can also be started from the Start menu")
     parser.add_argument("program_args", nargs=argparse.REMAINDER, metavar="args",
                         help="Command-line arguments passed to the program "
@@ -65,8 +68,9 @@ def main():
                              "(default: cp1252 like an English Windows; e.g. cp1254, "
                              "or utf-8 for UTF-8 narrow strings)")
     parser.add_argument("--clean", action="store_true",
-                        help="Only delete c_drive/ (scripts/remove_c_drive_environment.sh "
-                             "--all, asks for confirmation) and exit")
+                        help="Only delete drives/, every drive "
+                             "(scripts/remove_drives_environment.sh --all, asks for "
+                             "confirmation) and exit")
     parser.add_argument("--no-apps", action="store_true",
                         help="Don't compile the apps in apps/ (compile_apps.sh) into "
                              "C:\\Windows, like Explorer (explorer.exe)")
@@ -76,7 +80,7 @@ def main():
                              "(exit code: number of failed tests)")
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
-                        help="Don't run create_c_drive_environment.sh at startup")
+                        help="Don't run create_drives_environment.sh at startup")
     parser.add_argument("--logfile", metavar="FILE",
                         help="Also write the console output to FILE (without colors)")
     verbosity = parser.add_mutually_exclusive_group()
@@ -117,13 +121,16 @@ def main():
         sys.exit(1)
 
     if args.clean:
-        # Interactive: the script asks before deleting everything in c_drive/
+        # Interactive: the script asks before deleting everything in drives/
         try:
-            result = subprocess.run(['sh', REMOVE_C_DRIVE_SCRIPT, '--all'], cwd=SCRIPT_DIR)
+            result = subprocess.run(['sh', REMOVE_DRIVES_SCRIPT, '--all'], cwd=SCRIPT_DIR)
         except OSError as e:
-            log.error(f"Cannot run {REMOVE_C_DRIVE_SCRIPT}: {e}")
+            log.error(f"Cannot run {REMOVE_DRIVES_SCRIPT}: {e}")
             sys.exit(1)
         sys.exit(result.returncode)
+
+    # drives/A, drives/C, drives/D (c_drive/ of older versions becomes drives/C)
+    create_drive_folders()
 
     if args.tests:
         log.header("Compiling and Running Tests")
@@ -138,7 +145,7 @@ def main():
     use_gui = not args.no_gui
 
     if not args.no_create_environment:
-        run_setup_script(CREATE_C_DRIVE_SCRIPT, "Creating C Drive Environment")
+        run_setup_script(CREATE_DRIVES_SCRIPT, "Creating Drives Environment")
     if not args.no_apps:
         run_setup_script(COMPILE_APPS_SCRIPT, "Compiling Apps")
     create_environment_folders()
@@ -147,7 +154,7 @@ def main():
         log.error("An EXE name is required when the GUI is not available")
         sys.exit(1)
     if args.exe is not None and find_program(args.exe) is None:
-        log.error(f"File not found in emulation C drive: {args.exe}")
+        log.error(f"File not found on the emulated drives: {args.exe}")
         sys.exit(1)
 
     max_instr = args.max_instructions

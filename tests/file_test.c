@@ -17,7 +17,7 @@ limitations under the License.
 /*
 File I/O test - exercises the emulator's sandboxed file support.
 
-Everything happens inside the emulated C: drive (the host c_drive/ folder):
+Everything happens inside the emulated C: drive (the host drives/C folder):
   1. Win32 CreateFile/WriteFile/ReadFile round-trip.
   2. msvcrt fopen/fwrite/fgets round-trip.
   3. Files inside directories: the environment folder created at startup

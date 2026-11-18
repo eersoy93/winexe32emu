@@ -91,7 +91,7 @@ class ShellFoldersMixin:
         folder = self.SHELL_FOLDERS.get(csidl & 0xFF)
         if folder is None:
             return None
-        path = self.resolve_c_drive_path(folder)
+        path = self.resolve_drive_path(folder)
         if path is not None:
             try:
                 os.makedirs(path, exist_ok=True)
@@ -279,7 +279,7 @@ class ShellFoldersMixin:
             if in_computer():
                 entries = [f"{letter}:" for letter in self.LOGICAL_DRIVES]
             else:
-                host_dir = self.resolve_c_drive_path(state['dir'] + '\\')
+                host_dir = self.resolve_drive_path(state['dir'] + '\\')
                 try:
                     entries = sorted((e for e in os.listdir(host_dir)
                                       if os.path.isdir(os.path.join(host_dir, e))),
@@ -307,7 +307,7 @@ class ShellFoldersMixin:
                 return True
             # The trailing backslash keeps "C:" from meaning the current directory
             full = self.full_windows_path(path.rstrip('\\') + '\\', clamp=True)
-            host = self.resolve_c_drive_path(full) if full else None
+            host = self.resolve_drive_path(full) if full else None
             if host is None or not os.path.isdir(host):
                 return False
             full = full.rstrip('\\')
@@ -323,7 +323,7 @@ class ShellFoldersMixin:
             while full:
                 full = full.rstrip('\\')
                 parent, name = ntpath.split(full)
-                host = self.resolve_c_drive_path(full + '\\')
+                host = self.resolve_drive_path(full + '\\')
                 if host is not None and os.path.isdir(host):
                     if name and full.lower() != root.lower():
                         navigate(parent, select=name)

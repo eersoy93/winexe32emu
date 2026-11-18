@@ -71,13 +71,13 @@ class Shell32Mixin:
             return self._my_computer_file_info(psfi, cbFileInfo, flags, wide)
         name = ntpath.basename(path.rstrip('\\')) or path
         if not flags & SHGFI_USEFILEATTRIBUTES and path:
-            host = self.resolve_c_drive_path(path)
+            host = self.resolve_drive_path(path)
             if host is None or not os.path.exists(host):
                 return 0
             attributes = 0x10 if os.path.isdir(host) else 0x80
         index = self._sys_icon_index(path if len(path) <= 3 else name, attributes)
         if attributes & 0x10:
-            type_name = 'File folder' if len(path) > 3 else 'Local Disk'
+            type_name = 'File folder' if len(path) > 3 else self._drive_type_name(path)
         else:
             ext = name.rsplit('.', 1)[-1].upper() if '.' in name else ''
             type_name = f"{ext} File" if ext else 'File'
@@ -108,6 +108,13 @@ class Shell32Mixin:
         return self._write_file_info(psfi, cbFileInfo, flags, wide, self.SYS_ICON_COMPUTER,
                                      SFGAO_FOLDER | SFGAO_HASSUBFOLDER,
                                      self.MY_COMPUTER_NAME, 'System Folder')
+
+    # SHGetFileInfo's type names of the drive types (GetDriveType)
+    DRIVE_TYPE_FILE_INFO = {2: '3\u00bd-Inch Floppy Disk', 3: 'Local Disk', 5: 'CD Drive'}
+
+    def _drive_type_name(self, path):
+        drive = config.DRIVES.get(path[:1].upper())
+        return self.DRIVE_TYPE_FILE_INFO[drive[0]] if drive else 'Local Disk'
 
     def SHGetFileInfoW(self, args):
         return self.SHGetFileInfoA(args, wide=True)
@@ -146,7 +153,7 @@ class Shell32Mixin:
         """ShellExecute(Ex): run an EXE of the sandbox; returns (code > 32 on
         success, child emulator)"""
         full = self.full_windows_path(file) if file else None
-        host = self.resolve_c_drive_path(full) if full else None
+        host = self.resolve_drive_path(full) if full else None
         log.info(f"ShellExecute(\"{verb}\", \"{file}\", \"{params}\")")
         if host is None or not os.path.exists(host):
             return 2, None  # SE_ERR_FNF
@@ -248,10 +255,13 @@ class Shell32Mixin:
             self._mem_write(args[0] + 18, struct.pack('<I', 1 if aborted else 0))
             return code
 
-        hosts = [self.resolve_c_drive_path(source) for source in sources]
+        hosts = [self.resolve_drive_path(source) for source in sources]
         for src in hosts:
             if src is None or not os.path.exists(src):
                 return finish(2)  # ERROR_FILE_NOT_FOUND (DE_FILENOTFOUND)
+        # Deleting, moving or renaming on the CD-ROM D: fails (DE_ACCESSDENIEDSRC)
+        if func != 2 and self._write_protected(*hosts):
+            return finish(0x78)
         if func == 3 and confirm and sources and not self._confirm_delete(sources, hosts):
             aborted = True
             return finish(self.ERROR_CANCELLED)
@@ -264,8 +274,8 @@ class Shell32Mixin:
                         os.remove(src)
                     continue
                 target = targets[i] if i < len(targets) else (targets[0] if targets else '')
-                dst = self.resolve_c_drive_path(target)
-                if dst is None:
+                dst = self.resolve_drive_path(target)
+                if dst is None or self._write_protected(dst):
                     return finish(5)
                 if os.path.isdir(dst) and func in (1, 2):
                     dst = os.path.join(dst, os.path.basename(src))

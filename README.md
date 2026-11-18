@@ -23,7 +23,7 @@ The apps (like Explorer) and the test programs are compiled with the 32-bit MinG
 
 ## Usage
 
-Put EXE files in the c_drive/ folder (the emulated `C:\`). Then run:
+The emulated drives are folders of drives/: `A:` (a floppy disk) is drives/A, `C:` is drives/C and `D:` (a CD-ROM, read-only for the programs) is drives/D. Put EXE files in drives/C (the emulated `C:\`), or setup discs in drives/D. Then run:
 
 ```bash
 python3 winexe32emu.py
@@ -48,7 +48,7 @@ Use `-h` parameter for command-line help.
 - Loading the programs' own DLLs
 - Structured exception handling
 - A registry shared by the emulated programs
-- Fake C drive environment support
+- Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
 
 ## Versioning
 

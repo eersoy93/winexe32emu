@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 # Test programs live in their own folders in C:\Windows\Tests of the
 # emulated C drive (C:\Windows\Tests\api_test\api_test.exe)
-TESTS_DIR=c_drive/Windows/Tests
+TESTS_DIR=drives/C/Windows/Tests
 mkdir -p "$TESTS_DIR" || exit 1
 
 CFLAGS="-Wall -Wextra -Wno-unused-parameter"

@@ -28,10 +28,11 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 from src import pe_loader  # noqa: E402
-from src.config import C_DRIVE_PATH  # noqa: E402
+from src.config import C_DRIVE_PATH, DRIVES_PATH, drive_host_path  # noqa: E402
 from src.cpu import CPUEmulator  # noqa: E402
 from src.logger import DebugLogger  # noqa: E402
-from src.paths import resolve_c_drive_path, strip_win32_path_prefix  # noqa: E402
+from src.paths import (resolve_drive_path, strip_win32_path_prefix,  # noqa: E402
+                       windows_path_of_host)
 from src.pe_loader import PELoader  # noqa: E402
 from src.winapi import WinAPIHandler  # noqa: E402
 
@@ -181,14 +182,27 @@ class ApiBindingTest(unittest.TestCase):
 
 
 class SandboxTest(unittest.TestCase):
-    def test_paths_stay_in_c_drive(self):
-        root = os.path.realpath(C_DRIVE_PATH)
-        for name in (r'C:\Windows\..\..\..\etc\passwd', r'..\..\x', '/etc/passwd',
-                     r'\\server\share\x', r'\\?\C:\..\..\x', r'D:\..\..\x'):
+    def test_paths_stay_in_their_drive(self):
+        for name, letter in ((r'C:\Windows\..\..\..\etc\passwd', 'C'), (r'..\..\x', 'C'),
+                             ('/etc/passwd', 'C'), (r'\\server\share\x', 'C'),
+                             (r'\\?\C:\..\..\x', 'C'), (r'D:\..\..\x', 'D'),
+                             (r'a:\..\C\x', 'A')):
             with self.subTest(name=name):
-                path = resolve_c_drive_path(name)
+                root = os.path.realpath(drive_host_path(letter))
+                path = resolve_drive_path(name)
                 self.assertTrue(path is None or os.path.realpath(path).startswith(root + os.sep),
                                 path)
+
+    def test_drive_folders(self):
+        self.assertEqual(resolve_drive_path(r'C:\Windows'),
+                         os.path.realpath(os.path.join(C_DRIVE_PATH, 'Windows')))
+        self.assertEqual(resolve_drive_path(r'd:\setup.exe'),
+                         os.path.realpath(os.path.join(DRIVES_PATH, 'D', 'setup.exe')))
+        self.assertEqual(resolve_drive_path('A:\\'), os.path.realpath(drive_host_path('A')))
+        self.assertIsNone(resolve_drive_path(r'E:\x'))  # No such drive
+        self.assertEqual(windows_path_of_host(os.path.join(DRIVES_PATH, 'D', 'x', 'y.exe')),
+                         r'D:\x\y.exe')
+        self.assertIsNone(windows_path_of_host('/etc/passwd'))
 
     def test_win32_prefixes(self):
         self.assertEqual(strip_win32_path_prefix(r'\\?\C:\x'), r'C:\x')

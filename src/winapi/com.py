@@ -24,6 +24,7 @@ import ntpath
 from unicorn import *
 
 from .. import config, resources
+from ..config import DRIVES
 from ..logger import log
 
 
@@ -290,7 +291,7 @@ class ComMixin:
             if folders:
                 items.append(self.MY_COMPUTER_PATH)
             path = self._shell_folder(0x10)  # CSIDL_DESKTOPDIRECTORY
-        host = self.resolve_c_drive_path(path.rstrip('\\') + '\\') if path else None
+        host = self.resolve_drive_path(path.rstrip('\\') + '\\') if path else None
         try:
             names = sorted(os.listdir(host), key=str.lower) if host else []
         except OSError:
@@ -345,17 +346,23 @@ class ComMixin:
             return self.S_OK
         return self.E_NOTIMPL
 
+    # Explorer's names of the drive types (GetDriveType)
+    DRIVE_TYPE_NAMES = {2: '3\u00bd Floppy', 3: 'Local Disk', 5: 'CD Drive'}
+
     def _drive_display_name(self, path):
         """Explorer's name of a drive root like C:\\ ("Local Disk (C:)"), or None"""
         if len(path) <= 3 and path[1:2] == ':' and path.rstrip('\\')[2:] == '':
-            label = self.volume_label or 'Local Disk'
-            return f"{label} ({path[0].upper()}:)"
+            letter = path[0].upper()
+            if letter not in DRIVES:
+                return None
+            label = self._volume_label(letter) or self.DRIVE_TYPE_NAMES[DRIVES[letter][0]]
+            return f"{label} ({letter}:)"
         return None
 
     def _shell_item_attributes(self, path):
         if self._is_my_computer(path):
             return self.SFGAO_DIRECTORY  # A folder, not in the file system
-        host = self.resolve_c_drive_path(path)
+        host = self.resolve_drive_path(path)
         if host is None or not os.path.exists(host):
             return 0
         return self.SFGAO_FILE | (self.SFGAO_DIRECTORY if os.path.isdir(host) else 0)
@@ -383,7 +390,7 @@ class ComMixin:
                 return self.S_OK
             full = self.full_windows_path(ntpath.join(state['path'], name) if state['path']
                                           else name)
-            host = self.resolve_c_drive_path(full) if full else None
+            host = self.resolve_drive_path(full) if full else None
             if host is None or not os.path.exists(host):
                 return self.HRESULT_FILE_NOT_FOUND
             if len(full) > 3:
@@ -405,7 +412,7 @@ class ComMixin:
             if self._is_my_computer(path):
                 return self._com_query_new(self._shell_folder_object(self.MY_COMPUTER_PATH),
                                            riid, ppv)
-            host = self.resolve_c_drive_path(path) if path else None
+            host = self.resolve_drive_path(path) if path else None
             if host is None or not os.path.isdir(host):
                 return self.E_INVALIDARG
             return self._com_query_new(self._shell_folder_object(path), riid, ppv)
@@ -477,7 +484,7 @@ class ComMixin:
     def _shell_menu_verbs(self, paths):
         """Offsets of the shell verbs that apply to the items (None: separator)"""
         runnable = all(path.lower().endswith(('.exe', '.com')) and
-                       os.path.isfile(self.resolve_c_drive_path(path) or '') for path in paths)
+                       os.path.isfile(self.resolve_drive_path(path) or '') for path in paths)
         return ([0, None] if runnable else []) + [1, None, 2, None, 3]
 
     def _com_context_menu(self, method, wide, args):
@@ -557,9 +564,11 @@ class ComMixin:
         if verb == 'link':
             return self._shell_create_shortcuts(paths)
         if verb == 'delete':
-            hosts = [self.resolve_c_drive_path(path) for path in paths]
+            hosts = [self.resolve_drive_path(path) for path in paths]
             if None in hosts or not all(os.path.exists(host) for host in hosts):
                 return self.HRESULT_FILE_NOT_FOUND
+            if self._write_protected(*hosts):
+                return 0x80070005  # E_ACCESSDENIED: on the CD-ROM D:
             if not mask & 0x400 and not self._confirm_delete(paths, hosts):  # CMIC_MASK_FLAG_NO_UI
                 return self.S_OK  # Not an error (the host would report one): nothing is done
             try:
@@ -579,11 +588,13 @@ class ComMixin:
         """'Create Shortcut': "Shortcut to <name>.lnk" next to each item"""
         for path in paths:
             folder, name = ntpath.split(path.rstrip('\\'))
-            base = f"Shortcut to {ntpath.splitext(name)[0] if os.path.isfile(self.resolve_c_drive_path(path) or '') else name}"
+            base = f"Shortcut to {ntpath.splitext(name)[0] if os.path.isfile(self.resolve_drive_path(path) or '') else name}"
             target, number = ntpath.join(folder, base + '.lnk'), 2
-            while os.path.exists(self.resolve_c_drive_path(target) or ''):
+            while os.path.exists(self.resolve_drive_path(target) or ''):
                 target, number = ntpath.join(folder, f"{base} ({number}).lnk"), number + 1
-            host = self.resolve_c_drive_path(target)
+            host = self.resolve_drive_path(target)
+            if host is None or self._write_protected(host):
+                continue
             state = {'path': path, 'description': '', 'workdir': folder, 'arguments': '',
                      'relative': '', 'icon': '', 'icon_index': 0, 'show': 1, 'hotkey': 0}
             try:
@@ -596,7 +607,7 @@ class ComMixin:
 
     def _shell_properties(self, path):
         """'Properties': the item's type, location, size, times and attributes"""
-        host = self.resolve_c_drive_path(path)
+        host = self.resolve_drive_path(path)
         try:
             info = os.stat(host)
         except (OSError, TypeError):
@@ -673,7 +684,7 @@ class ComMixin:
                 return self.E_INVALIDARG
             if args[3]:  # WIN32_FIND_DATA of the target
                 self._mem_write(args[3], bytes(592 if wide else 320))
-                path = self.resolve_c_drive_path(state['path']) if state['path'] else None
+                path = self.resolve_drive_path(state['path']) if state['path'] else None
                 if path and os.path.exists(path):
                     attributes = 0x10 if os.path.isdir(path) else 0x20
                     self._mem_write(args[3], struct.pack('<I', attributes))
@@ -737,7 +748,7 @@ class ComMixin:
                 data = text.encode('utf-16-le')
                 strings += struct.pack('<H', len(data) // 2) + data
         target = self.full_windows_path(state['path']) or state['path']
-        host = self.resolve_c_drive_path(target) if target else None
+        host = self.resolve_drive_path(target) if target else None
         attributes, size, filetime = 0, 0, 0
         if host and os.path.exists(host):
             info = os.stat(host)
@@ -785,7 +796,7 @@ class ComMixin:
         filename = self.read_wide_string(args[1]) if args[1] else state['file']
         if not filename:
             return self.E_INVALIDARG
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None:
             return 0x80070005  # E_ACCESSDENIED
         if method == 'Load':
@@ -802,6 +813,8 @@ class ComMixin:
             log.debug(f"IPersistFile::Load(\"{filename}\") -> \"{state['path']}\"")
             return self.S_OK
         # Save
+        if self._write_protected(path):
+            return 0x80070005  # E_ACCESSDENIED: on the CD-ROM D:
         try:
             with open(path, 'wb') as f:
                 f.write(self._shell_link_data(state))

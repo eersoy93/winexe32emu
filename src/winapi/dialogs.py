@@ -770,7 +770,7 @@ class DialogsMixin:
         if '\\' in initial or ':' in initial:
             start_dir, initial = ntpath.split(initial)
         directory = self.full_windows_path(start_dir or self.current_directory, clamp=True)
-        host = self.resolve_c_drive_path(directory) if directory else None
+        host = self.resolve_drive_path(directory) if directory else None
         if host is None or not os.path.isdir(host):
             directory = self.current_directory
         log.info(f"{'GetSaveFileNameA' if save else 'GetOpenFileNameA'}"
@@ -789,7 +789,7 @@ class DialogsMixin:
         state = {'dir': directory, 'patterns': patterns, 'result': None}
 
         def fill():
-            host_dir = self.resolve_c_drive_path(state['dir'])
+            host_dir = self.resolve_drive_path(state['dir'])
             try:
                 entries = sorted(os.listdir(host_dir), key=str.lower)
             except (OSError, TypeError):
@@ -806,7 +806,7 @@ class DialogsMixin:
 
         def navigate(name):
             target = self.full_windows_path(ntpath.join(state['dir'], name), clamp=True)
-            host_dir = self.resolve_c_drive_path(target) if target else None
+            host_dir = self.resolve_drive_path(target) if target else None
             if host_dir is None or not os.path.isdir(host_dir):
                 return False
             state['dir'] = target
@@ -828,11 +828,11 @@ class DialogsMixin:
             full = self.full_windows_path(ntpath.join(state['dir'], name), clamp=True)
             if full is None:
                 return
-            path = self.resolve_c_drive_path(full)
+            path = self.resolve_drive_path(full)
             if not ntpath.splitext(full)[1] and default_ext and \
                     not (path and os.path.isfile(path)):
                 full += '.' + default_ext
-                path = self.resolve_c_drive_path(full)
+                path = self.resolve_drive_path(full)
             if path is None or (flags & 0x1000 and not os.path.isfile(path)):  # OFN_FILEMUSTEXIST
                 SoundPlayer.tone(440, 150)
                 return

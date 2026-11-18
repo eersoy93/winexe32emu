@@ -1,4 +1,5 @@
-# Virtual C drive
+# Emulated drives (A:, C:, D:), and c_drive/ of older versions
+drives/
 c_drive/
 
 # Python

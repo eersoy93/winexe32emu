@@ -119,7 +119,7 @@ static void test_files(void)
 
     check(!SetCurrentDirectoryA("NoSuchDir") && GetLastError() == ERROR_FILE_NOT_FOUND,
           "SetCurrentDirectoryA to a missing folder fails");
-    check(!SetCurrentDirectoryA("..\\.."), "SetCurrentDirectoryA cannot leave c_drive");
+    check(!SetCurrentDirectoryA("..\\.."), "SetCurrentDirectoryA cannot leave drive C:");
 
     check(MoveFileExA("a.txt", "b.txt", 0) &&
           GetFileAttributesA("a.txt") == INVALID_FILE_ATTRIBUTES, "MoveFileExA (rename)");
@@ -418,27 +418,32 @@ static void test_shell(void)
               info.dwAttributes & SFGAO_FOLDER,
               "SHGetFileInfoA (My Computer PIDL)");
         {
-            /* My Computer's items are the drives: only C:\ */
+            /* My Computer's items are the drives: A:\, C:\ and D:\ */
             IShellFolder *desktop = NULL, *computer = NULL;
             IEnumIDList *items = NULL;
-            LPITEMIDLIST item[2] = {NULL, NULL};
-            ULONG fetched = 0;
+            LPITEMIDLIST item[4] = {NULL, NULL, NULL, NULL};
+            char paths[3][MAX_PATH] = {"", "", ""};
+            ULONG fetched = 0, i;
             STRRET name;
             int ok = drives && SHGetDesktopFolder(&desktop) == S_OK &&
                      desktop->lpVtbl->BindToObject(desktop, drives, NULL, &IID_IShellFolder,
                                                    (void **)&computer) == S_OK &&
                      computer->lpVtbl->EnumObjects(computer, NULL, SHCONTF_FOLDERS,
                                                    &items) == S_OK &&
-                     items->lpVtbl->Next(items, 2, item, &fetched) == S_FALSE &&
-                     fetched == 1 && SHGetPathFromIDListA(item[0], buf) &&
-                     strcmp(buf, "C:\\") == 0;
-            check(ok, "IShellFolder::EnumObjects (My Computer holds only C:)");
-            check(ok && computer->lpVtbl->GetDisplayNameOf(computer, item[0], SHGDN_NORMAL,
+                     items->lpVtbl->Next(items, 4, item, &fetched) == S_FALSE &&
+                     fetched == 3 && SHGetPathFromIDListA(item[0], paths[0]) &&
+                     SHGetPathFromIDListA(item[1], paths[1]) &&
+                     SHGetPathFromIDListA(item[2], paths[2]) &&
+                     strcmp(paths[0], "A:\\") == 0 && strcmp(paths[1], "C:\\") == 0 &&
+                     strcmp(paths[2], "D:\\") == 0;
+            check(ok, "IShellFolder::EnumObjects (My Computer holds A:, C:, D:)");
+            check(ok && computer->lpVtbl->GetDisplayNameOf(computer, item[2], SHGDN_NORMAL,
                                                            &name) == S_OK &&
-                  name.uType == STRRET_WSTR && wcsstr(name.pOleStr, L"(C:)") != NULL,
-                  "IShellFolder::GetDisplayNameOf (Local Disk (C:))");
-            if (item[0])
-                CoTaskMemFree(item[0]);
+                  name.uType == STRRET_WSTR && wcscmp(name.pOleStr, L"CD Drive (D:)") == 0,
+                  "IShellFolder::GetDisplayNameOf (CD Drive (D:))");
+            for (i = 0; i < 4; i++)
+                if (item[i])
+                    CoTaskMemFree(item[i]);
             if (items)
                 items->lpVtbl->Release(items);
             if (computer)
@@ -527,6 +532,48 @@ static void test_oleaut(void)
           "CompareFileTime order");
 }
 
+static void test_drives(void)
+{
+    /* A: floppy disk, C: hard disk, D: CD-ROM (read-only); no E: */
+    char buf[MAX_PATH], fs[16];
+    DWORD serial = 0, max_len = 0, flags = 0, sectors = 0, bytes = 0, free_c = 0, total = 0;
+    HANDLE file;
+    check(GetLogicalDrives() == ((1 << 0) | (1 << 2) | (1 << 3)), "GetLogicalDrives (A:, C:, D:)");
+    check(GetLogicalDriveStringsA(sizeof(buf), buf) == 12 && strcmp(buf, "A:\\") == 0 &&
+          strcmp(buf + 4, "C:\\") == 0 && strcmp(buf + 8, "D:\\") == 0,
+          "GetLogicalDriveStringsA");
+    check(GetDriveTypeA("A:\\") == DRIVE_REMOVABLE && GetDriveTypeA("C:\\") == DRIVE_FIXED &&
+          GetDriveTypeA("D:\\") == DRIVE_CDROM && GetDriveTypeA("E:\\") == DRIVE_NO_ROOT_DIR,
+          "GetDriveTypeA (A: removable, C: fixed, D: CD-ROM, no E:)");
+    check(GetVolumeInformationA("D:\\", NULL, 0, &serial, &max_len, &flags, fs, sizeof(fs)) &&
+          strcmp(fs, "CDFS") == 0 && flags & FILE_READ_ONLY_VOLUME,
+          "GetVolumeInformationA (D: is a read-only CDFS volume)");
+    check(GetDiskFreeSpaceA("A:\\", &sectors, &bytes, &free_c, &total) &&
+          sectors * bytes * total == 1474560, "GetDiskFreeSpaceA (A: is a 1.44 MB floppy)");
+    check(GetDiskFreeSpaceA("D:\\", &sectors, &bytes, &free_c, &total) && free_c == 0,
+          "GetDiskFreeSpaceA (D: has no free space)");
+
+    file = CreateFileA("D:\\api_test.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    check(file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED,
+          "CreateFileA cannot write on the CD-ROM D:");
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+    check(!CreateDirectoryA("D:\\api_test_dir", NULL) && GetLastError() == ERROR_ACCESS_DENIED,
+          "CreateDirectoryA cannot write on the CD-ROM D:");
+    check(fopen("D:\\api_test.tmp", "w") == NULL, "fopen cannot write on the CD-ROM D:");
+
+    file = CreateFileA("A:\\api_test.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    check(file != INVALID_HANDLE_VALUE, "CreateFileA writes on the floppy disk A:");
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+    check(GetFileAttributesA("A:\\api_test.tmp") != INVALID_FILE_ATTRIBUTES &&
+          GetFileAttributesA("C:\\api_test.tmp") == INVALID_FILE_ATTRIBUTES,
+          "A: and C: are different drives");
+    check(DeleteFileA("A:\\api_test.tmp"), "DeleteFileA on A:");
+    check(GetFileAttributesA("E:\\") == INVALID_FILE_ATTRIBUTES, "There is no E: drive");
+    check(!SetCurrentDirectoryA("A:\\..\\C") , "SetCurrentDirectoryA cannot leave drive A:");
+}
+
 int main(void)
 {
     printf("=== API test ===\n");
@@ -538,6 +585,7 @@ int main(void)
     test_registry();
     test_shell();
     test_oleaut();
+    test_drives();
     printf("\n== %d failure(s) ==\n", failures);
     return failures;
 }

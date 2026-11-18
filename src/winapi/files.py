@@ -20,9 +20,9 @@ import struct
 from unicorn import *
 
 from .. import resources
-from ..config import C_DRIVE_PATH
 from ..logger import log
-from ..paths import resolve_c_drive_path, strip_win32_path_prefix
+from ..config import READ_ONLY_DRIVES
+from ..paths import drive_letter_of_host, resolve_drive_path, strip_win32_path_prefix
 from ..pe_loader import PELoader
 
 
@@ -31,25 +31,34 @@ class FilesMixin:
 
     # ==================== SANDBOXED FILE SYSTEM ====================
 
-    def resolve_c_drive_path(self, filename):
-        """Map a Windows-style filename into the c_drive/ sandbox (see the
-        module-level resolve_c_drive_path); relative names are taken
+    def resolve_drive_path(self, filename):
+        """Map a Windows-style filename into the drives/ sandbox (see the
+        module-level resolve_drive_path); relative names are taken
         relative to the current directory."""
         full = self.full_windows_path(filename)
         if full is None:
             if filename:
                 log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
             return None
-        if full == "C:\\":
-            os.makedirs(C_DRIVE_PATH, exist_ok=True)
-            return os.path.realpath(C_DRIVE_PATH)
-        return resolve_c_drive_path(full)
+        return resolve_drive_path(full)
+
+    def _write_protected(self, *host_paths):
+        """True, with ERROR_ACCESS_DENIED, if a host path is on a read-only
+        drive (the CD-ROM D:): programs cannot change its files"""
+        for path in host_paths:
+            if path is not None and drive_letter_of_host(path) in READ_ONLY_DRIVES:
+                self._last_error = 5  # ERROR_ACCESS_DENIED
+                return True
+        return False
 
     def full_windows_path(self, filename, clamp=False):
-        """Absolute, normalized "C:\\..." form of filename.
+        """Absolute, normalized "X:\\..." form of filename (X: its drive).
 
         A ".." above the root returns None, or stays at the root with clamp
-        (like GetFullPathName). Every drive letter is the emulated C: drive.
+        (like GetFullPathName). A name without a drive letter is on the
+        current directory's drive; "name" and the current drive's "X:name"
+        are relative to the current directory, another drive's "Y:name" to
+        that drive's root.
         """
         if not filename:
             return None
@@ -57,11 +66,14 @@ class FilesMixin:
         if name is None:
             return None
         name = name.replace('/', '\\')
+        current = self.current_directory
+        drive = current[0].upper()
         if len(name) >= 2 and name[1] == ':':
+            drive = name[0].upper()
             name = name[2:]
         if not name.startswith('\\'):
-            # "name" and "C:name" are relative to the current directory
-            name = self.current_directory[2:] + '\\' + name
+            base = current[2:] if drive == current[0].upper() else ''
+            name = base + '\\' + name
         parts = []
         for part in name.split('\\'):
             if part in ('', '.'):
@@ -73,7 +85,7 @@ class FilesMixin:
                     parts.pop()
             else:
                 parts.append(part)
-        result = "C:\\" + '\\'.join(parts)
+        result = f"{drive}:\\" + '\\'.join(parts)
         if parts and filename.endswith(('\\', '/')) and clamp:
             result += '\\'
         return result
@@ -178,7 +190,7 @@ class FilesMixin:
                           for folder in (exe_dir, "C:\\Windows\\System32", "C:\\Windows",
                                          self.current_directory)]
         for candidate in candidates:
-            path = self.resolve_c_drive_path(candidate) if candidate else None
+            path = self.resolve_drive_path(candidate) if candidate else None
             if path and os.path.isfile(path):
                 return candidate, path
         return None

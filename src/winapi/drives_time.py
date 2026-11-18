@@ -25,30 +25,83 @@ import unicodedata
 
 from unicorn import *
 
-from .. import config, winapi
-from ..config import C_DRIVE_PATH
+from .. import winapi
+from ..config import (DRIVE_CDROM, DRIVE_FIXED, DRIVE_REMOVABLE, DRIVES, FLOPPY_BYTES,
+                      READ_ONLY_DRIVES, drive_host_path)
 from ..logger import log
 from ..paths import strip_win32_path_prefix
 from ..sound import SoundPlayer
 
 
 class DrivesTimeMixin:
-    """Drives and volumes (only C:), file attributes and copies, time conversions"""
+    """Drives and volumes (A:, C:, D:), file attributes and copies, time conversions"""
 
-    # ---------- Drives and volumes (only C: exists) ----------
+    # ---------- Drives and volumes (config.DRIVES: drives/A, drives/C, drives/D) ----------
 
-    volume_label = ''
-    # Drive letters of the machine (GetLogicalDrives, My Computer's items):
-    # only C: (c_drive/) for now
-    LOGICAL_DRIVES = ('C',)
+    # Drive letters of the machine (GetLogicalDrives, My Computer's items)
+    LOGICAL_DRIVES = tuple(sorted(DRIVES))
+    # Volume labels by drive letter (SetVolumeLabel, for this session)
+    volume_labels = {}
+    ERROR_NOT_READY, ERROR_WRITE_PROTECT = 21, 19
+    # Bytes per sector and sectors per cluster of the drive types
+    DRIVE_GEOMETRY = {DRIVE_REMOVABLE: (512, 1), DRIVE_FIXED: (512, 8), DRIVE_CDROM: (2048, 1)}
+
+    def _volume_label(self, letter):
+        return winapi.WinAPIHandler.volume_labels.get(letter, '')
+
+    def _drive_letter(self, address, wide=False):
+        """Drive of a root path argument ("C:\\", NULL: the current drive), or
+        None if it names no drive of the machine"""
+        if not address:
+            return self.current_directory[0].upper()
+        root = strip_win32_path_prefix(self._read_text(address, wide))
+        if root is None:
+            return None
+        if len(root) >= 2 and root[1] == ':':
+            letter = root[0].upper()
+            return letter if letter in DRIVES else None
+        return self.current_directory[0].upper() if root[:1] in ('\\', '/') else None
 
     def _drive_root_ok(self, address, wide=False):
         """True if a root path argument (NULL: current drive) names an existing drive"""
-        if not address:
-            return True
-        root = strip_win32_path_prefix(self._read_text(address, wide))
-        return root is not None and not (len(root) >= 2 and root[1] == ':'
-                                         and root[0].upper() not in self.LOGICAL_DRIVES)
+        return self._drive_letter(address, wide) is not None
+
+    @staticmethod
+    def _folder_bytes(path):
+        total = 0
+        for folder, _, names in os.walk(path):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(folder, name))
+                except OSError:
+                    pass
+        return total
+
+    def _drive_space(self, letter):
+        """(free, total) bytes of a drive: C: is the host disk holding drives/,
+        A: a 1.44 MB floppy disk, D: a full CD of its files"""
+        drive_type = DRIVES[letter][0]
+        host = drive_host_path(letter)
+        os.makedirs(host, exist_ok=True)
+        if drive_type == DRIVE_REMOVABLE:
+            return max(0, FLOPPY_BYTES - self._folder_bytes(host)), FLOPPY_BYTES
+        if drive_type == DRIVE_CDROM:
+            return 0, self._folder_bytes(host)
+        usage = shutil.disk_usage(host)
+        return usage.free, usage.total
+
+    def _disk_free_space(self, letter, pointers, limit=0xFFFFFFFF):
+        """GetDiskFreeSpace: sectors per cluster, bytes per sector, free and
+        total clusters (at most limit)"""
+        sector_size, sectors = self.DRIVE_GEOMETRY[DRIVES[letter][0]]
+        cluster = sector_size * sectors
+        free, total = self._drive_space(letter)
+        values = (sectors, sector_size, min(free // cluster, limit),
+                  min(-(-total // cluster), limit))
+        for ptr, value in zip(pointers, values):
+            if ptr:
+                self._mem_write(ptr, struct.pack('<I', value))
+        return 1
 
     def GetLogicalDriveStringsA(self, args, wide=False):
         """GetLogicalDriveStringsA/W emulation (LOGICAL_DRIVES)"""
@@ -62,53 +115,62 @@ class DrivesTimeMixin:
     def GetLogicalDriveStringsW(self, args):
         return self.GetLogicalDriveStringsA(args, wide=True)
 
-    def GetDriveTypeW(self, args):
-        return 3 if self._drive_root_ok(args[0], True) else 1
+    def GetDriveTypeA(self, args, wide=False):
+        """GetDriveTypeA/W emulation - A: removable, C: fixed, D: CD-ROM"""
+        letter = self._drive_letter(args[0], wide)
+        return DRIVES[letter][0] if letter else 1  # DRIVE_NO_ROOT_DIR
 
-    def GetVolumeInformationW(self, args):
-        """GetVolumeInformationW emulation - a FAT32 volume"""
-        if not self._drive_root_ok(args[0], True):
+    def GetDriveTypeW(self, args):
+        return self.GetDriveTypeA(args, wide=True)
+
+    def GetVolumeInformationA(self, args, wide=False):
+        """GetVolumeInformationA/W emulation - C: FAT32, A: FAT, D: CDFS (read-only)"""
+        letter = self._drive_letter(args[0], wide)
+        if letter is None:
             self._last_error = 3  # ERROR_PATH_NOT_FOUND
             return 0
+        drive_type, file_system, serial = DRIVES[letter]
         (lpName, nNameSize, lpSerial, lpMaxComponent, lpFlags,
          lpFsName, nFsNameSize) = args[1:8]
-        for buf, size, text in ((lpName, nNameSize, winapi.WinAPIHandler.volume_label),
-                                (lpFsName, nFsNameSize, 'FAT32')):
+        for buf, size, text in ((lpName, nNameSize, self._volume_label(letter)),
+                                (lpFsName, nFsNameSize, file_system)):
             if buf:
-                if size <= len(text):
+                units = self._text_units(text, wide)
+                if size <= len(units):
                     self._last_error = 24  # ERROR_BAD_LENGTH
                     return 0
-                self._write_text(buf, text, True)
-        for ptr, value in ((lpSerial, 0x1E3A5C07), (lpMaxComponent, 255),
-                           (lpFlags, 0x6)):  # CASE_PRESERVED_NAMES | UNICODE_ON_DISK
+                self._write_units(buf, units, wide)
+        flags = 0x6  # CASE_PRESERVED_NAMES | UNICODE_ON_DISK
+        if letter in READ_ONLY_DRIVES:
+            flags |= 0x80000  # FILE_READ_ONLY_VOLUME
+        for ptr, value in ((lpSerial, serial), (lpMaxComponent, 255), (lpFlags, flags)):
             if ptr:
                 self._mem_write(ptr, struct.pack('<I', value))
         return 1
+
+    def GetVolumeInformationW(self, args):
+        return self.GetVolumeInformationA(args, wide=True)
 
     def GetDiskFreeSpaceW(self, args):
         """GetDiskFreeSpaceW emulation"""
-        if not self._drive_root_ok(args[0], True):
+        letter = self._drive_letter(args[0], True)
+        if letter is None:
             self._last_error = 3  # ERROR_PATH_NOT_FOUND
             return 0
-        usage = shutil.disk_usage(C_DRIVE_PATH)
-        sectors, sector_size = 8, 512
-        cluster = sectors * sector_size
-        values = (sectors, sector_size, min(usage.free // cluster, 0xFFFFFFFF),
-                  min(usage.total // cluster, 0xFFFFFFFF))
-        for ptr, value in zip(args[1:5], values):
-            if ptr:
-                self._mem_write(ptr, struct.pack('<I', value))
-        return 1
+        return self._disk_free_space(letter, args[1:5])
 
     def GetDiskFreeSpaceExA(self, args, wide=False):
-        """GetDiskFreeSpaceExA/W emulation - space of the host disk holding c_drive/"""
+        """GetDiskFreeSpaceExA/W emulation - space of the drive holding the path"""
+        letter = self.current_directory[0].upper()
         if args[0]:
-            path = self.resolve_c_drive_path(self._read_text(args[0], wide))
+            name = self._read_text(args[0], wide)
+            path = self.resolve_drive_path(name)
             if path is None or not os.path.exists(path):
                 self._last_error = 3  # ERROR_PATH_NOT_FOUND
                 return 0
-        usage = shutil.disk_usage(C_DRIVE_PATH)
-        for ptr, value in zip(args[1:4], (usage.free, usage.total, usage.free)):
+            letter = self.full_windows_path(name)[0]
+        free, total = self._drive_space(letter)
+        for ptr, value in zip(args[1:4], (free, total, free)):
             if ptr:
                 self._mem_write(ptr, struct.pack('<Q', value))
         return 1
@@ -123,47 +185,31 @@ class DrivesTimeMixin:
             mask |= 1 << (ord(letter) - ord('A'))
         return mask
 
-    def GetDriveTypeA(self, args):
-        """GetDriveTypeA emulation - C: is a fixed disk"""
-        return 3 if self._drive_root_ok(args[0]) else 1  # DRIVE_FIXED / DRIVE_NO_ROOT_DIR
-
-    def GetVolumeInformationA(self, args):
-        """GetVolumeInformationA emulation - a FAT32 volume"""
-        if not self._drive_root_ok(args[0]):
-            self._last_error = 3  # ERROR_PATH_NOT_FOUND
-            return 0
-        (lpName, nNameSize, lpSerial, lpMaxComponent, lpFlags,
-         lpFsName, nFsNameSize) = args[1:8]
-        for buf, size, text in ((lpName, nNameSize, winapi.WinAPIHandler.volume_label),
-                                (lpFsName, nFsNameSize, 'FAT32')):
-            if buf:
-                data = text.encode(config.ANSI_CODEPAGE, errors='replace')
-                if size <= len(data):
-                    self._last_error = 24  # ERROR_BAD_LENGTH
-                    return 0
-                self._mem_write(buf, data + b'\x00')
-        for ptr, value in ((lpSerial, 0x1E3A5C07), (lpMaxComponent, 255),
-                           (lpFlags, 0x6)):  # CASE_PRESERVED_NAMES | UNICODE_ON_DISK
-            if ptr:
-                self._mem_write(ptr, struct.pack('<I', value))
-        return 1
-
-    def SetVolumeLabelA(self, args):
-        """SetVolumeLabelA emulation - kept for this session"""
-        if not self._drive_root_ok(args[0]):
+    def SetVolumeLabelA(self, args, wide=False):
+        """SetVolumeLabelA/W emulation - kept for this session (not on a CD)"""
+        letter = self._drive_letter(args[0], wide)
+        if letter is None:
             self._last_error = 3
             return 0
-        label = self.read_string(args[1]) if args[1] else ''
-        winapi.WinAPIHandler.volume_label = label[:11].upper()
+        if letter in READ_ONLY_DRIVES:
+            self._last_error = self.ERROR_WRITE_PROTECT
+            return 0
+        label = self._read_text(args[1], wide) if args[1] else ''
+        winapi.WinAPIHandler.volume_labels[letter] = label[:11].upper()
         return 1
+
+    def SetVolumeLabelW(self, args):
+        return self.SetVolumeLabelA(args, wide=True)
 
     def SetFileAttributesA(self, args, wide=False):
         """SetFileAttributesA/W emulation - only the read-only flag maps to the host"""
         filename = self._read_text(args[0], wide)
         attributes = args[1]
-        path = self.resolve_c_drive_path(filename)
+        path = self.resolve_drive_path(filename)
         if path is None or not os.path.exists(path):
             self._last_error = 2  # ERROR_FILE_NOT_FOUND
+            return 0
+        if self._write_protected(path):
             return 0
         if not os.path.isdir(path):
             try:
@@ -206,7 +252,7 @@ class DrivesTimeMixin:
 
     def GetCompressedFileSizeA(self, args, wide=False):
         """GetCompressedFileSizeA/W emulation - the file size"""
-        path = self.resolve_c_drive_path(self._read_text(args[0], wide))
+        path = self.resolve_drive_path(self._read_text(args[0], wide))
         if path is None or not os.path.isfile(path):
             self._last_error = 2  # ERROR_FILE_NOT_FOUND
             return 0xFFFFFFFF
@@ -230,8 +276,8 @@ class DrivesTimeMixin:
 
     def CreateHardLinkA(self, args, wide=False):
         """CreateHardLinkA/W emulation (sandboxed)"""
-        new = self.resolve_c_drive_path(self._read_text(args[0], wide))
-        existing = self.resolve_c_drive_path(self._read_text(args[1], wide))
+        new = self.resolve_drive_path(self._read_text(args[0], wide))
+        existing = self.resolve_drive_path(self._read_text(args[1], wide))
         if new is None or existing is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return 0
@@ -256,7 +302,7 @@ class DrivesTimeMixin:
     def FindFirstChangeNotificationA(self, args, wide=False):
         """FindFirstChangeNotificationA/W emulation - a handle that is signaled
         when the folder's listing changes (checked at FindNextChangeNotification)"""
-        path = self.resolve_c_drive_path(self._read_text(args[0], wide))
+        path = self.resolve_drive_path(self._read_text(args[0], wide))
         if path is None or not os.path.isdir(path):
             self._last_error = 3  # ERROR_PATH_NOT_FOUND
             return 0xFFFFFFFF
@@ -707,6 +753,8 @@ class DrivesTimeMixin:
             self._last_error = 6  # ERROR_INVALID_HANDLE
             return 0
         path = info['path']
+        if self._write_protected(path):
+            return 0
         try:
             if info.get('fp'):
                 info['fp'].flush()  # Pending writes would bump the new time

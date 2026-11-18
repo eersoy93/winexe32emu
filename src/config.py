@@ -20,9 +20,31 @@ import os
 # Version info
 WINEXE32EMU_VERSION = "0.2.0"
 
-# Default EXE directory (c_drive/ in the repository root, the parent of src/)
+# The emulated drives: one folder per drive letter in drives/ (in the
+# repository root, the parent of src/); drives/C is C:\, the default EXE folder
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
+DRIVES_PATH = os.path.join(SCRIPT_DIR, "drives")
+# Drive letter -> (GetDriveType, file system, volume serial number), like a
+# classic PC: A: a floppy disk, C: the hard disk, D: a CD-ROM (read-only for
+# the programs; put files in drives/D on the host)
+DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_CDROM = 2, 3, 5
+DRIVES = {
+    'A': (DRIVE_REMOVABLE, 'FAT', 0x2A1B0C11),
+    'C': (DRIVE_FIXED, 'FAT32', 0x1E3A5C07),
+    'D': (DRIVE_CDROM, 'CDFS', 0x0D5C3A1E),
+}
+READ_ONLY_DRIVES = ('D',)
+FLOPPY_BYTES = 1474560  # 1.44 MB
+
+
+def drive_host_path(letter):
+    """Host folder of a drive letter (drives/C for C:)"""
+    return os.path.join(DRIVES_PATH, letter.upper())
+
+
+C_DRIVE_PATH = drive_host_path('C')
+# c_drive/ of the versions before drives/: moved to drives/C at startup
+OLD_C_DRIVE_PATH = os.path.join(SCRIPT_DIR, "c_drive")
 
 # User account of the emulated programs and the Windows Vista+ folder layout:
 # per-user files in the profile under C:\Users, shared ones in C:\Users\Public
@@ -36,7 +58,7 @@ PUBLIC_FOLDER = USERS_FOLDER + '\\Public'
 PROGRAM_DATA_FOLDER = 'C:\\ProgramData'
 
 # Environment variables seen by the emulated program. The folders they name
-# are created inside c_drive/ at startup.
+# are created inside drives/C at startup.
 PROGRAM_FILES_FOLDER = 'C:\\Program Files'
 DEFAULT_ENVIRONMENT = {
     'PATH': 'C:\\Windows\\System32;C:\\Windows',
@@ -62,7 +84,7 @@ ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 # Explorer app (the desktop's My Computer) compiled from apps/explorer/ at every start (compile_apps.sh)
 EXPLORER_PATH = 'C:\\Windows\\explorer.exe'
 
-# Emulated folder holding the test programs compiled with --tests (c_drive/Windows/Tests/)
+# Emulated folder holding the test programs compiled with --tests (drives/C/Windows/Tests/)
 TESTS_FOLDER = 'C:\\Windows\\Tests'
 
 # Folders searched for a bare EXE name (command line), in this order

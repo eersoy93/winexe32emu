@@ -865,7 +865,7 @@ class CPUEmulator:
         return None
 
     def load_dll(self, host_path, windows_path, call_entry=True):
-        """Load a real 32-bit DLL from the c_drive/ sandbox: map and relocate
+        """Load a real 32-bit DLL from the drives/ sandbox: map and relocate
         it, bind its imports to the emulated APIs (or other real DLLs) and
         run DllMain(DLL_PROCESS_ATTACH). Returns its base (HMODULE) or 0."""
         for module in self.dlls.values():
