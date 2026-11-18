@@ -23,7 +23,7 @@ The apps (like Explorer) and the test programs are compiled with the 32-bit MinG
 
 ## Usage
 
-The emulated drives are folders of drives/: `A:` (a floppy disk) is drives/A, `C:` is drives/C and `D:` (a CD-ROM, read-only for the programs) is drives/D. Put EXE files in drives/C (the emulated `C:\`), or setup discs in drives/D. Then run:
+Put your EXE files in drives/A (virtual floppy disk), or drives/C (virtual hard disk) or drvies/D (virtual CD-ROM), and then:
 
 ```bash
 python3 winexe32emu.py
@@ -49,7 +49,7 @@ Use `-h` parameter for command-line help.
 - Structured exception handling
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
-- My Computer (C:\Windows\explorer.exe): a folder tree and a details view of the drives and folders, Back/Forward/Up and an address bar, New Folder, Rename, Delete, Cut/Copy/Paste, context menus and Properties
+- Apps: Explorer only
 
 ## Versioning
 
