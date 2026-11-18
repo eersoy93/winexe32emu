@@ -360,6 +360,11 @@ class Kernel32MiscMixin:
 
         if hObject in self.handles:
             info = self.handles[hObject]
+            if info.get('shared'):
+                # DuplicateHandle: other handles still use the object
+                info['shared'] -= 1
+                del self.handles[hObject]
+                return 1
             if 'refs' in info:
                 # The last handle of a named object destroys its name
                 info['refs'] -= 1

@@ -102,6 +102,7 @@ run_test console_test "Hello, Tester!" "Tester"
 run_test sound_test "Done!"
 run_test thread_test "== 0 failure(s) =="
 run_test vista_api_test "== 0 failure(s) =="
+run_test ext_api_test "== 0 failure(s) =="
 run_test exception_test "== 0 failure(s) =="
 run_args_test argv_test "== 0 failure(s) ==" plain "two words" 'a\b' 'q"uote' '' end
 # Two processes: the second one finds what the first one saved

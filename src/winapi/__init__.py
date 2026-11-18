@@ -57,6 +57,13 @@ from .crt import CrtMixin
 from .crt_stdio import CrtStdioMixin
 from .crt_misc import CrtMiscMixin
 from .version_info import VersionInfoMixin
+from .shlwapi import ShlwapiMixin
+from .security import SecurityMixin
+from .kernel32_extra import Kernel32ExtraMixin
+from .user32_extra import User32ExtraMixin
+from .shell_extra import ShellExtraMixin
+from .system_extra import SystemExtraMixin
+from .network import NetworkMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -71,5 +78,7 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     ControlsMixin, ListViewMixin, TreeViewMixin, ToolbarMixin,
                     ComboBoxExMixin, RegistryMixin, ComMixin,
                     ExceptionsMixin, CrtBasicMixin, MsvcrtMixin,
-                    CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin):
+                    CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin,
+                    ShlwapiMixin, SecurityMixin, Kernel32ExtraMixin, User32ExtraMixin,
+                    ShellExtraMixin, SystemExtraMixin, NetworkMixin):
     """Windows API emulation"""
