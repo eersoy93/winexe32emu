@@ -139,7 +139,8 @@ class CrtStdioMixin:
 
     def vwprintf(self, args):
         """vwprintf emulation"""
-        return self._fprintf_common(0, self._printf_text(args[0], self._va_args(args[1]), wide=True))
+        text = self._printf_text(args[0], self._va_args(args[1]), wide=True)
+        return self._fprintf_common(0, text)
 
     def fwprintf(self, args):
         """fwprintf emulation"""
@@ -147,7 +148,8 @@ class CrtStdioMixin:
 
     def vfwprintf(self, args):
         """vfwprintf emulation"""
-        return self._fprintf_common(args[0], self._printf_text(args[1], self._va_args(args[2]), wide=True))
+        text = self._printf_text(args[1], self._va_args(args[2]), wide=True)
+        return self._fprintf_common(args[0], text)
 
     def swprintf(self, args):
         """swprintf emulation (msvcrt legacy form without a count)"""
@@ -333,7 +335,8 @@ class CrtStdioMixin:
     def fputws(self, args):
         """fputws emulation"""
         text = self.read_wide_string(args[0])
-        return 0 if self._stream_write(args[1], text.encode(config.ANSI_CODEPAGE, errors='replace')) else 0xFFFFFFFF
+        data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+        return 0 if self._stream_write(args[1], data) else 0xFFFFFFFF
 
     def _putws(self, args):
         """_putws emulation"""

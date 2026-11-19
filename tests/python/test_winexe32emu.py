@@ -308,7 +308,8 @@ class KnownFoldersTest(unittest.TestCase):
 class SecurityAndNetworkTest(unittest.TestCase):
     def test_sid_bytes(self):
         data = WinAPIHandler._sid_bytes('S-1-5-32-544')
-        self.assertEqual(data, bytes([1, 2, 0, 0, 0, 0, 0, 5]) + bytes([32, 0, 0, 0, 0x20, 2, 0, 0]))
+        self.assertEqual(data, bytes([1, 2, 0, 0, 0, 0, 0, 5]) +
+                         bytes([32, 0, 0, 0, 0x20, 2, 0, 0]))
         self.assertIsNone(WinAPIHandler._sid_bytes('S-2-5'))
         self.assertIsNone(WinAPIHandler._sid_bytes('not a SID'))
 

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: Window messages: SendMessage, PostMessage, timers, message loop, DefWindowProc"""
+"""WinAPIHandler mixin: Window messages: SendMessage, PostMessage, timers, message
+loop, DefWindowProc"""
 
 import struct
 import time
@@ -300,7 +301,8 @@ class MessagesMixin:
                 if wide:
                     self.emu.uc.mem_write(lParam, text.encode('utf-16-le') + b'\x00\x00')
                 else:
-                    self.emu.uc.mem_write(lParam, text.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+                    data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+                    self.emu.uc.mem_write(lParam, data + b'\x00')
             return len(text)
         if Msg == self.LB_GETTEXTLEN:
             return len(items[wParam]) if wParam < len(items) else self.LB_ERR
@@ -520,7 +522,7 @@ class MessagesMixin:
                 control.replace_selection(text)
             return 0
         return None
-    
+
     def PostMessageA(self, args):
         """PostMessageA emulation - queue a message for the message loop"""
         hWnd = args[0]
@@ -747,23 +749,24 @@ class MessagesMixin:
     def PeekMessageW(self, args):
         """PeekMessageW emulation (same as PeekMessageA in the emulator)"""
         return self.PeekMessageA(args)
-    
+
     def TranslateMessage(self, args):
         """TranslateMessage emulation"""
         lpMsg = args[0]
         log.debug("TranslateMessage()")
         return 1
-    
+
     def DispatchMessageA(self, args):
         """DispatchMessageA emulation - Call WndProc"""
         lpMsg = args[0]
         log.debug("DispatchMessageA()")
-        
+
         # Read MSG structure: hwnd, message, wParam, lParam, time, pt.x, pt.y
         try:
             msg_data = self.emu.uc.mem_read(lpMsg, 28)
-            hwnd, message, wParam, lParam, time_val, pt_x, pt_y = struct.unpack("<IIIIIii", msg_data)
-            
+            hwnd, message, wParam, lParam, time_val, pt_x, pt_y = struct.unpack(
+                "<IIIIIii", msg_data)
+
             log.debug(f"DispatchMessageA: hwnd=0x{hwnd:x}, msg=0x{message:x}")
 
             if message == self.WM_PAINT and self.gui and hwnd in self.gui.controls:
@@ -787,26 +790,27 @@ class MessagesMixin:
 
             # Find WndProc for this hwnd
             wndproc = self._find_wndproc_for_hwnd(hwnd)
-            
+
             if wndproc and wndproc != 0:
-                log.debug(f"Calling WndProc: 0x{wndproc:x}(hwnd=0x{hwnd:x}, msg=0x{message:x}, wParam=0x{wParam:x}, lParam=0x{lParam:x})")
-                
+                log.debug(f"Calling WndProc: 0x{wndproc:x}(hwnd=0x{hwnd:x}, msg=0x{message:x}, "
+                          f"wParam=0x{wParam:x}, lParam=0x{lParam:x})")
+
                 # Call WndProc callback
                 result = self._call_proc(wndproc, hwnd, message, wParam, lParam)
-                
+
                 log.debug(f"WndProc returned: 0x{result:x}")
                 return result
             else:
                 log.debug(f"WndProc not found, hwnd=0x{hwnd:x}")
-                
+
         except UcError as e:
             log.warning(f"DispatchMessageA error: {e}")
-        
+
         return 0
 
     def DispatchMessageW(self, args):
         return self.DispatchMessageA(args)
-    
+
     def _find_wndproc_for_hwnd(self, hwnd):
         """Find WndProc address for a specific hwnd"""
         # Get window class from GUI (only this process's own windows, no consoles)
@@ -827,9 +831,9 @@ class MessagesMixin:
             # No WndProc if no class_name (internal window)
             if not class_name:
                 return 0
-        
+
         return 0
-    
+
     def DefWindowProcA(self, args):
         """DefWindowProcA emulation"""
         hWnd = args[0]
@@ -863,4 +867,4 @@ class MessagesMixin:
 
     def DefWindowProcW(self, args):
         return self.DefWindowProcA(args)
-    
+

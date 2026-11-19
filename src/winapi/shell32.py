@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: shell32 (file info, ShellExecute, SHFileOperation), ole32 drag and drop, advapi32"""
+"""WinAPIHandler mixin: shell32 (file info, ShellExecute, SHFileOperation), ole32 drag
+and drop, advapi32"""
 
 import os
 import shutil

@@ -1,6 +1,10 @@
-# Lint settings (ruff check): Pyflakes errors and syntax errors
+# Lint settings (ruff check): Pyflakes, pycodestyle errors and warnings,
+# flake8-bugbear
+line-length = 100
+target-version = "py310"
+
 [lint]
-select = ["F", "E9"]
+select = ["F", "E", "W", "B"]
 ignore = [
     "F403", "F405",  # "from unicorn import *" & co. are on purpose
     "F841",          # API handlers name their unused arguments (args[n]) for clarity

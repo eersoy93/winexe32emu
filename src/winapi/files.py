@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: Sandboxed file system, modules (GetModuleHandle, GetProcAddress), command line"""
+"""WinAPIHandler mixin: Sandboxed file system, modules (GetModuleHandle,
+GetProcAddress), command line"""
 
 import io
 import os
@@ -241,17 +242,17 @@ class FilesMixin:
         if lpModuleName == 0:
             log.debug(f"GetModuleHandleA(NULL) -> 0x{self.emu.pe_loader.image_base:08x}")
             return self.emu.pe_loader.image_base
-        
+
         module_name = self.read_string(lpModuleName)
         log.debug(f"GetModuleHandleA(\"{module_name}\")")
         return self._module_handle(module_name, load=False)
-    
+
     def GetModuleHandleW(self, args):
         """GetModuleHandleW emulation"""
         lpModuleName = args[0]
         if lpModuleName == 0:
             return self.emu.pe_loader.image_base
-        
+
         module_name = self.read_wide_string(lpModuleName)
         log.debug(f"GetModuleHandleW(\"{module_name}\")")
         return self._module_handle(module_name, load=False)
@@ -358,12 +359,12 @@ class FilesMixin:
         """True if calls to dll_name!func_name can be emulated safely"""
         return (self.get_api_handler(func_name, dll_name) is not None and
                 self.stack_cleanup_bytes(dll_name, func_name) is not None)
-    
+
     def GetProcAddress(self, args):
         """GetProcAddress emulation - returns a hook stub for emulated APIs"""
         hModule = args[0]
         lpProcName = args[1]
-        
+
         info = self.handles.get(hModule)
         system = self.emu.system_modules.get(self._system_module_name(hModule))
         if info is None and system is not None:
@@ -395,7 +396,7 @@ class FilesMixin:
                 self.emu.note_missing_api(info['name'], proc_name,
                                           'GetProcAddress returned NULL')
         return addr
-    
+
     def ExitProcess(self, args):
         """ExitProcess emulation"""
         exit_code = args[0]
@@ -420,18 +421,18 @@ class FilesMixin:
         self.process_exited = True
         self.emu.stop_emulation = True
         return 1
-    
+
     def GetCommandLineA(self, args):
         """GetCommandLineA emulation"""
         log.debug("GetCommandLineA()")
         # Return memory address allocated for command line
         return self.emu.cmdline_addr
-    
+
     def GetCommandLineW(self, args):
         """GetCommandLineW emulation"""
         log.debug("GetCommandLineW()")
         return self.emu.cmdline_wide_addr
-    
+
     def SetUnhandledExceptionFilter(self, args):
         """SetUnhandledExceptionFilter emulation - the filter of unhandled
         exceptions; returns the previous one"""
@@ -480,7 +481,8 @@ class FilesMixin:
                 images.append((abs((w or 256) - size), -bits, icon_id))
             for _, _, icon_id in sorted(images):
                 icon = self._find_resource(3, icon_id, hModule)
-                decoded = resources._icon_image_rgba(bytes(self.emu.uc.mem_read(*icon))) if icon else None
+                decoded = (resources._icon_image_rgba(bytes(self.emu.uc.mem_read(*icon)))
+                           if icon else None)
                 if decoded:
                     return decoded
         except (struct.error, UcError):

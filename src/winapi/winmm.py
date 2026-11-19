@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: winmm: timers, PCM / ADPCM conversion, waveOut, msacm32, joystick, MCI, PlaySound"""
+"""WinAPIHandler mixin: winmm: timers, PCM / ADPCM conversion, waveOut, msacm32,
+joystick, MCI, PlaySound"""
 
 import sys
 import os
@@ -85,7 +86,7 @@ class WinmmMixin:
         neighbour resampling, stereo is mixed down by averaging)"""
         if channels == 2 and dst_channels == 1:
             samples = array.array('h', ((a + b) >> 1 for a, b in
-                                        zip(samples[0::2], samples[1::2])))
+                                        zip(samples[0::2], samples[1::2], strict=False)))
         elif channels == 1 and dst_channels == 2:
             stereo = array.array('h', bytes(4 * len(samples)))
             stereo[0::2] = samples
@@ -768,7 +769,8 @@ class WinmmMixin:
                     self._mci_notify(device_id, device, 4)
         elif message == 0x855:  # MCI_RESUME
             if device['mode'] == 529:
-                if device['music'] and getattr(winapi.WinAPIHandler, '_mci_music_owner', None) is device:
+                owner = getattr(winapi.WinAPIHandler, '_mci_music_owner', None)
+                if device['music'] and owner is device:
                     pygame.mixer.music.unpause()
                 device['mode'] = 526
                 device['started'] = time.time()

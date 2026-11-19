@@ -37,7 +37,7 @@ class User32WindowsMixin:
         """GetSystemMetrics emulation"""
         nIndex = args[0]
         width, height = self._screen_size()
-        
+
         metrics = {
             0: width,  # SM_CXSCREEN
             1: height, # SM_CYSCREEN
@@ -50,11 +50,11 @@ class User32WindowsMixin:
             17: height - 30 - 25,  # SM_CYFULLSCREEN: minus taskbar and caption
             80: 1,     # SM_CMONITORS
         }
-        
+
         result = metrics.get(nIndex, 0)
         log.debug(f"GetSystemMetrics({nIndex}) -> {result}")
         return result
-    
+
     # MB_OK ... MB_CANCELTRYCONTINUE: (label, result id) of the buttons
     MESSAGEBOX_BUTTONS = {0: [('OK', 1)], 1: [('OK', 1), ('Cancel', 2)],
                           2: [('&Abort', 3), ('&Retry', 4), ('&Ignore', 5)],
@@ -99,7 +99,7 @@ class User32WindowsMixin:
     def RegisterClassA(self, args, wide=False):
         """RegisterClassA/W emulation"""
         lpWndClass = args[0]
-        
+
         # Read WNDCLASS structure
         try:
             wndclass_data = self.emu.uc.mem_read(lpWndClass, 40)
@@ -110,12 +110,12 @@ class User32WindowsMixin:
             hbrBackground = struct.unpack("<I", wndclass_data[28:32])[0]
             lpszMenuName = struct.unpack("<I", wndclass_data[32:36])[0]
             lpszClassName = struct.unpack("<I", wndclass_data[36:40])[0]
-            
+
             class_name = self._read_text(lpszClassName, wide)
-            
+
             atom = self.next_atom
             self.next_atom += 1
-            
+
             self.registered_classes[class_name] = {
                 'atom': atom,
                 'style': style,
@@ -127,7 +127,7 @@ class User32WindowsMixin:
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
             }
             self.atoms[atom] = class_name
-            
+
             log.debug(f"RegisterClassA('{class_name}') -> 0x{atom:x}")
             return atom
         except UcError:
@@ -135,11 +135,11 @@ class User32WindowsMixin:
 
     def RegisterClassW(self, args):
         return self.RegisterClassA(args, wide=True)
-    
+
     def RegisterClassExA(self, args, wide=False):
         """RegisterClassExA/W emulation"""
         lpwcx = args[0]
-        
+
         try:
             # Read WNDCLASSEX structure
             wcex_data = self.emu.uc.mem_read(lpwcx, 48)
@@ -151,12 +151,12 @@ class User32WindowsMixin:
             hbrBackground = struct.unpack("<I", wcex_data[32:36])[0]
             lpszMenuName = struct.unpack("<I", wcex_data[36:40])[0]
             lpszClassName = struct.unpack("<I", wcex_data[40:44])[0]
-            
+
             class_name = self._read_text(lpszClassName, wide)
-            
+
             atom = self.next_atom
             self.next_atom += 1
-            
+
             self.registered_classes[class_name] = {
                 'atom': atom,
                 'style': style,
@@ -168,7 +168,7 @@ class User32WindowsMixin:
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
             }
             self.atoms[atom] = class_name
-            
+
             log.debug(f"RegisterClassExA('{class_name}') -> 0x{atom:x}")
             return atom
         except UcError:
@@ -176,7 +176,7 @@ class User32WindowsMixin:
 
     def RegisterClassExW(self, args):
         return self.RegisterClassExA(args, wide=True)
-    
+
     def CreateWindowExA(self, args, wide=False):
         """CreateWindowExA/W emulation"""
         dwExStyle = args[0]
@@ -198,18 +198,18 @@ class User32WindowsMixin:
         hMenu = args[9]
         hInstance = args[10]
         lpParam = args[11]
-        
+
         # Class name can be atom or string
         if lpClassName < 0x10000:
             class_name = self.atoms.get(lpClassName, f"ATOM_{lpClassName}")
         else:
             class_name = self._read_text(lpClassName, wide)
-        
+
         window_name = self._read_text(lpWindowName, wide)
-        
+
         log.info(f"{Fore.GREEN}CreateWindowExA{Style.RESET_ALL}('{class_name}', '{window_name}', "
                 f"pos=({x},{y}), size=({nWidth},{nHeight}))")
-        
+
         # Create real window if GUI exists
         if self.gui and self.gui.running:
             native = self.NATIVE_CLASSES.get(class_name.upper()) if isinstance(class_name, str) \
@@ -339,18 +339,18 @@ class User32WindowsMixin:
                            dwExStyle & 0xFFFFFFFF)
         self.emu.uc.mem_write(addr, data)
         return addr
-    
+
     def ShowWindow(self, args):
         """ShowWindow emulation"""
         hWnd = args[0]
         nCmdShow = args[1]
-        
+
         show_names = {0: "SW_HIDE", 1: "SW_SHOWNORMAL", 2: "SW_SHOWMINIMIZED",
                      3: "SW_SHOWMAXIMIZED", 4: "SW_SHOWNOACTIVATE", 5: "SW_SHOW"}
         show_name = show_names.get(nCmdShow, f"SW_{nCmdShow}")
-        
+
         log.debug(f"ShowWindow(0x{hWnd:x}, {show_name})")
-        
+
         if self.gui and self.gui.running:
             show = nCmdShow in [1, 3, 5, 6, 7, 8, 9, 10]
             self.gui.show_window(hWnd, show)
@@ -365,15 +365,15 @@ class User32WindowsMixin:
                 self._send_size(hWnd)
             elif show and win is not None and win.size_state is None:
                 self._send_size(hWnd)
-        
+
         return 1
-    
+
     def UpdateWindow(self, args):
         """UpdateWindow emulation"""
         hWnd = args[0]
         log.debug(f"UpdateWindow(0x{hWnd:x})")
         return 1
-    
+
     def DestroyWindow(self, args):
         """DestroyWindow emulation"""
         hWnd = args[0]
@@ -406,32 +406,32 @@ class User32WindowsMixin:
                 self.post_window_message(hWnd, self.WM_DESTROY, 0, 0)
 
         return 1
-    
+
     def SetWindowTextA(self, args, wide=False):
         """SetWindowTextA/W emulation"""
         hWnd = args[0]
         lpString = args[1]
-        
+
         text = self._read_text(lpString, wide)
         log.debug(f"SetWindowTextA(0x{hWnd:x}, '{text}')")
-        
+
         combo = self._native_window(hWnd, 'COMBOBOXEX') if self.gui else None
         if combo is not None:
             self.comboboxex_set_text(combo, text)
         elif self.gui:
             self.gui.set_window_text(hWnd, text)
-        
+
         return 1
 
     def SetWindowTextW(self, args):
         return self.SetWindowTextA(args, wide=True)
-    
+
     def GetWindowTextA(self, args, wide=False):
         """GetWindowTextA/W emulation"""
         hWnd = args[0]
         lpString = args[1]
         nMaxCount = args[2]
-        
+
         text = self._window_text(hWnd)
         self._last_error = 0
 
@@ -454,12 +454,12 @@ class User32WindowsMixin:
 
     def GetWindowTextW(self, args):
         return self.GetWindowTextA(args, wide=True)
-    
+
     def GetClientRect(self, args):
         """GetClientRect emulation"""
         hWnd = args[0]
         lpRect = args[1]
-        
+
         # Default rectangle
         left, top, right, bottom = 0, 0, 400, 300
 
@@ -471,21 +471,21 @@ class User32WindowsMixin:
             if control.class_name == 'STATUSBAR':
                 self.gui.layout_statusbar(control)
             right, bottom = control.width, control.height
-        
+
         if lpRect:
             rect_data = struct.pack("<iiii", left, top, right, bottom)
             self.emu.uc.mem_write(lpRect, rect_data)
-        
+
         log.debug(f"GetClientRect(0x{hWnd:x}) -> ({left}, {top}, {right}, {bottom})")
         return 1
-    
+
     def GetWindowRect(self, args):
         """GetWindowRect emulation"""
         hWnd = args[0]
         lpRect = args[1]
-        
+
         left, top, right, bottom = 100, 100, 500, 400
-        
+
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             left, top = win.x, win.y
@@ -502,10 +502,10 @@ class User32WindowsMixin:
             ox, oy = self.gui.client_origin(parent) if parent else (0, 0)
             left, top = ox + control.x, oy + control.y
             right, bottom = left + control.width, top + control.height
-        
+
         if lpRect:
             rect_data = struct.pack("<iiii", left, top, right, bottom)
             self.emu.uc.mem_write(lpRect, rect_data)
-        
+
         log.debug(f"GetWindowRect(0x{hWnd:x}) -> ({left}, {top}, {right}, {bottom})")
         return 1

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: Additional kernel32 APIs: libraries, system folders, lstr* strings, global memory"""
+"""WinAPIHandler mixin: Additional kernel32 APIs: libraries, system folders, lstr*
+strings, global memory"""
 
 import os
 import io
@@ -32,19 +33,19 @@ class Kernel32MiscMixin:
     """Additional kernel32 APIs: libraries, system folders, lstr* strings, global memory"""
 
     # ==================== ADDITIONAL APIs ====================
-    
+
     def SetErrorMode(self, args):
         """SetErrorMode emulation"""
         uMode = args[0]
         log.debug(f"SetErrorMode(0x{uMode:x})")
         return 0  # Previous mode
-    
+
     def GetModuleFileNameA(self, args):
         """GetModuleFileNameA emulation"""
         hModule = args[0]
         lpFilename = args[1]
         nSize = args[2]
-        
+
         # The EXE, a loaded DLL or an emulated system DLL (other handles: the EXE)
         filepath = self._module_path(hModule) or self.windows_exe_path()
         data = filepath.encode(config.ANSI_CODEPAGE, errors='replace')
@@ -60,50 +61,51 @@ class Kernel32MiscMixin:
 
         log.debug(f"GetModuleFileNameA(0x{hModule:x}) -> \"{filepath}\"")
         return len(data)
-    
+
     def GetModuleFileNameW(self, args):
         """GetModuleFileNameW emulation"""
         hModule = args[0]
         lpFilename = args[1]
         nSize = args[2]
-        
+
         # The EXE, a loaded DLL or an emulated system DLL (other handles: the EXE)
         filepath = self._module_path(hModule) or self.windows_exe_path()
         if nSize == 0:
             return 0
         if len(filepath) >= nSize:
-            self.emu.uc.mem_write(lpFilename, filepath[:nSize - 1].encode('utf-16-le') + b'\x00\x00')
+            data = filepath[:nSize - 1].encode('utf-16-le')
+            self.emu.uc.mem_write(lpFilename, data + b'\x00\x00')
             self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
             return nSize
         self.emu.uc.mem_write(lpFilename, filepath.encode('utf-16-le') + b'\x00\x00')
 
         log.debug(f"GetModuleFileNameW(0x{hModule:x}) -> \"{filepath}\"")
         return len(filepath)
-    
+
     def LoadLibraryA(self, args):
         """LoadLibraryA emulation"""
         lib_name = self.read_string(args[0])
         log.debug(f"LoadLibraryA(\"{lib_name}\")")
         return self._module_handle(lib_name, load=True)
-    
+
     def LoadLibraryW(self, args):
         """LoadLibraryW emulation"""
         lib_name = self.read_wide_string(args[0])
         log.debug(f"LoadLibraryW(\"{lib_name}\")")
         return self._module_handle(lib_name, load=True)
-    
+
     def LoadLibraryExA(self, args):
         """LoadLibraryExA emulation"""
         lib_name = self.read_string(args[0])
         log.debug(f"LoadLibraryExA(\"{lib_name}\", 0x{args[2]:x})")
         return self._module_handle(lib_name, load=True)
-    
+
     def LoadLibraryExW(self, args):
         """LoadLibraryExW emulation"""
         lib_name = self.read_wide_string(args[0])
         log.debug(f"LoadLibraryExW(\"{lib_name}\", 0x{args[2]:x})")
         return self._module_handle(lib_name, load=True)
-    
+
     def FreeLibrary(self, args):
         """FreeLibrary emulation - a real DLL is unloaded with its last
         reference (DllMain(DLL_PROCESS_DETACH)); the emulated system DLLs
@@ -131,7 +133,7 @@ class Kernel32MiscMixin:
         if module is not None:
             module['thread_calls'] = False
         return 1
-    
+
     def GetSystemDirectoryA(self, args):
         """GetSystemDirectoryA emulation: the length, or the needed size
         (with the terminator) when the buffer is too small"""
@@ -164,25 +166,25 @@ class Kernel32MiscMixin:
     def lstrlenA(self, args):
         """lstrlenA emulation"""
         lpString = args[0]
-        
+
         if lpString == 0:
             return 0
-        
+
         s = self.read_string(lpString)
         log.debug(f"lstrlenA(\"{s[:32]}...\") -> {len(s)}")
         return len(s)
-    
+
     def lstrlenW(self, args):
         """lstrlenW emulation"""
         lpString = args[0]
-        
+
         if lpString == 0:
             return 0
-        
+
         s = self.read_wide_string(lpString)
         log.debug(f"lstrlenW() -> {len(s)}")
         return len(s)
-    
+
     def IsDBCSLeadByteEx(self, args):
         """IsDBCSLeadByteEx emulation - supported code pages have no DBCS lead bytes"""
         return 0
@@ -191,7 +193,7 @@ class Kernel32MiscMixin:
         """GetStartupInfoA emulation"""
         lpStartupInfo = args[0]
         log.debug(f"GetStartupInfoA(0x{lpStartupInfo:08x})")
-        
+
         # Fill STARTUPINFOA structure (68 bytes)
         try:
             startup_info = struct.pack('<IIIIIIIIIIIIHHIIII',
@@ -218,11 +220,11 @@ class Kernel32MiscMixin:
         except UcError:
             pass
         return 0
-    
+
     def GetStartupInfoW(self, args):
         """GetStartupInfoW emulation"""
         return self.GetStartupInfoA(args)
-    
+
     def GetSystemDirectoryW(self, args):
         """GetSystemDirectoryW emulation (see GetSystemDirectoryA)"""
         log.debug("GetSystemDirectoryW()")
@@ -237,111 +239,111 @@ class Kernel32MiscMixin:
         """lstrcpyA/W emulation"""
         lpString1 = args[0]
         lpString2 = args[1]
-        
+
         units = self._read_units(lpString2, wide)
         self._write_units(lpString1, units, wide)
-        
+
         log.debug(f"lstrcpy{'W' if wide else 'A'}(0x{lpString1:08x}, "
                   f"\"{self._units_text(units[:32], wide)}\")")
         return lpString1
 
     def lstrcpyW(self, args):
         return self.lstrcpyA(args, wide=True)
-    
+
     def lstrcpynA(self, args):
         """lstrcpynA emulation"""
         lpString1 = args[0]
         lpString2 = args[1]
         iMaxLength = args[2]
-        
+
         if iMaxLength == 0 or iMaxLength >= 0x80000000:
             return lpString1
         src = self.read_cstring(lpString2, iMaxLength - 1)
         self.emu.uc.mem_write(lpString1, src + b'\x00')
-        
+
         log.debug(f"lstrcpynA(0x{lpString1:08x}, {src[:32]!r}, {iMaxLength})")
         return lpString1
-    
+
     def lstrcatA(self, args, wide=False):
         """lstrcatA/W emulation"""
         lpString1 = args[0]
         lpString2 = args[1]
-        
+
         dst = self._read_units(lpString1, wide)
         src = self._read_units(lpString2, wide)
         self._write_units(lpString1 + len(dst) * (2 if wide else 1), src, wide)
-        
+
         log.debug(f"lstrcat{'W' if wide else 'A'}() -> "
                   f"\"{self._units_text((dst + src)[:32], wide)}\"")
         return lpString1
 
     def lstrcatW(self, args):
         return self.lstrcatA(args, wide=True)
-    
+
     def lstrcmpA(self, args, wide=False, ignore_case=False):
         """lstrcmpA/W and lstrcmpiA/W emulation"""
         s1 = self._read_text(args[0], wide)
         s2 = self._read_text(args[1], wide)
         if ignore_case:
             s1, s2 = s1.lower(), s2.lower()
-        
+
         result = (s1 > s2) - (s1 < s2)
-        
+
         log.debug(f"lstrcmp{'i' if ignore_case else ''}{'W' if wide else 'A'}"
                   f"(\"{s1[:16]}\", \"{s2[:16]}\") -> {result}")
         return result & 0xFFFFFFFF
 
     def lstrcmpW(self, args):
         return self.lstrcmpA(args, wide=True)
-    
+
     def lstrcmpiA(self, args):
         """lstrcmpiA emulation (case-insensitive)"""
         return self.lstrcmpA(args, ignore_case=True)
 
     def lstrcmpiW(self, args):
         return self.lstrcmpA(args, wide=True, ignore_case=True)
-    
+
     def GlobalAlloc(self, args):
         """GlobalAlloc emulation"""
         uFlags = args[0]
         dwBytes = args[1]
-        
+
         addr = self.emu.heap_alloc(dwBytes)
-        
+
         # Zero memory if GMEM_ZEROINIT (0x0040) flag is set
         if addr and uFlags & 0x0040:
             self.emu.uc.mem_write(addr, b'\x00' * dwBytes)
-        
+
         log.debug(f"GlobalAlloc(0x{uFlags:x}, {dwBytes}) -> 0x{addr:08x}")
         return addr
-    
+
     def GlobalFree(self, args):
         """GlobalFree emulation"""
         hMem = args[0]
         log.debug(f"GlobalFree(0x{hMem:08x})")
         # NULL on success, the handle on failure
         return 0 if not hMem or self.emu.heap_free(hMem) else hMem
-    
+
     def GlobalLock(self, args):
         """GlobalLock emulation"""
         hMem = args[0]
         log.debug(f"GlobalLock(0x{hMem:08x})")
         return hMem  # Return same address
-    
+
     def GlobalUnlock(self, args):
         """GlobalUnlock emulation"""
         hMem = args[0]
         log.debug(f"GlobalUnlock(0x{hMem:08x})")
         return 1
-    
+
     def LocalAlloc(self, args):
         """LocalAlloc emulation"""
         return self.GlobalAlloc(args)
-    
+
     def LocalFree(self, args):
         """LocalFree emulation"""
         return self.GlobalFree(args)
-    
+
     def CloseHandle(self, args):
         """CloseHandle emulation"""
         hObject = args[0]
@@ -369,7 +371,7 @@ class Kernel32MiscMixin:
                     log.error(f"CloseHandle close error: {e}")
             del self.handles[hObject]
         return 1
-    
+
     def Sleep(self, args):
         """Sleep emulation - real wait so game loops pace correctly"""
         dwMilliseconds = args[0]
@@ -387,7 +389,7 @@ class Kernel32MiscMixin:
             if remaining <= 0 or (until is not None and not until()):
                 break
             self.emu.idle_wait(min(0.05, remaining))
-    
+
     # Critical sections: owner thread and recursion count by address
     def InitializeCriticalSection(self, args):
         """InitializeCriticalSection emulation"""

@@ -35,7 +35,7 @@ if PYGAME_AVAILABLE:
 
 class PseudoWindowsGUI:
     """Pygame-based fake Windows GUI environment"""
-    
+
     # Windows colors
     COLOR_DESKTOP = (58, 110, 165)  # #3a6ea5, Windows 2000 blue
     COLOR_WINDOW_BG = (212, 208, 200)  # Classic Windows gray (COLOR_BTNFACE)
@@ -91,7 +91,7 @@ class PseudoWindowsGUI:
         # Running programs (WinAPIHandler each); winapi routes messages to them
         self.processes = []
         self.winapi = _ProcessRouter(self)
-        
+
         # Window management
         self.windows = {}  # hwnd -> FakeWindow
         self.controls = {}  # hwnd -> FakeControl
@@ -161,29 +161,29 @@ class PseudoWindowsGUI:
         self.font_list = None
         self.font_bold = None
         self._font_cache = {}  # (face, size, bold, italic) -> pygame Font
-        
+
         # Event queue
         self.event_queue = queue.Queue()
         self.message_queue = queue.Queue()
-        
+
         # MessageBox queue
         self.messagebox_queue = queue.Queue()
         self.messageboxes = {}  # hwnd -> MessageBox state (buttons, request)
         # Guards windows/controls/z_order and display lists across threads
         self.lock = threading.RLock()
         self.messagebox_result = None
-        
+
         # Thread
         self.gui_thread = None
         self.ready = threading.Event()  # Set once the GUI loop is running
         self.consoles_opened = 0  # Cascades the console windows
-        
+
         # Console windows of the programs: hwnd -> FakeConsole
         self.consoles = {}
         self.font_console = None  # Monospace font
         self.console_cursor_visible = True  # Input cursor blinking
         self.console_cursor_timer = 0
-        
+
         # Window dragging
         self.dragging_window = None  # Dragged window hwnd
         self.drag_offset_x = 0
@@ -205,21 +205,21 @@ class PseudoWindowsGUI:
         if not PYGAME_AVAILABLE:
             log.warning("Pygame not available, GUI could not start!")
             return False
-        
+
         self.gui_thread = threading.Thread(target=self._gui_loop, daemon=True)
         self.gui_thread.start()
-        
+
         # Wait until the screen exists; programs started next need it
         # (e.g. a console program opens its console window at once)
         self.ready.wait(timeout=30)
         return self.running
-    
+
     def stop(self):
         """Stop GUI"""
         self.running = False
         if self.gui_thread:
             self.gui_thread.join(timeout=1.0)
-    
+
     def _gui_loop(self):
         """Main GUI loop"""
         # A click that focuses the emulator's window is also passed to the program
@@ -227,10 +227,10 @@ class PseudoWindowsGUI:
         pygame.init()
         pygame.display.set_caption(
             f"Windows 32-bit EXE Emulator v{WINEXE32EMU_VERSION} - Fake Desktop")
-        
+
         self.screen = pygame.display.set_mode((self.width, self.height), pygame.SCALED)
         self.clock = pygame.time.Clock()
-        
+
         # Load fonts
         pygame.font.init()
         self.font = pygame.font.SysFont('arial', 14)
@@ -242,10 +242,10 @@ class PseudoWindowsGUI:
         self.font_list = pygame.font.SysFont('arial', 12)
 
         self._refresh_desktop_icons()
-        
+
         self.running = True
         self.ready.set()
-        
+
         while self.running:
             # Window state is shared with the emulation thread
             with self.lock:
@@ -258,10 +258,10 @@ class PseudoWindowsGUI:
                 self._update_mouse_cursor()
                 self._post_size_changes()
                 self._post_activation_changes()
-            
+
             pygame.display.flip()
             self.clock.tick(60)
-        
+
         pygame.quit()
 
     @staticmethod
@@ -338,29 +338,29 @@ class PseudoWindowsGUI:
                     self._forward_key_up(vk, event)
                 if event.key == pygame.K_LALT:
                     self.alt_down = False
-        
+
         # MessageBox check
         self._check_messagebox()
-        
+
         # Cursor blinking (when a console waits for input)
         if any(c.input_active for c in self.consoles.values()):
             self.console_cursor_timer += 1
             if self.console_cursor_timer >= 30:  # ~0.5 seconds
                 self.console_cursor_timer = 0
                 self.console_cursor_visible = not self.console_cursor_visible
-        
+
         # Draw screen
         self._draw()
-    
+
     def _draw(self):
         """Draw screen"""
         # Desktop background
         self.screen.fill(self.COLOR_DESKTOP)
         self._draw_desktop_icons()
-        
+
         # Taskbar
         self._draw_taskbar()
-        
+
         # Draw windows (according to z-order)
         for hwnd in self.z_order:
             if hwnd in self.windows:
@@ -442,8 +442,9 @@ class PseudoWindowsGUI:
         pygame.draw.rect(image, black, bezel, 1)
         screen = pygame.Rect(7, 4, 18, 13)
         image.blit(self._gradient(screen.size, (0, 0, 128), (16, 132, 208)), screen.topleft)
-        pygame.draw.line(image, dark, (screen.left - 1, screen.top - 1), (screen.right, screen.top - 1))
-        pygame.draw.line(image, dark, (screen.left - 1, screen.top - 1), (screen.left - 1, screen.bottom))
+        corner = (screen.left - 1, screen.top - 1)
+        pygame.draw.line(image, dark, corner, (screen.right, screen.top - 1))
+        pygame.draw.line(image, dark, corner, (screen.left - 1, screen.bottom))
         pygame.draw.line(image, light, (screen.left, screen.bottom), (screen.right, screen.bottom))
         pygame.draw.line(image, light, (screen.right, screen.top), (screen.right, screen.bottom))
         pygame.draw.line(image, (200, 230, 255), (screen.left + 2, screen.top + 2),
@@ -519,7 +520,7 @@ class PseudoWindowsGUI:
     def _draw_desktop_icons(self):
         """Draw the desktop icons with their labels under them"""
         for i, ((name, data), rect) in enumerate(zip(self.desktop_icons,
-                                                     self._desktop_icon_rects())):
+                                                     self._desktop_icon_rects(), strict=False)):
             selected = (i == self.selected_icon)
             normal, tinted = self._program_icon(data, self.desktop_icon_paths.get(data),
                                                 self.ICON_SIZE)
@@ -598,7 +599,7 @@ class PseudoWindowsGUI:
         menu, items, rects = self.desktop_menu
         self._draw_menu_panel(menu)
         mouse_pos = pygame.mouse.get_pos()
-        for item, rect in zip(items, rects):
+        for item, rect in zip(items, rects, strict=False):
             if item is None:
                 self._draw_menu_separator(rect)
             else:
@@ -610,7 +611,7 @@ class PseudoWindowsGUI:
         self.desktop_menu = None
         if not menu.collidepoint(pos):
             return False
-        for item, rect in zip(items, rects):
+        for item, rect in zip(items, rects, strict=False):
             if item and button in (1, 3) and rect.collidepoint(pos):
                 item[1]()
         return True
@@ -639,8 +640,9 @@ class PseudoWindowsGUI:
         Rows are ('program', label, path or shortcut), ('submenu', label, rows),
         ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
         self.start_icon_paths = {}
-        shortcut_rows = self._shortcut_rows([winapi.WinAPIHandler.SHELL_FOLDERS[0x02],    # CSIDL_PROGRAMS
-                                             winapi.WinAPIHandler.SHELL_FOLDERS[0x17]])  # COMMON_PROGRAMS
+        folders = winapi.WinAPIHandler.SHELL_FOLDERS
+        # CSIDL_PROGRAMS, CSIDL_COMMON_PROGRAMS
+        shortcut_rows = self._shortcut_rows([folders[0x02], folders[0x17]])
         rows = []
         if self._explorer_available():
             rows = [('program', self._program_label(EXPLORER_PATH), EXPLORER_PATH)]
@@ -887,7 +889,7 @@ class PseudoWindowsGUI:
                 icon_size = self.START_TOP_ICON_SIZE
             open_index = (self.start_open_path[level]
                           if level < len(self.start_open_path) else None)
-            for i, ((kind, label, data), rect) in enumerate(zip(rows, rects)):
+            for i, ((kind, label, data), rect) in enumerate(zip(rows, rects, strict=False)):
                 if kind == 'separator':
                     self._draw_menu_separator(rect)
                 elif kind == 'empty':
@@ -1013,7 +1015,7 @@ class PseudoWindowsGUI:
             self.dragging_window = None
         if self.resizing_window == hwnd:
             self.resizing_window = None
-    
+
     TASKBAR_H = 30
     TASK_BTN_MAX_W = 160
     TASK_BTN_MIN_W = 40
@@ -1135,8 +1137,8 @@ class PseudoWindowsGUI:
         font = self.font_small_bold if is_active else self.font_small
         label = self._fit_text(font, win.title, rect.right - 5 - text_x)
         text_surface = font.render(label, True, self.COLOR_TEXT)
-        self.screen.blit(text_surface, (text_x,
-                                        rect.y + (rect.height - text_surface.get_height()) // 2 + offset))
+        text_y = rect.y + (rect.height - text_surface.get_height()) // 2 + offset
+        self.screen.blit(text_surface, (text_x, text_y))
 
     def _checker_surface(self, size):
         """White / gray checkered surface of this size (cached)"""
@@ -1200,7 +1202,7 @@ class PseudoWindowsGUI:
                     and not (skip_dialogs and win.is_dialog)):
                 self.active_window = h
                 return
-    
+
     def _draw_window_frame(self, window, border):
         """Soft shadow, face and the classic raised frame of a top-level window
         (a 1-pixel border is a plain dark line)"""
@@ -1217,7 +1219,7 @@ class PseudoWindowsGUI:
         """Draw window"""
         if not window.visible or window.minimized:
             return
-        
+
         is_active = (window.hwnd == self.active_window)
         border, caption = self.window_frame(window)
 
@@ -1456,7 +1458,7 @@ class PseudoWindowsGUI:
                          (bar.x, bar.bottom - 1), (bar.right - 1, bar.bottom - 1))
 
         item_rects = self._menu_item_rects(window)
-        for i, (item, rect) in enumerate(zip(window.menu, item_rects)):
+        for i, (item, rect) in enumerate(zip(window.menu, item_rects, strict=False)):
             is_open = (self.open_menu == (window.hwnd, i))
             if is_open:
                 pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
@@ -1475,7 +1477,7 @@ class PseudoWindowsGUI:
         self._menu_hover(panels, self.menu_path,
                          lambda hmenu, index: self._post_init_menu(win, hmenu, index))
         self._draw_menu_panels(self._menu_panels(items, x, y, self.menu_path))
-    
+
     def _combo_dropdown_rects(self, control):
         """Dropdown rect and item rects of an open combobox (screen coords)."""
         win = self.windows.get(control.parent_hwnd)
@@ -1512,7 +1514,7 @@ class PseudoWindowsGUI:
         pygame.draw.rect(self.screen, (128, 128, 128), drop, 1)
 
         mouse_pos = pygame.mouse.get_pos()
-        for i, (item, rect) in enumerate(zip(control.items, item_rects)):
+        for i, (item, rect) in enumerate(zip(control.items, item_rects, strict=False)):
             hovered = rect.collidepoint(mouse_pos)
             selected = (i == control.sel_index)
             if hovered or selected:
@@ -1535,7 +1537,8 @@ class PseudoWindowsGUI:
                 continue
             cx, cy = self.client_origin(c)
             border = self._child_border(c)
-            if cx - border <= x < cx - border + c.width and cy - border <= y < cy - border + c.height:
+            if (cx - border <= x < cx - border + c.width and
+                    cy - border <= y < cy - border + c.height):
                 return self.child_at(child, x, y)
         return hwnd
 
@@ -1808,7 +1811,8 @@ class PseudoWindowsGUI:
             for column in columns:
                 rect = pygame.Rect(x, cy, column['width'], header_h)
                 self._draw_button_3d(rect, '')
-                label = self._fit_text(self.font, column.get('text', ''), max(0, column['width'] - 12))
+                label = self._fit_text(self.font, column.get('text', ''),
+                                       max(0, column['width'] - 12))
                 surface = self.font.render(label, True, self.COLOR_TEXT)
                 align = column['fmt'] & 0x3
                 tx = x + 5 if align == 0 else (x + column['width'] - surface.get_width() - 6
@@ -2038,7 +2042,8 @@ class PseudoWindowsGUI:
         rects = owner._tb_layout(win)
         bw, bh = st['bitmap_size']
         mouse = self.mouse_pos
-        for i, (button, (left, top, right, bottom)) in enumerate(zip(st['buttons'], rects)):
+        buttons = zip(st['buttons'], rects, strict=False)
+        for i, (button, (left, top, right, bottom)) in enumerate(buttons):
             if button['state'] & 0x8:
                 continue
             rect = pygame.Rect(cx + left, cy + top, right - left, bottom - top)
@@ -2103,7 +2108,7 @@ class PseudoWindowsGUI:
         pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, drop)
         pygame.draw.rect(self.screen, (0, 0, 0), drop, 1)
         st = win.nstate
-        for i, (item, rect) in enumerate(zip(st['items'], rects)):
+        for item, rect in zip(st['items'], rects, strict=False):
             hovered = rect.collidepoint(self.mouse_pos)
             if hovered:
                 pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
@@ -2161,7 +2166,7 @@ class PseudoWindowsGUI:
         panel = pygame.Rect(x, y, total, height)
         rects = []
         left = x
-        for column, width in zip(columns, widths):
+        for column, width in zip(columns, widths, strict=False):
             top = y + 2
             for sub in column:
                 h = self.MENU_SEP_H if sub.get('separator') else self.MENU_ITEM_H
@@ -2189,7 +2194,7 @@ class PseudoWindowsGUI:
         mouse = self.mouse_pos
         for items, panel, rects in panels:
             self._draw_menu_panel(panel)
-            for index, (sub, rect) in enumerate(zip(items, rects)):
+            for index, (sub, rect) in enumerate(zip(items, rects, strict=False)):
                 if index and sub.get('break') == 'bar':
                     # Etched vertical line between the columns
                     bar_x = rect.x - 5
@@ -2217,7 +2222,8 @@ class PseudoWindowsGUI:
                         pygame.draw.circle(self.screen, color, (rect.x + 9, rect.centery), 3)
                     else:
                         pygame.draw.lines(self.screen, color, False,
-                                          [(rect.x + 5, rect.centery), (rect.x + 8, rect.centery + 3),
+                                          [(rect.x + 5, rect.centery),
+                                           (rect.x + 8, rect.centery + 3),
                                            (rect.x + 13, rect.centery - 3)], 2)
                 self.screen.blit(self.font.render(sub['text'], True, color), (rect.x + 20, ty))
                 if sub.get('shortcut'):
@@ -2225,7 +2231,8 @@ class PseudoWindowsGUI:
                     self.screen.blit(surface, (rect.right - 16 - surface.get_width(), ty))
                 if sub.get('items') is not None:
                     ax, ay = rect.right - 9, rect.centery
-                    pygame.draw.polygon(self.screen, color, [(ax, ay - 4), (ax, ay + 4), (ax + 4, ay)])
+                    pygame.draw.polygon(self.screen, color,
+                                        [(ax, ay - 4), (ax, ay + 4), (ax + 4, ay)])
 
     def _menu_hover(self, panels, path, notify):
         """Open the submenu under the mouse (closing deeper ones); notify(hmenu,
@@ -2235,7 +2242,7 @@ class PseudoWindowsGUI:
             items, panel, rects = panels[level]
             if not panel.collidepoint(mouse):
                 continue
-            for index, (sub, rect) in enumerate(zip(items, rects)):
+            for index, (sub, rect) in enumerate(zip(items, rects, strict=False)):
                 if not rect.collidepoint(mouse) or sub.get('separator'):
                     continue
                 if sub.get('items') is not None and not sub.get('grayed'):
@@ -2254,7 +2261,7 @@ class PseudoWindowsGUI:
             items, panel, rects = panels[level]
             if not panel.collidepoint(pos):
                 continue
-            for index, (sub, rect) in enumerate(zip(items, rects)):
+            for index, (sub, rect) in enumerate(zip(items, rects, strict=False)):
                 if rect.collidepoint(pos) and not sub.get('separator'):
                     if sub.get('grayed'):
                         return ('inside',)
@@ -2602,10 +2609,10 @@ class PseudoWindowsGUI:
             else:
                 self._draw_button_3d(rect, label, pressed=control.checked,
                                      disabled=not control.enabled)
-            
+
         elif control.class_name == "STATIC":
             self._draw_static(control, pygame.Rect(abs_x, abs_y, control.width, control.height))
-            
+
         elif control.class_name == "EDIT":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
             # Disabled and read-only edit controls have the dialog color
@@ -2614,7 +2621,7 @@ class PseudoWindowsGUI:
                              else self.COLOR_BUTTON, rect)
             inset = self._draw_window_edge(rect, control.style, control.ex_style)
             self._draw_edit_text(control, rect, padding=inset + 2)
-            
+
         elif control.class_name == "LISTBOX":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
@@ -2662,7 +2669,7 @@ class PseudoWindowsGUI:
             # Dropdown arrow inside the sunken edge
             arrow_rect = pygame.Rect(abs_x + control.width - 18, abs_y + 2, 16, box_h - 4)
             self._draw_button_3d(arrow_rect, "", small=True, arrow='down')
-            
+
         elif control.class_name in ["CHECKBOX", "BS_CHECKBOX"]:
             self._fill_ctl_background(control, pygame.Rect(abs_x, abs_y, control.width,
                                                            control.height))
@@ -2681,15 +2688,15 @@ class PseudoWindowsGUI:
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, box_rect)
             pygame.draw.rect(self.screen, (128, 128, 128), box_rect, 1)
             if control.checked:
-                pygame.draw.line(self.screen, self.COLOR_TEXT, 
+                pygame.draw.line(self.screen, self.COLOR_TEXT,
                                (abs_x + 2, abs_y + 8), (abs_x + 5, abs_y + 11), 2)
-                pygame.draw.line(self.screen, self.COLOR_TEXT, 
+                pygame.draw.line(self.screen, self.COLOR_TEXT,
                                (abs_x + 5, abs_y + 11), (abs_x + 11, abs_y + 4), 2)
             # Label
             text = self.font.render(self._mnemonic_text(control.text), True,
                                     *self._ctl_text_colors(control))
             self.screen.blit(text, (abs_x + 18, abs_y))
-            
+
         elif control.class_name == "PROGRESSBAR":
             self._draw_progressbar(control, abs_x, abs_y)
 
@@ -2713,7 +2720,7 @@ class PseudoWindowsGUI:
             dragging = (self.dragging_scrollbar is not None and
                         self.dragging_scrollbar[0] == control.hwnd)
             self._draw_button_3d(m['thumb'], "", pressed=dragging)
-    
+
     def _draw_window_edge(self, rect, style, ex_style):
         """Classic border of a child window by its styles: WS_EX_CLIENTEDGE
         (2 px sunken), WS_EX_STATICEDGE (1 px sunken), WS_BORDER (1 px black).
@@ -2787,7 +2794,7 @@ class PseudoWindowsGUI:
             steps = width if horizontal else height
             for i in range(steps):
                 t = i / max(1, steps - 1)
-                color = tuple(round(a + (b - a) * t) for a, b in zip(start, end))
+                color = tuple(round(a + (b - a) * t) for a, b in zip(start, end, strict=False))
                 if horizontal:
                     pygame.draw.line(surface, color, (i, 0), (i, height - 1))
                 else:
@@ -3299,8 +3306,8 @@ class PseudoWindowsGUI:
         """(left, top, right, bottom) a display list entry can paint, or None"""
         stype = shape['type']
         if 'rect' in shape:
-            l, t, r, b = shape['rect']
-            return (min(l, r), min(t, b), max(l, r), max(t, b))
+            left, top, right, bottom = shape['rect']
+            return (min(left, right), min(top, bottom), max(left, right), max(top, bottom))
         if stype == 'image':
             (x, y), (w, h) = shape['pos'], shape['size']
             return (x, y, x + w, y + h)
@@ -3790,7 +3797,7 @@ class PseudoWindowsGUI:
             return
 
         self.selected_icon = None  # The desktop click below selects again
-        
+
         # Check windows in reverse order (topmost first)
         for hwnd in reversed(self.z_order):
             if hwnd in self.windows:
@@ -3801,7 +3808,7 @@ class PseudoWindowsGUI:
                     self.z_order.remove(hwnd)
                     self.z_order.append(hwnd)
                     border, caption = self.window_frame(win)
-                    
+
                     # Caption buttons (the rects they are drawn at; dialogs only have close)
                     buttons = self._caption_button_rects(win) if caption else {}
                     if 'close' in buttons and buttons['close'].collidepoint(x, y):
@@ -3999,7 +4006,7 @@ class PseudoWindowsGUI:
             # No window under the mouse: the desktop gets the click
             if self._fullscreen_window() is None:
                 self._handle_desktop_click(pos, button)
-    
+
     def _post_mouse_down(self, target, x, y, button):
         """Post a button press (or wheel turn) to a child window at screen (x, y)"""
         api = target.owner
@@ -4363,19 +4370,19 @@ class PseudoWindowsGUI:
         height = 90 + max(len(lines) * line_h, 40 if text_x > 20 else 0)
         x = (self.width - width) // 2
         y = (self.height - height) // 2
-        
+
         hwnd = self.create_window(caption, x, y, width, height)
         win = self.windows[hwnd]
         win.is_dialog = True  # Show only close button
         win.messagebox_icon = icon if text_x > 20 else 0
-        
+
         # Text
         for i, line in enumerate(lines):
             if line:
                 win.controls.append(FakeControl(self.get_next_hwnd(), "STATIC", line,
                                                 text_x, 20 + i * line_h, width - text_x - 20,
                                                 line_h, 0x80))  # SS_NOPREFIX
-        
+
         # Buttons, the default one with the thick frame
         left = (width - buttons_w) // 2
         controls = []
@@ -4388,7 +4395,7 @@ class PseudoWindowsGUI:
             controls.append(button)
         self.messageboxes[hwnd] = {'request': request, 'buttons': controls,
                                    'focus': default, 'cancel': cancel, 'process': process}
-        
+
         self.show_window(hwnd)
 
     def _messagebox_icon_surface(self, icon):
@@ -4478,7 +4485,7 @@ class PseudoWindowsGUI:
                     self._messagebox_done(hwnd, button.mb_result)
                     break
         return True
-    
+
     @gui_locked
     def _close_window(self, hwnd, notify_app=True):
         """Close window.
@@ -4517,14 +4524,14 @@ class PseudoWindowsGUI:
             self.active_window = self.z_order[-1] if self.z_order else None
         if self.open_menu and self.open_menu[0] == hwnd:
             self.open_menu = None
-    
+
     @gui_locked
     def get_next_hwnd(self):
         """Get new HWND"""
         hwnd = self.next_hwnd
         self.next_hwnd += 4
         return hwnd
-    
+
     @gui_locked
     def create_window(self, title, x, y, width, height, style=0, owner=None, parent=0):
         """Create new window (a child window if parent is a window handle)"""
@@ -4544,10 +4551,10 @@ class PseudoWindowsGUI:
             self.windows[parent].children.append(hwnd)
         else:
             self.z_order.append(hwnd)
-        
+
         log.debug(f"GUI: Window created - HWND=0x{hwnd:08x}, '{title}'")
         return hwnd
-    
+
     @gui_locked
     def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0,
                        control_id=0, ex_style=0):
@@ -4558,10 +4565,10 @@ class PseudoWindowsGUI:
         control.control_id = control_id
 
         self.controls[hwnd] = control
-        
+
         if parent_hwnd in self.windows:
             self.windows[parent_hwnd].controls.append(control)
-        
+
         log.debug(f"GUI: Control created - HWND=0x{hwnd:08x}, {class_name}, '{text}'")
         return hwnd
 
@@ -4578,7 +4585,7 @@ class PseudoWindowsGUI:
             self.focused_control = None
         if self.open_combo == hwnd:
             self.open_combo = None
-    
+
     @gui_locked
     def show_window(self, hwnd, show=True):
         """Show/hide window"""
@@ -4590,7 +4597,7 @@ class PseudoWindowsGUI:
                     self.z_order.append(hwnd)
         elif hwnd in self.controls:
             self.controls[hwnd].visible = show
-    
+
     @gui_locked
     def set_window_text(self, hwnd, text):
         """Set window/control text"""
@@ -4604,7 +4611,7 @@ class PseudoWindowsGUI:
             control.set_selection(0)
             control.edit_scroll = control.edit_top_line = 0
             control.modified = False
-    
+
     def get_window_text(self, hwnd):
         """Get window/control text"""
         if hwnd in self.windows:
@@ -4612,7 +4619,7 @@ class PseudoWindowsGUI:
         elif hwnd in self.controls:
             return self.controls[hwnd].text
         return ""
-    
+
     def show_messagebox(self, caption, text, msg_type=0, request=None, process=None):
         """Show MessageBox (thread-safe); the chosen button's id is stored in
         request['result'] when it closes. process (if any) owns it: the box
@@ -4625,9 +4632,9 @@ class PseudoWindowsGUI:
             'process': process,
         })
         return 1  # IDOK
-    
+
     # ==================== CONSOLE WINDOW ====================
-    
+
     @gui_locked
     def create_console(self, title, owner):
         """Open a console window for a process (called on its emulation thread)"""
@@ -4654,7 +4661,7 @@ class PseudoWindowsGUI:
         self.cancel_console_input(console)
         self.consoles.pop(console.hwnd, None)
         self._remove_window(console.hwnd)
-    
+
     def _draw_console_window(self, window, console):
         """Draw console window"""
         if not window.visible or window.minimized:
@@ -4669,7 +4676,7 @@ class PseudoWindowsGUI:
         content_y = window.y + 30
         content_width = window.width - 10
         content_height = window.height - 35
-        
+
         # Content background
         content_rect = pygame.Rect(content_x, content_y, content_width, content_height)
         self._draw_edge(content_rect.inflate(2, 2), self.COLOR_BUTTON_SHADOW,
@@ -4718,7 +4725,7 @@ class PseudoWindowsGUI:
         """Write to a process's console (thread-safe); text without a final LF
         leaves the line open, so later output (or typed input) continues it"""
         color = self.CONSOLE_COLORS.get(stream, self.CONSOLE_COLORS['stdout'])
-        
+
         # CR has no glyph; console lines are split on LF only
         text = text.replace('\r\n', '\n').replace('\r', '')
 
@@ -4734,10 +4741,10 @@ class PseudoWindowsGUI:
                 else:
                     console.lines.append([(part, color)])
                     console.line_open = True
-        
+
         # Check maximum line count
         del console.lines[:-FakeConsole.MAX_LINES]
-    
+
     def request_console_input(self, console):
         """
         Read a line typed into a console - called from the emulation thread,
@@ -4759,6 +4766,6 @@ class PseudoWindowsGUI:
                 self.z_order.remove(console.hwnd)
             self.z_order.append(console.hwnd)
             self.active_window = console.hwnd
-        
+
         console.input_ready.wait()  # Blocking wait
         return console.input_result

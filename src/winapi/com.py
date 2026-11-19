@@ -37,17 +37,17 @@ class ComMixin:
         """OleInitialize emulation"""
         log.debug("OleInitialize()")
         return 0  # S_OK
-    
+
     def OleUninitialize(self, args):
         """OleUninitialize emulation"""
         log.debug("OleUninitialize()")
         return 0
-    
+
     def CoInitialize(self, args):
         """CoInitialize emulation"""
         log.debug("CoInitialize()")
         return 0  # S_OK
-    
+
     def CoUninitialize(self, args):
         """CoUninitialize emulation"""
         log.debug("CoUninitialize()")
@@ -588,7 +588,8 @@ class ComMixin:
         """'Create Shortcut': "Shortcut to <name>.lnk" next to each item"""
         for path in paths:
             folder, name = ntpath.split(path.rstrip('\\'))
-            base = f"Shortcut to {ntpath.splitext(name)[0] if os.path.isfile(self.resolve_drive_path(path) or '') else name}"
+            is_file = os.path.isfile(self.resolve_drive_path(path) or '')
+            base = f"Shortcut to {ntpath.splitext(name)[0] if is_file else name}"
             target, number = ntpath.join(folder, base + '.lnk'), 2
             while os.path.exists(self.resolve_drive_path(target) or ''):
                 target, number = ntpath.join(folder, f"{base} ({number}).lnk"), number + 1
@@ -827,7 +828,7 @@ class ComMixin:
             state['file'] = filename
         state['dirty'] = False
         return self.S_OK
-    
+
     # MSVCRT.DLL APIs
     def _ensure_fmode_addr(self):
         """Allocate memory for _fmode variable"""
@@ -835,7 +836,7 @@ class ComMixin:
             self._fmode_addr = self.emu.heap_alloc(4)
             self.emu.uc.mem_write(self._fmode_addr, struct.pack('<I', 0x4000))  # _O_TEXT
         return self._fmode_addr
-    
+
     def _ensure_commode_addr(self):
         """Allocate memory for _commode variable"""
         if self._commode_addr == 0:
@@ -849,7 +850,7 @@ class ComMixin:
             self._crt_static['_adjust_fdiv'] = self.emu.heap_alloc(4)
             self._mem_write(self._crt_static['_adjust_fdiv'], struct.pack('<I', 0))
         return self._crt_static['_adjust_fdiv']
-    
+
     def api__p__fmode(self, args):
         """__p__fmode emulation - Returns address of _fmode variable"""
         addr = self._ensure_fmode_addr()
@@ -879,7 +880,7 @@ class ComMixin:
         addr = self._ensure_commode_addr()
         log.debug(f"__p__commode() -> 0x{addr:08x}")
         return addr
-    
+
     def api__set_app_type(self, args):
         """__set_app_type emulation"""
         app_type = args[0]
@@ -890,7 +891,7 @@ class ComMixin:
     def _query_app_type(self, args):
         """_query_app_type emulation - the __set_app_type value (default: console)"""
         return getattr(self, 'crt_app_type', 1)  # _crt_console_app
-    
+
     def _controlfp(self, args):
         """_controlfp emulation - floating point control word"""
         new_val = args[0]
@@ -898,13 +899,13 @@ class ComMixin:
         log.debug(f"_controlfp(0x{new_val:x}, 0x{mask:x})")
         # Return default FPU control word
         return 0x9001F  # Default x86 FPU control word
-    
+
     def _initterm(self, args):
         """_initterm emulation - Run C++ static initializer table"""
         pfbegin = args[0]
         pfend = args[1]
         log.debug(f"_initterm(0x{pfbegin:08x}, 0x{pfend:08x})")
-        
+
         self._run_initializers(pfbegin, pfend, stop_on_error=False)
         return 0
 
@@ -928,7 +929,7 @@ class ComMixin:
         """_initterm_e emulation - stops at the first initializer returning non-zero"""
         log.debug(f"_initterm_e(0x{args[0]:08x}, 0x{args[1]:08x})")
         return self._run_initializers(args[0], args[1], stop_on_error=True)
-    
+
     @staticmethod
     def split_command_line(command_line):
         """Split a command line into argv like the Microsoft C runtime:
@@ -1021,23 +1022,23 @@ class ComMixin:
         self.emu.uc.mem_write(p_env, struct.pack(
             '<I', self._read_u32(self._ensure_env_ptr('_environ_ptr_addr'))))
         return 0
-    
+
     def api__wgetmainargs(self, args):
         """__wgetmainargs emulation - wide char version"""
         p_argc = args[0]
         p_argv = args[1]
         p_env = args[2]
         do_wildcard = args[3]
-        
+
         log.debug(f"__wgetmainargs(0x{p_argc:08x}, 0x{p_argv:08x}, 0x{p_env:08x}, {do_wildcard})")
-        
+
         wargv = self._argv_array(True)
         self.emu.uc.mem_write(p_argc, struct.pack('<I', self._argc_count()))
         self.emu.uc.mem_write(p_argv, struct.pack('<I', wargv))
         self.emu.uc.mem_write(p_env, struct.pack(
             '<I', self._read_u32(self._ensure_env_ptr('_wenviron_ptr_addr', wide=True))))
         return 0
-    
+
     def api__p___argc(self, args):
         """__p___argc emulation"""
         if self._argc == 0:
@@ -1067,7 +1068,7 @@ class ComMixin:
         address = self._argv_variable(True)
         log.debug(f"__p___wargv() -> 0x{address:08x}")
         return address
-    
+
     def _amsg_exit(self, args):
         """_amsg_exit emulation - runtime error message and exit"""
         errnum = args[0]
@@ -1076,14 +1077,14 @@ class ComMixin:
         self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0
-    
+
     def _cexit(self, args):
         """_cexit emulation - run exit handlers without terminating"""
         log.debug("_cexit()")
         self.run_exit_handlers()
         self.flush_std_streams()
         return 0
-    
+
     def _exit(self, args):
         """_exit emulation - terminate without running exit handlers"""
         code = args[0]
@@ -1093,7 +1094,7 @@ class ComMixin:
         self.emu.detach_process()  # Ends with ExitProcess: the DLLs' DllMain
         self.emu.stop_emulation = True
         return 0
-    
+
     def exit(self, args):
         """exit emulation - run atexit handlers, flush, terminate"""
         code = args[0]
@@ -1105,20 +1106,20 @@ class ComMixin:
         self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0
-    
+
     def _XcptFilter(self, args):
         """_XcptFilter emulation - the CRT's last chance filter lets unhandled
         exceptions through (the emulator reports them)"""
         log.debug("_XcptFilter()")
         return 0  # EXCEPTION_CONTINUE_SEARCH
-    
+
     def _except_handler3(self, args):
         """_except_handler3(record, frame, context, dispatcher) emulation - when
         called directly (the exception dispatcher handles its frames itself)"""
         record, node, context = args[0], args[1], args[2]
         return self._frame_handler(record, node, context, lambda exc: (
             self._seh3_handle(node, exc) if exc else self._seh3_unwind_to(node, -1)))
-    
+
     def api__CxxFrameHandler3(self, args):
         """__CxxFrameHandler emulation - called directly (not by the exception
         dispatcher, which handles C++ frames itself): continue the search"""

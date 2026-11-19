@@ -253,7 +253,7 @@ def main():
         if gui:
             gui.stop()
         sys.exit(1)
-    
+
     def stop_programs():
         """Stop the running programs and wait for their emulation threads: the
         interpreter must not free a Unicorn instance that is still running"""

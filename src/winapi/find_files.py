@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: FindFirstFile / FindNextFile, computer and user names, tokens, system info"""
+"""WinAPIHandler mixin: FindFirstFile / FindNextFile, computer and user names, tokens,
+system info"""
 
 import sys
 import os
@@ -385,7 +386,7 @@ class FindFilesMixin:
             self.emu.uc.mem_write(lpNumberOfBytesRead, struct.pack('<I', len(data)))
 
         return 1
-    
+
     def ReadConsoleA(self, args, wide=False):
         """ReadConsoleA/W emulation - Read user input from console"""
         hConsoleInput = args[0]
@@ -442,10 +443,10 @@ class FindFilesMixin:
         lpName = args[0]
         lpBuffer = args[1]
         nSize = args[2]
-        
+
         name = self._read_text(lpName, wide)
         log.debug(f"GetEnvironmentVariable{'W' if wide else 'A'}(\"{name}\")")
-        
+
         value = self.environment.get(name.upper())
         if value is None:
             self._last_error = 203  # ERROR_ENVVAR_NOT_FOUND

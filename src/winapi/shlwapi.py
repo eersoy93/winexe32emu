@@ -922,7 +922,7 @@ class ShlwapiMixin:
             else:
                 hue = 160 + (red - green) * 40 / delta
             hue = int(round(hue)) % 240
-        for address, value in zip(args[1:4], (hue, luminance, saturation)):
+        for address, value in zip(args[1:4], (hue, luminance, saturation), strict=True):
             if address:
                 self._mem_write(address, struct.pack('<H', value))
         return 0

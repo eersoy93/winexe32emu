@@ -149,7 +149,7 @@ class ExeResourcesMixin:
             self._last_error = 5  # ERROR_ACCESS_DENIED: already has a console
             return 0
         return 1
-    
+
     def FreeConsole(self, args):
         """FreeConsole emulation"""
         log.debug("FreeConsole()")
@@ -157,7 +157,7 @@ class ExeResourcesMixin:
             self._last_error = 6  # ERROR_INVALID_HANDLE
             return 0
         return 1
-    
+
     def GetStdHandle(self, args):
         """GetStdHandle emulation"""
         nStdHandle = args[0]
@@ -169,7 +169,7 @@ class ExeResourcesMixin:
         # Convert signed values for 32-bit
         if nStdHandle > 0x80000000:
             nStdHandle = nStdHandle - 0x100000000
-        
+
         name = handle_names.get(nStdHandle & 0xFFFFFFFF, f"Unknown({nStdHandle})")
         log.debug(f"GetStdHandle({name})")
         if (nStdHandle & 0xFFFFFFFF) in self.std_handles:  # SetStdHandle
@@ -202,14 +202,14 @@ class ExeResourcesMixin:
     def SetHandleCount(self, args):
         """SetHandleCount emulation - Win32 has no handle limit, returns the request"""
         return args[0]
-    
+
     def WriteFile(self, args):
         """WriteFile emulation"""
         hFile = args[0]
         lpBuffer = args[1]
         nNumberOfBytesToWrite = args[2]
         lpNumberOfBytesWritten = args[3]
-        
+
         try:
             data = self.emu.uc.mem_read(lpBuffer, nNumberOfBytesToWrite)
             bytes_written = nNumberOfBytesToWrite
@@ -247,14 +247,14 @@ class ExeResourcesMixin:
         except Exception as e:
             log.error(f"WriteFile error: {e}")
             return 0
-    
+
     def WriteConsoleA(self, args, wide=False):
         """WriteConsoleA/W emulation"""
         hConsoleOutput = args[0]
         lpBuffer = args[1]
         nNumberOfCharsToWrite = args[2]
         lpNumberOfCharsWritten = args[3]
-        
+
         try:
             if wide:
                 data = self.emu.uc.mem_read(lpBuffer, nNumberOfCharsToWrite * 2)
@@ -265,7 +265,7 @@ class ExeResourcesMixin:
             log.program_output("CONSOLE", text)
             self.console_output.append(text)
             self.console_write(text)
-            
+
             if lpNumberOfCharsWritten != 0:
                 self.emu.uc.mem_write(lpNumberOfCharsWritten,
                                       struct.pack('<I', nNumberOfCharsToWrite))
@@ -338,7 +338,7 @@ class ExeResourcesMixin:
             return 0
         self.emu.uc.mem_write(lpMultiByteStr, out)
         return len(out)
-    
+
     def GetLastError(self, args):
         """GetLastError emulation"""
         log.debug(f"GetLastError() -> {self._last_error}")
@@ -489,8 +489,9 @@ class ExeResourcesMixin:
         dwSize = args[1]
         flAllocationType = args[2]
         flProtect = args[3]
-        
-        log.debug(f"VirtualAlloc(0x{lpAddress:08x}, 0x{dwSize:x}, 0x{flAllocationType:x}, 0x{flProtect:x})")
+
+        log.debug(f"VirtualAlloc(0x{lpAddress:08x}, 0x{dwSize:x}, 0x{flAllocationType:x}, "
+                  f"0x{flProtect:x})")
 
         MEM_COMMIT, MEM_RESERVE = 0x1000, 0x2000
         if dwSize == 0 or (flAllocationType & MEM_COMMIT and
@@ -583,7 +584,7 @@ class ExeResourcesMixin:
         self.virtual_allocs[base] = size
         self.mapped_virtual_allocs.add(base)
         return base
-    
+
     def VirtualFree(self, args):
         """VirtualFree emulation"""
         lpAddress = args[0]
@@ -616,22 +617,22 @@ class ExeResourcesMixin:
                 self._last_error = 487
                 return 0
         return 1
-    
+
     def HeapCreate(self, args):
         """HeapCreate emulation"""
         log.debug("HeapCreate()")
         return self.get_next_handle()
-    
+
     def HeapAlloc(self, args):
         """HeapAlloc emulation"""
         hHeap = args[0]
         dwFlags = args[1]
         dwBytes = args[2]
-        
+
         addr = self.emu.heap_alloc(dwBytes)
         log.debug(f"HeapAlloc(0x{hHeap:x}, 0x{dwFlags:x}, 0x{dwBytes:x}) -> 0x{addr:08x}")
         return addr
-    
+
     def HeapFree(self, args):
         """HeapFree emulation"""
         lpMem = args[2]

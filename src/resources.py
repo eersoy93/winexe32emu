@@ -302,4 +302,4 @@ def read_exe_icon(host_path, size=32):
 
 
 # Last: winapi (through gui) imports this module too
-from . import winapi
+from . import winapi  # noqa: E402

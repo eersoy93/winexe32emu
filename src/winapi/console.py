@@ -107,13 +107,13 @@ class ConsoleMixin:
         resolvers.update(self._crt_variable_resolvers())
         resolver = resolvers.get(name)
         return resolver() if resolver else None
-        
+
     def get_next_handle(self):
         """Create new handle"""
         handle = self.next_handle
         self.next_handle += 4
         return handle
-    
+
     def _read_until_null(self, address, max_bytes, unit):
         """Read up to max_bytes from emulated memory, stopping at a NUL unit.
 
@@ -164,7 +164,7 @@ class ConsoleMixin:
     def read_string(self, address, max_len=0x10000):
         """Read null-terminated ANSI string from memory"""
         return self.read_cstring(address, max_len).decode(config.ANSI_CODEPAGE, errors='replace')
-    
+
     def read_wide_string(self, address, max_len=0x8000):
         """Read wide string (UTF-16) from memory"""
         if not address:

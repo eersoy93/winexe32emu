@@ -42,7 +42,7 @@ class CrtMiscMixin:
 
     @staticmethod
     def _cmp_units(a, b):
-        for x, y in zip(a, b):
+        for x, y in zip(a, b, strict=False):
             if x != y:
                 return -1 if x < y else 1
         if len(a) != len(b):
@@ -605,7 +605,8 @@ class CrtMiscMixin:
 
     def _ui64toa(self, args):
         """_ui64toa emulation"""
-        self._write_units(args[2], self._int_to_units(self._arg_qword(args, 0), args[3], False), False)
+        units = self._int_to_units(self._arg_qword(args, 0), args[3], False)
+        self._write_units(args[2], units, False)
         return args[2]
 
     def _i64tow(self, args):
@@ -694,7 +695,7 @@ class CrtMiscMixin:
         directory, name = rest[:cut], rest[cut:]
         dot = name.rfind('.')
         fname, ext = (name[:dot], name[dot:]) if dot != -1 else (name, '')
-        for addr, part in zip(args[1:5], (drive, directory, fname, ext)):
+        for addr, part in zip(args[1:5], (drive, directory, fname, ext), strict=True):
             if addr:
                 self._write_units(addr, self._text_units(part, False), False)
         return 0
@@ -786,7 +787,8 @@ class CrtMiscMixin:
                 rest = line[end + 1:] if end != -1 else ''
             else:
                 rest = line.partition(' ')[2]
-            self._crt_static[key] = self._alloc_units(self._text_units(rest.lstrip(' \t'), wide), wide)
+            units = self._text_units(rest.lstrip(' \t'), wide)
+            self._crt_static[key] = self._alloc_units(units, wide)
         return self._crt_static[key]
 
     # ---- Process control and signals ----
@@ -1129,7 +1131,7 @@ class CrtMiscMixin:
             spec = fmt[i]
             i += 1
 
-            def num(value, width=2):
+            def num(value, width=2, alt=alt):
                 return str(value) if alt else str(value).zfill(width)
 
             values = {
@@ -1142,7 +1144,8 @@ class CrtMiscMixin:
                 'U': num(week(0)), 'W': num(week(1)), 'w': str(wday),
                 'y': num(year % 100), 'Y': str(year), 'C': num(year // 100),
                 'Z': tz_name,
-                'z': f"{'+' if tz_minutes >= 0 else '-'}{abs(tz_minutes) // 60:02d}{abs(tz_minutes) % 60:02d}",
+                'z': (f"{'+' if tz_minutes >= 0 else '-'}"
+                      f"{abs(tz_minutes) // 60:02d}{abs(tz_minutes) % 60:02d}"),
                 'n': '\n', 't': '\t', '%': '%',
                 'D': f"{mon + 1:02d}/{mday:02d}/{year % 100:02d}",
                 'F': f"{year}-{mon + 1:02d}-{mday:02d}",

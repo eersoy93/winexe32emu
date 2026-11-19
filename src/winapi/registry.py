@@ -419,7 +419,7 @@ class RegistryMixin:
 
     def RegEnumValueW(self, args):
         return self.RegEnumValueA(args, wide=True)
-    
+
 
     # ---------- Key trees and the older and newer registry APIs ----------
 
@@ -573,7 +573,7 @@ class RegistryMixin:
                                    default=0),
                   max((len(self._registry_value_bytes(v, wide)) for v in values), default=0),
                   0)
-        for address, count in zip(args[4:11], counts):
+        for address, count in zip(args[4:11], counts, strict=True):
             if address:
                 self._mem_write(address, struct.pack('<I', count))
         if args[11]:

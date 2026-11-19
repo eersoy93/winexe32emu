@@ -260,7 +260,7 @@ class Kernel32ExtraMixin:
     def RtlGetNtVersionNumbers(self, args):
         """RtlGetNtVersionNumbers(&major, &minor, &build)"""
         values = (self.OS_VERSION[0], self.OS_VERSION[1], self.OS_VERSION[2] | 0xF0000000)
-        for address, value in zip(args[:3], values):
+        for address, value in zip(args[:3], values, strict=True):
             if address:
                 self._mem_write(address, struct.pack('<I', value))
         return 0
@@ -370,7 +370,7 @@ class Kernel32ExtraMixin:
         user = int(time.process_time() * 10000000)
         elapsed = int((time.time() - start) * 10000000)
         idle = max(0, elapsed - user)
-        for address, value in zip(args[:3], (idle, idle, user)):
+        for address, value in zip(args[:3], (idle, idle, user), strict=True):
             if address:
                 self._mem_write(address, struct.pack('<Q', value))
         return 1
@@ -455,7 +455,7 @@ class Kernel32ExtraMixin:
             self._last_error = 5
             return 0
         times = struct.unpack('<3Q', data[4:28])
-        for address, value in zip(args[1:4], times):
+        for address, value in zip(args[1:4], times, strict=True):
             if address:
                 self._mem_write(address, struct.pack('<Q', value))
         return 1
@@ -961,7 +961,7 @@ class Kernel32ExtraMixin:
         """RtlCompareMemory(a, b, length) - the length of the equal prefix"""
         first = bytes(self.emu.uc.mem_read(args[0], args[2])) if args[2] else b''
         second = bytes(self.emu.uc.mem_read(args[1], args[2])) if args[2] else b''
-        for i, (x, y) in enumerate(zip(first, second)):
+        for i, (x, y) in enumerate(zip(first, second, strict=False)):
             if x != y:
                 return i
         return args[2]

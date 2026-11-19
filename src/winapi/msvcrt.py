@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: msvcrt: character classes, string functions, stdio, variables (the "C" locale)"""
+"""WinAPIHandler mixin: msvcrt: character classes, string functions, stdio, variables
+(the "C" locale)"""
 
 import os
 import struct
@@ -232,7 +233,8 @@ class MsvcrtMixin:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s[::-1].encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+            data = s[::-1].encode(config.ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(s_addr, data + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -242,7 +244,8 @@ class MsvcrtMixin:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s.lower().encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+            data = s.lower().encode(config.ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(s_addr, data + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -252,7 +255,8 @@ class MsvcrtMixin:
         s_addr = args[0]
         s = self.read_string(s_addr)
         try:
-            self.emu.uc.mem_write(s_addr, s.upper().encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+            data = s.upper().encode(config.ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(s_addr, data + b'\x00')
         except Exception:
             pass
         return s_addr
@@ -372,7 +376,8 @@ class MsvcrtMixin:
                 v //= radix
             text = ('-' + out) if neg else out
         try:
-            self.emu.uc.mem_write(buf, text.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+            data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(buf, data + b'\x00')
         except Exception:
             pass
         return buf
@@ -399,7 +404,8 @@ class MsvcrtMixin:
                 v //= radix
             text = out
         try:
-            self.emu.uc.mem_write(buf, text.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
+            data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+            self.emu.uc.mem_write(buf, data + b'\x00')
         except Exception:
             pass
         return buf
@@ -514,7 +520,8 @@ class MsvcrtMixin:
             if as_wide == wide_src:
                 text_units = list(units)
             elif as_wide:
-                raw = bytes(units).decode(config.ANSI_CODEPAGE, errors='replace').encode('utf-16-le')
+                text = bytes(units).decode(config.ANSI_CODEPAGE, errors='replace')
+                raw = text.encode('utf-16-le')
                 text_units = list(struct.unpack(f'<{len(raw) // 2}H', raw))
             else:
                 text = ''.join(chr(u) for u in units)
@@ -674,7 +681,8 @@ class MsvcrtMixin:
                 if not suppress:
                     ptr = next_arg()
                     if ptr:
-                        self._mem_write(ptr, struct.pack('<d' if length in ('l', 'L') else '<f', value))
+                        fmt = '<d' if length in ('l', 'L') else '<f'
+                        self._mem_write(ptr, struct.pack(fmt, value))
                     assigned += 1
             elif conv in 'cCsS[':
                 as_wide = self._wide_spec(conv if conv != '[' else 's', length, wide_fmt)
@@ -893,7 +901,8 @@ class MsvcrtMixin:
         if fp is None:
             return 0xFFFFFFFF
         try:
-            fp.seek(offset, {0: os.SEEK_SET, 1: os.SEEK_CUR, 2: os.SEEK_END}.get(whence, os.SEEK_SET))
+            origin = {0: os.SEEK_SET, 1: os.SEEK_CUR, 2: os.SEEK_END}.get(whence, os.SEEK_SET)
+            fp.seek(offset, origin)
             return 0
         except OSError:
             return 0xFFFFFFFF
@@ -1073,12 +1082,12 @@ class MsvcrtMixin:
             except OSError:
                 return 0xFFFFFFFF
         return 0
-    
+
     def api__iob_func(self, args):
         """__iob_func emulation - stdin/stdout/stderr file handles"""
         log.debug("__iob_func()")
         return self._ensure_iob()
-    
+
     def api__acrt_iob_func(self, args):
         """__acrt_iob_func emulation - UCRT version"""
         index = args[0]
@@ -1155,7 +1164,7 @@ class MsvcrtMixin:
     def _crt_variable_api_map(self):
         """The __p__ accessors and helper functions of the msvcrt variables"""
         variables = self._crt_variable_resolvers()
-        api = {f'__p_{name}': (lambda resolve: lambda args: resolve())(resolve)
+        api = {f'__p_{name}': (lambda args, resolve=resolve: resolve())
                for name, resolve in variables.items()}
         api.update({
             '__p__iob': self.api__iob_func,
@@ -1195,7 +1204,7 @@ class MsvcrtMixin:
     def _wassert(self, args):
         return self._assert_common(self.read_wide_string(args[0]),
                                    self.read_wide_string(args[1]), args[2])
-    
+
     def _errno(self, args):
         """_errno emulation - address of the thread's errno variable"""
         if self._errno_addr == 0:
@@ -1227,7 +1236,7 @@ class MsvcrtMixin:
         elif fd == 2:
             return 0x12
         return 0xFFFFFFFF  # INVALID_HANDLE_VALUE
-    
+
     def _ismbblead(self, args):
         """_ismbblead emulation - no multibyte lead bytes in the C locale"""
         return 0
@@ -1237,14 +1246,14 @@ class MsvcrtMixin:
         fd = args[0]
         log.debug(f"_isatty({fd})")
         return 1 if fd in [0, 1, 2] else 0
-    
+
     def _setmode(self, args):
         """_setmode emulation"""
         fd = args[0]
         mode = args[1]
         log.debug(f"_setmode({fd}, 0x{mode:x})")
         return mode  # Previous mode
-    
+
     # Memory functions
     def malloc(self, args):
         """malloc emulation"""
@@ -1252,7 +1261,7 @@ class MsvcrtMixin:
         addr = self.emu.heap_alloc_small(size)
         log.debug(f"malloc({size}) -> 0x{addr:08x}")
         return addr
-    
+
     def calloc(self, args):
         """calloc emulation"""
         num = args[0]
@@ -1263,7 +1272,7 @@ class MsvcrtMixin:
         addr = self.emu.heap_alloc(total)
         log.debug(f"calloc({num}, {size}) -> 0x{addr:08x}")
         return addr  # heap_alloc memory is already zeroed
-    
+
     def realloc(self, args):
         """realloc emulation - preserves the old block's contents"""
         ptr = args[0]
@@ -1290,7 +1299,7 @@ class MsvcrtMixin:
         self.emu.heap_free(ptr)
         log.debug(f"realloc(0x{ptr:08x}, {size}) -> 0x{addr:08x}")
         return addr
-    
+
     def free(self, args):
         """free emulation"""
         ptr = args[0]
