@@ -14,7 +14,7 @@
 
 """WinAPIHandler mixin: Console windows and I/O, exit handlers, guest strings"""
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..logger import log

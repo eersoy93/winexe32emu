@@ -21,7 +21,7 @@ import re
 import struct
 import time
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..config import USER_NAME
@@ -378,7 +378,7 @@ class FindFilesMixin:
         if data:
             try:
                 self.emu.uc.mem_write(lpBuffer, data)
-            except Exception as e:
+            except UcError as e:
                 log.error(f"ReadFile mem_write error: {e}")
                 return 0
 

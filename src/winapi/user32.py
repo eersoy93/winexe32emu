@@ -17,7 +17,7 @@ longs, system colors"""
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..logger import log
@@ -345,11 +345,8 @@ class User32Mixin:
                 success = 0
                 value = 0
 
-        if lpTranslated:
-            try:
-                self.emu.uc.mem_write(lpTranslated, struct.pack('<I', success))
-            except Exception:
-                pass
+        if lpTranslated and not self._mem_write(lpTranslated, struct.pack('<I', success)):
+            log.warning(f"GetDlgItemInt: cannot write to 0x{lpTranslated:08x}")
 
         log.debug(f"GetDlgItemInt(0x{hDlg:x}, {nIDDlgItem}) -> {value} (ok={success})")
         return value & 0xFFFFFFFF

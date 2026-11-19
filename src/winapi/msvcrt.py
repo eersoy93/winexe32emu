@@ -20,7 +20,7 @@ import struct
 import time
 from functools import cmp_to_key
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..guest import ConsoleStream, _ScanSource
@@ -111,32 +111,17 @@ class MsvcrtMixin:
         """strchr emulation - pointer to first occurrence of a char (or NULL)"""
         s_addr = args[0]
         c = args[1] & 0xFF
-        try:
-            data = self.emu.uc.mem_read(s_addr, 4096)
-        except Exception:
-            return 0
-        end = data.find(b'\x00')
-        limit = len(data) if end == -1 else end + 1  # include terminator (c may be 0)
-        for i in range(limit):
-            if data[i] == c:
-                return s_addr + i
-        return 0
+        data = self.read_cstring(s_addr) + b'\x00'  # c may be the terminator
+        idx = data.find(bytes([c]))
+        return s_addr + idx if s_addr and idx != -1 else 0
 
     def strrchr(self, args):
         """strrchr emulation - pointer to last occurrence of a char (or NULL)"""
         s_addr = args[0]
         c = args[1] & 0xFF
-        try:
-            data = self.emu.uc.mem_read(s_addr, 4096)
-        except Exception:
-            return 0
-        end = data.find(b'\x00')
-        limit = len(data) if end == -1 else end + 1
-        found = -1
-        for i in range(limit):
-            if data[i] == c:
-                found = i
-        return (s_addr + found) if found != -1 else 0
+        data = self.read_cstring(s_addr) + b'\x00'
+        idx = data.rfind(bytes([c]))
+        return s_addr + idx if s_addr and idx != -1 else 0
 
     def strstr(self, args):
         """strstr emulation - pointer to first occurrence of a substring"""
@@ -154,16 +139,16 @@ class MsvcrtMixin:
     def strncmp(self, args):
         """strncmp emulation"""
         n = args[2]
-        try:
-            d1 = bytes(self.emu.uc.mem_read(args[0], n))
-            d2 = bytes(self.emu.uc.mem_read(args[1], n))
-        except Exception:
+        if n == 0:
             return 0
-        # Compare up to n bytes, stopping at a shared null terminator
-        for i in range(n):
-            a, b = d1[i], d2[i]
+        # Up to n bytes of each string (the terminator compares too); n may
+        # be far bigger than the strings (strncmp(a, b, SIZE_MAX))
+        limit = min(n, 0x10000)
+        d1 = self.read_cstring(args[0], limit)[:limit] + b'\x00'
+        d2 = self.read_cstring(args[1], limit)[:limit] + b'\x00'
+        for a, b in zip(d1[:n], d2[:n], strict=False):
             if a != b:
-                return -1 if a < b else 1
+                return 0xFFFFFFFF if a < b else 1
             if a == 0:
                 break
         return 0
@@ -232,33 +217,27 @@ class MsvcrtMixin:
         """_strrev emulation - reverse a string in place"""
         s_addr = args[0]
         s = self.read_string(s_addr)
-        try:
-            data = s[::-1].encode(config.ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(s_addr, data + b'\x00')
-        except Exception:
-            pass
+        data = s[::-1].encode(config.ANSI_CODEPAGE, errors='replace')
+        if not self._mem_write(s_addr, data + b'\x00'):
+            log.warning(f"String function: cannot write to 0x{s_addr:08x}")
         return s_addr
 
     def _strlwr(self, args):
         """_strlwr emulation - lowercase in place"""
         s_addr = args[0]
         s = self.read_string(s_addr)
-        try:
-            data = s.lower().encode(config.ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(s_addr, data + b'\x00')
-        except Exception:
-            pass
+        data = s.lower().encode(config.ANSI_CODEPAGE, errors='replace')
+        if not self._mem_write(s_addr, data + b'\x00'):
+            log.warning(f"String function: cannot write to 0x{s_addr:08x}")
         return s_addr
 
     def _strupr(self, args):
         """_strupr emulation - uppercase in place"""
         s_addr = args[0]
         s = self.read_string(s_addr)
-        try:
-            data = s.upper().encode(config.ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(s_addr, data + b'\x00')
-        except Exception:
-            pass
+        data = s.upper().encode(config.ANSI_CODEPAGE, errors='replace')
+        if not self._mem_write(s_addr, data + b'\x00'):
+            log.warning(f"String function: cannot write to 0x{s_addr:08x}")
         return s_addr
 
     def _strdup(self, args):
@@ -281,7 +260,8 @@ class MsvcrtMixin:
         n = args[2]
         try:
             data = self.emu.uc.mem_read(s_addr, n)
-        except Exception:
+        except UcError:
+            log.warning(f"memchr: cannot read 0x{s_addr:08x} (+{n})")
             return 0
         idx = data.find(bytes([c]))
         return (s_addr + idx) if idx != -1 else 0
@@ -331,11 +311,9 @@ class MsvcrtMixin:
         base = args[2]
         text = self.read_string(nptr)
         value, consumed = self._parse_c_integer(text, base)
-        if endptr:
-            try:
-                self.emu.uc.mem_write(endptr, struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF))
-            except Exception:
-                pass
+        if endptr and not self._mem_write(endptr,
+                                          struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF)):
+            log.warning(f"strtol/strtoul: cannot write the end pointer to 0x{endptr:08x}")
         # Clamp to signed long range
         if value > 0x7FFFFFFF:
             value = 0x7FFFFFFF
@@ -350,11 +328,9 @@ class MsvcrtMixin:
         base = args[2]
         text = self.read_string(nptr)
         value, consumed = self._parse_c_integer(text, base)
-        if endptr:
-            try:
-                self.emu.uc.mem_write(endptr, struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF))
-            except Exception:
-                pass
+        if endptr and not self._mem_write(endptr,
+                                          struct.pack('<I', (nptr + consumed) & 0xFFFFFFFF)):
+            log.warning(f"strtol/strtoul: cannot write the end pointer to 0x{endptr:08x}")
         return value & 0xFFFFFFFF
 
     def _itoa(self, args):
@@ -375,11 +351,9 @@ class MsvcrtMixin:
                 out = digs[v % radix] + out
                 v //= radix
             text = ('-' + out) if neg else out
-        try:
-            data = text.encode(config.ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(buf, data + b'\x00')
-        except Exception:
-            pass
+        data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+        if not self._mem_write(buf, data + b'\x00'):
+            log.warning(f"Integer to string: cannot write to 0x{buf:08x}")
         return buf
 
     def itoa(self, args):
@@ -403,11 +377,9 @@ class MsvcrtMixin:
                 out = digs[v % radix] + out
                 v //= radix
             text = out
-        try:
-            data = text.encode(config.ANSI_CODEPAGE, errors='replace')
-            self.emu.uc.mem_write(buf, data + b'\x00')
-        except Exception:
-            pass
+        data = text.encode(config.ANSI_CODEPAGE, errors='replace')
+        if not self._mem_write(buf, data + b'\x00'):
+            log.warning(f"Integer to string: cannot write to 0x{buf:08x}")
         return buf
 
     def qsort(self, args):
@@ -427,7 +399,8 @@ class MsvcrtMixin:
         try:
             elements = [bytes(self.emu.uc.mem_read(base + i * size, size))
                         for i in range(num)]
-        except Exception:
+        except UcError:
+            log.warning(f"qsort: cannot read the array at 0x{base:08x}")
             return 0
 
         # Two scratch buffers for the comparator arguments
@@ -435,21 +408,20 @@ class MsvcrtMixin:
         buf_b = self.emu.heap_alloc(size)
 
         def cmp(a, b):
-            try:
-                self.emu.uc.mem_write(buf_a, a)
-                self.emu.uc.mem_write(buf_b, b)
-            except Exception:
-                return 0
+            self.emu.uc.mem_write(buf_a, a)
+            self.emu.uc.mem_write(buf_b, b)
             r = self.emu.call_callback(compar, [buf_a, buf_b])
             # Return value is a signed int
             if r >= 0x80000000:
                 r -= 0x100000000
             return r
 
+        # An exception the comparison function throws (GuestUnwind) goes on
+        # to the program's handler
         try:
             elements.sort(key=cmp_to_key(cmp))
             self.emu.uc.mem_write(base, b''.join(elements))
-        except Exception as e:
+        except UcError as e:
             log.warning(f"qsort failed: {e}")
         finally:
             self.emu.heap_free(buf_a)
@@ -847,7 +819,7 @@ class MsvcrtMixin:
         if data:
             try:
                 self.emu.uc.mem_write(ptr, data)
-            except Exception as e:
+            except UcError as e:
                 log.error(f"fread mem_write error: {e}")
                 return 0
         return len(data) // size  # count of complete elements read
@@ -869,7 +841,7 @@ class MsvcrtMixin:
         fp = self._p_stream(stream)
         try:
             data = bytes(self.emu.uc.mem_read(ptr, total))
-        except Exception as e:
+        except UcError as e:
             log.error(f"fwrite mem_read error: {e}")
             return 0
 
@@ -1050,7 +1022,7 @@ class MsvcrtMixin:
         out += b'\x00'
         try:
             self.emu.uc.mem_write(buf, bytes(out))
-        except Exception as e:
+        except UcError as e:
             log.error(f"fgets mem_write error: {e}")
             return 0
         return buf

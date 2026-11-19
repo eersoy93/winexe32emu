@@ -21,7 +21,7 @@ import struct
 import threading
 import time
 
-from unicorn import *
+from unicorn import UC_PROT_EXEC, UC_PROT_READ, UC_PROT_WRITE, UcError
 
 from .. import winapi
 from ..guest import QWordResult

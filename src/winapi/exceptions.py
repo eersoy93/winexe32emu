@@ -18,8 +18,11 @@ security cookie"""
 import re
 import struct
 
-from unicorn import *
-from unicorn.x86_const import *
+from unicorn import UcError
+from unicorn.x86_const import (UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX, UC_X86_REG_EBP,
+                               UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
+                               UC_X86_REG_EFLAGS, UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_ESI,
+                               UC_X86_REG_ESP, UC_X86_REG_FS, UC_X86_REG_GS, UC_X86_REG_SS)
 
 from ..guest import ApiJump
 from ..logger import log

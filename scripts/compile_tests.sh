@@ -93,6 +93,10 @@ for src in tests/*_dll.c tests/*.c; do
             # the DLL itself), loads copies of it, page protections
             LIBS="-lkernel32 -mconsole ${OUT_DIR}/loader_test_dll.dll"
             ;;
+        gui_test)
+            # GUI application - a window, controls and messages on the fake desktop
+            LIBS="-lkernel32 -luser32 -lgdi32 -mconsole"
+            ;;
         compat_test)
             # Console application - file names, devices, system DLL images,
             # the PEB, static TLS and TLS callbacks

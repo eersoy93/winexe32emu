@@ -18,7 +18,7 @@ import re
 import struct
 import time
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..logger import log

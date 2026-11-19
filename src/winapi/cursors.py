@@ -18,7 +18,7 @@ import os
 import struct
 
 import pefile
-from unicorn import *
+from unicorn import UcError
 
 from .. import resources
 from ..logger import log

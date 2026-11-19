@@ -20,7 +20,7 @@ drives sandbox it never reaches the host: names resolve only to itself
 import ipaddress
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 
 class NetworkMixin:

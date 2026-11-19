@@ -17,7 +17,7 @@
 import struct
 
 from colorama import Fore, Style
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, windows
 from ..logger import log
@@ -399,13 +399,35 @@ class User32WindowsMixin:
             self.painted_windows.discard(hWnd)
             self.window_longs.pop(hWnd, None)
         elif self.gui and hWnd in self.gui.windows:
+            # Like Windows: WM_DESTROY is sent at once, while the window still
+            # exists, then the window and its children are gone (IsWindow is
+            # FALSE, its pending messages are dropped)
+            wndproc = self._find_wndproc_for_hwnd(hWnd)
+            if wndproc:
+                self._call_proc(wndproc, hWnd, self.WM_DESTROY, 0, 0)
             self.gui._close_window(hWnd, notify_app=False)
-            # Deliver WM_DESTROY via the queue: a synchronous call here would
-            # nest emu_start inside an already-running callback
-            if self._find_wndproc_for_hwnd(hWnd):
-                self.post_window_message(hWnd, self.WM_DESTROY, 0, 0)
+            with self.gui.lock:
+                gone = self._window_and_children(hWnd)
+                self.gui._remove_window(hWnd)
+            with self.message_lock:
+                self.message_queue[:] = [m for m in self.message_queue if m['hwnd'] not in gone]
+            for handle in gone:
+                self.painted_windows.discard(handle)
+                self.window_longs.pop(handle, None)
+        elif self.gui:
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
 
         return 1
+
+    def _window_and_children(self, hwnd):
+        """A window's handle and those of its child windows and controls"""
+        handles = {hwnd}
+        win = self.gui.windows.get(hwnd)
+        for child in (win.children if win else []):
+            handles |= self._window_and_children(child)
+        handles |= {h for h, c in self.gui.controls.items() if c.parent_hwnd == hwnd}
+        return handles
 
     def SetWindowTextA(self, args, wide=False):
         """SetWindowTextA/W emulation"""

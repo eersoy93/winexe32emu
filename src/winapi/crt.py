@@ -18,7 +18,7 @@ import re
 import struct
 import math
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, winapi
 from ..guest import QWordResult, X87Result

@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
@@ -181,14 +182,6 @@ class ApiBindingTest(unittest.TestCase):
         self.assertIsNone(handler.stack_cleanup_bytes('kernel32.dll', 'NoSuchApi'))
 
 
-class UnicornStateTest(unittest.TestCase):
-    """The Unicorn internals the emulator depends on (a Unicorn upgrade may
-    move them: requirements.txt pins the version)"""
-
-    def test_exception_state_offset_is_found(self):
-        self.assertIsNotNone(CPUEmulator._find_exception_state_offset())
-
-
 class SandboxTest(unittest.TestCase):
     def test_paths_stay_in_their_drive(self):
         for name, letter in ((r'C:\Windows\..\..\..\etc\passwd', 'C'), (r'..\..\x', 'C'),
@@ -259,6 +252,111 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(strip_win32_path_prefix(r'\\.\C:\x'), r'C:\x')
         self.assertIsNone(strip_win32_path_prefix(r'\\?\UNC\server\x'))
         self.assertEqual(strip_win32_path_prefix(r'C:\x'), r'C:\x')
+
+
+class SymlinkSandboxTest(unittest.TestCase):
+    def test_symlink_out_of_a_drive_is_blocked(self):
+        os.makedirs(C_DRIVE_PATH, exist_ok=True)
+        with tempfile.TemporaryDirectory() as outside:
+            link = os.path.join(C_DRIVE_PATH, 'SymlinkTest')
+            try:
+                os.symlink(outside, link)
+            except (OSError, NotImplementedError):
+                self.skipTest("no symbolic links")
+            try:
+                self.assertIsNone(resolve_drive_path(r'C:\SymlinkTest\x.txt'))
+                self.assertIsNone(resolve_drive_path(r'c:\symlinktest'))
+            finally:
+                os.remove(link)
+
+
+class PageProtectionTest(unittest.TestCase):
+    def test_permissions(self):
+        from unicorn import UC_PROT_ALL, UC_PROT_EXEC, UC_PROT_NONE, UC_PROT_READ, UC_PROT_WRITE
+        emu = CPUEmulator.__new__(CPUEmulator)
+        emu.dep_enabled = True
+        self.assertEqual(emu.uc_permissions(0x04), UC_PROT_READ | UC_PROT_WRITE)
+        self.assertEqual(emu.uc_permissions(0x02), UC_PROT_READ)
+        self.assertEqual(emu.uc_permissions(0x20), UC_PROT_READ | UC_PROT_EXEC)
+        self.assertEqual(emu.uc_permissions(0x40), UC_PROT_ALL)
+        self.assertEqual(emu.uc_permissions(0x01), UC_PROT_NONE)
+        self.assertEqual(emu.uc_permissions(0x04 | 0x100), UC_PROT_NONE)  # PAGE_GUARD
+        self.assertEqual(emu.uc_permissions(0), UC_PROT_NONE)  # reserved
+        emu.dep_enabled = False  # Without DEP readable memory executes
+        self.assertEqual(emu.uc_permissions(0x04), UC_PROT_ALL)
+        self.assertEqual(emu.uc_permissions(0x02), UC_PROT_READ | UC_PROT_EXEC)
+
+    def test_valid_protection(self):
+        valid = WinAPIHandler.valid_protection
+        for protection in (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x104, 0x204):
+            self.assertTrue(valid(protection), hex(protection))
+        for protection in (0, 0x03, 0x06, 0x100, 0x1004):
+            self.assertFalse(valid(protection), hex(protection))
+
+    def test_recorded_ranges_split(self):
+        handler = bare_handler()
+        handler.page_protections = []
+        handler.record_protection(0x10000, 0x14000, 0x04)
+        handler.record_protection(0x11000, 0x12000, 0x02)
+        self.assertEqual(handler._page_protection(0x10000), 0x04)
+        self.assertEqual(handler._page_protection(0x11000), 0x02)
+        self.assertEqual(handler._page_protection(0x13000), 0x04)
+        self.assertEqual(handler._page_protection(0x20000), 0x40)  # not recorded: RWX
+        handler.record_protection(0x10000, 0x14000, 0x40)  # back to the default
+        self.assertEqual(handler.page_protections, [])
+
+    def test_section_protections(self):
+        protections = CPUEmulator._SECTION_PROTECTIONS
+        self.assertEqual(protections[(1, 1, 0)], 0x20)  # .text: PAGE_EXECUTE_READ
+        self.assertEqual(protections[(0, 1, 0)], 0x02)  # .rdata: PAGE_READONLY
+        self.assertEqual(protections[(0, 1, 1)], 0x08)  # .data: PAGE_WRITECOPY
+        self.assertEqual(len(protections), 8)
+
+
+class MissingApiReportTest(unittest.TestCase):
+    def test_report_file(self):
+        class Loader:
+            filepath = '/x/prog.exe'
+        emu = CPUEmulator.__new__(CPUEmulator)
+        emu.missing_apis, emu.pe_loader, emu.api_handler = {}, Loader(), None
+        emu.note_missing_api('KERNEL32.dll', 'NoSuchApi', 'called, returned 0')
+        emu.note_missing_api('kernel32.dll', 'NoSuchApi', 'called, returned 0')
+        emu.note_missing_api('user32.dll', 'Other', 'GetProcAddress returned NULL')
+        with tempfile.TemporaryDirectory() as folder:
+            CPUEmulator.missing_apis_file = os.path.join(folder, 'missing.txt')
+            try:
+                emu.report_missing_apis()
+                with open(CPUEmulator.missing_apis_file, encoding='utf-8') as f:
+                    lines = f.read().splitlines()
+            finally:
+                CPUEmulator.missing_apis_file = None
+        self.assertEqual(lines, ['?\tkernel32.dll!NoSuchApi: called, returned 0 (2 times)',
+                                 '?\tuser32.dll!Other: GetProcAddress returned NULL'])
+
+
+class MessageQueueTest(unittest.TestCase):
+    def test_coalescing(self):
+        handler = bare_handler()
+        handler.message_queue, handler.message_lock = [], threading.Lock()
+        post = handler.post_window_message
+        post(1, handler.WM_MOUSEMOVE, 0, 1)
+        post(1, handler.WM_MOUSEMOVE, 0, 2)  # replaces the pending one
+        post(2, handler.WM_MOUSEMOVE, 0, 3)  # another window
+        post(1, handler.WM_SETCURSOR, 1, 0)
+        post(1, 0x0100, 0x41, 0)  # WM_KEYDOWN
+        post(1, handler.WM_SETCURSOR, 1, 1)  # only the latest per window stays
+        self.assertEqual([(m['hwnd'], m['message'], m['lParam']) for m in handler.message_queue],
+                         [(1, 0x200, 2), (2, 0x200, 3), (1, 0x100, 0), (1, 0x20, 1)])
+        post(-1, 0x10, -1, 0)  # values are 32-bit
+        self.assertEqual(handler.message_queue[-1]['hwnd'], 0xFFFFFFFF)
+        self.assertEqual(handler.message_queue[-1]['wParam'], 0xFFFFFFFF)
+
+
+class ProcessIdTest(unittest.TestCase):
+    def test_unique_ids(self):
+        ids = [CPUEmulator.allocate_id() for _ in range(100)]
+        self.assertEqual(len(set(ids)), 100)
+        self.assertTrue(all(i % 4 == 0 for i in ids))
 
 
 class ShlwapiTest(unittest.TestCase):
@@ -334,7 +432,8 @@ class SecurityAndNetworkTest(unittest.TestCase):
 
 class CpuExceptionStateTest(unittest.TestCase):
     def test_calibration(self):
-        """The field that turns a second #DE into a double fault is found"""
+        """The field that turns a second #DE into a double fault is found (a
+        Unicorn upgrade may move it: requirements.txt pins the version)"""
         offset = CPUEmulator._find_exception_state_offset()
         self.assertIsInstance(offset, int)
 

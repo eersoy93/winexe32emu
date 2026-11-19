@@ -16,7 +16,7 @@
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, resources, winapi
 from ..logger import log
@@ -352,7 +352,7 @@ class User32MiscMixin:
         return self.SetClassLongA(args)
 
     SC_SIZE, SC_MOVE, SC_MINIMIZE, SC_MAXIMIZE = 0xF000, 0xF010, 0xF020, 0xF030
-    SC_CLOSE, SC_RESTORE = 0xF060, 0xF120
+    SC_RESTORE = 0xF120  # (SC_CLOSE: CoreMixin)
 
     def GetSystemMenu(self, args):
         """GetSystemMenu emulation - the window menu of a window (its copy

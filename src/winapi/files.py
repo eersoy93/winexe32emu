@@ -19,7 +19,7 @@ import io
 import os
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, resources
 from ..logger import log

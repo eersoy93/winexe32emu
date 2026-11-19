@@ -23,7 +23,7 @@ import struct
 import time
 import wave
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import winapi
 from ..config import PYGAME_AVAILABLE

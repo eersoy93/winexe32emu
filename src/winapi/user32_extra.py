@@ -20,7 +20,7 @@ window subclassing"""
 import struct
 import time
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import winapi
 from ..logger import log

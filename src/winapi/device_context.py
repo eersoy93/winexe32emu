@@ -16,7 +16,7 @@
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import gui
 from ..logger import log

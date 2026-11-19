@@ -18,7 +18,7 @@ import os
 import struct
 import ntpath
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, winapi
 from ..config import (PROGRAM_DATA_FOLDER, PROGRAM_FILES_FOLDER, PUBLIC_FOLDER,

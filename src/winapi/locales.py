@@ -19,7 +19,7 @@ import struct
 import time
 import datetime
 
-from unicorn import *
+from unicorn import UcError
 
 
 class LocalesMixin:

@@ -24,7 +24,7 @@ import time
 import datetime
 import unicodedata
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import winapi
 from ..config import (DRIVE_CDROM, DRIVE_FIXED, DRIVE_REMOVABLE, DRIVES, FLOPPY_BYTES,

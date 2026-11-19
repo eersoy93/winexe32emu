@@ -16,7 +16,7 @@
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, gui
 from ..config import PYGAME_AVAILABLE

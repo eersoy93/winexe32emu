@@ -63,6 +63,9 @@ def main():
                         help="Heap memory amount in MiB (default: 128)")
     parser.add_argument("--no-gui", action="store_true",
                         help="Run without GUI")
+    parser.add_argument("--exit-when-done", action="store_true",
+                        help="With the GUI: close the fake desktop when the program named "
+                             "on the command line ends (and exit with its exit code)")
     parser.add_argument("--codepage", default="cp1252",
                         help="ANSI code page for 'A' APIs and CRT strings "
                              "(default: cp1252 like an English Windows; e.g. cp1254, "
@@ -270,6 +273,9 @@ def main():
     try:
         if gui:
             while gui.running:
+                if (args.exit_when_done and args.exe is not None and
+                        not programs[0][1].is_alive()):
+                    break
                 time.sleep(0.1)
             gui.stop()
             stop_programs()
