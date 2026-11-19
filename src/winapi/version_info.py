@@ -17,7 +17,7 @@
 import os
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
 from ..logger import log

@@ -22,7 +22,7 @@ import json
 import re
 from functools import wraps
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, winapi
 from ..config import C_DRIVE_PATH, PROGRAM_FILES_FOLDER

@@ -23,9 +23,18 @@ import time
 import ntpath
 
 import pefile
-from unicorn import *
-from unicorn.x86_const import *
-from capstone import *
+from unicorn import (UC_ARCH_X86, UC_CTL_IO_WRITE, UC_CTL_TLB_FLUSH, UC_ERR_INSN_INVALID, UC_ERR_OK,
+                     UC_HOOK_BLOCK, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_PROT,
+                     UC_HOOK_MEM_UNMAPPED, UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED,
+                     UC_MEM_READ_UNMAPPED, UC_MEM_WRITE_PROT, UC_MEM_WRITE_UNMAPPED, UC_MODE_32,
+                     UC_PROT_ALL, UC_PROT_EXEC, UC_PROT_NONE, UC_PROT_READ, UC_PROT_WRITE, Uc,
+                     UcError)
+from unicorn.x86_const import (UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX, UC_X86_REG_EBP,
+                               UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
+                               UC_X86_REG_EFLAGS, UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_ESI,
+                               UC_X86_REG_ESP, UC_X86_REG_FS, UC_X86_REG_GDTR, UC_X86_REG_GS,
+                               UC_X86_REG_SS)
+from capstone import CS_ARCH_X86, CS_MODE_32, Cs
 
 from . import config
 from .guest import ApiJump, GuestUnwind, QWordResult, X87Result

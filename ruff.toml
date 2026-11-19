@@ -6,6 +6,5 @@ target-version = "py310"
 [lint]
 select = ["F", "E", "W", "B"]
 ignore = [
-    "F403", "F405",  # "from unicorn import *" & co. are on purpose
-    "F841",          # API handlers name their unused arguments (args[n]) for clarity
+    "F841",  # API handlers name their unused arguments (args[n]) for clarity
 ]

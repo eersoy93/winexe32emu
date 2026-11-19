@@ -17,9 +17,10 @@
 import struct
 from functools import cmp_to_key
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config
+from ..logger import log
 
 
 class ListViewMixin:
@@ -1040,6 +1041,6 @@ class ListViewMixin:
         if font:
             try:
                 return font.size(text)[0]
-            except Exception:
-                pass
+            except (ValueError, UnicodeError) as e:  # Text pygame cannot measure
+                log.debug(f"Text width of {text!r}: {e}")
         return 7 * len(text)

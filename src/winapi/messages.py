@@ -18,7 +18,7 @@ loop, DefWindowProc"""
 import struct
 import time
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, winapi
 from ..logger import log
@@ -199,6 +199,25 @@ class MessagesMixin:
             return to_colorref(prev)
         return None
 
+    BM_CLICK = 0x00F5
+
+    def _click_button(self, control):
+        """BM_CLICK: the button acts as if clicked (an automatic check box or
+        radio button changes its state) and its parent gets WM_COMMAND with
+        BN_CLICKED at once"""
+        style = control.style & 0xF
+        parent = control.parent_hwnd
+        if control.class_name == 'CHECKBOX':
+            if style == 0x3:  # BS_AUTOCHECKBOX
+                control.checked = not control.checked
+            elif style == 0x9 and self.gui and parent in self.gui.windows:  # BS_AUTORADIOBUTTON
+                with self.gui.lock:
+                    self.gui._check_auto_radio(self.gui.windows[parent], control)
+        if parent:
+            wParam = ((self.BN_CLICKED & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
+            self.SendMessageA([parent, self.WM_COMMAND, wParam, control.hwnd])
+        return 0
+
     def _control_message(self, control, Msg, wParam, lParam, wide=False):
         """Handle a message sent to a child control (emulation thread).
 
@@ -253,6 +272,8 @@ class MessagesMixin:
         if Msg == self.BM_SETCHECK:
             control.checked = bool(wParam)
             return 0
+        if Msg == self.BM_CLICK and control.class_name in ('BUTTON', 'CHECKBOX'):
+            return self._click_button(control)
 
         # ----- Listbox messages -----
         if Msg == self.LB_ADDSTRING:
@@ -531,6 +552,7 @@ class MessagesMixin:
         lParam = args[3]
         log.debug(f"PostMessageA(0x{hWnd:x}, 0x{Msg:x}, 0x{wParam:x}, 0x{lParam:x})")
         if Msg == self.WM_QUIT:
+            self.quit_code = wParam
             self.quit_requested = True
         else:
             self.post_window_message(hWnd, Msg, wParam, lParam)
@@ -543,7 +565,9 @@ class MessagesMixin:
         """PostQuitMessage emulation - request message loop exit"""
         nExitCode = args[0]
         log.debug(f"PostQuitMessage({nExitCode})")
-        # The blocking GetMessageA relies on this to break the loop
+        # The blocking GetMessageA relies on this to break the loop; WM_QUIT
+        # carries the exit code in wParam
+        self.quit_code = nExitCode
         self.quit_requested = True
         return 0
 
@@ -694,7 +718,7 @@ class MessagesMixin:
         # This runs on the emulation thread; the GUI thread feeds message_queue.
         while True:
             if self.quit_requested:
-                self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
+                self._write_msg(lpMsg, 0, self.WM_QUIT, self.quit_code, 0)
                 return 0
 
             msg = self._next_message(True, hWnd, wMsgFilterMin, wMsgFilterMax)
@@ -734,7 +758,8 @@ class MessagesMixin:
 
         # Quit pending or GUI gone: report WM_QUIT (PeekMessage returns TRUE)
         if self.quit_requested or (self.gui and not self.gui.running) or not self.gui:
-            self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
+            code = self.quit_code if self.quit_requested else 0
+            self._write_msg(lpMsg, 0, self.WM_QUIT, code, 0)
             return 1
 
         msg = self._next_message(remove, hWnd, wMsgFilterMin, wMsgFilterMax)

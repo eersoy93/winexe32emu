@@ -16,7 +16,7 @@
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import winapi
 from ..logger import log

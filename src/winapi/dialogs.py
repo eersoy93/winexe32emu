@@ -20,7 +20,7 @@ import time
 import fnmatch
 import ntpath
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, gui, winapi
 from ..logger import log

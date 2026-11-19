@@ -21,7 +21,7 @@ import shutil
 import struct
 import time
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, winapi
 from ..config import DRIVES

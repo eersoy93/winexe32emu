@@ -20,8 +20,8 @@ import struct
 import math
 import time
 
-from unicorn import *
-from unicorn.x86_const import *
+from unicorn import UcError
+from unicorn.x86_const import UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_EDI, UC_X86_REG_ESI
 
 from .. import config
 from ..guest import ApiJump, QWordResult, X87Result

@@ -110,8 +110,27 @@ run_args_test registry_test "== 0 failure(s) ==" write
 run_args_test registry_test "== 0 failure(s) ==" read
 run_crash_test exception_test fastfail "__fastfail(7)"
 run_crash_test exception_test int3 "Unhandled exception 0x80000003"
+# run_gui_test NAME EXPECTED: like run_test, on the fake desktop (SDL's dummy
+# video driver: no display needed); the desktop closes when the program ends
+run_gui_test() {
+    name=$1
+    expected=$2
+    output=$(SDL_VIDEODRIVER=dummy timeout "$TIMEOUT" "$PYTHON" winexe32emu.py \
+        --exit-when-done --no-create-environment --no-apps -q "${name}.exe" 2>&1 </dev/null)
+    code=$?
+    if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -qF -- "$expected"; then
+        echo "PASS: ${name} (GUI)"
+        passed=$((passed + 1))
+    else
+        echo "FAIL: ${name} (GUI) (exit code ${code})"
+        printf '%s\n' "$output" | tail -n 10 | sed 's/^/    /'
+        failed=$((failed + 1))
+    fi
+}
+
 run_test seh_test "== 0 failure(s) =="
 run_test compat_test "== 0 failure(s) =="
+run_gui_test gui_test "== 0 failure(s) =="
 # Two processes: the second one finds the marker the first one's DLL wrote
 # in DllMain(DLL_PROCESS_DETACH) when that process ended
 run_args_test loader_test "== 0 failure(s) =="

@@ -21,7 +21,7 @@ import struct
 import time
 import uuid
 
-from unicorn import *
+from unicorn import UcError
 
 from ..config import USER_PROFILE_FOLDER
 from ..logger import log

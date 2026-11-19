@@ -21,7 +21,7 @@ import struct
 import datetime
 import ntpath
 
-from unicorn import *
+from unicorn import UcError
 
 from .. import config, resources
 from ..config import DRIVES

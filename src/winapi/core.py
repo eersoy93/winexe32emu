@@ -742,6 +742,7 @@ class CoreMixin:
         self.dirty_controls = {}  # Owner-draw controls waiting for WM_DRAWITEM (ordered)
         self._drawitem_buf = 0
         self.quit_requested = False
+        self.quit_code = 0  # wParam of WM_QUIT (PostQuitMessage)
         # True once the emulated process is gone (ExitProcess or emulation end).
         # After that no window can consume messages, so the GUI must stop
         # treating windows as live app windows (e.g. X click posts WM_CLOSE).

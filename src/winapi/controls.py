@@ -16,7 +16,7 @@
 
 import struct
 
-from unicorn import *
+from unicorn import UcError
 
 
 class ControlsMixin:

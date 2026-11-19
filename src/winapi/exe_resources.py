@@ -19,7 +19,7 @@ import re
 import struct
 import codecs
 
-from unicorn import *
+from unicorn import UC_PROT_ALL, UcError
 
 from .. import config
 from ..logger import log
