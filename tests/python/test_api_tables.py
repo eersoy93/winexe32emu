@@ -28,6 +28,7 @@ import textwrap
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from src.gui import PseudoWindowsGUI  # noqa: E402
 from src.winapi import WinAPIHandler  # noqa: E402
 
 
@@ -62,19 +63,28 @@ def highest_argument(func):
     return highest
 
 
+def names_in_two_classes(classes):
+    """{name: [class names]} of the names more than one class defines"""
+    owners = collections.defaultdict(list)
+    for cls in classes:
+        if cls is object:
+            continue
+        for name in vars(cls):
+            if not (name.startswith('__') and name.endswith('__')):
+                owners[name].append(cls.__name__)
+    return {name: owners_ for name, owners_ in owners.items() if len(owners_) > 1}
+
+
 class MixinTest(unittest.TestCase):
-    def test_no_name_in_two_classes(self):
-        """A name defined by two mixins would silently use the first one in
-        the method resolution order (WinAPIHandler itself only caches)"""
-        owners = collections.defaultdict(list)
-        for cls in WinAPIHandler.__mro__[1:]:
-            if cls is object:
-                continue
-            for name in vars(cls):
-                if not (name.startswith('__') and name.endswith('__')):
-                    owners[name].append(cls.__name__)
-        twice = {name: classes for name, classes in owners.items() if len(classes) > 1}
-        self.assertEqual(twice, {})
+    """A name defined by two mixins would silently use the first one in the
+    method resolution order"""
+
+    def test_winapi_handler(self):
+        # (WinAPIHandler itself only caches)
+        self.assertEqual(names_in_two_classes(WinAPIHandler.__mro__[1:]), {})
+
+    def test_gui(self):
+        self.assertEqual(names_in_two_classes(PseudoWindowsGUI.__mro__), {})
 
 
 class ArgumentCountTest(unittest.TestCase):
