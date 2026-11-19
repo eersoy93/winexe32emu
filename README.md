@@ -62,9 +62,9 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 
 ## Tested Programs
 
-- 7-Zip 4.65 (x86, NSIS setup and program)
-- 7-Zip 9.20 (x86, NSIS setup and program)
-- 7-Zip 26.06 (x86, setup and program)
+- 7-Zip 4.65 (x86, NSIS setup and programs)
+- 7-Zip 9.20 (x86, NSIS setup and programs)
+- 7-Zip 26.06 (x86, setup and programs)
 - Ants (setup and program)
 - Ski32
 
