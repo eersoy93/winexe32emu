@@ -89,6 +89,28 @@ class FakeDesktopTest(unittest.TestCase):
         self.assertFalse(gui.gui_thread.is_alive())
         self.assertEqual(self.errors, [])
 
+    def test_long_messagebox_text_wraps(self):
+        """A long message box line wraps like on Windows: the box stays
+        narrower than the screen and shows the whole text"""
+        gui = PseudoWindowsGUI(800, 600)
+        self.assertTrue(gui.start())
+        try:
+            text = ("Setup couldn't create a SYSTEM.MDW file. After Setup is completed, "
+                    "reboot your computer, then run the Workgroup Administrator before you "
+                    "run this application.")
+            gui.show_messagebox('Workgroup Administrator', text, 0x30)
+            self.wait_frames(gui)
+            with gui.lock:
+                (hwnd,) = list(gui.messageboxes)
+                win = gui.windows[hwnd]
+                lines = [c.text for c in win.controls if c.class_name == 'STATIC']
+            self.assertLess(win.width, 800 * 3 // 4)
+            self.assertGreater(len(lines), 1)
+            self.assertEqual(' '.join(lines), text)
+        finally:
+            gui.stop()
+        self.assertEqual(self.errors, [])
+
 
 if __name__ == '__main__':
     unittest.main()

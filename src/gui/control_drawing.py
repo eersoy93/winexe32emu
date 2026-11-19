@@ -37,7 +37,10 @@ class ControlDrawingMixin:
         if control.font:
             self.font = self._get_render_font(control.font)
         try:
-            self._draw_control_body(control, parent_x + control.x, parent_y + control.y)
+            # An owner-draw button or static shows only what its parent draws
+            # (WM_DRAWITEM): its own face and text are not drawn
+            if not self._is_owner_draw(control):
+                self._draw_control_body(control, parent_x + control.x, parent_y + control.y)
         finally:
             self.font = gui_font
         if control.drawn_shapes:
@@ -48,6 +51,12 @@ class ControlDrawingMixin:
             for shape in control.drawn_shapes:
                 self._draw_shape(shape, abs_x, abs_y)
             self.screen.set_clip(prev_clip)
+
+    @staticmethod
+    def _is_owner_draw(control):
+        """BS_OWNERDRAW button or SS_OWNERDRAW static"""
+        return ((control.class_name == 'BUTTON' and control.style & 0xF == 0xB) or
+                (control.class_name == 'STATIC' and control.style & 0x1F == 0xD))
 
     def _wrap_text(self, text, width):
         """Split text into lines that fit width pixels (word wrap)"""

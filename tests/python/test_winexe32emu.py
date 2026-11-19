@@ -199,8 +199,9 @@ class SandboxTest(unittest.TestCase):
     def test_drive_folders(self):
         self.assertEqual(resolve_drive_path(r'C:\Windows'),
                          os.path.realpath(os.path.join(C_DRIVE_PATH, 'Windows')))
-        self.assertEqual(resolve_drive_path(r'd:\setup.exe'),
-                         os.path.realpath(os.path.join(DRIVES_PATH, 'D', 'setup.exe')))
+        # A name no CD in drives/D has (a SETUP.EXE there keeps its own case)
+        self.assertEqual(resolve_drive_path(r'd:\no_such_setup.exe'),
+                         os.path.realpath(os.path.join(DRIVES_PATH, 'D', 'no_such_setup.exe')))
         self.assertEqual(resolve_drive_path('A:\\'), os.path.realpath(drive_host_path('A')))
         self.assertIsNone(resolve_drive_path(r'E:\x'))  # No such drive
         self.assertEqual(windows_path_of_host(os.path.join(DRIVES_PATH, 'D', 'x', 'y.exe')),
@@ -501,6 +502,79 @@ class SecurityAndNetworkTest(unittest.TestCase):
         self.assertIn('__WSAFDIsSet', WinAPIHandler._api_method_names())
         for helper in ('_no_service', '_no_theme', '_not_a_socket', '_wsa_fd_is_set'):
             self.assertNotIn(helper, WinAPIHandler._api_method_names())
+
+
+class DrawTextTest(unittest.TestCase):
+    def test_prefixes(self):
+        self.assertEqual(WinAPIHandler._strip_prefixes('&Typical'), ('Typical', 0))
+        self.assertEqual(WinAPIHandler._strip_prefixes('C&ustom'), ('Custom', 1))
+        self.assertEqual(WinAPIHandler._strip_prefixes('A && B'), ('A & B', -1))
+
+    def test_word_break(self):
+        handler = bare_handler()
+        handler.gui = None
+        handler.dc_state = {}  # No font: 8 pixels per character
+        breaks = WinAPIHandler.DT_WORDBREAK
+        self.assertEqual(handler._text_lines(1, 'aaa bbb ccc', 60, breaks), [(0, 7), (8, 11)])
+        self.assertEqual(handler._text_lines(1, 'one\r\ntwo', 400, breaks), [(0, 3), (5, 8)])
+        self.assertEqual(handler._text_lines(1, 'aaa bbb ccc', 60, WinAPIHandler.DT_SINGLELINE),
+                         [(0, 11)])
+        # A word wider than the line gets a line of its own
+        self.assertEqual(handler._text_lines(1, 'aaaaaaaaaa b', 40, breaks), [(0, 10), (11, 12)])
+
+
+class VirtualReservationTest(unittest.TestCase):
+    def test_reserved_pages_are_not_used_memory(self):
+        """A MEM_RESERVE region counts only its committed pages (Microsoft Jet
+        reserves as much address space as the physical memory)"""
+        handler = bare_handler()
+        base = 0x20000000
+        handler.virtual_allocs = {base: 0x40000000, 0x60000000: 0x100000}
+        handler.mapped_virtual_allocs = {base, 0x60000000}
+        handler.virtual_commits = {base: set()}
+        self.assertEqual(handler._big_region_usage(), 0x100000)
+        self.assertTrue(handler._commit_pages(base, base + 0x1000, base + 0x4000))
+        self.assertTrue(handler._commit_pages(base, base, base + 0x2000))  # One page again
+        self.assertEqual(handler._big_region_usage(), 0x100000 + 0x4000)
+        handler.BIG_REGION_BUDGET = 0x105000
+        self.assertFalse(handler._commit_pages(base, base + 0x4000, base + 0x6000))
+
+
+class ShellFoldersRegistryTest(unittest.TestCase):
+    def test_defaults(self):
+        roots = WinAPIHandler._default_registry()
+        node = roots[0x80000001]
+        for part in ('software', 'microsoft', 'windows', 'currentversion', 'explorer',
+                     'shell folders'):
+            node = node['keys'][part]
+        self.assertEqual(node['values']['programs']['data'],
+                         WinAPIHandler.SHELL_FOLDERS[0x02] + '\x00')
+
+    def test_merge_keeps_saved_values(self):
+        saved = WinAPIHandler._new_registry_key('HKEY_CURRENT_USER')
+        saved['values']['x'] = {'name': 'X', 'type': 1, 'data': 'saved\x00'}
+        default = WinAPIHandler._new_registry_key('HKEY_CURRENT_USER')
+        default['values']['x'] = {'name': 'X', 'type': 1, 'data': 'default\x00'}
+        default['values']['y'] = {'name': 'Y', 'type': 1, 'data': 'y\x00'}
+        default['keys']['software'] = WinAPIHandler._new_registry_key('Software')
+        merged = WinAPIHandler._merge_registry_defaults(saved, default)
+        self.assertEqual(merged['values']['x']['data'], 'saved\x00')
+        self.assertEqual(merged['values']['y']['data'], 'y\x00')
+        self.assertIn('software', merged['keys'])
+
+
+class ChildFrameTest(unittest.TestCase):
+    def test_child_frames(self):
+        from src.gui import PseudoWindowsGUI
+        gui = PseudoWindowsGUI
+        # Office 95 Setup's dialogs: WS_CHILD | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME
+        self.assertEqual(gui.child_frame_size(0x44C800C0, dialog=True),
+                         (gui.BORDER, gui.TITLE_BAR_H))
+        self.assertEqual(gui.child_frame_size(0x440000C0, dialog=True), (gui.BORDER, 0))
+        self.assertEqual(gui.child_frame_size(0x440000C0), (0, 0))
+        self.assertEqual(gui.child_frame_size(0x50800000), (1, 0))  # WS_BORDER
+        self.assertEqual(gui.child_frame_size(0x50000000, 0x200), (1, 0))  # Client edge
+        self.assertEqual(gui.child_frame_size(0x50000000), (0, 0))
 
 
 class CpuExceptionStateTest(unittest.TestCase):

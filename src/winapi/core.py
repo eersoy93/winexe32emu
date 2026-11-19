@@ -756,6 +756,9 @@ class CoreMixin:
         self.module_handles = {}  # lowercase DLL name -> fake HMODULE
         self.virtual_allocs = {}  # VirtualAlloc base -> reserved size
         self.mapped_virtual_allocs = set()  # Bases mapped at a requested address
+        # Mapped regions reserved without MEM_COMMIT: base -> indexes of their
+        # committed pages (only those count as used "physical" memory)
+        self.virtual_commits = {}
         self.next_handle = 0x1000
         self.console_output = []
         # Own console: has_console follows AllocConsole/FreeConsole, console is
@@ -766,6 +769,7 @@ class CoreMixin:
         self.file_streams = {}
         self.next_file_ptr = 0x0F000000  # dedicated range for fake FILE* pointers
         self.registered_classes = {}  # Registered window classes
+        self.module_classes = {}  # (lower-case name, hInstance) -> registered_classes entry
         self.system_class_data = {}  # System class name -> fields changed by SetClassLong
         self.system_menus = {}  # hwnd -> window menu (GetSystemMenu)
         self.shell_malloc = 0  # IMalloc of SHGetMalloc
@@ -866,6 +870,7 @@ class CoreMixin:
         self._sys_file_icons = []
         self._sys_file_icon_indexes = {}
         self.icons = {}
+        self.system_icons = {}  # HICON of a LoadIcon(NULL, IDI_*) -> message box icon kind
         self._dialog_fonts = {}  # (face, size) of a dialog template -> GDI font handle
         self.accelerators = {}
         self.clipboard_open = False

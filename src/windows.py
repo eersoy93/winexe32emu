@@ -52,6 +52,10 @@ class FakeWindow:
         self.text = title
         self.region = None  # SetWindowRgn rectangles (window coordinates)
         self.dialog_brush = None  # Dialog background chosen by WM_CTLCOLORDLG (RGB)
+        # A child window whose class has no background brush is not erased:
+        # its parent's drawing shows through where it does not paint
+        self.transparent = False
+        self.wndclass = None  # Registered class (of its module) of a program's window
 
         # Retained drawing list (GDI display list, redrawn every frame):
         # Rectangle/Ellipse/LineTo/SetPixel/Polygon/TextOut... items

@@ -392,10 +392,16 @@ class FilesMixin:
             log.debug(f"GetProcAddress(\"{info['name']}\", \"{proc_name}\") -> 0x{addr:08x}")
         if not addr:
             self._last_error = 127  # ERROR_PROC_NOT_FOUND
-            if module is None and info and info.get('type') == 'module':
+            if (module is None and info and info.get('type') == 'module' and
+                    (info['name'].lower(), proc_name.upper()) not in self.NOT_WINDOWS_APIS):
                 self.emu.note_missing_api(info['name'], proc_name,
                                           'GetProcAddress returned NULL')
         return addr
+
+    # Functions no Windows exports, which programs look up to detect another
+    # environment: NULL is the right answer, not a missing API. ISTNT is in
+    # the KERNEL32 of the Phar Lap TNT DOS extender (Microsoft Setup checks it).
+    NOT_WINDOWS_APIS = {('kernel32.dll', 'ISTNT')}
 
     def ExitProcess(self, args):
         """ExitProcess emulation"""
@@ -493,6 +499,14 @@ class FilesMixin:
         """LoadIconA/W emulation - an icon of the EXE's resources (its image is
         kept for SS_ICON statics and image lists); system icons are opaque"""
         log.debug(f"LoadIcon(0x{args[0]:x}, 0x{args[1]:x})")
+        if not args[0] and args[1] in self.SYSTEM_ICONS:
+            # A shared system icon: the same handle each time; DrawIcon draws
+            # the message box icons (IDI_HAND, IDI_QUESTION, ...)
+            handles = self.__dict__.setdefault('_system_icon_handles', {})
+            if args[1] not in handles:
+                handles[args[1]] = self.get_next_handle()
+                self.system_icons[handles[args[1]]] = self.SYSTEM_ICONS[args[1]]
+            return handles[args[1]]
         handle = self.get_next_handle()
         if args[0] and self._is_own_module(args[0]):
             image = self._load_icon_image(self._resource_name_key(args[1], wide), hModule=args[0])
@@ -501,6 +515,9 @@ class FilesMixin:
                 return 0
             self.icons[handle] = image
         return handle
+
+    # IDI_* -> the message box icon drawn for it (0: the application icon)
+    SYSTEM_ICONS = {32512: 0, 32513: 1, 32514: 2, 32515: 3, 32516: 4, 32517: 0, 32518: 3}
 
     def LoadIconW(self, args):
         """LoadIconW emulation"""

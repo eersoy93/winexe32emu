@@ -65,7 +65,9 @@ class RegistryMixin:
                 saved = cls._load_registry_file()
                 for hkey, name in cls.REGISTRY_ROOTS.items():
                     if hkey != cls.HKEY_CLASSES_ROOT and name in saved:
-                        roots[hkey] = saved[name]
+                        # The default keys and values a saved registry lacks
+                        # (an older emulator did not make them) are added
+                        roots[hkey] = cls._merge_registry_defaults(saved[name], roots[hkey])
                 node = roots[0x80000002]
                 for part in ('SOFTWARE', 'Classes'):
                     node = node['keys'].setdefault(part.lower(), cls._new_registry_key(part))
@@ -85,7 +87,46 @@ class RegistryMixin:
         for name, folder in (('ProgramFilesDir', PROGRAM_FILES_FOLDER),
                              ('CommonFilesDir', PROGRAM_FILES_FOLDER + '\\Common Files')):
             node['values'][name.lower()] = {'name': name, 'type': 1, 'data': folder + '\x00'}
+        # The special folders under Explorer\Shell Folders (setup programs
+        # like Microsoft Office 95's read the Start menu's Programs from there)
+        folders = getattr(cls, 'SHELL_FOLDERS', {})
+        for hkey, root, names in ((0x80000001, 'Software', cls.USER_SHELL_FOLDER_NAMES),
+                                  (0x80000002, 'SOFTWARE', cls.COMMON_SHELL_FOLDER_NAMES)):
+            node = roots[hkey]
+            for part in (root, 'Microsoft', 'Windows', 'CurrentVersion', 'Explorer',
+                         'Shell Folders'):
+                node = node['keys'].setdefault(part.lower(), cls._new_registry_key(part))
+            for name, csidl in names:
+                if csidl in folders:
+                    node['values'][name.lower()] = {'name': name, 'type': 1,
+                                                    'data': folders[csidl] + '\x00'}
         return roots
+
+    # Explorer\Shell Folders value -> CSIDL: the user's (HKEY_CURRENT_USER) and
+    # the shared ones (HKEY_LOCAL_MACHINE)
+    USER_SHELL_FOLDER_NAMES = (
+        ('AppData', 0x1A), ('Cache', 0x20), ('Cookies', 0x21), ('Desktop', 0x10),
+        ('Favorites', 0x06), ('Fonts', 0x14), ('History', 0x22), ('Local AppData', 0x1C),
+        ('My Music', 0x0D), ('My Pictures', 0x27), ('My Video', 0x0E), ('Personal', 0x05),
+        ('Programs', 0x02), ('Recent', 0x08), ('SendTo', 0x09), ('Start Menu', 0x0B),
+        ('Startup', 0x07), ('Templates', 0x15), ('Administrative Tools', 0x30))
+    COMMON_SHELL_FOLDER_NAMES = (
+        ('Common AppData', 0x23), ('Common Desktop', 0x19), ('Common Documents', 0x2E),
+        ('Common Programs', 0x17), ('Common Start Menu', 0x16), ('Common Startup', 0x18),
+        ('Common Templates', 0x2D), ('Common Administrative Tools', 0x2F),
+        ('CommonMusic', 0x35), ('CommonPictures', 0x36), ('CommonVideo', 0x37))
+
+    @classmethod
+    def _merge_registry_defaults(cls, saved, default):
+        """saved (a key node) with the keys and values of default it does not have"""
+        for name, value in default['values'].items():
+            saved['values'].setdefault(name, value)
+        for name, child in default['keys'].items():
+            if name in saved['keys']:
+                cls._merge_registry_defaults(saved['keys'][name], child)
+            else:
+                saved['keys'][name] = child
+        return saved
 
     @classmethod
     def _registry_to_json(cls, node):

@@ -95,19 +95,31 @@ class DialogsMixin:
         size = template['font'][1] if template['font'] else 8
         return 1.5 * size / 8, 1.625 * size / 8
 
-    def _create_dialog(self, template, owner, proc=0, handler=None, parent=0, pos=(0, 0)):
+    def _create_dialog(self, template, owner, proc=0, handler=None, parent=0, pos=(0, 0),
+                       child_style=None):
         """Create a dialog window and its controls from a parsed template (a
-        child dialog of parent at client position pos, like a property page).
+        child dialog of parent at client position pos, like a property page;
+        child_style is its window style, else a frameless WS_CHILD).
         Dialog units are converted for an 8 pt dialog font."""
         bx, by = self._dialog_units(template)
         client_w, client_h = round(template['cx'] * bx), round(template['cy'] * by)
+        title = template['title'] if isinstance(template['title'], str) else ''
         if parent:
-            hwnd = self.gui.create_window('', pos[0], pos[1], client_w, client_h,
-                                          self.WS_CHILD, owner=self, parent=parent)
+            style = self.WS_CHILD if child_style is None else child_style & ~self.WS_VISIBLE
+            ex_style = 0 if child_style is None else template['ex_style']
+            # A child dialog with WS_CAPTION or DS_MODALFRAME has a frame around
+            # the client area of the template's size
+            border, caption = gui.PseudoWindowsGUI.child_frame_size(style, ex_style, dialog=True)
+            hwnd = self.gui.create_window(title, pos[0], pos[1],
+                                          client_w + 2 * border,
+                                          client_h + 2 * border + caption,
+                                          style, owner=self, parent=parent)
             win = self.gui.windows[hwnd]
             win.class_name = '#32770'
+            win.ex_style = ex_style
             self.dialogs[hwnd] = {'proc': proc, 'handler': handler, 'owner': owner,
                                   'result': 0, 'ended': False}
+            self._set_dialog_instance(hwnd, template)
             self._create_dialog_items(hwnd, template, bx, by)
             return hwnd
         border, caption = gui.PseudoWindowsGUI.frame_size(template['style'], dialog=True)
@@ -125,7 +137,6 @@ class DialogsMixin:
             x, y = ox + round(template['x'] * bx), oy + round(template['y'] * by)
         x = max(0, min(x, screen_w - width))
         y = max(0, min(y, screen_h - 30 - height))
-        title = template['title'] if isinstance(template['title'], str) else ''
         hwnd = self.gui.create_window(title, x, y, width, height,
                                       template['style'] & ~self.WS_VISIBLE, owner=self)
         win = self.gui.windows[hwnd]
@@ -133,8 +144,16 @@ class DialogsMixin:
         win.is_dialog = True
         self.dialogs[hwnd] = {'proc': proc, 'handler': handler, 'owner': owner,
                               'result': 0, 'ended': False}
+        self._set_dialog_instance(hwnd, template)
         self._create_dialog_items(hwnd, template, bx, by)
         return hwnd
+
+    def _set_dialog_instance(self, hwnd, template):
+        """GWL_HINSTANCE of a dialog (the module of its template) and its
+        DS_SETFONT font (WM_GETFONT)"""
+        if template.get('module'):
+            self.window_longs.setdefault(hwnd, {})[-6] = template['module']
+        self.dialogs[hwnd]['font'] = self._dialog_font(template)
 
     def _dialog_font(self, template):
         """GDI font handle of a dialog template's DS_SETFONT font (shared by the
@@ -174,6 +193,10 @@ class DialogsMixin:
                 child_win.visible = bool(style & self.WS_VISIBLE) and native != 'TOOLTIPS'
                 self._native_moved(child_win)
                 continue
+            if self._app_class(cls) is not None:
+                self._create_class_item(hwnd, item, cls, text, bx, by, font_handle,
+                                        template.get('module', 0))
+                continue
             if cls.upper() == 'BUTTON' and (style & 0xF) in self.CHECK_BUTTON_STYLES:
                 cls = 'CHECKBOX'
             elif cls.upper() == 'MSCTLS_STATUSBAR32':
@@ -206,6 +229,44 @@ class DialogsMixin:
                     control.width, control.height = control.icon[0], control.icon[1]
             control.visible = bool(style & self.WS_VISIBLE)
             control.enabled = not style & 0x08000000  # WS_DISABLED
+
+    # Classes the emulator draws itself even if a program registers one by that name
+    SYSTEM_CONTROL_CLASSES = ('BUTTON', 'EDIT', 'STATIC', 'LISTBOX', 'COMBOBOX', 'SCROLLBAR',
+                              'MSCTLS_STATUSBAR32', 'MSCTLS_PROGRESS32')
+
+    def _app_class(self, name):
+        """Name of the program's registered window class called name (window
+        class names ignore case), or None for the system's control classes"""
+        if not isinstance(name, str) or name.upper() in self.SYSTEM_CONTROL_CLASSES:
+            return None
+        if name in self.registered_classes:
+            return name
+        upper = name.upper()
+        return next((key for key in self.registered_classes if key.upper() == upper), None)
+
+    def _create_class_item(self, dlg, item, cls, text, bx, by, font_handle, module):
+        """A dialog item of a class the program registered (like the gauge and
+        the status texts of Microsoft Setup's DLL): a child window with the
+        class's window procedure, created like CreateWindowEx does (WM_CREATE,
+        then the dialog's font with WM_SETFONT)"""
+        atom = self.registered_classes[self._app_class(cls)]['atom']
+        name = self._alloc_units(self._text_units(text, False), False) if text else 0
+        try:
+            hwnd = self.CreateWindowExA([
+                item['ex_style'], atom, name, (item['style'] | self.WS_CHILD) & 0xFFFFFFFF,
+                round(item['x'] * bx) & 0xFFFFFFFF, round(item['y'] * by) & 0xFFFFFFFF,
+                round(item['cx'] * bx) & 0xFFFFFFFF, round(item['cy'] * by) & 0xFFFFFFFF,
+                dlg, item['id'] & 0xFFFF, module, 0])
+        finally:
+            if name:
+                self.emu.heap_free(name)
+        win = self.gui.windows.get(hwnd)
+        if win is None:
+            return
+        win.ex_style = item['ex_style']
+        win.enabled = not item['style'] & 0x08000000  # WS_DISABLED
+        if font_handle:
+            self._send(hwnd, 0x0030, font_handle, 0)  # WM_SETFONT
 
     def _dialog_of(self, hwnd):
         """The dialog hwnd belongs to (itself or the parent of a control), or 0"""
@@ -267,6 +328,20 @@ class DialogsMixin:
             '<7I4iI', kind, control.control_id, 0, 1, 0, hwnd, hdc,
             0, 0, control.width, control.height, 0))
         parent = control.parent_hwnd
+        # Like the button and static controls of Windows: the DC gets the
+        # control's font and the colors its parent chooses with WM_CTLCOLOR*
+        # (DefWindowProc's are the 3D face color and black text)
+        state = self.dc_state[hdc]
+        if control.font_handle in self.gdi_objects:
+            state['font'] = control.font_handle
+        state['bk_color'] = self.SYS_COLORS.get(15, (212, 208, 200))  # COLOR_BTNFACE
+        state['text_color'] = self.SYS_COLORS.get(18, (0, 0, 0))  # COLOR_BTNTEXT
+        message = self.WM_CTLCOLORBTN if kind == 4 else self.WM_CTLCOLORSTATIC
+        if self._dialog_of(parent) == parent:
+            self._dialog_message(parent, message, hdc, hwnd)
+        elif self._find_wndproc_for_hwnd(parent):
+            self.emu.call_wndproc(self._find_wndproc_for_hwnd(parent), parent, message, hdc,
+                                  hwnd)
         try:
             if self._dialog_of(parent):
                 self._dialog_message(parent, self.WM_DRAWITEM, control.control_id,
@@ -311,13 +386,34 @@ class DialogsMixin:
                 brush = self.emu.call_wndproc(wndproc, parent, message, hdc, hwnd) \
                     if wndproc else 0
             state = self.dc_state.get(hdc)
-            if not brush or state is None:
+            if not brush or state is None or self._is_default_ctl_color(message, brush, state):
                 return None
             # A hollow brush (NULL_BRUSH) has no color: the parent shows through
             return {'text': state['text_color'], 'bk_mode': state['bk_mode'],
                     'bk_color': state['bk_color'], 'brush': self._brush_color(brush)}
         finally:
             self._delete_dc(hdc)
+
+    WM_CTLCOLORMSGBOX, WM_CTLCOLORSCROLLBAR = 0x0132, 0x0137
+
+    def _default_ctl_color(self, message, hdc):
+        """DefWindowProc's (and DefDlgProc's) WM_CTLCOLOR*: the DC gets black
+        text on the 3D face color (the window color for edit controls and list
+        boxes); returns the brush of that color"""
+        index = 5 if message in (self.WM_CTLCOLOREDIT, self.WM_CTLCOLORLISTBOX) else 15
+        state = self.dc_state.get(hdc)
+        if state is not None:
+            state['text_color'] = self.SYS_COLORS[8]  # COLOR_WINDOWTEXT
+            state['bk_color'] = self.SYS_COLORS[index]
+        return self.GetSysColorBrush([index])
+
+    def _is_default_ctl_color(self, message, brush, state):
+        """The answer to a WM_CTLCOLOR* message is DefWindowProc's (the parent
+        chose nothing)"""
+        index = 5 if message in (self.WM_CTLCOLOREDIT, self.WM_CTLCOLORLISTBOX) else 15
+        return (brush == self.GetSysColorBrush([index]) and
+                state['text_color'] == self.SYS_COLORS[8] and
+                state['bk_color'] == self.SYS_COLORS[index])
 
     def _update_ctl_colors(self, control):
         """Colors of a control from its parent's WM_CTLCOLOR* answer"""
@@ -488,9 +584,8 @@ class DialogsMixin:
             bx, by = self._dialog_units(template)
             dlg = self._create_dialog(template, hWndParent, proc=lpDialogFunc,
                                       parent=hWndParent,
-                                      pos=(round(template['x'] * bx), round(template['y'] * by)))
-            self.gui.windows[dlg].style = template['style'] & ~self.WS_VISIBLE
-            self.gui.windows[dlg].ex_style = template['ex_style']
+                                      pos=(round(template['x'] * bx), round(template['y'] * by)),
+                                      child_style=template['style'])
         else:
             dlg = self._create_dialog(template, self._owner_window(hWndParent),
                                       proc=lpDialogFunc)
@@ -505,6 +600,10 @@ class DialogsMixin:
     def _send_dialog_message(self, dlg, message, wParam, lParam):
         """SendMessage to a dialog: its procedure, then the DefDlgProc defaults"""
         result = self._dialog_message(dlg, message, wParam, lParam)
+        if message == 0x0031 and not result and dlg in self.dialogs:  # WM_GETFONT
+            return self.dialogs[dlg].get('font', 0)  # DefDlgProc: the dialog's font
+        if self.WM_CTLCOLORMSGBOX <= message <= self.WM_CTLCOLORSTATIC and not result:
+            return self._default_ctl_color(message, wParam)
         if message == self.WM_NEXTDLGCTL and not result and dlg in self.dialogs:
             win = self.gui.windows.get(dlg)
             if lParam & 0xFFFF:  # wParam is the control to focus

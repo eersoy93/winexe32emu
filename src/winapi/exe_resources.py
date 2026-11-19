@@ -498,6 +498,7 @@ class ExeResourcesMixin:
                            not self.valid_protection(flProtect)):
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
+        reserve_only = not flAllocationType & MEM_COMMIT
         if lpAddress:
             for base, size in self.virtual_allocs.items():
                 if base <= lpAddress and lpAddress + dwSize <= base + size:
@@ -505,9 +506,12 @@ class ExeResourcesMixin:
                     start = lpAddress & ~0xFFF
                     end = (lpAddress + dwSize + 0xFFF) & ~0xFFF
                     if flAllocationType & MEM_COMMIT:
+                        if not self._commit_pages(base, start, end):
+                            self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
+                            return 0
                         self.set_protection(start, end, flProtect)
                     return start
-            addr = self._map_virtual_at(lpAddress, dwSize)
+            addr = self._map_virtual_at(lpAddress, dwSize, reserve_only)
             if not addr:
                 self._last_error = 487  # ERROR_INVALID_ADDRESS
             else:
@@ -517,8 +521,9 @@ class ExeResourcesMixin:
         size = self.emu._align_size(dwSize, 0x1000)
         if size >= self.BIG_VIRTUAL_ALLOC:
             # Big blocks get their own region (host memory is committed lazily),
-            # so they don't use up the heap
-            addr = self._map_big_region(size)
+            # so they don't use up the heap. A reservation only takes address
+            # space: Microsoft Jet reserves as much as the physical memory.
+            addr = self._map_big_region(size, reserve_only)
             if addr:
                 self._protect_new_allocation(addr, flAllocationType, flProtect)
                 return addr
@@ -544,13 +549,31 @@ class ExeResourcesMixin:
     BIG_REGION_BUDGET = 0x40000000
 
     def _big_region_usage(self):
-        return sum(self.virtual_allocs[base] for base in self.mapped_virtual_allocs
-                   if base in self.virtual_allocs)
+        """Bytes of the mapped VirtualAlloc regions in use: whole regions, but
+        only the committed pages of reservations"""
+        usage = 0
+        for base in self.mapped_virtual_allocs:
+            if base in self.virtual_allocs:
+                pages = self.virtual_commits.get(base)
+                usage += self.virtual_allocs[base] if pages is None else len(pages) * 0x1000
+        return usage
 
-    def _map_big_region(self, size):
+    def _commit_pages(self, base, start, end):
+        """Count the pages start..end of the region at base as committed; False
+        if that is more than the budget of big regions allows"""
+        pages = self.virtual_commits.get(base)
+        if pages is None:
+            return True  # Counted in full since it was allocated
+        new = set(range((start - base) >> 12, (end - base) >> 12)) - pages
+        if new and self._big_region_usage() + len(new) * 0x1000 > self.BIG_REGION_BUDGET:
+            return False
+        pages |= new
+        return True
+
+    def _map_big_region(self, size, reserve_only=False):
         """Map a big VirtualAlloc block at a free address; its base or 0"""
         emu = self.emu
-        if self._big_region_usage() + size > self.BIG_REGION_BUDGET:
+        if not reserve_only and self._big_region_usage() + size > self.BIG_REGION_BUDGET:
             return 0
         base = emu._free_image_base(0, emu._align_size(size, 0x10000))
         if base is None:
@@ -562,9 +585,11 @@ class ExeResourcesMixin:
         emu.mapped_regions.append((base, base + size))
         self.virtual_allocs[base] = size
         self.mapped_virtual_allocs.add(base)
+        if reserve_only:
+            self.virtual_commits[base] = set()
         return base
 
-    def _map_virtual_at(self, address, size):
+    def _map_virtual_at(self, address, size, reserve_only=False):
         """Map a new region at a requested address (rounded down to the 64K
         allocation granularity) if it is free; returns its base or 0"""
         emu = self.emu
@@ -583,6 +608,8 @@ class ExeResourcesMixin:
         emu.mapped_regions.append((base, end))
         self.virtual_allocs[base] = size
         self.mapped_virtual_allocs.add(base)
+        if reserve_only:
+            self.virtual_commits[base] = set()
         return base
 
     def VirtualFree(self, args):
@@ -598,6 +625,7 @@ class ExeResourcesMixin:
                 return 0
             # Whatever reuses the memory gets it fully accessible
             self.set_protection(lpAddress, lpAddress + size, self.PAGE_EXECUTE_READWRITE)
+            self.virtual_commits.pop(lpAddress, None)
             if lpAddress in self.mapped_virtual_allocs:
                 self.mapped_virtual_allocs.discard(lpAddress)
                 self.emu.unmap_shared(lpAddress, size)
@@ -610,7 +638,15 @@ class ExeResourcesMixin:
                     start = lpAddress & ~0xFFF
                     end = base + size if dwSize == 0 else min(
                         (lpAddress + dwSize + 0xFFF) & ~0xFFF, base + size)
-                    self.emu.uc.mem_write(start, bytes(end - start))
+                    pages = self.virtual_commits.get(base)
+                    if pages is None:
+                        self.emu.uc.mem_write(start, bytes(end - start))
+                    else:
+                        # Only committed pages hold data (a reservation may be huge)
+                        first, last = (start - base) >> 12, (end - base) >> 12
+                        for page in [p for p in pages if first <= p < last]:
+                            self.emu.uc.mem_write(base + (page << 12), bytes(0x1000))
+                            pages.discard(page)
                     self.set_protection(start, end, 0)
                     break
             else:

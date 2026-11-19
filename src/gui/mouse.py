@@ -524,6 +524,8 @@ class MouseMixin:
                         self.focused_control = None
                     content_x, content_y = self.client_origin(target)
                     if target is not win and y < content_y:
+                        if button == 1 and self.child_frame(target)[1]:
+                            self._child_caption_click(target, x, y)
                         return
                     for control in target.controls:
                         if not (control.visible and control.enabled):
@@ -668,6 +670,19 @@ class MouseMixin:
             # No window under the mouse: the desktop gets the click
             if self._fullscreen_window() is None:
                 self._handle_desktop_click(pos, button)
+
+    def _child_caption_click(self, child, x, y):
+        """A left click on the title bar of a child window: its close button
+        closes it (WM_CLOSE), the rest of the bar starts dragging it inside
+        its parent"""
+        bar, close = self._child_caption_rects(child)
+        if close is not None and close.collidepoint(x, y):
+            self._close_window(child.hwnd)
+        elif bar.collidepoint(x, y):
+            # Child coordinates are relative to the parent's client area
+            self.dragging_window = child.hwnd
+            self.drag_offset_x = x - child.x
+            self.drag_offset_y = y - child.y
 
     def _post_mouse_down(self, target, x, y, button):
         """Post a button press (or wheel turn) to a child window at screen (x, y)"""

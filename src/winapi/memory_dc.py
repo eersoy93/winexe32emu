@@ -87,9 +87,10 @@ class MemoryDCMixin:
     def _translate_shape(shape, dx, dy):
         """Copy of a display list entry shifted by (dx, dy)"""
         moved = dict(shape)
-        if 'rect' in moved:
-            left, top, right, bottom = moved['rect']
-            moved['rect'] = (left + dx, top + dy, right + dx, bottom + dy)
+        for key in ('rect', 'clip'):
+            if key in moved:
+                left, top, right, bottom = moved[key]
+                moved[key] = (left + dx, top + dy, right + dx, bottom + dy)
         if 'pos' in moved:
             x, y = moved['pos']
             moved['pos'] = (x + dx, y + dy)
@@ -142,6 +143,13 @@ class MemoryDCMixin:
                                               min(right, sx + cx), min(bottom, sy + cy)))
             shapes.append(self._translate_shape(shape, dx, dy))
 
+        if rop in (self.DSPDXAX, self.PSDPXAX):
+            # The source is a mask: its white (DSPDxax) or black (PSDPxax)
+            # pixels paint the destination's brush color, the others leave it
+            brush = self._dc_brush_color(hdcDest)
+            shapes = [self._mask_paint(s, brush, rop == self.DSPDXAX) if s['type'] == 'image'
+                      else s for s in shapes]
+
         # Shapes under a later one covering the whole copied area are invisible
         for i in range(len(shapes) - 1, 0, -1):
             if gui.PseudoWindowsGUI.covers_rect(shapes[i], (x, y, x + cx, y + cy)):
@@ -158,6 +166,11 @@ class MemoryDCMixin:
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
+        if self.gui and hwnd in self.gui.controls:
+            # An owner-draw control's DC (WM_DRAWITEM)
+            for shape in shapes:
+                self.gui.add_shape(hwnd, shape)
+            return 1
         if not self.gui or not hwnd or hwnd not in self.gui.windows:
             return 1
 
@@ -177,6 +190,10 @@ class MemoryDCMixin:
     SRCAND = 0x008800C6
     SRCINVERT = 0x00660046
     NOTSRCCOPY = 0x00330008
+    DSNA = 0x00220326  # D AND NOT S: a mask's white part blackens the destination
+    DSPDXAX = 0x00E20746  # Brush color where the source is white (transparent bitmaps)
+    PSDPXAX = 0x00B8074A  # Brush color where the source is black
+    MERGEPAINT = 0x00BB0226  # NOT S OR D
     PATCOPY = 0x00F00021
     BLACKNESS = 0x00000042
     WHITENESS = 0x00FF0062
@@ -209,6 +226,27 @@ class MemoryDCMixin:
             cropped['rop'] = rop
         cropped.pop('_surface', None)
         return cropped
+
+    def _dc_brush_color(self, hdc):
+        """(r, g, b) of the brush selected into a DC (the default is white)"""
+        state = self.dc_state.get(hdc) or {}
+        color = self._brush_color(state.get('brush')) if state.get('brush') else None
+        return color if color is not None else (255, 255, 255)
+
+    @staticmethod
+    def _mask_paint(shape, brush, white):
+        """Image shape of a mask blitted with DSPDxax / PSDPxax: the brush
+        color where the mask is white (white True) or black, transparent
+        (a color key) elsewhere"""
+        key = (0, 0, 0) if brush != (0, 0, 0) else (255, 255, 255)
+        paint, keep = bytes(brush), bytes(key)
+        data = shape['data']
+        target = b'\xff\xff\xff' if white else b'\x00\x00\x00'
+        pixels = b''.join(paint if data[i:i + 3] == target else keep
+                          for i in range(0, len(data), 3))
+        painted = dict(shape, data=pixels, rop=MemoryDCMixin.SRCCOPY, colorkey=key)
+        painted.pop('_surface', None)
+        return painted
 
     def _to_monochrome(self, shape, bk_color):
         """Shape blitted into a monochrome bitmap: the background color becomes
@@ -451,12 +489,13 @@ class MemoryDCMixin:
             return int(round(yd + (y - sy_src) * scale_y))
 
         scaled = dict(shape)
-        if 'rect' in scaled:
-            left, top, right, bottom = scaled['rect']
-            x1, x2 = tx(left), tx(right)
-            y1, y2 = ty(top), ty(bottom)
-            # Normalize so mirrored blits keep left < right, top < bottom
-            scaled['rect'] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        for key in ('rect', 'clip'):
+            if key in scaled:
+                left, top, right, bottom = scaled[key]
+                x1, x2 = tx(left), tx(right)
+                y1, y2 = ty(top), ty(bottom)
+                # Normalize so mirrored blits keep left < right, top < bottom
+                scaled[key] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
         if 'pos' in scaled:
             x, y = scaled['pos']
             scaled['pos'] = (tx(x), ty(y))
@@ -520,6 +559,11 @@ class MemoryDCMixin:
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
+        if self.gui and hwnd in self.gui.controls:
+            # An owner-draw control's DC (WM_DRAWITEM)
+            for shape in shapes:
+                self.gui.add_shape(hwnd, shape)
+            return 1
         if not self.gui or not hwnd or hwnd not in self.gui.windows:
             return 1
 

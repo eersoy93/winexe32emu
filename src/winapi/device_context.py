@@ -133,8 +133,9 @@ class DeviceContextMixin:
         if self.gui and hwnd:
             self.gui.add_shape(hwnd, shape)
 
-    def _add_text(self, hdc, text, x, y):
-        """Append a text item to the DC's display list (window or memory DC)"""
+    def _add_text(self, hdc, text, x, y, clip=None):
+        """Append a text item to the DC's display list (window or memory DC);
+        clip (left, top, right, bottom) cuts it off outside a rectangle"""
         state = self.dc_state.get(hdc, {})
         shape = {
             'type': 'text',
@@ -145,6 +146,8 @@ class DeviceContextMixin:
             # OPAQUE background mode fills the text cell with the background color
             'bk': state.get('bk_color') if state.get('bk_mode', 2) == 2 else None,
         }
+        if clip is not None:
+            shape['clip'] = clip
         self._add_shape(hdc, shape)
 
     def BeginPaint(self, args):
@@ -306,108 +309,171 @@ class DeviceContextMixin:
         return 1
 
     ETO_OPAQUE = 0x2
+    ETO_CLIPPED = 0x4
 
     def ExtTextOutA(self, args, wide=False):
         """ExtTextOutA/W(hdc, x, y, options, lprect, lpString, c, lpDx) - TextOut
-        that can first fill a rectangle with the background color (ETO_OPAQUE);
-        clipping (ETO_CLIPPED) and the character spacing (lpDx) are ignored"""
+        that can first fill a rectangle with the background color (ETO_OPAQUE)
+        and keep the text inside it (ETO_CLIPPED); the character spacing (lpDx)
+        is ignored"""
         hdc, options, lprect, lpString, c = args[0], args[3], args[4], args[5], args[6]
         x, y = self._signed32(args[1]), self._signed32(args[2])
         text = self._read_text(lpString, wide)[:c] if lpString and c else ''
         log.debug(f"ExtTextOut{'W' if wide else 'A'}(0x{hdc:x}, {x}, {y}, \"{text}\")")
-        if options & self.ETO_OPAQUE and lprect:
+        rect = None
+        if options & (self.ETO_OPAQUE | self.ETO_CLIPPED) and lprect:
             try:
                 rect = struct.unpack('<iiii', self.emu.uc.mem_read(lprect, 16))
             except UcError:
                 rect = None
+        if options & self.ETO_OPAQUE and rect:
             state = self.dc_state.get(hdc)
-            if rect and state is not None:
+            if state is not None:
                 self._add_shape(hdc, {'type': 'rect', 'rect': rect,
                                       'fill': state.get('bk_color', (255, 255, 255)),
                                       'pen': None})
         if self.gui and text:
-            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
+            clip = rect if options & self.ETO_CLIPPED else None
+            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y), clip=clip)
         return 1
 
     def ExtTextOutW(self, args):
         return self.ExtTextOutA(args, wide=True)
 
+    DT_CENTER, DT_RIGHT, DT_VCENTER, DT_BOTTOM = 0x1, 0x2, 0x4, 0x8
+    DT_WORDBREAK, DT_SINGLELINE, DT_EXPANDTABS, DT_NOCLIP = 0x10, 0x20, 0x40, 0x100
+    DT_CALCRECT, DT_NOPREFIX = 0x400, 0x800
+    DT_HIDEPREFIX, DT_PREFIXONLY = 0x100000, 0x200000
+
+    @staticmethod
+    def _strip_prefixes(text):
+        """(text, index of the underlined character or -1): an & marks the next
+        character (a mnemonic), && is a literal &"""
+        out = []
+        underline = -1
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == '&' and i + 1 < len(text):
+                i += 1
+                if text[i] != '&':
+                    underline = len(out)
+                out.append(text[i])
+            elif ch != '&':
+                out.append(ch)
+            i += 1
+        return ''.join(out), underline
+
+    def _text_lines(self, hdc, text, width, flags):
+        """[(start, end)] character ranges of the lines DrawText shows: the text
+        breaks at newlines (unless DT_SINGLELINE) and, with DT_WORDBREAK,
+        between words where a line gets wider than width"""
+        if flags & self.DT_SINGLELINE:
+            return [(0, len(text))]
+        lines = []
+        start = 0
+        for paragraph in text.split('\n'):
+            end = start + len(paragraph)
+            if paragraph.endswith('\r'):
+                end -= 1  # CR LF
+            if not flags & self.DT_WORDBREAK:
+                lines.append((start, end))
+            else:
+                line_start = start
+                while True:
+                    # The longest run of words from line_start that fits
+                    pos, fit = line_start, None
+                    while pos < end:
+                        space = text.find(' ', pos, end)
+                        word_end = end if space < 0 else space
+                        if self._text_extent(hdc, text[line_start:word_end])[0] > width and \
+                                fit is not None:
+                            break
+                        fit = word_end
+                        pos = word_end + 1
+                        if space < 0:
+                            break
+                    if fit is None or fit >= end:
+                        lines.append((line_start, end))
+                        break
+                    lines.append((line_start, fit))
+                    line_start = fit
+                    while line_start < end and text[line_start] == ' ':
+                        line_start += 1
+                    if line_start >= end:
+                        break
+            start += len(paragraph) + 1
+        return lines
+
+    def _draw_text(self, hdc, text, lprc, flags):
+        """DrawText A/W: the text in the rectangle (or its size with DT_CALCRECT);
+        returns the height of the text"""
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None:
+            return 0
+        left, top, right, bottom = rect
+        log.debug(f"DrawText(0x{hdc:x}, \"{text}\", rect=({left},{top},{right},{bottom}), "
+                  f"flags=0x{flags:x})")
+        underline = -1
+        if not flags & self.DT_NOPREFIX:
+            text, underline = self._strip_prefixes(text)
+        if flags & self.DT_EXPANDTABS:
+            text = text.replace('\t', ' ' * 8)
+        if flags & self.DT_SINGLELINE:
+            text = text.replace('\r', ' ').replace('\n', ' ')
+        line_h = self._text_extent(hdc, 'Xg')[1]
+        lines = self._text_lines(hdc, text, right - left, flags)
+        widths = [self._text_extent(hdc, text[s:e])[0] for s, e in lines]
+        height = line_h * len(lines)
+
+        if flags & self.DT_CALCRECT:
+            # The rectangle bounds the text: its widest line and its last line
+            self._write_rect(lprc, left, top, left + max(widths, default=0), top + height)
+            return height
+
+        y = top
+        if flags & self.DT_SINGLELINE:
+            if flags & self.DT_VCENTER:
+                y = top + (bottom - top - line_h) // 2
+            elif flags & self.DT_BOTTOM:
+                y = bottom - line_h
+        state = self.dc_state.get(hdc, {})
+        drawn = self.gui and (state.get('memory') or self._dc_hwnd(hdc) not in self.gui.consoles)
+        for (start, end), width in zip(lines, widths, strict=True):
+            if flags & self.DT_CENTER:
+                x = left + (right - left - width) // 2
+            elif flags & self.DT_RIGHT:
+                x = right - width
+            else:
+                x = left
+            if drawn and not flags & self.DT_PREFIXONLY:
+                self._add_text(hdc, text[start:end], x, y)
+            if drawn and start <= underline < end and not flags & self.DT_HIDEPREFIX:
+                # The mnemonic's underline, below the baseline
+                ux = x + self._text_extent(hdc, text[start:underline])[0]
+                uw = self._text_extent(hdc, text[underline])[0]
+                uy = y + self._text_ascent(line_h) + 1
+                self._add_shape(hdc, {'type': 'line', 'from': (ux, uy),
+                                      'to': (ux + max(uw, 1) - 1, uy),
+                                      'pen': (state.get('text_color') or (0, 0, 0), 1)})
+            y += line_h
+        return (y - top) if flags & (self.DT_VCENTER | self.DT_BOTTOM) else height
+
     def DrawTextA(self, args):
         """DrawTextA emulation"""
-        hdc = args[0]
-        lpchText = args[1]
-        cchText = args[2]
-        lprc = args[3]
-        format_flags = args[4]
-
+        hdc, lpchText, cchText, lprc, flags = args[:5]
         text = self.read_string(lpchText) if lpchText else ""
-        if cchText > 0 and len(text) > cchText:
+        if 0 <= cchText < 0x80000000 and len(text) > cchText:
             text = text[:cchText]
-
-        # Read RECT structure
-        x, y, width, height = 0, 0, 400, 300
-        if lprc:
-            try:
-                rect_data = self.emu.uc.mem_read(lprc, 16)
-                left, top, right, bottom = struct.unpack("<iiii", rect_data)
-                x, y = left, top
-                width, height = right - left, bottom - top
-            except UcError:
-                pass
-
-        log.debug(f"DrawTextA(0x{hdc:x}, \"{text}\", rect=({x},{y},{width},{height}))")
-
-        # DT_CENTER (0x01) ve DT_VCENTER (0x04) flag'leri
-        DT_CENTER = 0x01
-        DT_VCENTER = 0x04
-
-        draw_x = x
-        draw_y = y
-        text_w, text_h = self._text_extent(hdc, text)
-
-        if format_flags & DT_CENTER:
-            draw_x = x + (width - text_w) // 2
-        elif format_flags & 0x02:  # DT_RIGHT
-            draw_x = x + width - text_w
-        if format_flags & DT_VCENTER:
-            draw_y = y + (height - text_h) // 2
-        elif format_flags & 0x08:  # DT_BOTTOM
-            draw_y = y + height - text_h
-
-        if self.gui:
-            state = self.dc_state.get(hdc, {})
-            if state.get('memory') or self._dc_hwnd(hdc) not in self.gui.consoles:
-                self._add_text(hdc, text, draw_x, draw_y)
-
-        return height  # Text height
+        return self._draw_text(hdc, text, lprc, flags)
 
     def DrawTextW(self, args):
         """DrawTextW emulation"""
-        hdc = args[0]
-        lpchText = args[1]
-        cchText = args[2]
-        lprc = args[3]
-        format_flags = args[4]
-
+        hdc, lpchText, cchText, lprc, flags = args[:5]
         text = self.read_wide_string(lpchText) if lpchText else ""
-        if cchText > 0 and len(text) > cchText:
+        if 0 <= cchText < 0x80000000 and len(text) > cchText:
             text = text[:cchText]
-
-        x, y = 0, 0
-        if lprc:
-            try:
-                rect_data = self.emu.uc.mem_read(lprc, 16)
-                left, top, right, bottom = struct.unpack("<iiii", rect_data)
-                x, y = left, top
-            except UcError:
-                pass
-
-        log.debug(f"DrawTextW(0x{hdc:x}, \"{text}\")")
-
-        if self.gui:
-            self._add_text(hdc, text, x, y)
-
-        return 20  # Text height
+        return self._draw_text(hdc, text, lprc, flags)
 
     def SetTextColor(self, args):
         """SetTextColor emulation"""

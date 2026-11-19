@@ -131,6 +131,39 @@ class WindowDrawingMixin:
             self._draw_window_button(buttons['max'], "❐" if window.maximized else "□", "max")
             self._draw_window_button(buttons['min'], "─", "min")
 
+    WS_SYSMENU = 0x00080000
+
+    def _child_caption_rects(self, child):
+        """(title bar, close button or None) screen rects of a child window
+        with a caption; the close button is there with WS_SYSMENU"""
+        border, caption = self.child_frame(child)
+        fx, fy = self.frame_origin(child)
+        bar = pygame.Rect(fx + border, fy + border, child.width - 2 * border, caption - 1)
+        if not child.style & self.WS_SYSMENU:
+            return bar, None
+        w, h = self.CAPTION_BTN_W, self.CAPTION_BTN_H
+        return bar, pygame.Rect(bar.right - 2 - w, bar.y + (bar.height - h) // 2, w, h)
+
+    def _draw_child_caption(self, child, is_active):
+        """Title bar of a child window (WS_CAPTION): the gradient, the title and
+        the close button, like a dialog's"""
+        bar, close = self._child_caption_rects(child)
+        if is_active:
+            colors = (self.COLOR_TITLE_BAR, self.COLOR_TITLE_BAR_GRADIENT)
+            text_color = self.COLOR_TITLE_TEXT
+        else:
+            colors = (self.COLOR_TITLE_BAR_INACTIVE, self.COLOR_TITLE_BAR_INACTIVE_GRADIENT)
+            text_color = self.COLOR_TITLE_TEXT_INACTIVE
+        if bar.width <= 0 or bar.height <= 0:
+            return
+        self.screen.blit(self._gradient(bar.size, *colors), bar.topleft)
+        right = close.x if close is not None else bar.right
+        title = self._fit_text(self.font_bold, child.title, right - 4 - (bar.x + 4))
+        title_text = self.font_bold.render(title, True, text_color)
+        self.screen.blit(title_text, (bar.x + 4, bar.centery - title_text.get_height() // 2))
+        if close is not None:
+            self._draw_window_button(close, "×", "close")
+
     CAPTION_ICON_SIZE = 16
 
     def _draw_caption_icon(self, window):
@@ -203,11 +236,31 @@ class WindowDrawingMixin:
             font = self._get_render_font(shape.get('font'))
             surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT,
                                   shape.get('bk'))
+            prev_clip = None
+            if shape.get('clip'):
+                # ExtTextOut's ETO_CLIPPED rectangle
+                left, top, right, bottom = shape['clip']
+                prev_clip = screen.get_clip()
+                screen.set_clip(pygame.Rect(ox + left, oy + top, right - left,
+                                            bottom - top).clip(prev_clip))
             screen.blit(surface, (ox + x, oy + y))
             if shape.get('font') and shape['font'].get('underline'):
                 line_y = oy + y + surface.get_height() - 2
                 pygame.draw.line(screen, shape.get('color') or self.COLOR_TEXT,
                                  (ox + x, line_y), (ox + x + surface.get_width(), line_y))
+            if prev_clip is not None:
+                screen.set_clip(prev_clip)
+
+        elif stype == 'icon':
+            x, y = shape['pos']
+            if 'system' in shape:
+                surface = (self._messagebox_icon_surface(shape['system']) if shape['system']
+                           else self._exe_icon(None, 32)[0])
+            else:
+                surface = self._image_surface_rgba(shape['image'])
+            if surface.get_size() != shape['size']:
+                surface = pygame.transform.smoothscale(surface, shape['size'])
+            screen.blit(surface, (ox + x, oy + y))
 
         elif stype == 'pixel':
             x, y = shape['pos']
@@ -217,30 +270,43 @@ class WindowDrawingMixin:
         elif stype == 'image':
             x, y = shape['pos']
             if shape['size'][0] > 0 and shape['size'][1] > 0:
-                screen.blit(self._image_surface(shape), (ox + x, oy + y))
+                screen.blit(self._image_surface(shape), (ox + x, oy + y),
+                            special_flags=self._rop_blend(shape.get('rop')))
+
+    @staticmethod
+    def _rop_blend(rop):
+        """Pygame blend flag that draws an image with raster operation rop over
+        what is below (0: a plain copy). With the black and white masks
+        programs use them for, the results are exact: D AND S is D * S,
+        D OR S is max(D, S); the NOT S operations blend the inverted image."""
+        api = winapi.WinAPIHandler
+        if rop in (api.SRCAND, api.DSNA):
+            return pygame.BLEND_RGB_MULT
+        if rop in (api.SRCPAINT, api.MERGEPAINT):
+            return pygame.BLEND_RGB_MAX
+        return 0
 
     def _image_surface(self, shape):
-        """Pygame surface of an image shape, cached in the shape.
-
-        Raster operations are approximated with transparency: SRCAND leaves
-        white pixels out (mask), SRCPAINT/SRCINVERT leave black pixels out.
-        """
+        """Pygame surface of an image shape, cached in the shape. The NOT S
+        raster operations get the inverted image (see _rop_blend); SRCINVERT is
+        approximated with transparency: black pixels leave the destination."""
         rop = shape.get('rop')
         key = (shape['size'], rop)
         cached = shape.get('_surface')
         if cached and cached[0] == key:
             return cached[1]
         data = shape['data']
-        if rop == winapi.WinAPIHandler.NOTSRCCOPY:
-            data = bytes(255 - b for b in data)
+        api = winapi.WinAPIHandler
+        if rop in (api.NOTSRCCOPY, api.DSNA, api.MERGEPAINT):
+            data = bytes(data).translate(bytes(range(255, -1, -1)))
         from_bytes = getattr(pygame.image, 'frombytes', None) or pygame.image.fromstring
         surface = from_bytes(data, shape['dim'], 'RGB')
         if shape['size'] != shape['dim']:
             surface = pygame.transform.scale(surface, shape['size'])
-        if rop == winapi.WinAPIHandler.SRCAND:
-            surface.set_colorkey((255, 255, 255))
-        elif rop in (winapi.WinAPIHandler.SRCPAINT, winapi.WinAPIHandler.SRCINVERT):
+        if rop == api.SRCINVERT:
             surface.set_colorkey((0, 0, 0))
+        elif shape.get('colorkey') is not None:
+            surface.set_colorkey(shape['colorkey'])  # Its transparent pixels
         shape['_surface'] = (key, surface)
         return surface
 

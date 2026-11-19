@@ -432,8 +432,8 @@ class User32Mixin:
             return old & 0xFFFFFFFF
         if nIndex == -8 and not set_value:  # GWL_HWNDPARENT
             return self._parent_of(hWnd) & 0xFFFFFFFF
-        if nIndex == -6 and not set_value:  # GWL_HINSTANCE
-            return self.emu.pe_loader.image_base
+        if nIndex == -6 and not set_value:  # GWL_HINSTANCE: the module that created it
+            return (store.get(nIndex) or self.emu.pe_loader.image_base) & 0xFFFFFFFF
         if nIndex == GWL_STYLE:
             control = self.gui.controls.get(hWnd) if self.gui and win is None else None
             if control is not None:
@@ -684,7 +684,8 @@ class User32Mixin:
         return self.capture_hwnd
 
     def GetParent(self, args):
-        """GetParent emulation - parent of a child window or control, owner of a dialog"""
+        """GetParent emulation - parent of a child window or control, owner of a
+        WS_POPUP dialog; like Windows, NULL for an overlapped (owned) window"""
         hWnd = args[0]
         if not self.gui:
             return 0
@@ -694,7 +695,9 @@ class User32Mixin:
         if win is not None and win.parent:
             return win.parent
         dialog = self.dialogs.get(hWnd)
-        return dialog['owner'] if dialog else 0
+        if dialog is None or win is None or not win.style & self.WS_POPUP:
+            return 0
+        return dialog['owner'] or 0
 
     def SetParent(self, args):
         """SetParent emulation - previous parent"""

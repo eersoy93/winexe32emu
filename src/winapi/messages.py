@@ -52,6 +52,10 @@ class MessagesMixin:
         if Msg in (WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH) and self.gui and \
                 hWnd in self.gui.controls and self._control_subclass(hWnd):
             return self.emu.call_wndproc(self._control_subclass(hWnd), hWnd, Msg, wParam, lParam)
+        if Msg == WM_SETTEXT and self._text_wndproc(hWnd):
+            # A program's window class (a custom static text, say) sees its new
+            # text and repaints; DefWindowProc stores it
+            return self._call_proc(self._text_wndproc(hWnd), hWnd, Msg, wParam, lParam)
         if Msg == WM_SETTEXT:
             return self.SetWindowTextA([hWnd, lParam], wide)
         if Msg == WM_GETTEXT:
@@ -139,6 +143,14 @@ class MessagesMixin:
 
     def SendMessageW(self, args):
         return self.SendMessageA(args, wide=True)
+
+    def _text_wndproc(self, hwnd):
+        """Window procedure that gets WM_SETTEXT for hwnd: that of a window of
+        a program's own class (not a dialog or an emulated control), else 0"""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if win is None or win.native or hwnd in self.dialogs or win.owner is not self:
+            return 0
+        return self._find_wndproc_for_hwnd(hwnd)
 
     PBM_SETRANGE, PBM_SETPOS, PBM_DELTAPOS, PBM_SETSTEP = 0x401, 0x402, 0x403, 0x404
     PBM_STEPIT, PBM_SETRANGE32, PBM_GETRANGE, PBM_GETPOS = 0x405, 0x406, 0x407, 0x408
@@ -849,7 +861,9 @@ class MessagesMixin:
             # Subclassed window (SetWindowLong GWL_WNDPROC) or emulated control
             if window.wndproc:
                 return window.wndproc
-            # Find WndProc from window class name
+            # The window's class: the one of its module, else by its name
+            if getattr(window, 'wndclass', None) is not None:
+                return window.wndclass.get('wndproc', 0)
             class_name = getattr(window, 'class_name', None)
             if class_name and class_name in self.registered_classes:
                 return self.registered_classes[class_name].get('wndproc', 0)
@@ -859,14 +873,24 @@ class MessagesMixin:
 
         return 0
 
-    def DefWindowProcA(self, args):
-        """DefWindowProcA emulation"""
+    def DefWindowProcA(self, args, wide=False):
+        """DefWindowProcA/W emulation"""
         hWnd = args[0]
         Msg = args[1]
         wParam = args[2]
         lParam = args[3]
         log.debug(f"DefWindowProcA(0x{hWnd:x}, 0x{Msg:x})")
 
+        if Msg == 0x000C:  # WM_SETTEXT: the window's text (its caption)
+            if self.gui:
+                self.gui.set_window_text(hWnd, self._read_text(lParam, wide) if lParam else '')
+            return 1
+        if Msg == 0x000D:  # WM_GETTEXT
+            return self.GetWindowTextA([hWnd, lParam, wParam], wide)
+        if Msg == 0x000E:  # WM_GETTEXTLENGTH
+            return len(self._window_text(hWnd))
+        if 0x0132 <= Msg <= 0x0138:  # WM_CTLCOLORMSGBOX ... WM_CTLCOLORSTATIC
+            return self._default_ctl_color(Msg, wParam)
         if Msg == self.WM_SETCURSOR:
             return self._default_set_cursor(hWnd, wParam, lParam)
         if Msg == self.WM_NCCREATE:
@@ -891,5 +915,5 @@ class MessagesMixin:
         return 0
 
     def DefWindowProcW(self, args):
-        return self.DefWindowProcA(args)
+        return self.DefWindowProcA(args, wide=True)
 

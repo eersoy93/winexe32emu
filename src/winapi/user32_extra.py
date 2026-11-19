@@ -1146,9 +1146,8 @@ class User32ExtraMixin:
         if template['style'] & self.WS_CHILD and parent in self.gui.windows:
             bx, by = self._dialog_units(template)
             dlg = self._create_dialog(template, parent, proc=args[3], parent=parent,
-                                      pos=(round(template['x'] * bx), round(template['y'] * by)))
-            self.gui.windows[dlg].style = template['style'] & ~self.WS_VISIBLE
-            self.gui.windows[dlg].ex_style = template['ex_style']
+                                      pos=(round(template['x'] * bx), round(template['y'] * by)),
+                                      child_style=template['style'])
         else:
             dlg = self._create_dialog(template, self._owner_window(parent), proc=args[3])
         self._show_dialog(dlg, args[4], show=bool(template['style'] & self.WS_VISIBLE))
@@ -1361,11 +1360,35 @@ class User32ExtraMixin:
             data = struct.pack('<5I', 1, 16, 16, 0, 0)
         return 1 if self._mem_write(args[1], data) else 0
 
+    def _draw_icon(self, hdc, x, y, hicon, width=0, height=0):
+        """Add an icon to a DC's display list: a program's icon image or a
+        system icon (the message box ones); False for an unknown icon"""
+        if hdc not in self.dc_state:
+            return False
+        shape = {'type': 'icon', 'pos': (x, y)}
+        if hicon in self.system_icons:
+            shape['system'] = self.system_icons[hicon]
+            size = width or 32
+            shape['size'] = (size, height or size)
+        elif self.icons.get(hicon):
+            image = self.icons[hicon]
+            shape['image'] = image
+            shape['size'] = (width or image[0], height or image[1])
+        else:
+            return False
+        self._add_shape(hdc, shape)
+        return True
+
     def DrawIcon(self, args):
-        return 1
+        """DrawIcon(hdc, x, y, hIcon)"""
+        x, y = self._read_signed_args(args, 1, 2)
+        return 1 if self._draw_icon(args[0], x, y, args[3]) else 0
 
     def DrawIconEx(self, args):
-        return 1
+        """DrawIconEx(hdc, x, y, hIcon, cx, cy, step, brush, flags) - cx, cy 0:
+        the icon's size"""
+        x, y, cx, cy = self._read_signed_args(args, 1, 2) + self._read_signed_args(args, 4, 2)
+        return 1 if self._draw_icon(args[0], x, y, args[3], max(cx, 0), max(cy, 0)) else 0
 
     # ---------- comctl32 window subclassing ----------
 

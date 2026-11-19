@@ -44,10 +44,12 @@ class MessageBoxesMixin:
         """Show MessageBox; each line of text gets its own row, the buttons of
         its MB_* type below. request (if any) gets the chosen button's id."""
         buttons, default, cancel = winapi.WinAPIHandler.messagebox_buttons(msg_type)
-        lines = text.replace('\r\n', '\n').split('\n')
         line_h = 18
         icon = (msg_type >> 4) & 0x7  # MB_ICONHAND, QUESTION, EXCLAMATION, ASTERISK
         text_x = 64 if icon in (1, 2, 3, 4) else 20
+        # Like Windows, long lines wrap at word breaks: the box stays narrower
+        # than the screen
+        lines = self._wrap_text(text, max(200, self.width * 5 // 8 - text_x))
         button_w, gap = 80, 8
         buttons_w = len(buttons) * button_w + (len(buttons) - 1) * gap
         text_w = max(self.font.size(line)[0] for line in lines)

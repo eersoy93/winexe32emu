@@ -115,7 +115,10 @@ class StatusBarMixin:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         left, top, right, bottom = rect
-        border, caption = gui.PseudoWindowsGUI.frame_size(dwStyle)
+        if dwStyle & self.WS_CHILD:
+            border, caption = gui.PseudoWindowsGUI.child_frame_size(dwStyle)
+        else:
+            border, caption = gui.PseudoWindowsGUI.frame_size(dwStyle)
         caption += gui.PseudoWindowsGUI.MENU_H if bMenu else 0
         return 1 if self._write_rect(lpRect, left - border, top - border - caption,
                                      right + border, bottom + border) else 0

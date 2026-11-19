@@ -39,7 +39,8 @@ class DisplayListMixin:
     def covers_rect(shape, area):
         """True if shape opaquely hides everything in area (left, top, right, bottom)"""
         if shape['type'] == 'image':
-            if shape.get('rop') not in (0x00CC0020, 0x00330008):  # SRCCOPY, NOTSRCCOPY
+            if shape.get('rop') not in (0x00CC0020, 0x00330008) or \
+                    shape.get('colorkey') is not None:  # Only opaque SRCCOPY, NOTSRCCOPY
                 return False
             (left, top), (w, h) = shape['pos'], shape['size']
             right, bottom = left + w, top + h
@@ -104,7 +105,7 @@ class DisplayListMixin:
         if 'rect' in shape:
             left, top, right, bottom = shape['rect']
             return (min(left, right), min(top, bottom), max(left, right), max(top, bottom))
-        if stype == 'image':
+        if stype in ('image', 'icon'):
             (x, y), (w, h) = shape['pos'], shape['size']
             return (x, y, x + w, y + h)
         if stype == 'pixel':
@@ -128,9 +129,13 @@ class DisplayListMixin:
         cover = None
         if shape['type'] == 'rect' and shape.get('fill') is not None:
             cover = cls.shape_bbox(shape)
-        elif shape['type'] == 'image' and shape.get('rop') in (0x00CC0020, 0x00330008):
+        elif shape['type'] == 'image' and shape.get('rop') in (0x00CC0020, 0x00330008) and \
+                shape.get('colorkey') is None:  # An opaque copy
             cover = cls.shape_bbox(shape)
-        same_text = shape['type'] == 'text' and shape.get('bk') is not None
+        # An opaque text hides an older one at its place (unless it is clipped:
+        # a progress bar draws its percentage twice, each in a part of the bar)
+        same_text = shape['type'] == 'text' and shape.get('bk') is not None and \
+            not shape.get('clip')
         if cover is None and not same_text:
             shapes.append(shape)  # Cheap path: most shapes hide nothing
             return shapes

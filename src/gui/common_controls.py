@@ -40,10 +40,8 @@ class CommonControlsMixin:
             c = self.windows.get(child)
             if c is None or not c.visible:
                 continue
-            cx, cy = self.client_origin(c)
-            border = self._child_border(c)
-            if (cx - border <= x < cx - border + c.width and
-                    cy - border <= y < cy - border + c.height):
+            fx, fy = self.frame_origin(c)
+            if fx <= x < fx + c.width and fy <= y < fy + c.height:
                 return self.child_at(child, x, y)
         return hwnd
 

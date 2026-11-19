@@ -127,6 +127,8 @@ class User32WindowsMixin:
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
             }
             self.atoms[atom] = class_name
+            self.module_classes[(class_name.lower(), hInstance)] = \
+                self.registered_classes[class_name]
 
             log.debug(f"RegisterClassA('{class_name}') -> 0x{atom:x}")
             return atom
@@ -168,6 +170,8 @@ class User32WindowsMixin:
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
             }
             self.atoms[atom] = class_name
+            self.module_classes[(class_name.lower(), hInstance)] = \
+                self.registered_classes[class_name]
 
             log.debug(f"RegisterClassExA('{class_name}') -> 0x{atom:x}")
             return atom
@@ -249,12 +253,23 @@ class User32WindowsMixin:
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
                 self.gui.windows[hwnd].class_name = class_name
+                if hInstance:  # GWL_HINSTANCE (a DLL finds its resources with it)
+                    self.window_longs.setdefault(hwnd, {})[-6] = hInstance
+                # Like Windows, the class the module hInstance registered comes
+                # first (two DLLs may register classes of the same name)
+                wndclass = self.module_classes.get((class_name.lower(), hInstance)) \
+                    if isinstance(class_name, str) else None
+                if wndclass is not None:
+                    self.gui.windows[hwnd].wndclass = wndclass
+                else:
+                    wndclass = self.registered_classes.get(class_name)
                 # The client area is erased with the class background brush
-                wndclass = self.registered_classes.get(class_name)
                 if wndclass and wndclass.get('background'):
                     color = self._brush_color(wndclass['background'])
                     if color is not None:
                         self.gui.windows[hwnd].bg_color = color
+                elif wndclass and dwStyle & self.WS_CHILD:
+                    self.gui.windows[hwnd].transparent = True
                 # Top-level windows get their menu bar from hMenu (like SetMenu),
                 # else from the class menu (lpszMenuName)
                 if (not dwStyle & self.WS_CHILD and not hMenu and wndclass and
@@ -437,6 +452,9 @@ class User32WindowsMixin:
         text = self._read_text(lpString, wide)
         log.debug(f"SetWindowTextA(0x{hWnd:x}, '{text}')")
 
+        if self._text_wndproc(hWnd):
+            # Like Windows: WM_SETTEXT to the window's procedure
+            return self.SendMessageA([hWnd, 0x000C, 0, lpString], wide)  # WM_SETTEXT
         combo = self._native_window(hWnd, 'COMBOBOXEX') if self.gui else None
         if combo is not None:
             self.comboboxex_set_text(combo, text)

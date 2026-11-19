@@ -187,12 +187,19 @@ class LayoutMixin:
             return False
         return bool(owner._find_wndproc_for_hwnd(hwnd)) or hwnd in owner.dialogs
 
+    def frame_origin(self, win):
+        """Screen coordinates of a window's top-left corner (its frame)"""
+        if win.parent in self.windows:
+            px, py = self.client_origin(self.windows[win.parent])
+            return (px + win.x, py + win.y)
+        return (win.x, win.y)
+
     def client_origin(self, win):
         """Screen coordinates of a window's client area origin."""
         if win.parent in self.windows:
             px, py = self.client_origin(self.windows[win.parent])
-            border = self._child_border(win)
-            return (px + win.x + border, py + win.y + border)
+            border, caption = self.child_frame(win)
+            return (px + win.x + border, py + win.y + border + caption)
         border, caption = self.window_frame(win)
         top = win.y + border + caption
         if win.menu:
@@ -202,8 +209,9 @@ class LayoutMixin:
     def client_size(self, win):
         """Client area size (width, height) of a window."""
         if win.parent in self.windows:
-            border = self._child_border(win)
-            return (max(0, win.width - 2 * border), max(0, win.height - 2 * border))
+            border, caption = self.child_frame(win)
+            return (max(0, win.width - 2 * border),
+                    max(0, win.height - 2 * border - caption))
         border, caption = self.window_frame(win)
         height = win.height - 2 * border - caption
         if win.menu:
@@ -256,10 +264,33 @@ class LayoutMixin:
                 win.x, win.y, win.width, win.height = 0, 0, width, height - 30
         log.info(f"Display mode changed to {width}x{height}")
 
-    @staticmethod
-    def _child_border(win):
-        """Frame width of a child window: 1 with WS_BORDER or WS_EX_CLIENTEDGE"""
-        return 1 if win.style & 0x00800000 or win.ex_style & 0x200 else 0
+    WS_EX_DLGMODALFRAME = 0x1
+    WS_EX_CLIENTEDGE = 0x200
+
+    @classmethod
+    def child_frame_size(cls, style, ex_style=0, dialog=False):
+        """(border, caption height) of a child window with this style: a child
+        with WS_CAPTION has a title bar and a dialog frame like a top-level
+        window (Office 95 Setup's dialogs are child windows), WS_DLGFRAME,
+        WS_THICKFRAME and a dialog's DS_MODALFRAME give the raised frame,
+        WS_BORDER and WS_EX_CLIENTEDGE a 1-pixel line"""
+        if style & cls.WS_CAPTION == cls.WS_CAPTION:
+            return cls.BORDER, cls.TITLE_BAR_H
+        if (style & (cls.WS_DLGFRAME | cls.WS_THICKFRAME) or ex_style & cls.WS_EX_DLGMODALFRAME
+                or (dialog and style & cls.DS_MODALFRAME)):
+            return cls.BORDER, 0
+        if style & cls.WS_BORDER or ex_style & cls.WS_EX_CLIENTEDGE:
+            return 1, 0
+        return 0, 0
+
+    def child_frame(self, win):
+        """(border, caption height) of a child window"""
+        return self.child_frame_size(win.style, win.ex_style,
+                                     getattr(win, 'class_name', None) == '#32770')
+
+    def _child_border(self, win):
+        """Frame width of a child window"""
+        return self.child_frame(win)[0]
 
     def size_state(self, win):
         """(SIZE_RESTORED/MINIMIZED/MAXIMIZED, client width, client height) for WM_SIZE"""
@@ -298,19 +329,31 @@ class LayoutMixin:
     def _draw_child_windows(self, window):
         """Draw the visible child windows of window (inside its client area)"""
         parent_clip = self.screen.get_clip()
+        # The topmost child with a title bar shows it active (with its top-level window)
+        captioned = [hwnd for hwnd in window.children
+                     if hwnd in self.windows and self.windows[hwnd].visible
+                     and self.child_frame(self.windows[hwnd])[1]]
+        active_child = captioned[-1] if captioned and \
+            self.top_level_of(window.hwnd) == self.active_window else None
         for hwnd in window.children:
             child = self.windows.get(hwnd)
             if child is None or not child.visible:
                 continue
             cx, cy = self.client_origin(child)
             cw, ch = self.client_size(child)
-            border = self._child_border(child)
-            frame = pygame.Rect(cx - border, cy - border, cw + 2 * border, ch + 2 * border)
+            border, caption = self.child_frame(child)
+            frame = pygame.Rect(*self.frame_origin(child), child.width, child.height)
             self.screen.set_clip(frame.clip(parent_clip))
-            if border:
+            if border > 1:
+                pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, frame)
+                self._draw_raised(frame)
+            elif border:
                 pygame.draw.rect(self.screen, (0, 0, 0), frame, border)
+            if caption:
+                self._draw_child_caption(child, hwnd == active_child)
             content = pygame.Rect(cx, cy, cw, ch)
-            pygame.draw.rect(self.screen, child.dialog_brush or child.bg_color, content)
+            if not child.transparent or child.dialog_brush:
+                pygame.draw.rect(self.screen, child.dialog_brush or child.bg_color, content)
             self.screen.set_clip(content.clip(parent_clip))
             if child.native:
                 self._draw_native(child, cx, cy, cw, ch)

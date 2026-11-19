@@ -317,6 +317,8 @@ class User32MiscMixin:
                 return 0
         wndclass = self.registered_classes.pop(match)
         self.atoms.pop(wndclass['atom'], None)
+        for key in [k for k, v in self.module_classes.items() if v is wndclass]:
+            del self.module_classes[key]
         log.debug(f"UnregisterClass('{match}')")
         return 1
 
@@ -348,7 +350,8 @@ class User32MiscMixin:
         name = self._window_class_name(hwnd) if self.gui else None
         if name is None:
             return None
-        wndclass = self.registered_classes.get(name)
+        win = self.gui.windows.get(hwnd)
+        wndclass = getattr(win, 'wndclass', None) or self.registered_classes.get(name)
         if wndclass is None:
             # The system classes: SetClassLong changes them for this process
             wndclass = self.system_class_data.setdefault(name.upper(), {'style': 0x8})
@@ -540,10 +543,8 @@ class User32MiscMixin:
             cwin = self.gui.windows.get(child)
             if cwin is None or (not cwin.visible and args[3] & 0x1):  # CWP_SKIPINVISIBLE
                 continue
-            cx, cy = self.gui.client_origin(cwin)
-            border = self.gui._child_border(cwin)
-            if cx - border <= sx < cx - border + cwin.width and \
-                    cy - border <= sy < cy - border + cwin.height:
+            fx, fy = self.gui.frame_origin(cwin)
+            if fx <= sx < fx + cwin.width and fy <= sy < fy + cwin.height:
                 return child
         for control in win.controls:
             if (control.visible or not args[3] & 0x1) and \

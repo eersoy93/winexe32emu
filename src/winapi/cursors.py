@@ -151,7 +151,8 @@ class CursorsMixin:
         """hCursor of a window's class (0 if it has none); the emulated common
         controls' classes have the arrow"""
         win = self.gui.windows.get(hwnd) if self.gui else None
-        wndclass = self.registered_classes.get(getattr(win, 'class_name', None) or '')
+        wndclass = getattr(win, 'wndclass', None) or \
+            self.registered_classes.get(getattr(win, 'class_name', None) or '')
         if wndclass:
             return wndclass.get('cursor', 0)
         return self._system_cursor(self.IDC_ARROW) if getattr(win, 'native', None) else 0
