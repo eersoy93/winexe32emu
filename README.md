@@ -60,7 +60,7 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - APIs the emulator lacks: a program that calls one gets 0 (see `--missing-apis`), and one with an unknown calling convention stops the program
 - Execution protection (DEP) of the heap: `malloc` memory stays executable even for NX-compatible programs (`VirtualAlloc` and `VirtualProtect` memory is protected)
 
-## Tested Programs
+## Supported Programs (playable but may not be supported 100%)
 
 - 7-Zip 4.65 (x86, NSIS setup and programs)
 - 7-Zip 9.20 (x86, NSIS setup and programs)
