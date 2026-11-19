@@ -21,3 +21,8 @@ venv/
 *.exe
 *.EXE
 *.Exe
+
+# Setup CDS
+*.iso
+*.ISO
+*.Iso
