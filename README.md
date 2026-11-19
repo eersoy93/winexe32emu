@@ -50,7 +50,7 @@ python3 winexe32emu.py --tests
 
 A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-gui api_test.exe`. GitHub Actions runs all of these on every push.
 
-## Not Supported
+## Not Supported (Currently)
 
 - 64-bit (x64) programs, and 16-bit DOS and Windows 3.x programs
 - .NET programs (the .NET runtime is not emulated)
@@ -74,14 +74,12 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - x86 CPU emulation (Unicorn)
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support
-- An offline network: Windows Sockets resolve only localhost and create no sockets (currently)
-- Loading the programs' own DLLs (imported or with LoadLibrary): reference counts, FreeLibrary, DllMain notifications
-- Page protections (VirtualProtect, VirtualAlloc reserve/commit, guard pages, image sections) and DEP for NX-compatible programs
-- Structured exception handling
+- An offline network: sockets resolve only localhost and create no sockets (currently)
+- Page protections and DEP for NX-compatible programs
+- Structured Exception Handling
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
-- Windows file name rules on the drives: case-insensitive names, NUL/CON devices, invalid names rejected
-- PEB loader data and process parameters, in-memory system DLL images (PE headers and exports) and static TLS with TLS callbacks
+- Windows file name rules on the virtual drives
 - Apps: Explorer only
 
 ## Versioning
