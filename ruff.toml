@@ -1,7 +1,7 @@
 # Lint settings (ruff check): Pyflakes, pycodestyle errors and warnings,
 # flake8-bugbear
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [lint]
 select = ["F", "E", "W", "B"]

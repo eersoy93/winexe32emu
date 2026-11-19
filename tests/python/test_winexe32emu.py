@@ -352,6 +352,16 @@ class MessageQueueTest(unittest.TestCase):
         self.assertEqual(handler.message_queue[-1]['wParam'], 0xFFFFFFFF)
 
 
+class VersionTest(unittest.TestCase):
+    def test_pyproject_version(self):
+        import tomllib
+        from src.config import WINEXE32EMU_VERSION
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+        with open(os.path.join(root, 'pyproject.toml'), 'rb') as f:
+            project = tomllib.load(f)['project']
+        self.assertEqual(project['version'], WINEXE32EMU_VERSION)
+
+
 class ProcessIdTest(unittest.TestCase):
     def test_unique_ids(self):
         ids = [CPUEmulator.allocate_id() for _ in range(100)]

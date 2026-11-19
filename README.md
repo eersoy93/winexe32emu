@@ -6,6 +6,8 @@
 
 ## Installation
 
+winexe32emu needs Python 3.11 or newer. It runs from its repository folder (it is not installed as a package):
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -32,6 +34,31 @@ python3 winexe32emu.py
 Use `-h` parameter for command-line help.
 
 To see which APIs a program needs but the emulator does not emulate yet, check the summary at the end of its run, or collect them in a file with `--missing-apis FILE`.
+
+## Running the Tests
+
+```bash
+# Lint and unit tests (no MinGW-w64 needed; the fake desktop's test uses SDL's dummy driver)
+pip install ruff
+ruff check .
+SDL_VIDEODRIVER=dummy python3 -m unittest discover -s tests/python -v
+
+# Emulator tests: compiles the C programs in tests/ into C:\Windows\Tests and runs each
+# one (exit code: number of failures)
+python3 winexe32emu.py --tests
+```
+
+A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-gui api_test.exe`. GitHub Actions runs all of these on every push.
+
+## Not Supported
+
+- 64-bit (x64) programs, and 16-bit DOS and Windows 3.x programs
+- .NET programs (the .NET runtime is not emulated)
+- DirectX, OpenGL and other hardware graphics; the fake desktop draws with GDI only
+- A real network: Windows Sockets only resolve localhost and create no sockets
+- Drivers, services and other system components
+- APIs the emulator lacks: a program that calls one gets 0 (see `--missing-apis`), and one with an unknown calling convention stops the program
+- Execution protection (DEP) of the heap: `malloc` memory stays executable even for NX-compatible programs (`VirtualAlloc` and `VirtualProtect` memory is protected)
 
 ## Tested Programs
 
