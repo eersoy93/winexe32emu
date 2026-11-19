@@ -85,7 +85,8 @@ class ListViewMixin:
             if (len(win.nstate['items']) + rows - 1) // rows <= columns:
                 rows = max(1, height // self.LV_ROW_H)  # No scroll bar needed
             return cell_w, self.LV_ROW_H, rows, columns, True
-        cell_w, cell_h = self.LV_ICON_CELL if view == 0 else             (win.nstate.get('cell_w') or 120, self.LV_ROW_H)
+        cell_w, cell_h = (self.LV_ICON_CELL if view == 0 else
+                          (win.nstate.get('cell_w') or 120, self.LV_ROW_H))
         per_row = max(1, (width - 16) // cell_w)
         return cell_w, cell_h, per_row, max(1, height // cell_h), False
 
@@ -417,7 +418,8 @@ class ListViewMixin:
                               0, st['items'][index]['param'], 0) + b'\x00' * 16
         result = self._notify_simple(win, self.LVN_ENDLABELEDITW, payload)
         if buf:
-            if result and index < len(st['items']) and st['items'][index]['texts'].get(0) is not None:
+            if (result and index < len(st['items']) and
+                    st['items'][index]['texts'].get(0) is not None):
                 st['items'][index]['texts'][0] = text
             st['items'][index]['cache'].pop(0, None) if index < len(st['items']) else None
             self.emu.heap_free(buf)
@@ -745,7 +747,8 @@ class ListViewMixin:
                                                  struct.pack('<iiIIIiiI', -1, 0, 0, 0, 0, 0, 0, 0)):
                 for i, item in enumerate(items):
                     self._notify_simple(win, self.LVN_DELETEITEM,
-                                        struct.pack('<iiIIIiiI', i, 0, 0, 0, 0, 0, 0, item['param']))
+                                        struct.pack('<iiIIIiiI', i, 0, 0, 0, 0, 0, 0,
+                                                    item['param']))
             st['items'] = []
             st['focus'] = st['mark'] = -1
             st['top'] = 0
@@ -846,7 +849,8 @@ class ListViewMixin:
                 if wide:
                     self._copy_text_out(info['text_ptr'], info['cch'], column['text'])
                 else:
-                    data = column['text'].encode(config.ANSI_CODEPAGE, 'replace')[:max(0, info['cch'] - 1)]
+                    data = column['text'].encode(config.ANSI_CODEPAGE, 'replace')
+                    data = data[:max(0, info['cch'] - 1)]
                     self._mem_write(info['text_ptr'], data + b'\x00')
             if info['mask'] & 0x8:
                 self._mem_write(lParam + 20, struct.pack('<i', column['sub']))
@@ -889,9 +893,11 @@ class ListViewMixin:
             if 0 <= wParam < len(st['columns']):
                 width = lParam & 0xFFFF
                 if width >= 0xFFFE:  # LVSCW_AUTOSIZE(_USEHEADER)
-                    width = max([self._native_text_width(st['columns'][wParam]['text']) + 12] +
-                                [self._native_text_width(self._lv_item_text(win, i, st['columns'][wParam]['sub'])) + 12 +
-                                 (self.lv_icon_space(win) if st['columns'][wParam]['sub'] == 0 else 0)
+                    column = st['columns'][wParam]
+                    icon = self.lv_icon_space(win) if column['sub'] == 0 else 0
+                    width = max([self._native_text_width(column['text']) + 12] +
+                                [self._native_text_width(
+                                    self._lv_item_text(win, i, column['sub'])) + 12 + icon
                                  for i in range(min(len(items), 200))])
                 columns = [dict(c) for c in st['columns']]
                 columns[wParam]['width'] = width - 0x10000 if width & 0x8000 else width

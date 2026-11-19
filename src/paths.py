@@ -269,8 +269,8 @@ def create_environment_folders(environment=DEFAULT_ENVIRONMENT):
             log.warning(f"Cannot create environment folder {folder}: {e}")
 
 
-# Scripts: drives/ folders and the apps (apps/ into C:\Windows) at startup, and the test programs (--tests: compiled
-# into C:\Windows\Tests and run without the GUI)
+# Scripts: drives/ folders and the apps (apps/ into C:\Windows) at startup, and the test
+# programs (--tests: compiled into C:\Windows\Tests and run without the GUI)
 CREATE_DRIVES_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "create_drives_environment.sh")
 COMPILE_APPS_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "compile_apps.sh")
 RUN_TESTS_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "run_tests.sh")

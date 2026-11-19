@@ -293,15 +293,18 @@ class SecurityMixin:
     def LookupAccountNameA(self, args, wide=False):
         """LookupAccountNameA/W(system, name, sid, &cb, domain, &cch, &use)"""
         wanted = self._read_text(args[1], wide).lower() if args[1] else ''
+        found = None
         for sid, account in self._known_accounts.items():
             names = {account[0].lower()}
             if account[1]:
                 names.add(f'{account[1]}\\{account[0]}'.lower())
             if wanted in names:
+                found = sid, account
                 break
-        else:
+        if found is None:
             self._last_error = 1332  # ERROR_NONE_MAPPED
             return 0
+        sid, account = found
         data = self._sid_bytes(sid)
         sid_size = self._read_u32(args[3]) if args[3] else 0
         domain_ok, domain_needed = self._store_account_text(account[1], args[4], args[5],

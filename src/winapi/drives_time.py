@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: Drives and volumes (only C:), file attributes and copies, time conversions"""
+"""WinAPIHandler mixin: Drives and volumes, file attributes and copies, time
+conversions"""
 
 import os
 import shutil
@@ -98,7 +99,7 @@ class DrivesTimeMixin:
         free, total = self._drive_space(letter)
         values = (sectors, sector_size, min(free // cluster, limit),
                   min(-(-total // cluster), limit))
-        for ptr, value in zip(pointers, values):
+        for ptr, value in zip(pointers, values, strict=False):
             if ptr:
                 self._mem_write(ptr, struct.pack('<I', value))
         return 1
@@ -170,7 +171,7 @@ class DrivesTimeMixin:
                 return 0
             letter = self.full_windows_path(name)[0]
         free, total = self._drive_space(letter)
-        for ptr, value in zip(args[1:4], (free, total, free)):
+        for ptr, value in zip(args[1:4], (free, total, free), strict=True):
             if ptr:
                 self._mem_write(ptr, struct.pack('<Q', value))
         return 1
@@ -624,26 +625,26 @@ class DrivesTimeMixin:
         key1 = (texts[0].lower(), texts[0].swapcase())
         key2 = (texts[1].lower(), texts[1].swapcase())
         return 1 if key1 < key2 else 3 if key1 > key2 else 2
-    
+
     def GetProcessHeap(self, args):
         """GetProcessHeap emulation"""
         log.debug("GetProcessHeap()")
         return self.emu.process_heap
-    
+
     def GetCurrentProcess(self, args):
         """GetCurrentProcess emulation"""
         log.debug("GetCurrentProcess()")
         return 0xFFFFFFFF  # Pseudo handle
-    
+
     def GetCurrentProcessId(self, args):
         """GetCurrentProcessId emulation"""
         log.debug("GetCurrentProcessId()")
         return self.emu.process_id
-    
+
     def GetCurrentThreadId(self, args):
         """GetCurrentThreadId emulation"""
         return self.emu.current_thread.tid
-    
+
     def GetTickCount(self, args):
         """GetTickCount emulation"""
         import time
@@ -708,13 +709,13 @@ class DrivesTimeMixin:
         lpPerformanceCount = args[0]
         import time
         count = int(time.time() * 1000000)
-        
+
         if lpPerformanceCount != 0:
             self.emu.uc.mem_write(lpPerformanceCount, struct.pack('<Q', count))
-        
+
         log.debug("QueryPerformanceCounter()")
         return 1
-    
+
     def GetSystemTimeAsFileTime(self, args):
         """GetSystemTimeAsFileTime emulation"""
         lpSystemTimeAsFileTime = args[0]
@@ -723,10 +724,10 @@ class DrivesTimeMixin:
         # Unix time: seconds since January 1, 1970
         # Difference: 11644473600 seconds
         filetime = int((time.time() + 11644473600) * 10000000)
-        
+
         if lpSystemTimeAsFileTime != 0:
             self.emu.uc.mem_write(lpSystemTimeAsFileTime, struct.pack('<Q', filetime))
-        
+
         log.debug("GetSystemTimeAsFileTime()")
         return 0
 
@@ -774,12 +775,12 @@ class DrivesTimeMixin:
             self._last_error = 5  # ERROR_ACCESS_DENIED
             return 0
         return 1
-    
+
     def IsDebuggerPresent(self, args):
         """IsDebuggerPresent emulation"""
         log.debug("IsDebuggerPresent() -> 0")
         return 0  # No debugger
-    
+
     def GetVersion(self, args):
         """GetVersion emulation - Returns Windows Vista SP2"""
         log.debug("GetVersion()")
@@ -788,17 +789,17 @@ class DrivesTimeMixin:
         # Low word: Major (low byte) | Minor (high byte) = 0x0006
         # High word: Build number = 6002 = 0x1772
         return 0x17720006  # Build 6002, Version 6.0
-    
+
     def GetVersionExA(self, args):
         """GetVersionExA emulation - Windows Vista SP2"""
         lpVersionInfo = args[0]
         log.debug(f"GetVersionExA(0x{lpVersionInfo:08x})")
-        
+
         # Fill OSVERSIONINFOA or OSVERSIONINFOEXA structure
         try:
             # Read dwOSVersionInfoSize
             size = struct.unpack('<I', self.emu.uc.mem_read(lpVersionInfo, 4))[0]
-            
+
             # Windows Vista SP2 info
             # OSVERSIONINFOA: 148 bytes
             # OSVERSIONINFOEXA: 156 bytes
@@ -839,16 +840,16 @@ class DrivesTimeMixin:
         except Exception as e:
             log.error(f"GetVersionExA error: {e}")
             return 0
-    
+
     def GetVersionExW(self, args):
         """GetVersionExW emulation - Windows Vista SP2 (Unicode)"""
         lpVersionInfo = args[0]
         log.debug(f"GetVersionExW(0x{lpVersionInfo:08x})")
-        
+
         try:
             # Read dwOSVersionInfoSize
             size = struct.unpack('<I', self.emu.uc.mem_read(lpVersionInfo, 4))[0]
-            
+
             # Windows Vista SP2 info
             # OSVERSIONINFOW: 276 bytes (128 WCHAR = 256 bytes for szCSDVersion)
             # OSVERSIONINFOEXW: 284 bytes

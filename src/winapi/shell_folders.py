@@ -26,6 +26,9 @@ from ..config import (PROGRAM_DATA_FOLDER, PROGRAM_FILES_FOLDER, PUBLIC_FOLDER,
 from ..logger import log
 
 
+ADMINISTRATIVE_TOOLS = '\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools'
+
+
 class ShellFoldersMixin:
     """Shell folders (shell32), keyboard, system settings, display modes"""
 
@@ -69,8 +72,8 @@ class ShellFoldersMixin:
         0x2B: PROGRAM_FILES_FOLDER + '\\Common Files',               # CSIDL_PROGRAM_FILES_COMMON
         0x2D: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Templates',  # CSIDL_COMMON_TEMPLATES
         0x2E: PUBLIC_FOLDER + '\\Documents',                         # CSIDL_COMMON_DOCUMENTS
-        0x2F: PROGRAM_DATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools',
-        0x30: USER_APPDATA_FOLDER + '\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools',
+        0x2F: PROGRAM_DATA_FOLDER + ADMINISTRATIVE_TOOLS,         # CSIDL_COMMON_ADMINTOOLS
+        0x30: USER_APPDATA_FOLDER + ADMINISTRATIVE_TOOLS,         # CSIDL_ADMINTOOLS
         0x35: PUBLIC_FOLDER + '\\Music',                             # CSIDL_COMMON_MUSIC
         0x36: PUBLIC_FOLDER + '\\Pictures',                          # CSIDL_COMMON_PICTURES
         0x37: PUBLIC_FOLDER + '\\Videos',                            # CSIDL_COMMON_VIDEO

@@ -34,14 +34,14 @@ class CrtBasicMixin:
         data = self._read_until_null(s, 0x7FFFFFFF, 1) or b''
         log.debug(f"strlen(0x{s:08x}) -> {len(data)}")
         return len(data)
-    
+
     def wcslen(self, args):
         """wcslen emulation"""
         s = args[0]
         string = self.read_wide_string(s)
         log.debug(f"wcslen() -> {len(string)}")
         return len(string)
-    
+
     def memset(self, args):
         """memset emulation"""
         dest = args[0]
@@ -53,7 +53,7 @@ class CrtBasicMixin:
         except UcError:
             pass
         return dest
-    
+
     def memcpy(self, args):
         """memcpy emulation"""
         dest = args[0]
@@ -67,11 +67,11 @@ class CrtBasicMixin:
         except UcError as e:
             log.warning(f"memcpy(0x{dest:08x}, 0x{src:08x}, {count}) failed: {e}")
         return dest
-    
+
     def memmove(self, args):
         """memmove emulation"""
         return self.memcpy(args)
-    
+
     def memcmp(self, args):
         """memcmp emulation"""
         buf1 = args[0]
@@ -87,7 +87,7 @@ class CrtBasicMixin:
             return 0
         except UcError:
             return 0
-    
+
     def strcpy(self, args):
         """strcpy emulation"""
         dest = args[0]
@@ -98,7 +98,7 @@ class CrtBasicMixin:
         except UcError:
             pass
         return dest
-    
+
     def strncpy(self, args):
         """strncpy emulation"""
         dest = args[0]
@@ -111,7 +111,7 @@ class CrtBasicMixin:
         except UcError:
             pass
         return dest
-    
+
     def strcmp(self, args):
         """strcmp emulation"""
         s1 = self.read_string(args[0])
@@ -121,7 +121,7 @@ class CrtBasicMixin:
         elif s1 > s2:
             return 1
         return 0
-    
+
     def _stricmp(self, args):
         """_stricmp emulation (case-insensitive)"""
         s1 = self.read_string(args[0]).lower()
@@ -131,7 +131,7 @@ class CrtBasicMixin:
         elif s1 > s2:
             return 1
         return 0
-    
+
     def strcat(self, args):
         """strcat emulation"""
         dest = args[0]
@@ -143,7 +143,7 @@ class CrtBasicMixin:
         except UcError:
             pass
         return dest
-    
+
     _FORMAT_SPEC_RE = re.compile(
         r'%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d*))?'
         r'(hh|h|ll|l|L|I64|I32|I|j|z|t|w)?([diouxXcCsSpnfFeEgGaA%])')
@@ -319,7 +319,7 @@ class CrtBasicMixin:
         data = self._format_string(fmt, args[1:]).encode(config.ANSI_CODEPAGE, errors='replace')
         self._stdout_stream().write(data)
         return len(data)
-    
+
     def puts(self, args):
         """puts emulation"""
         s = self.read_string(args[0])

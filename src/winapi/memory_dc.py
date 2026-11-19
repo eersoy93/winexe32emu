@@ -61,8 +61,8 @@ class MemoryDCMixin:
         """Copy of a display list entry shifted by (dx, dy)"""
         moved = dict(shape)
         if 'rect' in moved:
-            l, t, r, b = moved['rect']
-            moved['rect'] = (l + dx, t + dy, r + dx, b + dy)
+            left, top, right, bottom = moved['rect']
+            moved['rect'] = (left + dx, top + dy, right + dx, bottom + dy)
         if 'pos' in moved:
             x, y = moved['pos']
             moved['pos'] = (x + dx, y + dy)
@@ -110,9 +110,9 @@ class MemoryDCMixin:
                             box[3] <= sy or box[1] >= sy + cy):
                     continue  # Outside the copied area
                 if shape['type'] == 'rect':
-                    l, t, r, b = box
-                    shape = dict(shape, rect=(max(l, sx), max(t, sy),
-                                              min(r, sx + cx), min(b, sy + cy)))
+                    left, top, right, bottom = box
+                    shape = dict(shape, rect=(max(left, sx), max(top, sy),
+                                              min(right, sx + cx), min(bottom, sy + cy)))
             shapes.append(self._translate_shape(shape, dx, dy))
 
         # Shapes under a later one covering the whole copied area are invisible
@@ -425,9 +425,9 @@ class MemoryDCMixin:
 
         scaled = dict(shape)
         if 'rect' in scaled:
-            l, t, r, b = scaled['rect']
-            x1, x2 = tx(l), tx(r)
-            y1, y2 = ty(t), ty(b)
+            left, top, right, bottom = scaled['rect']
+            x1, x2 = tx(left), tx(right)
+            y1, y2 = ty(top), ty(bottom)
             # Normalize so mirrored blits keep left < right, top < bottom
             scaled['rect'] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
         if 'pos' in scaled:
@@ -735,7 +735,7 @@ class MemoryDCMixin:
             class Nearest(dict):
                 def __missing__(cache, color):
                     index = min(range(len(palette)), key=lambda i: sum(
-                        (a - b) ** 2 for a, b in zip(palette[i], color)))
+                        (a - b) ** 2 for a, b in zip(palette[i], color, strict=False)))
                     cache[color] = index
                     return index
             index_of = Nearest().__getitem__
@@ -747,7 +747,7 @@ class MemoryDCMixin:
                     gray[level] = index_of((level, level, level))
                 indices = reds.translate(gray)
             else:
-                indices = bytes(map(index_of, zip(reds, rgb[1::3], rgb[2::3])))
+                indices = bytes(map(index_of, zip(reds, rgb[1::3], rgb[2::3], strict=False)))
             row_bytes = (width * bpp + 7) // 8
 
             def pack(row_indices, nbytes):

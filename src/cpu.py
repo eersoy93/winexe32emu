@@ -132,7 +132,7 @@ class GuestThread:
 
 class CPUEmulator(ProcessEnvironmentMixin):
     """Unicorn-based x86 CPU emulator"""
-    
+
     # Memory layout constants
     STACK_BASE = 0x7FF00000
     STACK_SIZE = 0x00100000  # 1MB stack
@@ -175,7 +175,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
     SMALL_BLOCK_CACHED = 0x80
     # A thread that runs this long without blocking lets the others run
     THREAD_TIME_SLICE = 0.02
-    
+
     # Process and thread ids: one pool for every emulated process, multiples
     # of 4 like on Windows
     _next_id = 0x400
@@ -213,7 +213,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.instruction_count = 0
         self.block_insn_counts = {}  # (address, size) -> instructions in block
         self.max_instructions = 0  # Maximum instruction limit (0 = unlimited)
-        
+
         # Memory management
         self.heap_current = self.HEAP_BASE
         self.heap_blocks = {}  # addr -> requested size (for realloc)
@@ -221,22 +221,22 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.heap_free_bins = {}  # aligned size -> set of free block addrs
         self.heap_free_ends = {}  # free block end addr -> start addr
         self.mapped_regions = []
-        
+
         # API hook system
         self.api_hooks = {}
         self.api_handler = None
         self.crashed = False
         self.next_hook_addr = self.API_HOOK_BASE
         self.dynamic_stubs = {}  # (dll, name) -> stub addr from GetProcAddress
-        
+
         # Callback system
         self.callback_return_addr = self.CALLBACK_RETURN_ADDR
         self.pending_callback = None  # Pending callback info
-        
+
         # Console input system
         self.pending_console_read = None  # Pending ReadConsoleA request
         self.stop_for_input = False  # Paused for input?
-        
+
         # Special memory addresses
         self.cmdline_addr = 0
         self.cmdline_wide_addr = 0
@@ -640,35 +640,35 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def initialize(self):
         """Initialize emulator"""
         log.header("Initializing CPU Emulator")
-        
+
         # Create Unicorn emulator (32-bit x86)
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
-        
+
         # Create Capstone disassembler
         self.cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self.cs.detail = True
-        
+
         log.success("Unicorn and Capstone initialized")
-        
+
         # Create API handler (with GUI reference)
         self.api_handler = WinAPIHandler(self, self.gui)
         # DEP like 32-bit Windows' default (OptIn): only for NX-compatible EXEs
         self.dep_enabled = bool(
             self.pe_loader.pe.OPTIONAL_HEADER.DllCharacteristics & 0x0100)
-        
+
         # Setup memory
         if not self._setup_memory():
             return False
-        
+
         # Setup stack
         self._setup_stack()
-        
+
         # Create PEB/TEB structures
         self._setup_peb_teb()
-        
+
         # Setup callback return hook region
         self._setup_callback_return_hook()
-        
+
         # Structures programs read from memory: static TLS, the system DLL
         # images and the PEB's module lists, the process parameters
         self.init_thread_tls(self.main_thread)
@@ -688,35 +688,35 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
         # Register hooks
         self._setup_hooks()
-        
+
         return True
-    
+
     def _align_address(self, addr, alignment=0x1000):
         """Align address"""
         return addr & ~(alignment - 1)
-    
+
     def _align_size(self, size, alignment=0x1000):
         """Align size"""
         return (size + alignment - 1) & ~(alignment - 1)
-    
+
     def _map_memory(self, address, size, perms=UC_PROT_ALL):
         """Map memory region"""
         aligned_addr = self._align_address(address)
         aligned_size = self._align_size(size + (address - aligned_addr))
-        
+
         # Check for overlap
         for start, end in self.mapped_regions:
             if aligned_addr < end and aligned_addr + aligned_size > start:
                 # Already mapped, skip
                 return
-        
+
         try:
             self.map_shared(aligned_addr, aligned_size, perms)
             self.mapped_regions.append((aligned_addr, aligned_addr + aligned_size))
             log.debug(f"Memory mapped: 0x{aligned_addr:08x} - 0x{aligned_addr + aligned_size:08x}")
         except UcError as e:
             log.warning(f"Memory map error: {e}")
-    
+
     def _reserved_regions(self):
         """Address ranges the emulator itself uses (start, end)"""
         return [(0, 0x10000),
@@ -742,7 +742,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def _setup_memory(self):
         """Load PE file into memory. Returns False on failure."""
         log.header("Memory Configuration")
-        
+
         image_size = self._align_size(self.pe_loader.pe.OPTIONAL_HEADER.SizeOfImage)
         image_base = self._choose_image_base(image_size)
         if image_base is None:
@@ -756,10 +756,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
             log.warning(f"ImageBase 0x{self.pe_loader.image_base:08x} overlaps emulator "
                         f"memory, relocating to 0x{image_base:08x}")
             self.pe_loader.rebase(image_base)
-        
+
         # Allocate memory for main image
         self._map_memory(image_base, image_size)
-        
+
         # The image as the Windows loader maps it: headers and sections at
         # their RVAs (pefile clips raw data to the virtual sizes and zero
         # fills the rest), never past SizeOfImage
@@ -767,29 +767,32 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.uc.mem_write(image_base, pe_data[:image_size])
         log.info(f"PE image loaded: 0x{image_base:08x} - 0x{image_base + image_size:08x}")
         for section in self.pe_loader.sections:
-            log.info(f"Section '{section['name']}' at 0x{image_base + section['virtual_address']:08x}")
-        
+            address = image_base + section['virtual_address']
+            log.info(f"Section '{section['name']}' at 0x{address:08x}")
+
         # Allocate memory for stack
         self._map_memory(self.STACK_BASE, self.STACK_SIZE)
-        log.info(f"Stack allocated: 0x{self.STACK_BASE:08x} - 0x{self.STACK_BASE + self.STACK_SIZE:08x}")
-        
+        log.info(f"Stack allocated: 0x{self.STACK_BASE:08x} - "
+                 f"0x{self.STACK_BASE + self.STACK_SIZE:08x}")
+
         # Allocate memory for heap - larger and aligned
         try:
             self.map_shared(self.HEAP_BASE, self.HEAP_SIZE, UC_PROT_ALL)
             self.mapped_regions.append((self.HEAP_BASE, self.HEAP_BASE + self.HEAP_SIZE))
-            log.info(f"Heap allocated: 0x{self.HEAP_BASE:08x} - 0x{self.HEAP_BASE + self.HEAP_SIZE:08x}")
+            log.info(f"Heap allocated: 0x{self.HEAP_BASE:08x} - "
+                     f"0x{self.HEAP_BASE + self.HEAP_SIZE:08x}")
             self.map_shared(self.heap_class_map_addr, self.heap_class_map_size,
                             UC_PROT_READ | UC_PROT_WRITE)
             self.heap_class_map = self.shared_regions[self.heap_class_map_addr][2]
         except UcError as e:
             log.error(f"Heap allocation error: {e}")
             return False
-        
+
         # API hook region
         self._map_memory(self.API_HOOK_BASE, self.API_HOOK_SIZE)
         log.info(f"API Hook region: 0x{self.API_HOOK_BASE:08x}")
         return True
-    
+
     def _setup_stack(self):
         """Configure stack"""
         # Set ESP to middle of stack
@@ -798,9 +801,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.uc.reg_write(UC_X86_REG_EBP, esp)
         # Returning from the entry point ends the process with EAX as exit code
         self.uc.mem_write(esp, struct.pack('<I', self.PROCESS_EXIT_ADDR))
-        
+
         log.info(f"Stack pointer: ESP = 0x{esp:08x}")
-        
+
         # Allocate memory for command line
         cmdline = self.api_handler.windows_command_line()
         cmdline_bytes = cmdline.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00'
@@ -810,14 +813,14 @@ class CPUEmulator(ProcessEnvironmentMixin):
         cmdline_wide = cmdline.encode('utf-16-le') + b'\x00\x00'
         self.cmdline_wide_addr = self.heap_alloc(len(cmdline_wide))
         self.uc.mem_write(self.cmdline_wide_addr, cmdline_wide)
-    
+
     def _setup_peb_teb(self):
         """Create PEB and TEB structures"""
         # Memory for TEB
         self.teb_addr = self.heap_alloc(0x1000)
         # Memory for PEB
         self.peb_addr = self.heap_alloc(0x1000)
-        
+
         # TEB structure (simplified)
         # Offset 0x00: SEH chain
         # Offset 0x04: Stack base
@@ -826,7 +829,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Offset 0x30: PEB pointer
         teb_data = b'\x00' * 0x1000
         teb_data = bytearray(teb_data)
-        
+
         # SEH chain end marker, StackBase, StackLimit
         struct.pack_into('<III', teb_data, 0x00, 0xFFFFFFFF,
                          self.STACK_BASE + self.STACK_SIZE, self.STACK_BASE)
@@ -838,16 +841,16 @@ class CPUEmulator(ProcessEnvironmentMixin):
         struct.pack_into('<I', teb_data, 0x20, self.process_id)
         # ThreadId (FS:[0x24])
         struct.pack_into('<I', teb_data, 0x24, self.main_thread.tid)
-        
+
         self.uc.mem_write(self.teb_addr, bytes(teb_data))
-        
+
         # PEB structure (simplified)
         # Offset 0x02: BeingDebugged
         # Offset 0x08: ImageBaseAddress
         # Offset 0x0C: Ldr
         peb_data = b'\x00' * 0x1000
         peb_data = bytearray(peb_data)
-        
+
         # ImageBaseAddress
         struct.pack_into('<I', peb_data, 0x08, self.pe_loader.image_base)
         # BeingDebugged = 0
@@ -857,15 +860,15 @@ class CPUEmulator(ProcessEnvironmentMixin):
         struct.pack_into('<I', peb_data, 0x18, self.process_heap)
         # OSMajorVersion, OSMinorVersion, OSBuildNumber, OSPlatformId (matches GetVersion)
         struct.pack_into('<IIHHI', peb_data, 0xA4, 6, 0, 6002, 0, 2)
-        
+
         self.uc.mem_write(self.peb_addr, bytes(peb_data))
-        
+
         self._setup_segments(self.uc, self.teb_addr)
         self.main_thread.teb = self.teb_addr
-        
+
         log.info(f"TEB configured: 0x{self.teb_addr:08x}")
         log.info(f"PEB configured: 0x{self.peb_addr:08x}")
-    
+
     def heap_alloc(self, size, alignment=16):
         """Allocate zeroed heap memory, reusing freed blocks. Returns 0 when exhausted."""
         span = self._align_size(max(size, 1), 16)
@@ -882,7 +885,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 return 0
             if addr != self.heap_current:
                 # The alignment gap becomes a free block for later small allocations
-                self.heap_free_bins.setdefault(addr - self.heap_current, set()).add(self.heap_current)
+                self.heap_free_bins.setdefault(addr - self.heap_current,
+                                               set()).add(self.heap_current)
                 self.heap_free_ends[addr] = self.heap_current
             self.heap_current = addr + span
         self.heap_blocks[addr] = size
@@ -969,11 +973,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.heap_current = new_end
         self.heap_blocks[addr] = new_size
         return True
-    
+
     def _setup_import_hooks(self):
         """Setup hooks for import functions"""
         log.header("Setting Up API Hooks")
-        
+
         # Create hook address for each import
         for dll_name, functions in self.pe_loader.imports.items():
             log.info(f"DLL hook: {dll_name}")
@@ -1009,11 +1013,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
                     self.uc.mem_write(iat_addr, struct.pack('<I', data_addr))
                     log.debug(f"  Data: {func_name} -> 0x{data_addr:08x}")
                     continue
-                
+
                 hook_addr = self._create_api_stub(dll_name, func_name)
                 if not hook_addr:
                     break
-                
+
                 # Write hook address to IAT
                 self.uc.mem_write(iat_addr, struct.pack('<I', hook_addr))
                 log.debug(f"  Hook: {func_name} -> 0x{hook_addr:08x}")
@@ -1170,7 +1174,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         if key not in self.dynamic_stubs:
             self.dynamic_stubs[key] = self._create_api_stub(dll_name, func_name)
         return self.dynamic_stubs[key]
-    
+
     def _setup_callback_return_hook(self):
         """Setup callback return hook region"""
         # Allocate special memory region for callback return address
@@ -1273,7 +1277,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.uc.mem_write(free_addr, free)
         self.native_routines['malloc'] = malloc_addr
         self.native_routines['free'] = free_addr
-    
+
     @property
     def pending_unwind(self):
         return getattr(self.current_thread, 'pending_unwind', None)
@@ -1305,19 +1309,19 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def call_callback(self, callback_addr, args, return_handler=None, regs=None):
         """
         Call callback function (WndProc, EnumWindowsProc, etc.)
-        
+
         Args:
             callback_addr: Address of callback function
             args: Callback arguments (list)
             return_handler: Function to call when callback finishes (optional)
-        
+
         Returns:
             Callback return value (EAX)
         """
         if callback_addr == 0:
             log.warning("Callback address is 0, skipping call")
             return 0
-        
+
         # Save current state
         saved_esp = self.uc.reg_read(UC_X86_REG_ESP)
         saved_eip = self.uc.reg_read(UC_X86_REG_EIP)
@@ -1328,7 +1332,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         saved_esi = self.uc.reg_read(UC_X86_REG_ESI)
         saved_edi = self.uc.reg_read(UC_X86_REG_EDI)
         saved_ebp = self.uc.reg_read(UC_X86_REG_EBP)
-        
+
         # Add callback info to stack
         callback_info = {
             'addr': callback_addr,
@@ -1347,28 +1351,28 @@ class CPUEmulator(ProcessEnvironmentMixin):
             }
         }
         self.callback_stack.append(callback_info)
-        
+
         # Push arguments to stack (right to left - cdecl/stdcall)
         esp = saved_esp
-        
+
         # Push arguments in reverse order
         for arg in reversed(args):
             esp -= 4
             self.uc.mem_write(esp, struct.pack("<I", arg & 0xFFFFFFFF))
-        
+
         # Push callback_return_addr as return address
         esp -= 4
         self.uc.mem_write(esp, struct.pack("<I", self.callback_return_addr))
-        
+
         # Update ESP
         self.uc.reg_write(UC_X86_REG_ESP, esp)
         # Register arguments (thiscall ECX, the frame of an exception funclet in EBP)
         for name, value in (regs or {}).items():
             self.uc.reg_write({'ecx': UC_X86_REG_ECX, 'ebp': UC_X86_REG_EBP,
                                'eax': UC_X86_REG_EAX}[name], value & 0xFFFFFFFF)
-        
+
         log.debug(f"Calling callback: 0x{callback_addr:08x} args={[hex(a) for a in args]}")
-        
+
         # Run callback. Unicorn's instruction budget is shared with the outer
         # emu_start (nested runs clobber it), so pass 0 (unlimited) here and
         # let the Python-side max_instructions check in _hook_code limit
@@ -1377,18 +1381,18 @@ class CPUEmulator(ProcessEnvironmentMixin):
             self.emulate(self.uc, callback_addr, self.callback_return_addr)
         except UcError as e:
             log.error(f"Callback error: {e}")
-        
+
         # Get return value
         result = self.uc.reg_read(UC_X86_REG_EAX)
-        
+
         # Pop callback info from stack
         if self.callback_stack:
             completed_callback = self.callback_stack.pop()
-            
+
             # Call return handler if exists
             if completed_callback.get('return_handler'):
                 completed_callback['return_handler'](result)
-        
+
         # Restore state (except EAX - return value)
         self.uc.reg_write(UC_X86_REG_ESP, saved_esp)
         self.uc.reg_write(UC_X86_REG_EIP, saved_eip)
@@ -1398,7 +1402,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.uc.reg_write(UC_X86_REG_ESI, saved_esi)
         self.uc.reg_write(UC_X86_REG_EDI, saved_edi)
         self.uc.reg_write(UC_X86_REG_EBP, saved_ebp)
-        
+
         log.debug(f"Callback completed: 0x{callback_addr:08x} -> 0x{result:08x}")
 
         # An exception thrown in the callback is caught further out
@@ -1406,25 +1410,25 @@ class CPUEmulator(ProcessEnvironmentMixin):
         if unwind is not None and not self.stop_emulation:
             self.pending_unwind = None
             raise GuestUnwind(unwind)
-        
+
         return result
-    
+
     def call_wndproc(self, wndproc_addr, hwnd, msg, wParam, lParam):
         """
         Call WndProc callback
-        
+
         Args:
             wndproc_addr: Address of WndProc function
             hwnd: Window handle
             msg: Message code (WM_PAINT, etc.)
             wParam: wParam value
             lParam: lParam value
-        
+
         Returns:
             WndProc return value
         """
         return self.call_callback(wndproc_addr, [hwnd, msg, wParam, lParam])
-    
+
     def _setup_hooks(self):
         """Register Unicorn hooks"""
         self._add_hooks(self.uc)
@@ -1447,7 +1451,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Memory access error hooks
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._hook_mem_invalid)
         uc.hook_add(UC_HOOK_MEM_PROT, self._hook_mem_protect)
-        
+
         # Interrupt hook
         uc.hook_add(UC_HOOK_INTR, self._hook_interrupt)
 
@@ -1465,12 +1469,13 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
         # Limit check (max_instructions <= 0 means unlimited)
         if self.max_instructions > 0 and self.instruction_count > self.max_instructions:
-            log.warning(f"Maximum instruction limit reached ({self.max_instructions})! Stopping emulation...")
+            log.warning(f"Maximum instruction limit reached ({self.max_instructions})! "
+                        f"Stopping emulation...")
             self.stop_emulation = True
 
         if self.stop_emulation:
             uc.emu_stop()
-    
+
     def _hook_code(self, uc, address, size, user_data):
         """Hook for API stubs and the callback return address"""
         if (self.stop_emulation or self.current_thread.stop or
@@ -1590,7 +1595,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         elif isinstance(result, QWordResult):
             uc.reg_write(UC_X86_REG_EDX, result.value >> 32)
             result = result.value
-        
+
         # Return to caller. stdcall APIs (kernel32, user32, gdi32, ...) pop
         # their own arguments; cdecl CRT functions leave them to the caller.
         if cleanup is None:
@@ -1616,12 +1621,12 @@ class CPUEmulator(ProcessEnvironmentMixin):
             uc.reg_write(UC_X86_REG_EAX, result & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EIP, eip)
             uc.reg_write(UC_X86_REG_ESP, new_esp)
-    
+
     def _hook_mem_invalid(self, uc, access, address, size, value, user_data):
         """Invalid memory access hook"""
         access_types = {
             UC_MEM_READ_UNMAPPED: "READ",
-            UC_MEM_WRITE_UNMAPPED: "WRITE", 
+            UC_MEM_WRITE_UNMAPPED: "WRITE",
             UC_MEM_FETCH_UNMAPPED: "FETCH",
         }
         access_type = access_types.get(access, f"Unknown({access})")
@@ -1688,7 +1693,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 return
             self.apply_jump(uc, jump)
             address = jump.eip
-    
+
     # CPU exceptions -> (Windows exception code, description, faulting
     # instruction length: 0 when EIP already points at it)
     CPU_EXCEPTIONS = {
@@ -1920,10 +1925,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.report_missing_apis()
         if count_instructions:
             log.info(f"Total instruction count: {self.instruction_count}")
-        
+
         # Show register state
         self._print_registers()
-    
+
     # ---------- Unemulated APIs ----------
 
     # --missing-apis: the file every process appends its unemulated APIs to
@@ -1960,7 +1965,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def _print_registers(self):
         """Print register values"""
         log.header("Register State")
-        
+
         regs = [
             ("EAX", UC_X86_REG_EAX), ("EBX", UC_X86_REG_EBX),
             ("ECX", UC_X86_REG_ECX), ("EDX", UC_X86_REG_EDX),
@@ -1968,25 +1973,25 @@ class CPUEmulator(ProcessEnvironmentMixin):
             ("EBP", UC_X86_REG_EBP), ("ESP", UC_X86_REG_ESP),
             ("EIP", UC_X86_REG_EIP), ("EFLAGS", UC_X86_REG_EFLAGS),
         ]
-        
+
         for i in range(0, len(regs), 2):
             name1, reg1 = regs[i]
             val1 = self.uc.reg_read(reg1)
-            
+
             if i + 1 < len(regs):
                 name2, reg2 = regs[i + 1]
                 val2 = self.uc.reg_read(reg2)
                 log.info(f"{name1}: 0x{val1:08x}    {name2}: 0x{val2:08x}")
             else:
                 log.info(f"{name1}: 0x{val1:08x}")
-    
+
     def disassemble(self, address, count=10):
         """Disassemble starting from specified address"""
         log.header(f"Disassembly @ 0x{address:08x}")
-        
+
         try:
             code = self.uc.mem_read(address, count * 15)  # Each instruction max 15 bytes
-            
+
             disasm_count = 0
             for insn in self.cs.disasm(bytes(code), address):
                 bytes_str = ' '.join(f'{b:02x}' for b in insn.bytes)

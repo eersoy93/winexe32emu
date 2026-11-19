@@ -248,7 +248,7 @@ class DeviceContextMixin:
         hdc = args[0]
         index = args[1]
         width, height = self._screen_size()
-        
+
         caps = {
             4: 320,     # HORZSIZE (mm)
             6: 240,     # VERTSIZE (mm)
@@ -262,11 +262,11 @@ class DeviceContextMixin:
             117: height, # DESKTOPVERTRES
             118: width,  # DESKTOPHORZRES
         }
-        
+
         result = caps.get(index, 0)
         log.debug(f"GetDeviceCaps(0x{hdc:x}, {index}) -> {result}")
         return result & 0xFFFFFFFF
-    
+
     def TextOutA(self, args):
         """TextOutA emulation - Draw text"""
         hdc = args[0]
@@ -274,7 +274,7 @@ class DeviceContextMixin:
         y = args[2]
         lpString = args[3]
         c = args[4]
-        
+
         text = self.read_string(lpString) if lpString else ""
         if c > 0 and len(text) > c:
             text = text[:c]
@@ -285,7 +285,7 @@ class DeviceContextMixin:
             self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
 
         return 1
-    
+
     def TextOutW(self, args):
         """TextOutW emulation - Draw Unicode text"""
         hdc = args[0]
@@ -293,7 +293,7 @@ class DeviceContextMixin:
         y = args[2]
         lpString = args[3]
         c = args[4]
-        
+
         text = self.read_wide_string(lpString) if lpString else ""
         if c > 0 and len(text) > c:
             text = text[:c]
@@ -304,7 +304,7 @@ class DeviceContextMixin:
             self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
 
         return 1
-    
+
     def DrawTextA(self, args):
         """DrawTextA emulation"""
         hdc = args[0]
@@ -312,11 +312,11 @@ class DeviceContextMixin:
         cchText = args[2]
         lprc = args[3]
         format_flags = args[4]
-        
+
         text = self.read_string(lpchText) if lpchText else ""
         if cchText > 0 and len(text) > cchText:
             text = text[:cchText]
-        
+
         # Read RECT structure
         x, y, width, height = 0, 0, 400, 300
         if lprc:
@@ -327,13 +327,13 @@ class DeviceContextMixin:
                 width, height = right - left, bottom - top
             except UcError:
                 pass
-        
+
         log.debug(f"DrawTextA(0x{hdc:x}, \"{text}\", rect=({x},{y},{width},{height}))")
-        
+
         # DT_CENTER (0x01) ve DT_VCENTER (0x04) flag'leri
         DT_CENTER = 0x01
         DT_VCENTER = 0x04
-        
+
         draw_x = x
         draw_y = y
         text_w, text_h = self._text_extent(hdc, text)
@@ -346,14 +346,14 @@ class DeviceContextMixin:
             draw_y = y + (height - text_h) // 2
         elif format_flags & 0x08:  # DT_BOTTOM
             draw_y = y + height - text_h
-        
+
         if self.gui:
             state = self.dc_state.get(hdc, {})
             if state.get('memory') or self._dc_hwnd(hdc) not in self.gui.consoles:
                 self._add_text(hdc, text, draw_x, draw_y)
 
         return height  # Text height
-    
+
     def DrawTextW(self, args):
         """DrawTextW emulation"""
         hdc = args[0]
@@ -361,7 +361,7 @@ class DeviceContextMixin:
         cchText = args[2]
         lprc = args[3]
         format_flags = args[4]
-        
+
         text = self.read_wide_string(lpchText) if lpchText else ""
         if cchText > 0 and len(text) > cchText:
             text = text[:cchText]
@@ -381,7 +381,7 @@ class DeviceContextMixin:
             self._add_text(hdc, text, x, y)
 
         return 20  # Text height
-    
+
     def SetTextColor(self, args):
         """SetTextColor emulation"""
         hdc = args[0]

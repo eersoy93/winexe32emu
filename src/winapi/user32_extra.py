@@ -460,7 +460,7 @@ class User32ExtraMixin:
     HKL_US = 0x04090409
 
     # Characters typed with Shift on the US keyboard -> the unshifted key's character
-    US_SHIFTED = dict(zip(')!@#$%^&*(~_+{}|:"<>?', '0123456789`-=[]\\;\',./'))
+    US_SHIFTED = dict(zip(')!@#$%^&*(~_+{}|:"<>?', '0123456789`-=[]\\;\',./', strict=True))
     # Character of an OEM key -> its virtual key
     US_OEM_KEYS = {';': 0xBA, '=': 0xBB, ',': 0xBC, '-': 0xBD, '.': 0xBE, '/': 0xBF,
                    '`': 0xC0, '[': 0xDB, '\\': 0xDC, ']': 0xDD, "'": 0xDE}
@@ -1040,7 +1040,7 @@ class User32ExtraMixin:
         values = self.__dict__.get('_layered', {}).get(args[0])
         if values is None:
             return 0
-        for address, fmt, value in zip(args[1:4], ('<I', '<B', '<I'), values):
+        for address, fmt, value in zip(args[1:4], ('<I', '<B', '<I'), values, strict=True):
             if address:
                 self._mem_write(address, struct.pack(fmt, value))
         return 1

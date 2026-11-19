@@ -46,7 +46,8 @@ class OleAutMixin:
         pch, length = args[0], args[1]
         if length >= 0x10000000:
             return 0
-        data = bytes(self.emu.uc.mem_read(pch, length * 2)) if pch and length else b'\x00' * (length * 2)
+        data = (bytes(self.emu.uc.mem_read(pch, length * 2)) if pch and length else
+                b'\x00' * (length * 2))
         return self._alloc_bstr(data)
 
     def SysAllocStringByteLen(self, args):

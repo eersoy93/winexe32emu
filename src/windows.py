@@ -29,7 +29,7 @@ def gui_locked(method):
 
 class FakeWindow:
     """Fake Windows window"""
-    
+
     def __init__(self, hwnd, title, x, y, width, height, style=0):
         self.hwnd = hwnd
         self.title = title
@@ -72,29 +72,29 @@ class FakeWindow:
         self.minimized = False
         self.maximized = False
         self.is_dialog = False  # True if Dialog/MessageBox (only close button)
-        
+
         # Original dimensions for restore
         self.restore_x = x
         self.restore_y = y
         self.restore_width = width
         self.restore_height = height
-        
+
     def contains_point(self, px, py):
         """Is point inside window?"""
         if self.minimized:
             return False
-        return (self.x <= px <= self.x + self.width and 
+        return (self.x <= px <= self.x + self.width and
                 self.y <= py <= self.y + self.height)
-    
+
     def get_title_bar_rect(self):
         """Title bar rectangle"""
         return (self.x, self.y, self.width, 25)
-    
+
     def minimize(self):
         """Minimize window"""
         if not self.minimized:
             self.minimized = True
-    
+
     def restore(self):
         """Restore window"""
         if self.minimized:
@@ -105,7 +105,7 @@ class FakeWindow:
             self.width = self.restore_width
             self.height = self.restore_height
             self.maximized = False
-    
+
     def maximize(self, screen_width, screen_height, taskbar_height=30):
         """Maximize window"""
         if not self.maximized:
@@ -114,7 +114,7 @@ class FakeWindow:
             self.restore_y = self.y
             self.restore_width = self.width
             self.restore_height = self.height
-            
+
             # Go fullscreen (except taskbar)
             self.x = 0
             self.y = 0
@@ -128,7 +128,7 @@ class FakeWindow:
 
 class FakeControl:
     """Fake Windows control (Button, Edit, Static, etc.)"""
-    
+
     def __init__(self, hwnd, class_name, text, x, y, width, height, style=0, ex_style=0):
         self.hwnd = hwnd
         self.class_name = class_name.upper()
@@ -229,7 +229,7 @@ class FakeControl:
 
     def line_of(self, offset):
         """Index of the line that contains character offset"""
-        for index, (start, end) in enumerate(self.edit_lines()):
+        for index, (_start, end) in enumerate(self.edit_lines()):
             if offset <= end:
                 return index
         return len(self.edit_lines()) - 1
@@ -238,7 +238,7 @@ class FakeControl:
         """Is point inside control?"""
         abs_x = parent_x + self.x
         abs_y = parent_y + self.y
-        return (abs_x <= px <= abs_x + self.width and 
+        return (abs_x <= px <= abs_x + self.width and
                 abs_y <= py <= abs_y + self.height)
 
 
@@ -286,4 +286,4 @@ class _ProcessRouter:
 
 
 # Last: winapi (through gui) imports this module too
-from . import winapi
+from . import winapi  # noqa: E402

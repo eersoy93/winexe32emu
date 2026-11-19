@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: INI files (GetPrivateProfileString / WritePrivateProfileString), environment strings"""
+"""WinAPIHandler mixin: INI files (GetPrivateProfileString /
+WritePrivateProfileString), environment strings"""
 
 import re
 
@@ -367,4 +368,4 @@ class IniFilesMixin:
 
     def ExpandEnvironmentStringsW(self, args):
         return self.ExpandEnvironmentStringsA(args, wide=True)
-    
+

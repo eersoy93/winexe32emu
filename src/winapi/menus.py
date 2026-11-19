@@ -331,7 +331,7 @@ class MenusMixin:
         hmenu, first, last, check, flags = args[:5]
         by_position = flags & self.MF_BYPOSITION
         found = False
-        for menu, items in ([(hmenu, self.menus.get(hmenu, []))] if by_position else
+        for _menu, items in ([(hmenu, self.menus.get(hmenu, []))] if by_position else
                             [(h, i) for h, i in self.menus.items()]):
             for index, item in enumerate(items):
                 key = index if by_position else item['id']
@@ -439,8 +439,9 @@ class MenusMixin:
             elif mask & 0x40 and not info['type_data']:
                 item['text'] = ''
         if mask & 0x1:  # MIIM_STATE
-            flags = (flags & ~(self.MF_GRAYED | self.MF_DISABLED | self.MF_CHECKED |
-                               self.MF_DEFAULT | 0x80)) | (info['state'] & (0x3 | 0x8 | 0x1000 | 0x80))
+            flags = ((flags & ~(self.MF_GRAYED | self.MF_DISABLED | self.MF_CHECKED |
+                                self.MF_DEFAULT | 0x80)) |
+                     (info['state'] & (0x3 | 0x8 | 0x1000 | 0x80)))
         if mask & 0x2:  # MIIM_ID
             item['id'] = info['id']
         if mask & 0x4:  # MIIM_SUBMENU

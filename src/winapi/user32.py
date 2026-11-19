@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: USER32: RECT utilities, window positions, dialog items, window longs, system colors"""
+"""WinAPIHandler mixin: USER32: RECT utilities, window positions, dialog items, window
+longs, system colors"""
 
 import struct
 
@@ -159,9 +160,9 @@ class User32Mixin:
         nWidth = args[3]
         nHeight = args[4]
         bRepaint = args[5]
-        
+
         log.debug(f"MoveWindow(0x{hWnd:x}, {X}, {Y}, {nWidth}, {nHeight})")
-        
+
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             X, Y, nWidth, nHeight = self._read_signed_args(args, 1, 4)
@@ -173,9 +174,9 @@ class User32Mixin:
             control = self.gui.controls[hWnd]
             (control.x, control.y, control.width,
              control.height) = self._read_signed_args(args, 1, 4)
-        
+
         return 1
-    
+
     def _native_moved(self, win):
         """Emulated controls that size themselves: a rebar's height follows its
         bands, a combobox shows only its edit box"""
@@ -199,9 +200,9 @@ class User32Mixin:
         cx = args[4]
         cy = args[5]
         uFlags = args[6]
-        
+
         log.debug(f"SetWindowPos(0x{hWnd:x}, {X}, {Y}, {cx}, {cy})")
-        
+
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             X, Y, cx, cy = self._read_signed_args(args, 2, 4)
@@ -212,7 +213,8 @@ class User32Mixin:
                     win.width, win.height = cx, cy
                 if (not uFlags & 0x0004 and win.parent is None  # SWP_NOZORDER
                         and hWnd in self.gui.z_order):
-                    after = hWndInsertAfter if hWndInsertAfter < 0x80000000 else hWndInsertAfter - 0x100000000
+                    after = (hWndInsertAfter if hWndInsertAfter < 0x80000000 else
+                             hWndInsertAfter - 0x100000000)
                     if after in (0, -1):  # HWND_TOP, HWND_TOPMOST
                         self.gui.z_order.remove(hWnd)
                         self.gui.z_order.append(hWnd)
@@ -239,22 +241,22 @@ class User32Mixin:
                 control.visible = True
             elif uFlags & 0x0080:  # SWP_HIDEWINDOW
                 control.visible = False
-        
+
         return 1
-    
+
     def EnableWindow(self, args):
         """EnableWindow emulation"""
         hWnd = args[0]
         bEnable = args[1]
         log.debug(f"EnableWindow(0x{hWnd:x}, {bEnable})")
-        
+
         if self.gui and hWnd in self.gui.windows:
             self.gui.windows[hWnd].enabled = bool(bEnable)
         elif self.gui and hWnd in self.gui.controls:
             self.gui.controls[hWnd].enabled = bool(bEnable)
-        
+
         return 1
-    
+
     def GetDlgItem(self, args):
         """GetDlgItem emulation"""
         hDlg = args[0]

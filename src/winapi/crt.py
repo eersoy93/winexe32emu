@@ -354,11 +354,13 @@ class CrtMixin:
     def _c_pow(x, y):
         odd_int = float(y).is_integer() and int(y) % 2 == 1
         if x == 0 and y < 0:
-            raise winapi.WinAPIHandler._MathRange(math.copysign(math.inf, x) if odd_int else math.inf)
+            raise winapi.WinAPIHandler._MathRange(
+                math.copysign(math.inf, x) if odd_int else math.inf)
         try:
             return math.pow(x, y)
         except OverflowError:
-            raise winapi.WinAPIHandler._MathRange(-math.inf if x < 0 and odd_int else math.inf)
+            raise winapi.WinAPIHandler._MathRange(
+                -math.inf if x < 0 and odd_int else math.inf) from None
 
     _MATH_FUNCTIONS = {
         'sin': (math.sin, 1), 'cos': (math.cos, 1), 'tan': (math.tan, 1),

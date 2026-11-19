@@ -102,7 +102,7 @@ class NetworkMixin:
         except ValueError:
             return None
         limits = [256] * (len(values) - 1) + [256 ** (5 - len(values))]
-        if any(v < 0 or v >= limit for v, limit in zip(values, limits)):
+        if any(v < 0 or v >= limit for v, limit in zip(values, limits, strict=True)):
             return None
         number = 0
         for value in values[:-1]:

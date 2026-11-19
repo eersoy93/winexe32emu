@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WinAPIHandler mixin: Exception handling (MSVC x86 SEH, C++ exceptions), atexit, security cookie"""
+"""WinAPIHandler mixin: Exception handling (MSVC x86 SEH, C++ exceptions), atexit,
+security cookie"""
 
 import re
 import struct
@@ -579,7 +580,7 @@ class ExceptionsMixin:
         """_global_unwind2(frame) emulation (msvcrt): unwind the frames above"""
         self._global_unwind(args[0])
         return 0
-    
+
     def _onexit(self, args):
         """_onexit emulation - atexit registration"""
         func = args[0]
@@ -587,7 +588,7 @@ class ExceptionsMixin:
         if func:
             self.exit_handlers.append(func)
         return func  # Success
-    
+
     def atexit(self, args):
         """atexit emulation"""
         func = args[0]
@@ -595,38 +596,38 @@ class ExceptionsMixin:
         if func:
             self.exit_handlers.append(func)
         return 0  # Success
-    
+
     def _lock(self, args):
         """_lock emulation - critical section"""
         locknum = args[0]
         log.debug(f"_lock({locknum})")
         return 0
-    
+
     def _unlock(self, args):
         """_unlock emulation"""
         locknum = args[0]
         log.debug(f"_unlock({locknum})")
         return 0
-    
+
     def _encoded_null(self, args):
         """_encoded_null emulation"""
         return 0
-    
+
     def _decode_pointer(self, args):
         """_decode_pointer emulation"""
         ptr = args[0]
         return ptr  # No encoding, return directly
-    
+
     def _encode_pointer(self, args):
         """_encode_pointer emulation"""
         ptr = args[0]
         return ptr  # No encoding, return directly
-    
+
     def _crt_debugger_hook(self, args):
         """_crt_debugger_hook emulation"""
         log.debug("_crt_debugger_hook()")
         return 0
-    
+
     def api__dllonexit(self, args):
         """__dllonexit emulation"""
         func = args[0]
@@ -634,21 +635,21 @@ class ExceptionsMixin:
         if func:
             self.exit_handlers.append(func)
         return func
-    
+
     def _invoke_watson(self, args):
         """_invoke_watson emulation - security error handler"""
         log.error("_invoke_watson() - Security violation detected!")
         self.emu.stop_emulation = True
         return 0
-    
+
     def api__security_init_cookie(self, args):
         """__security_init_cookie emulation - stack cookie initialization"""
         log.debug("__security_init_cookie()")
         return 0
-    
+
     def api__security_check_cookie(self, args):
         """__security_check_cookie emulation"""
         cookie = args[0]
         log.debug(f"__security_check_cookie(0x{cookie:08x})")
         return 0
-    
+

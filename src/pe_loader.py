@@ -233,7 +233,7 @@ class PELoader:
         delta = new_base - self.image_base
         self.pe.relocate_image(new_base)
         self.image_base = new_base
-        for section, info in zip(self.pe.sections, self.sections):
+        for section, info in zip(self.pe.sections, self.sections, strict=True):
             info['data'] = bytes(section.get_data())
         for functions in self.imports.values():
             for func in functions:

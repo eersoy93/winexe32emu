@@ -123,7 +123,8 @@ class ComboBoxExMixin:
                 text, image = self._comboboxex_edit_text(win), st.get('image', -1)
                 param = 0
             elif 0 <= index < len(items):
-                text, image, param = items[index]['text'], items[index]['image'], items[index]['param']
+                item = items[index]
+                text, image, param = item['text'], item['image'], item['param']
             else:
                 return 0
             if info['mask'] & 0x1 and info['text_ptr']:

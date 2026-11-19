@@ -561,7 +561,8 @@ class DialogsMixin:
         """Dialog template of a property page (resource or in memory)"""
         if flags & 0x1:  # PSP_DLGINDIRECT
             return self._parse_dialog_template(bytes(self.emu.uc.mem_read(template_ref, 0x4000)))
-        key = template_ref if template_ref < 0x10000 else self._resource_name_key(template_ref, True)
+        key = (template_ref if template_ref < 0x10000 else
+               self._resource_name_key(template_ref, True))
         resource = self._find_resource(5, key, hinst)
         if resource is None:
             return None
@@ -755,7 +756,7 @@ class DialogsMixin:
                         break
                     parts.append(text)
                     address += (len(text) + 1) * (2 if wide else 1)
-                filters = list(zip(parts[0::2], parts[1::2]))
+                filters = list(zip(parts[0::2], parts[1::2], strict=False))
         except UcError:
             return 0
         if not self.gui or not self.gui.running:

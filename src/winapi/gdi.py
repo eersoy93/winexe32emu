@@ -40,7 +40,8 @@ class GdiMixin:
             'color': self._colorref_to_rgb(colorref),
             'width': max(1, width),
         }
-        log.debug(f"CreatePen(style={style}, width={width}, color=0x{colorref:06x}) -> 0x{handle:x}")
+        log.debug(f"CreatePen(style={style}, width={width}, color=0x{colorref:06x}) "
+                  f"-> 0x{handle:x}")
         return handle
 
     def CreateSolidBrush(self, args):
@@ -569,9 +570,9 @@ class GdiMixin:
         def inside(rects, x, y):
             return any(r[0] <= x < r[2] and r[1] <= y < r[3] for r in rects)
         bands = []
-        for top, bottom in zip(ys, ys[1:]):
+        for top, bottom in zip(ys, ys[1:], strict=False):
             row = []
-            for left, right in zip(xs, xs[1:]):
+            for left, right in zip(xs, xs[1:], strict=False):
                 if test(inside(first, left, top), inside(second, left, top)):
                     if row and row[-1][2] == left:
                         row[-1] = (row[-1][0], top, right, bottom)
