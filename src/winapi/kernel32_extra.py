@@ -916,6 +916,33 @@ class Kernel32ExtraMixin:
             return 0
         return 1 if self._mem_write(args[1], struct.pack('<I', 0)) else 0
 
+    def PeekConsoleInputA(self, args):
+        """PeekConsoleInputA/W, ReadConsoleInputA/W(console, buffer, length,
+        &count) - the console has no input events: 0 events"""
+        if not self._is_console_handle(args[0]):
+            self._last_error = 6
+            return 0
+        return 1 if self._mem_write(args[3], struct.pack('<I', 0)) else 0
+
+    def PeekConsoleInputW(self, args):
+        return self.PeekConsoleInputA(args)
+
+    def ReadConsoleInputA(self, args):
+        return self.PeekConsoleInputA(args)
+
+    def ReadConsoleInputW(self, args):
+        return self.PeekConsoleInputA(args)
+
+    def CreatePipe(self, args):
+        """CreatePipe(&read, &write, attributes, size) - anonymous pipes are
+        not emulated"""
+        self._last_error = 50  # ERROR_NOT_SUPPORTED
+        return 0
+
+    def FlushViewOfFile(self, args):
+        """FlushViewOfFile(base, size) - the views are written when unmapped"""
+        return 1
+
     def SetConsoleScreenBufferSize(self, args):
         return 1 if self._console_output_handle(args[0]) else 0
 

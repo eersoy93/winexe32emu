@@ -189,6 +189,10 @@ class Kernel32MiscMixin:
         """IsDBCSLeadByteEx emulation - supported code pages have no DBCS lead bytes"""
         return 0
 
+    def IsDBCSLeadByte(self, args):
+        """IsDBCSLeadByte emulation - the ANSI code page has no DBCS lead bytes"""
+        return 0
+
     def GetStartupInfoA(self, args):
         """GetStartupInfoA emulation"""
         lpStartupInfo = args[0]

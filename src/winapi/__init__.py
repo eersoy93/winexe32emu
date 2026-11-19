@@ -64,6 +64,8 @@ from .user32_extra import User32ExtraMixin
 from .shell_extra import ShellExtraMixin
 from .system_extra import SystemExtraMixin
 from .network import NetworkMixin
+from .dde import DdeMixin
+from .lz32 import Lz32Mixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -80,5 +82,6 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     ExceptionsMixin, CrtBasicMixin, MsvcrtMixin,
                     CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin,
                     ShlwapiMixin, SecurityMixin, Kernel32ExtraMixin, User32ExtraMixin,
-                    ShellExtraMixin, SystemExtraMixin, NetworkMixin):
+                    ShellExtraMixin, SystemExtraMixin, NetworkMixin, DdeMixin,
+                    Lz32Mixin):
     """Windows API emulation"""

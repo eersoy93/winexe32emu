@@ -26,6 +26,8 @@ from unicorn import UcError
 from .. import config, resources
 from ..config import DRIVES
 from ..logger import log
+from .registry import registry_locked
+from .typelib import guid_text, type_library_attributes, type_library_data
 
 
 class ComMixin:
@@ -1124,3 +1126,197 @@ class ComMixin:
         """__CxxFrameHandler emulation - called directly (not by the exception
         dispatcher, which handles C++ frames itself): continue the search"""
         return 1  # ExceptionContinueSearch
+
+    # ---------- Type libraries (oleaut32: LoadTypeLib, RegisterTypeLib) ----------
+
+    IID_ITYPELIB = '00020402-0000-0000-c000-000000000046'
+    TYPE_E_CANTLOADLIBRARY = 0x80029C4A
+
+    COM_INTERFACES.update({
+        'type_lib': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetTypeInfoCount', 1),
+            ('GetTypeInfo', 3), ('GetTypeInfoType', 3), ('GetTypeInfoOfGuid', 3),
+            ('GetLibAttr', 2), ('GetTypeComp', 2), ('GetDocumentation', 6), ('IsName', 4),
+            ('FindName', 6), ('ReleaseTLibAttr', 2)],
+    })
+
+    def _type_library_attributes(self, name):
+        """Library attributes of a type library file ("FILE.DLL\\2": its
+        TYPELIB resource 2); None if there is no such file"""
+        candidates = [(name, None)]
+        head, _, tail = name.rpartition('\\')
+        if head and tail.isdigit():
+            candidates.append((head, int(tail)))
+        for candidate, index in candidates:
+            full = self.full_windows_path(candidate)
+            host = self.resolve_drive_path(full) if full else None
+            if host and os.path.isfile(host):
+                attributes = type_library_attributes(type_library_data(host, index))
+                return attributes or {'guid': '00000000-0000-0000-0000-000000000000',
+                                      'lcid': 0, 'syskind': 1, 'major': 0, 'minor': 0,
+                                      'flags': 0, 'name': '', 'doc': ''}
+        return None
+
+    def LoadTypeLib(self, args):
+        """LoadTypeLib(szFile, pptlib) - an ITypeLib object with the library's
+        attributes but no type information: enough for setup programs and
+        DllRegisterServer functions that register libraries"""
+        name = self.read_wide_string(args[0]) if args[0] else ''
+        if args[1]:
+            self._mem_write(args[1], struct.pack('<I', 0))
+        attributes = self._type_library_attributes(name) if name else None
+        if attributes is None:
+            log.debug(f"LoadTypeLib(\"{name}\"): not found")
+            return self.TYPE_E_CANTLOADLIBRARY
+        pointers = self._com_new_object(
+            [((self.IID_ITYPELIB, self.IID_IUNKNOWN), self._com_vtable('ITypeLib', 'type_lib'))],
+            {'file': name, 'attr': None, 'library': attributes})
+        log.debug(f"LoadTypeLib(\"{name}\") -> {{{attributes['guid']}}} "
+                  f"{attributes['major']}.{attributes['minor']}")
+        return self.S_OK if self._mem_write(args[1], struct.pack(
+            '<I', pointers[self.IID_ITYPELIB])) else self.E_POINTER
+
+    def LoadTypeLibEx(self, args):
+        """LoadTypeLibEx(szFile, regkind, pptlib)"""
+        return self.LoadTypeLib([args[0], args[2]])
+
+    @registry_locked
+    def RegisterTypeLib(self, args):
+        """RegisterTypeLib(ptlib, szFullPath, szHelpDir) - enters the library
+        in HKEY_CLASSES_ROOT\\TypeLib\\{LIBID}\\major.minor"""
+        state = self.com_objects.get(args[0])
+        if state is None or 'library' not in state:
+            return self.E_INVALIDARG
+        library = state['library']
+        path = self.read_wide_string(args[1]) if args[1] else state['file']
+        help_dir = self.read_wide_string(args[2]) if args[2] else ''
+        version = f"TypeLib\\{{{library['guid'].upper()}}}\\{library['major']}.{library['minor']:x}"
+        values = [(version, '', library.get('doc') or library['name']),
+                  (f"{version}\\{library['lcid']:x}\\win32", '', path),
+                  (f"{version}\\FLAGS", '', str(library['flags'])),
+                  (f"{version}\\HELPDIR", '', help_dir)]
+        for key, value_name, text in values:
+            node, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, key, create=True)
+            if node is None:
+                return 0x80029C83  # TYPE_E_REGISTRYACCESS
+            node['values'][value_name.lower()] = {'name': value_name, 'type': 1,
+                                                  'data': text + '\x00'}
+        self._save_registry()
+        log.debug(f"RegisterTypeLib: {version} -> \"{path}\"")
+        return self.S_OK
+
+    def UnRegisterTypeLib(self, args):
+        return self.S_OK
+
+    def _com_type_lib(self, method, wide, args):
+        """ITypeLib methods: a library without type information"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        if method == 'GetTypeInfoCount':
+            return 0
+        if method == 'GetLibAttr':  # TLIBATTR: GUID, lcid, syskind (SYS_WIN32), version, flags
+            if state['attr'] is None:
+                library = state['library']
+                state['attr'] = self.emu.heap_alloc(32)
+                self._mem_write(state['attr'], self._guid_bytes(library['guid']) + struct.pack(
+                    '<IIHHH', library['lcid'], library['syskind'], library['major'],
+                    library['minor'], library['flags']))
+            return self.S_OK if self._mem_write(args[1], struct.pack(
+                '<I', state['attr'])) else self.E_POINTER
+        if method == 'ReleaseTLibAttr':
+            return self.S_OK
+        if method == 'IsName':
+            if args[3]:
+                self._mem_write(args[3], struct.pack('<i', 0))
+            return self.S_OK
+        if method in ('GetTypeInfo', 'GetTypeInfoType', 'GetTypeInfoOfGuid'):
+            return 0x8002802B  # TYPE_E_ELEMENTNOTFOUND
+        return self.E_NOTIMPL
+
+    # ---------- ole32: classes of files, automatic conversion ----------
+
+    MK_E_CANTOPENFILE = 0x800401EA
+    MK_E_INVALIDEXTENSION = 0x800401E6
+    ZERO_GUID = '00000000-0000-0000-0000-000000000000'
+
+    def _registry_default_text(self, key):
+        """Default value text of HKEY_CLASSES_ROOT\\key ('' if none)"""
+        node, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, key)
+        value = node['values'].get('') if node else None
+        data = value.get('data') if value else ''
+        return data.rstrip('\x00') if isinstance(data, str) else ''
+
+    @staticmethod
+    def _storage_clsid(data):
+        """CLSID of the root storage of a compound file (OLE structured
+        storage), None if data is not one"""
+        if data[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' or len(data) < 512:
+            return None
+        sector_size = 1 << struct.unpack_from('<H', data, 0x1E)[0]
+        first_directory = struct.unpack_from('<I', data, 0x30)[0]
+        root = 512 + first_directory * sector_size if sector_size >= 512 else None
+        if root is None or root + 0x60 > len(data):
+            return None
+        clsid = data[root + 0x50:root + 0x60]
+        return guid_text(clsid)
+
+    @registry_locked
+    def GetClassFile(self, args):
+        """GetClassFile(szFilename, pclsid) - the CLSID of a compound file's
+        root storage, else the class registered for its extension"""
+        name = self.read_wide_string(args[0]) if args[0] else ''
+        host = self.resolve_drive_path(name) if name else None
+        self._mem_write(args[1], self._guid_bytes(self.ZERO_GUID))
+        try:
+            with open(host, 'rb') as f:
+                header = f.read(0x10000)
+        except (OSError, TypeError):
+            return self.MK_E_CANTOPENFILE
+        clsid = self._storage_clsid(header)
+        if clsid is None or clsid == self.ZERO_GUID:
+            extension = ntpath.splitext(name)[1]
+            prog_id = self._registry_default_text(extension) if extension else ''
+            text = self._registry_default_text(prog_id + '\\CLSID') if prog_id else ''
+            clsid = text.strip('{}').lower() if len(text.strip('{}')) == 36 else None
+        if clsid is None:
+            return self.MK_E_INVALIDEXTENSION
+        self._mem_write(args[1], self._guid_bytes(clsid))
+        return self.S_OK
+
+    @registry_locked
+    def OleSetAutoConvert(self, args):
+        """OleSetAutoConvert(clsidOld, clsidNew) - HKEY_CLASSES_ROOT\\CLSID\\
+        {old}\\AutoConvertTo; a NULL new class removes it"""
+        old = self._read_guid(args[0])
+        if not old:
+            return self.E_INVALIDARG
+        key = f'CLSID\\{{{old.upper()}}}'
+        node, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, key, create=True)
+        if node is None:
+            return 0x80040152  # REGDB_E_WRITEREGDB
+        auto = node['keys'].get('autoconvertto')
+        if not args[1]:
+            if auto is not None:
+                self._mark_deleted(auto)
+                del node['keys']['autoconvertto']
+            self._save_registry()
+            return self.S_OK
+        new = self._read_guid(args[1])
+        auto, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, key + '\\AutoConvertTo', create=True)
+        auto['values'][''] = {'name': '', 'type': 1, 'data': f'{{{new.upper()}}}\x00'}
+        self._save_registry()
+        return self.S_OK
+
+    @registry_locked
+    def OleGetAutoConvert(self, args):
+        """OleGetAutoConvert(clsidOld, pClsidNew)"""
+        old = self._read_guid(args[0])
+        text = self._registry_default_text(f'CLSID\\{{{old.upper()}}}\\AutoConvertTo')
+        clsid = text.strip('{}').lower()
+        if len(clsid) != 36:
+            self._mem_write(args[1], bytes(self.emu.uc.mem_read(args[0], 16)))
+            return 0x80040155  # REGDB_E_KEYMISSING
+        self._mem_write(args[1], self._guid_bytes(clsid))
+        return self.S_OK

@@ -36,6 +36,8 @@ from src.paths import (device_name, drive_path_error, resolve_drive_path,  # noq
                        strip_win32_path_prefix, windows_path_of_host)
 from src.pe_loader import PELoader  # noqa: E402
 from src.winapi import WinAPIHandler  # noqa: E402
+from src.winapi.dde import parse_progman_commands, split_command_line  # noqa: E402
+from src.winapi.lz32 import expand_szdd, expanded_name  # noqa: E402
 
 # Some tests provoke warnings (blocked paths, a broken registry file)
 DebugLogger.level = DebugLogger.WARNING + 1
@@ -411,6 +413,67 @@ class KnownFoldersTest(unittest.TestCase):
         self.assertIn(r'C:\Program Files\Common Files', folders)
         self.assertTrue(any(f.endswith(r'\Downloads') for f in folders))
         self.assertFalse(any('(x86)' in f or 'syswow64' in f.lower() for f in folders))
+
+
+class ProgramManagerDdeTest(unittest.TestCase):
+    def test_parse_commands(self):
+        commands = parse_progman_commands(
+            '[CreateGroup(Microsoft Office)] [ShowGroup("Microsoft Office",1)]'
+            '[AddItem("C:\\MSOffice\\Word, 7\\WINWORD.EXE" /n,Microsoft Word,,0)][Reload]')
+        self.assertEqual(commands, [
+            ('creategroup', ['Microsoft Office']),
+            ('showgroup', ['Microsoft Office', '1']),
+            ('additem', ['C:\\MSOffice\\Word, 7\\WINWORD.EXE /n', 'Microsoft Word', '', '0']),
+            ('reload', []),
+        ])
+        self.assertEqual(split_command_line('"C:\\A B\\x.exe" /s'), ('C:\\A B\\x.exe', '/s'))
+        self.assertEqual(split_command_line('C:\\x.exe'), ('C:\\x.exe', ''))
+
+    def test_groups_and_items(self):
+        handler = bare_handler()
+        with tempfile.TemporaryDirectory() as folder:
+            handler.SHELL_FOLDERS = {0x02: 'C:\\Programs', 0x17: 'C:\\Common'}
+            handler.resolve_drive_path = lambda path: os.path.join(
+                folder, *path[3:].split('\\'))
+            handler._write_protected = lambda *paths: False
+            handler._shell_link_data = lambda link: ('|'.join(
+                (link['path'], link['arguments'], link['workdir']))).encode()
+            self.assertTrue(handler._progman_execute(
+                '[CreateGroup(Office: 95)][AddItem("C:\\Office\\winword.exe" /n,Word,,,,,C:\\Docs)]'
+                '[AddItem(C:\\Office\\excel.exe)]'))
+            group = os.path.join(folder, 'Programs', 'Office_ 95')
+            self.assertEqual(sorted(os.listdir(group)), ['Word.lnk', 'excel.lnk'])
+            with open(os.path.join(group, 'Word.lnk'), 'rb') as f:
+                self.assertEqual(f.read(), b'C:\\Office\\winword.exe|/n|C:\\Docs')
+            self.assertEqual(handler._progman_request('Groups'), 'Office_ 95\r\n')
+            self.assertTrue(handler._progman_execute('[DeleteItem(excel)]'))
+            self.assertEqual(os.listdir(group), ['Word.lnk'])
+            self.assertTrue(handler._progman_execute('[DeleteGroup(Office: 95)]'))
+            self.assertFalse(os.path.exists(group))
+            self.assertFalse(handler._progman_execute('[AddItem()]'))
+
+    def test_connect(self):
+        handler = bare_handler()
+        state = handler._dde_state()
+        state['instances'][1] = {'callback': 0, 'flags': 0, 'wide': False, 'error': 0}
+        state['strings'].update({2: 'PROGMAN', 3: 'Excel', 4: 'progman'})
+        self.assertEqual(handler.DdeCmpStringHandles([2, 4]), 0)
+        self.assertNotEqual(handler.DdeConnect([1, 2, 2, 0]), 0)
+        self.assertEqual(handler.DdeConnect([1, 3, 3, 0]), 0)
+        self.assertEqual(handler.DdeGetLastError([1]), 0x400A)  # DMLERR_NO_CONV_ESTABLISHED
+        self.assertEqual(handler.DdeGetLastError([1]), 0)
+
+
+class SzddTest(unittest.TestCase):
+    def test_expand(self):
+        header = b'SZDD\x88\xf0\x27\x33A' + b'T' + (9).to_bytes(4, 'little')
+        # Literals A, B, C, then a match of 6 bytes from the window position
+        # where the first literal went (4096 - 16 = 0xFF0)
+        data = header + bytes([0x07]) + b'ABC' + bytes([0xF0, 0xF3])
+        self.assertEqual(expand_szdd(data), b'ABCABCABC')
+        self.assertEqual(expanded_name('README.TX_', data), 'README.TXT')
+        self.assertEqual(expand_szdd(b'plain'), b'plain')
+        self.assertEqual(expanded_name('README.TXT', b'plain'), 'README.TXT')
 
 
 class SecurityAndNetworkTest(unittest.TestCase):

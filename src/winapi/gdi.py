@@ -14,6 +14,8 @@
 
 """WinAPIHandler mixin: GDI drawing APIs: pens, brushes, palettes, shapes, fonts"""
 
+import ntpath
+import os
 import struct
 
 from unicorn import UcError
@@ -635,6 +637,73 @@ class GdiMixin:
             self._mem_write(args[1], struct.pack('<4i', *box))
         return self._region_kind(rects)
 
+    # ---------- Clipping regions of DCs (kept for their queries; drawing is
+    # not clipped to them) ----------
+
+    def _dc_bounds(self, hdc):
+        """The whole drawing surface of a DC: a memory DC's bitmap, a window's
+        client area or the screen"""
+        state = self.dc_state.get(hdc, {})
+        if state.get('memory'):
+            bmp = self.gdi_objects.get(state.get('bitmap')) or {}
+            return (0, 0, bmp.get('width', 1), bmp.get('height', 1))
+        hwnd = self.dc_map.get(hdc)
+        if self.gui and hwnd in self.gui.windows:
+            return (0, 0) + tuple(self.gui.client_size(self.gui.windows[hwnd]))
+        if self.gui and hwnd in self.gui.controls:
+            control = self.gui.controls[hwnd]
+            return (0, 0, control.width, control.height)
+        return (0, 0) + tuple(self._screen_size())
+
+    def _dc_clip(self, hdc):
+        """Clip rectangles of a DC (its whole surface if it has no clip region)"""
+        clip = self.dc_state[hdc].get('clip')
+        return list(clip) if clip is not None else [self._dc_bounds(hdc)]
+
+    def _rect_clip(self, args, test):
+        hdc = args[0]
+        if hdc not in self.dc_state:
+            return 0  # ERROR
+        left, top, right, bottom = self._read_signed_args(args, 1, 4)
+        rect = [(left, top, right, bottom)] if left < right and top < bottom else []
+        clip = self._combine_rects(self._dc_clip(hdc), rect, test)
+        self.dc_state[hdc]['clip'] = clip
+        return self._region_kind(clip)
+
+    def IntersectClipRect(self, args):
+        """IntersectClipRect(hdc, left, top, right, bottom) - returns the region kind"""
+        return self._rect_clip(args, lambda a, b: a and b)
+
+    def ExcludeClipRect(self, args):
+        """ExcludeClipRect(hdc, left, top, right, bottom) - returns the region kind"""
+        return self._rect_clip(args, lambda a, b: a and not b)
+
+    def SelectClipRgn(self, args):
+        """SelectClipRgn(hdc, hrgn) - a copy of the region; NULL removes the clipping"""
+        hdc, hrgn = args[0], args[1]
+        if hdc not in self.dc_state:
+            return 0
+        if not hrgn:
+            self.dc_state[hdc]['clip'] = None
+            return self.SIMPLEREGION
+        region = self.gdi_objects.get(hrgn)
+        if region is None or region['type'] != 'region':
+            return 0
+        self.dc_state[hdc]['clip'] = list(region['rects'])
+        return self._region_kind(region['rects'])
+
+    def GetClipBox(self, args):
+        """GetClipBox(hdc, lprect) - bounding rectangle of the visible area"""
+        hdc = args[0]
+        if hdc not in self.dc_state:
+            return 0
+        rects = self._dc_clip(hdc)
+        box = (min(r[0] for r in rects), min(r[1] for r in rects),
+               max(r[2] for r in rects), max(r[3] for r in rects)) if rects else (0, 0, 0, 0)
+        if args[1]:
+            self._mem_write(args[1], struct.pack('<4i', *box))
+        return self._region_kind(rects)
+
     def SetWindowRgn(self, args):
         """SetWindowRgn emulation - the system owns the region afterwards (it is
         kept with the window; drawing is not clipped to it)"""
@@ -678,6 +747,169 @@ class GdiMixin:
             'width': 0,
         }
         log.debug(f"CreateHatchBrush({iHatch}, 0x{colorref:06x}) -> 0x{handle:x}")
+        return handle
+
+    # DC state that SaveDC does not copy: the drawing of memory DCs, the kind
+    # of DC and the stack of saved states itself
+    _UNSAVED_DC_KEYS = ('shapes', 'memory', 'saved')
+
+    def SaveDC(self, args):
+        """SaveDC(hdc) emulation - pushes the DC's state (objects, colors,
+        modes, position); returns the new save level, 0 on error"""
+        state = self.dc_state.get(args[0])
+        if state is None:
+            return 0
+        saved = {k: v for k, v in state.items() if k not in self._UNSAVED_DC_KEYS}
+        state.setdefault('saved', []).append(saved)
+        return len(state['saved'])
+
+    def RestoreDC(self, args):
+        """RestoreDC(hdc, nSavedDC) emulation - a positive level, or a negative
+        one counted back from the latest save (-1: the latest)"""
+        hdc, level = args[0], self._signed32(args[1])
+        state = self.dc_state.get(hdc)
+        stack = state.get('saved', []) if state else []
+        if level < 0:
+            level += len(stack) + 1
+        if not 1 <= level <= len(stack):
+            return 0
+        saved = stack[level - 1]
+        del stack[level - 1:]
+        bitmap = saved.pop('bitmap', None)
+        state.update(saved)
+        if bitmap is not None and bitmap != state.get('bitmap'):
+            self.SelectObject([hdc, bitmap or self._dc_default_objects()['bitmap']])
+        return 1
+
+    # Font files added with AddFontResource (lower-case Windows paths), shared
+    # by the emulated programs. The fonts are not loaded: text is drawn with
+    # the fake desktop's own fonts.
+    font_resources = {}
+
+    def AddFontResourceA(self, args, wide=False):
+        """AddFontResourceA/W(lpFileName) - the number of fonts added (1), 0 if
+        the file does not exist"""
+        name = self._read_text(args[0], wide) if args[0] else ''
+        path = self.full_windows_path(name) if name else None
+        host = self.resolve_drive_path(path) if path else None
+        if host is None or not os.path.isfile(host):
+            # A bare file name is looked up in the Fonts folder
+            path = 'C:\\Windows\\Fonts\\' + ntpath.basename(name) if name else None
+            host = self.resolve_drive_path(path) if path else None
+            if host is None or not os.path.isfile(host):
+                log.debug(f"AddFontResource(\"{name}\"): no such file")
+                return 0
+        counts = type(self).font_resources
+        counts[path.lower()] = counts.get(path.lower(), 0) + 1
+        log.debug(f"AddFontResource(\"{name}\") -> \"{path}\"")
+        return 1
+
+    def AddFontResourceW(self, args):
+        return self.AddFontResourceA(args, wide=True)
+
+    def AddFontResourceExA(self, args):
+        """AddFontResourceExA(name, fl, pdv) - private fonts are added like the others"""
+        return self.AddFontResourceA(args)
+
+    def AddFontResourceExW(self, args):
+        return self.AddFontResourceA(args, wide=True)
+
+    def RemoveFontResourceA(self, args, wide=False):
+        """RemoveFontResourceA/W(lpFileName) - 0 if the font was not added"""
+        name = self._read_text(args[0], wide) if args[0] else ''
+        counts = type(self).font_resources
+        for path in (self.full_windows_path(name) if name else None,
+                     'C:\\Windows\\Fonts\\' + ntpath.basename(name) if name else None):
+            if path and counts.get(path.lower()):
+                counts[path.lower()] -= 1
+                if not counts[path.lower()]:
+                    del counts[path.lower()]
+                return 1
+        return 0
+
+    def RemoveFontResourceW(self, args):
+        return self.RemoveFontResourceA(args, wide=True)
+
+    def RemoveFontResourceExA(self, args):
+        return self.RemoveFontResourceA(args)
+
+    def RemoveFontResourceExW(self, args):
+        return self.RemoveFontResourceA(args, wide=True)
+
+    def CreateScalableFontResourceA(self, args, wide=False):
+        """CreateScalableFontResourceA/W(fdwHidden, lpszFontRes, lpszFontFile,
+        lpszCurrentPath) - writes the font resource (.FOT) file, which here
+        only names the TrueType file"""
+        fot = self._read_text(args[1], wide) if args[1] else ''
+        ttf = self._read_text(args[2], wide) if args[2] else ''
+        host = self.resolve_drive_path(fot) if fot else None
+        if host is None or self._write_protected(host):
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if os.path.exists(host):
+            self._last_error = 80  # ERROR_FILE_EXISTS
+            return 0
+        try:
+            with open(host, 'wb') as f:
+                f.write(b'FONTRES:' + ttf.encode(config.ANSI_CODEPAGE, errors='replace'))
+        except OSError:
+            self._last_error = 3  # ERROR_PATH_NOT_FOUND
+            return 0
+        return 1
+
+    def CreateScalableFontResourceW(self, args):
+        return self.CreateScalableFontResourceA(args, wide=True)
+
+    # ---------- Mapping modes (only MM_TEXT: one logical unit is one pixel) ----------
+
+    MM_TEXT = 1
+
+    def SetMapMode(self, args):
+        """SetMapMode(hdc, mode) - the previous mode; drawing stays in pixels"""
+        state = self.dc_state.get(args[0])
+        if state is None or not 1 <= args[1] <= 8:
+            return 0
+        previous = state.get('map_mode', self.MM_TEXT)
+        state['map_mode'] = args[1]
+        return previous
+
+    def GetMapMode(self, args):
+        state = self.dc_state.get(args[0])
+        return state.get('map_mode', self.MM_TEXT) if state is not None else 0
+
+    def DPtoLP(self, args):
+        """DPtoLP(hdc, lppt, c) - device and logical coordinates are the same"""
+        return 1 if args[0] in self.dc_state else 0
+
+    def LPtoDP(self, args):
+        return 1 if args[0] in self.dc_state else 0
+
+    def GetNearestColor(self, args):
+        """GetNearestColor(hdc, color) emulation - the display has 32 bits per
+        pixel, so every RGB color is shown as it is; a palette index or
+        palette-relative COLORREF gives its RGB value"""
+        return args[1] & 0x00FFFFFF
+
+    def CreatePatternBrush(self, args):
+        """CreatePatternBrush(hbm) emulation - brushes are solid: the pattern is
+        approximated by the average color of the bitmap (gray, like the
+        common 8x8 dither patterns, if it cannot be read)"""
+        hbm = args[0]
+        bmp = self.gdi_objects.get(hbm)
+        if not bmp or bmp['type'] != 'bitmap':
+            return 0
+        color = (128, 128, 128)
+        try:
+            pixels = self._bitmap_rgb(hbm)
+        except (UcError, ValueError, TypeError):
+            pixels = None
+        if pixels:
+            count = len(pixels) // 3
+            if count:
+                color = tuple(sum(pixels[i::3]) // count for i in range(3))
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {'type': 'brush', 'color': color, 'width': 0}
+        log.debug(f"CreatePatternBrush(0x{hbm:x}) -> 0x{handle:x}, color {color}")
         return handle
 
     def CreateFontA(self, args):
@@ -732,10 +964,10 @@ class GdiMixin:
     def CreateFontIndirectW(self, args):
         return self.CreateFontIndirectA(args, wide=True)
 
-    def GetTextExtentPoint32A(self, args):
-        """GetTextExtentPoint32A emulation - measure a string"""
+    def GetTextExtentPoint32A(self, args, wide=False):
+        """GetTextExtentPoint32A/W emulation - measure a string"""
         hdc = args[0]
-        text = self.read_string(args[1]) if args[1] else ""
+        text = self._read_text(args[1], wide) if args[1] else ""
         c = args[2]
         lpSize = args[3]
         if c > 0 and len(text) > c:
@@ -745,6 +977,17 @@ class GdiMixin:
         if lpSize:
             self.emu.uc.mem_write(lpSize, struct.pack("<ii", width, height))
         return 1
+
+    def GetTextExtentPoint32W(self, args):
+        return self.GetTextExtentPoint32A(args, wide=True)
+
+    def GetTextExtentPointA(self, args):
+        """GetTextExtentPointA - the Win16-era name; in Win32 it is the same as
+        GetTextExtentPoint32A"""
+        return self.GetTextExtentPoint32A(args)
+
+    def GetTextExtentPointW(self, args):
+        return self.GetTextExtentPoint32A(args, wide=True)
 
     def _text_extent(self, hdc, text):
         """(width, height) of text in the DC's font, measured with the font the

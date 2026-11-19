@@ -297,6 +297,42 @@ class User32MiscMixin:
     def GetClassInfoW(self, args):
         return self.GetClassInfoA(args, wide=True)
 
+    def UnregisterClassA(self, args, wide=False):
+        """UnregisterClassA/W(lpClassName, hInstance) - fails while windows of
+        the class exist"""
+        lpClassName = args[0]
+        name = (self.atoms.get(lpClassName) if lpClassName < 0x10000 else
+                self._read_text(lpClassName, wide))
+        match = next((n for n in self.registered_classes if name and n.lower() == name.lower()),
+                     None)
+        if match is None:
+            self._last_error = 1411  # ERROR_CLASS_DOES_NOT_EXIST
+            return 0
+        if self.gui:
+            with self.gui.lock:
+                in_use = any((getattr(w, 'class_name', None) or '').lower() == match.lower()
+                             for w in self.gui.windows.values())
+            if in_use:
+                self._last_error = 1412  # ERROR_CLASS_HAS_WINDOWS
+                return 0
+        wndclass = self.registered_classes.pop(match)
+        self.atoms.pop(wndclass['atom'], None)
+        log.debug(f"UnregisterClass('{match}')")
+        return 1
+
+    def UnregisterClassW(self, args):
+        return self.UnregisterClassA(args, wide=True)
+
+    def WinHelpA(self, args, wide=False):
+        """WinHelpA/W(hWndMain, lpszHelp, uCommand, dwData) - there is no Help
+        viewer: the request (or HELP_QUIT) succeeds without showing anything"""
+        help_file = self._read_text(args[1], wide) if args[1] else ''
+        log.debug(f"WinHelp(\"{help_file}\", 0x{args[2]:x})")
+        return 1
+
+    def WinHelpW(self, args):
+        return self.WinHelpA(args, wide=True)
+
     def GetClassInfoExW(self, args):
         return self.GetClassInfoA(args, wide=True, ex=True)
 

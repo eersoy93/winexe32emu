@@ -272,11 +272,12 @@ class User32Mixin:
                 win = self.gui.windows.get(child)
                 if win is not None and win.control_id == nIDDlgItem:
                     return child
-            if hDlg not in self.dialogs:
-                self._last_error = 1421  # ERROR_CONTROL_ID_NOT_FOUND
-                return 0
+            # No such control: NULL, which programs rely on to stop loops
+            # over consecutive control IDs
+            self._last_error = 1421  # ERROR_CONTROL_ID_NOT_FOUND
+            return 0
 
-        # Fallback: return dialog item ID as handle
+        # Without the fake desktop there are no controls: the ID stands for one
         return 0x20000 + nIDDlgItem
 
     def GetDlgItemTextA(self, args, wide=False):

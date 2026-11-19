@@ -21,6 +21,7 @@ from unicorn import UcError
 
 from .. import config
 from ..logger import log
+from .lz32 import expand_szdd
 
 try:
     import pefile
@@ -162,3 +163,117 @@ class VersionInfoMixin:
 
     def VerQueryValueW(self, args):
         return self.VerQueryValueA(args, wide=True)
+
+    # ---------- Installing files (VerFindFile, VerInstallFile) ----------
+
+    VFFF_ISSHAREDFILE = 0x1
+    VFF_CURNEDEST = 0x1
+    VFF_BUFFTOOSMALL = 0x4
+    VIFF_FORCEINSTALL = 0x1
+    VIF_TEMPFILE = 0x1
+    VIF_SRCOLD = 0x4
+    VIF_WRITEPROT = 0x40
+    VIF_CANNOTCREATE = 0x800
+    VIF_CANNOTREADSRC = 0x10000
+    VIF_BUFFTOOSMALL = 0x40000
+
+    def _write_sized_text(self, buffer, size_ptr, text):
+        """Write text to a buffer whose size (with the NUL) is in *size_ptr,
+        which receives the needed size; False if it does not fit"""
+        size = self._read_u32(size_ptr) if size_ptr else 0
+        needed = len(text.encode(config.ANSI_CODEPAGE, errors='replace')) + 1
+        if size_ptr:
+            self._mem_write(size_ptr, struct.pack('<I', needed))
+        if not buffer or size < needed:
+            return False
+        self._write_text(buffer, text, False)
+        return True
+
+    def VerFindFileA(self, args):
+        """VerFindFileA(uFlags, szFileName, szWinDir, szAppDir, szCurDir,
+        puCurDirLen, szDestDir, puDestDirLen) - where a file being installed
+        should go (the system folder for shared files, else the application's
+        folder) and where a version of it already is"""
+        flags = args[0]
+        name = self.read_string(args[1]) if args[1] else ''
+        win_dir = self.read_string(args[2]) if args[2] else 'C:\\Windows'
+        app_dir = self.read_string(args[3]) if args[3] else ''
+        system_dir = 'C:\\Windows\\System32'
+        dest = system_dir if flags & self.VFFF_ISSHAREDFILE or not app_dir else app_dir
+        current = ''
+        for folder in (dest, system_dir, win_dir, app_dir):
+            if not folder or not name:
+                continue
+            host = self.resolve_drive_path(folder.rstrip('\\') + '\\' + name)
+            if host and os.path.isfile(host):
+                current = folder.rstrip('\\') or folder
+                break
+        log.debug(f"VerFindFileA(\"{name}\") -> current \"{current}\", destination \"{dest}\"")
+        result = 0
+        if not self._write_sized_text(args[4], args[5], current):
+            result |= self.VFF_BUFFTOOSMALL
+        if not self._write_sized_text(args[6], args[7], dest):
+            result |= self.VFF_BUFFTOOSMALL
+        if current and current.lower() != dest.rstrip('\\').lower():
+            result |= self.VFF_CURNEDEST
+        return result
+
+    @staticmethod
+    def _fixed_file_version(data):
+        """(file version MS, LS) of the VS_FIXEDFILEINFO in a file's bytes, or None"""
+        index = data.find(b'\xbd\x04\xef\xfe')
+        if index < 0 or index + 16 > len(data):
+            return None
+        return struct.unpack_from('<II', data, index + 8)
+
+    def VerInstallFileA(self, args):
+        """VerInstallFileA(uFlags, szSrcFileName, szDestFileName, szSrcDir,
+        szDestDir, szCurDir, szTmpFile, puTmpFileLen) - copies (and expands) a
+        file into the destination folder. Unless forced, a newer installed
+        version is kept: the source is left as a temporary file
+        (VIF_TEMPFILE | VIF_SRCOLD)."""
+        flags = args[0]
+        src_name, dest_name, src_dir, dest_dir = (
+            self.read_string(a) if a else '' for a in args[1:5])
+        source = self.resolve_drive_path(src_dir.rstrip('\\') + '\\' + src_name)
+        dest_folder = self.resolve_drive_path(dest_dir) if dest_dir else None
+        log.info(f"VerInstallFile: \"{src_dir}\\{src_name}\" -> \"{dest_dir}\\{dest_name}\"")
+        try:
+            with open(source, 'rb') as f:
+                data = expand_szdd(f.read())
+        except (OSError, TypeError):
+            return self.VIF_CANNOTREADSRC
+        if dest_folder is None or self._write_protected(dest_folder):
+            return self.VIF_WRITEPROT
+        dest = os.path.join(dest_folder, dest_name)
+        existing = None
+        if os.path.isfile(dest):
+            try:
+                with open(dest, 'rb') as f:
+                    existing = f.read()
+            except OSError:
+                existing = None
+        new_version = self._fixed_file_version(data)
+        old_version = self._fixed_file_version(existing) if existing else None
+        if (not flags & self.VIFF_FORCEINSTALL and new_version and old_version and
+                old_version > new_version):
+            temp_name = 'VER' + format(os.getpid() & 0xFFFF, '04X') + '.TMP'
+            try:
+                with open(os.path.join(dest_folder, temp_name), 'wb') as f:
+                    f.write(data)
+            except OSError:
+                return self.VIF_CANNOTCREATE
+            result = self.VIF_TEMPFILE | self.VIF_SRCOLD
+            if not self._write_sized_text(args[6], args[7], temp_name):
+                result |= self.VIF_BUFFTOOSMALL
+            return result
+        try:
+            os.makedirs(dest_folder, exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(data)
+        except OSError as e:
+            log.warning(f"VerInstallFile: {e}")
+            return self.VIF_CANNOTCREATE
+        if args[7]:
+            self._mem_write(args[7], struct.pack('<I', 0))
+        return 0

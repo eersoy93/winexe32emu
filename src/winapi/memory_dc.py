@@ -49,6 +49,33 @@ class MemoryDCMixin:
         log.debug(f"CreateCompatibleBitmap(0x{hdc:x}, {width}, {height}) -> 0x{handle:x}")
         return handle
 
+    def CreateDiscardableBitmap(self, args):
+        """CreateDiscardableBitmap(hdc, cx, cy) - a compatible bitmap (Win32
+        never discards it)"""
+        return self.CreateCompatibleBitmap(args)
+
+    CBM_INIT = 0x4
+
+    def CreateDIBitmap(self, args):
+        """CreateDIBitmap(hdc, pbmih, flInit, pjBits, pbmi, iUsage) - a
+        device-dependent bitmap, with the DIB's picture if CBM_INIT"""
+        hdc, header, flags, bits, info, usage = args[:6]
+        try:
+            width, height = struct.unpack('<ii', self.emu.uc.mem_read(header + 4, 8)) \
+                if header else (0, 0)
+        except UcError:
+            return 0
+        rgb = None
+        if flags & self.CBM_INIT and bits and info:
+            decoded = self._read_dib(hdc, info, bits, usage)
+            if decoded is not None:
+                dib_width, dib_height, rgb, _ = decoded
+                if (dib_width, dib_height) != (abs(width), abs(height)):
+                    rgb = None
+        handle = self._new_bitmap(abs(width), abs(height), 32, rgb)
+        log.debug(f"CreateDIBitmap({width}x{height}, init={bool(rgb)}) -> 0x{handle:x}")
+        return handle
+
     def DeleteDC(self, args):
         """DeleteDC emulation - free a memory DC"""
         hdc = args[0]

@@ -99,6 +99,20 @@ class ProcessesMixin:
                             struct.pack('<4I', hProcess, hThread, pid, tid))
         return 1
 
+    def WinExec(self, args):
+        """WinExec(lpCmdLine, uCmdShow) - runs a program; a value above 31 on
+        success, else ERROR_FILE_NOT_FOUND (2) or ERROR_BAD_FORMAT (11)"""
+        info = self.emu.heap_alloc(16)
+        try:
+            if not self.CreateProcessA([0, args[0], 0, 0, 0, 0, 0, 0, 0, info]):
+                return 11 if self._last_error == 193 else 2
+            process, thread = struct.unpack('<II', self.emu.uc.mem_read(info, 8))
+            self.CloseHandle([process])
+            self.CloseHandle([thread])
+            return 33
+        finally:
+            self.emu.heap_free(info)
+
     @staticmethod
     def _child_running(child):
         thread = getattr(child, 'thread', None)

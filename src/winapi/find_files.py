@@ -465,7 +465,9 @@ class FindFilesMixin:
         name = self._read_text(args[0], wide)
         value = self._read_text(args[1], wide) if args[1] else None
         log.debug(f"SetEnvironmentVariable{'W' if wide else 'A'}(\"{name}\", {value!r})")
-        if not name or '=' in name:
+        # A leading '=' is allowed: the hidden per-drive current directories
+        # ("=C:") that the CRT's _chdir sets (and fails without)
+        if not name or '=' in name[1:]:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         if value is None:

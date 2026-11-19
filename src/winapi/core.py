@@ -69,18 +69,26 @@ class CoreMixin:
         'GetOpenFileNameW': 1, 'GetSaveFileNameA': 1, 'GetSaveFileNameW': 1,
         # gdi32
         'CombineRgn': 4, 'CreateRectRgn': 4, 'CreateRectRgnIndirect': 1, 'GetRgnBox': 2,
+        'ExcludeClipRect': 5, 'GetClipBox': 2, 'IntersectClipRect': 5, 'SelectClipRgn': 2,
+        'AddFontResourceA': 1, 'AddFontResourceExA': 3, 'AddFontResourceExW': 3,
+        'AddFontResourceW': 1, 'RemoveFontResourceA': 1, 'RemoveFontResourceExA': 3,
+        'RemoveFontResourceExW': 3, 'RemoveFontResourceW': 1,
         'Arc': 9, 'BitBlt': 9, 'Chord': 9, 'CreateBitmap': 5, 'CreateBrushIndirect': 1,
         'CreateCompatibleBitmap': 3, 'CreateCompatibleDC': 1, 'CreateDCA': 4,
         'CreateFontA': 14, 'CreateFontIndirectA': 1, 'CreateHatchBrush': 2,
-        'CreatePalette': 1, 'CreatePen': 3, 'CreatePenIndirect': 1, 'CreateSolidBrush': 1,
+        'CreatePalette': 1, 'CreatePen': 3, 'CreatePenIndirect': 1, 'CreatePatternBrush': 1,
+        'CreateSolidBrush': 1,
         'DeleteDC': 1, 'DeleteObject': 1, 'Ellipse': 5, 'EnumFontFamiliesA': 4,
-        'GetBkColor': 1, 'GetDeviceCaps': 2, 'GetDIBits': 7, 'GetObjectA': 3, 'GetPixel': 3,
+        'GetBkColor': 1, 'GetDeviceCaps': 2, 'GetDIBits': 7, 'GetNearestColor': 2,
+        'GetObjectA': 3, 'GetPixel': 3, 'RestoreDC': 2, 'SaveDC': 1,
         'GetStockObject': 1, 'GetTextColor': 1, 'GetTextExtentPoint32A': 4,
+        'GetTextExtentPoint32W': 4, 'GetTextExtentPointA': 4, 'GetTextExtentPointW': 4,
         'GetTextMetricsA': 2, 'LineTo': 3, 'MoveToEx': 4, 'PatBlt': 6, 'Pie': 9, 'Polygon': 3,
         'Polyline': 3, 'RealizePalette': 1, 'Rectangle': 5, 'RoundRect': 7, 'SelectObject': 2,
         'SelectPalette': 3, 'SetBkColor': 2, 'SetBkMode': 2, 'SetPixel': 4, 'SetROP2': 2,
         'SetStretchBltMode': 2, 'SetTextAlign': 2, 'SetTextColor': 2, 'StretchBlt': 11,
         'StretchDIBits': 13, 'TextOutA': 5, 'TextOutW': 5,
+        'ExtTextOutA': 8, 'ExtTextOutW': 8,
         # kernel32
         'AllocConsole': 0, 'Beep': 2, 'CloseHandle': 1, 'CompareStringA': 6, 'CopyFileA': 3,
         'CopyFileW': 3, 'CreateDirectoryA': 2, 'CreateDirectoryW': 2, 'CreateFileA': 7,
@@ -112,7 +120,7 @@ class CoreMixin:
         'GlobalAlloc': 2, 'GlobalFree': 1, 'GlobalLock': 1, 'GlobalMemoryStatus': 1,
         'GlobalUnlock': 1, 'HeapAlloc': 3, 'HeapCreate': 3, 'HeapDestroy': 1, 'HeapFree': 3,
         'HeapReAlloc': 4, 'HeapSize': 3, 'InitializeCriticalSection': 1,
-        'InitializeCriticalSectionAndSpinCount': 2, 'IsDBCSLeadByteEx': 2,
+        'InitializeCriticalSectionAndSpinCount': 2, 'IsDBCSLeadByte': 1, 'IsDBCSLeadByteEx': 2,
         'IsDebuggerPresent': 0, 'LCMapStringA': 6, 'LCMapStringW': 6,
         'LeaveCriticalSection': 1, 'LoadLibraryA': 1, 'LoadLibraryExA': 3,
         'LoadLibraryExW': 3, 'LoadLibraryW': 1, 'LoadResource': 2, 'LocalAlloc': 2,
@@ -279,13 +287,44 @@ class CoreMixin:
         'SendDlgItemMessageA': 5, 'SendDlgItemMessageW': 5, 'SetClipboardData': 2,
         'SetMenuItemInfoA': 4, 'SetMenuItemInfoW': 4, 'SetParent': 2,
         'SystemParametersInfoW': 4, 'TrackPopupMenu': 7, 'TrackPopupMenuEx': 6,
-        'TranslateAcceleratorA': 3, 'TranslateAcceleratorW': 3, 'WindowFromPoint': 2,
+        'TranslateAcceleratorA': 3, 'TranslateAcceleratorW': 3, 'UnregisterClassA': 2,
+        'UnregisterClassW': 2, 'WindowFromPoint': 2, 'WinHelpA': 4, 'WinHelpW': 4,
         # user32: window classes, messages, images, regions (NSIS installers)
         'DrawFocusRect': 2, 'FindWindowExA': 4, 'FindWindowExW': 4, 'GetClassLongA': 2,
         'GetClassLongW': 2, 'GetMessagePos': 0, 'GetSystemMenu': 2, 'LoadImageA': 6,
         'LoadImageW': 6, 'MapWindowPoints': 4, 'MessageBoxIndirectA': 1,
         'MessageBoxIndirectW': 1, 'SendMessageTimeoutA': 7, 'SendMessageTimeoutW': 7,
         'SetClassLongA': 3, 'SetClassLongW': 3, 'SetWindowRgn': 3,
+        # Setup programs: lz32, mpr, version, and their gdi32, kernel32, user32 extras
+        'CopyLZFile': 2, 'GetExpandedNameA': 2, 'GetExpandedNameW': 2, 'LZClose': 1,
+        'LZCopy': 2, 'LZDone': 0, 'LZInit': 1, 'LZOpenFileA': 3, 'LZOpenFileW': 3,
+        'LZRead': 3, 'LZSeek': 3, 'LZStart': 0,
+        'WNetAddConnection2A': 4, 'WNetAddConnectionA': 3, 'WNetCancelConnection2A': 3,
+        'WNetCancelConnectionA': 2, 'WNetConnectionDialog': 2, 'WNetGetConnectionA': 3,
+        'WNetGetLastErrorA': 5,
+        'VerFindFileA': 8, 'VerInstallFileA': 8,
+        'CreateDIBitmap': 6, 'CreateDiscardableBitmap': 3, 'CreateScalableFontResourceA': 4,
+        'CreateScalableFontResourceW': 4, 'DPtoLP': 3, 'GetMapMode': 1, 'LPtoDP': 3,
+        'SetMapMode': 2,
+        'CreatePipe': 4, 'FlushViewOfFile': 2, 'PeekConsoleInputA': 4,
+        'PeekConsoleInputW': 4, 'ReadConsoleInputA': 4, 'ReadConsoleInputW': 4, 'WinExec': 2,
+        'DefDlgProcA': 4, 'DefDlgProcW': 4, 'ExcludeUpdateRgn': 2, 'FreeDDElParam': 2,
+        'HideCaret': 1, 'PackDDElParam': 3, 'ReuseDDElParam': 5, 'SetActiveWindow': 1,
+        'ShowCaret': 1, 'UnpackDDElParam': 4,
+        'GetClassFile': 2, 'OleGetAutoConvert': 2, 'OleSetAutoConvert': 2,
+        'LoadTypeLib': 2, 'LoadTypeLibEx': 3, 'RegisterTypeLib': 3, 'UnRegisterTypeLib': 5,
+        # user32: DDEML
+        'DdeAbandonTransaction': 3, 'DdeAccessData': 2, 'DdeAddData': 4,
+        'DdeClientTransaction': 8, 'DdeCmpStringHandles': 2, 'DdeConnect': 4,
+        'DdeConnectList': 5, 'DdeCreateDataHandle': 7, 'DdeCreateStringHandleA': 3,
+        'DdeCreateStringHandleW': 3, 'DdeDisconnect': 1, 'DdeDisconnectList': 1,
+        'DdeEnableCallback': 3, 'DdeFreeDataHandle': 1, 'DdeFreeStringHandle': 2,
+        'DdeGetData': 4, 'DdeGetLastError': 1, 'DdeImpersonateClient': 1,
+        'DdeInitializeA': 4, 'DdeInitializeW': 4, 'DdeKeepStringHandle': 2,
+        'DdeNameService': 4, 'DdePostAdvise': 3, 'DdeQueryConvInfo': 3,
+        'DdeQueryNextServer': 2, 'DdeQueryStringA': 5, 'DdeQueryStringW': 5,
+        'DdeReconnect': 1, 'DdeSetUserHandle': 3, 'DdeUnaccessData': 1,
+        'DdeUninitialize': 1,
         # kernel32: paths and INI files
         'GetLongPathNameA': 3, 'GetLongPathNameW': 3, 'GetPrivateProfileIntA': 4,
         'GetPrivateProfileIntW': 4, 'GetShortPathNameA': 3, 'GetShortPathNameW': 3,
@@ -1019,9 +1058,12 @@ class CoreMixin:
 
     def _environ_array(self, wide):
         """New NULL-terminated array of "NAME=value" strings of the
-        environment (the C runtime's environ/_wenviron)"""
+        environment (the C runtime's environ/_wenviron); like the real C
+        runtime it leaves out the hidden "=C:" (per-drive directory) variables"""
         pointers = []
         for name, value in sorted(self.environment.items()):
+            if name.startswith('='):
+                continue
             units = self._text_units(f"{name}={value}", wide) + [0]
             address = self.emu.heap_alloc(len(units) * (2 if wide else 1))
             self._write_units(address, units, wide, terminate=False)

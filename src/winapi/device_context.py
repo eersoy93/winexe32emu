@@ -305,6 +305,33 @@ class DeviceContextMixin:
 
         return 1
 
+    ETO_OPAQUE = 0x2
+
+    def ExtTextOutA(self, args, wide=False):
+        """ExtTextOutA/W(hdc, x, y, options, lprect, lpString, c, lpDx) - TextOut
+        that can first fill a rectangle with the background color (ETO_OPAQUE);
+        clipping (ETO_CLIPPED) and the character spacing (lpDx) are ignored"""
+        hdc, options, lprect, lpString, c = args[0], args[3], args[4], args[5], args[6]
+        x, y = self._signed32(args[1]), self._signed32(args[2])
+        text = self._read_text(lpString, wide)[:c] if lpString and c else ''
+        log.debug(f"ExtTextOut{'W' if wide else 'A'}(0x{hdc:x}, {x}, {y}, \"{text}\")")
+        if options & self.ETO_OPAQUE and lprect:
+            try:
+                rect = struct.unpack('<iiii', self.emu.uc.mem_read(lprect, 16))
+            except UcError:
+                rect = None
+            state = self.dc_state.get(hdc)
+            if rect and state is not None:
+                self._add_shape(hdc, {'type': 'rect', 'rect': rect,
+                                      'fill': state.get('bk_color', (255, 255, 255)),
+                                      'pen': None})
+        if self.gui and text:
+            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
+        return 1
+
+    def ExtTextOutW(self, args):
+        return self.ExtTextOutA(args, wide=True)
+
     def DrawTextA(self, args):
         """DrawTextA emulation"""
         hdc = args[0]

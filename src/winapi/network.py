@@ -541,5 +541,44 @@ class NetworkMixin:
     URLDownloadToFileW = URLDownloadToCacheFileA = URLDownloadToCacheFileW = URLDownloadToFileA
 
 
+    # ---------- mpr.dll: network drive connections (there is no network) ----------
+
+    ERROR_NO_NETWORK = 1222
+    ERROR_NOT_CONNECTED = 2250
+
+    def WNetAddConnectionA(self, args):
+        """WNetAddConnection(A/2A/3A) - no network to connect to"""
+        return self.ERROR_NO_NETWORK
+
+    def WNetAddConnection2A(self, args):
+        return self.ERROR_NO_NETWORK
+
+    def WNetCancelConnectionA(self, args):
+        """WNetCancelConnection(A/2A) - no drive is a network connection"""
+        return self.ERROR_NOT_CONNECTED
+
+    def WNetCancelConnection2A(self, args):
+        return self.ERROR_NOT_CONNECTED
+
+    def WNetConnectionDialog(self, args):
+        return self.ERROR_NO_NETWORK
+
+    def WNetGetConnectionA(self, args):
+        """WNetGetConnectionA(lpLocalName, lpRemoteName, lpnLength) - the
+        drives are local"""
+        return self.ERROR_NOT_CONNECTED
+
+    def WNetGetLastErrorA(self, args):
+        """WNetGetLastErrorA(lpError, lpErrorBuf, nErrorBufSize, lpNameBuf,
+        nNameBufSize) - no network error happened"""
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<I', 0))
+        if args[1] and args[2]:
+            self._mem_write(args[1], b'\x00')
+        if args[3] and args[4]:
+            self._mem_write(args[3], b'\x00')
+        return 0
+
+
 # A method named __WSAFDIsSet would be name-mangled in the class body
 setattr(NetworkMixin, '__WSAFDIsSet', NetworkMixin._wsa_fd_is_set)

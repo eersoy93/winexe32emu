@@ -1452,3 +1452,35 @@ class User32ExtraMixin:
             if caller_hwnd == hwnd:
                 return self._call_subclass(hwnd, chain, index - 1, args[1], args[2], args[3])
         return self._call_subclass(hwnd, [], -1, args[1], args[2], args[3])
+
+    # ---------- Activation, carets, update regions, DefDlgProc ----------
+
+    def SetActiveWindow(self, args):
+        """SetActiveWindow(hWnd) - activates (brings to the top) a top-level
+        window; the previously active window"""
+        previous = self.GetForegroundWindow([])
+        if self.gui and args[0] in self.gui.windows:
+            self.BringWindowToTop(args)
+        return previous
+
+    def HideCaret(self, args):
+        """HideCaret/ShowCaret(hWnd) - the caret of edit controls is drawn by
+        the fake desktop; programs' own carets are not drawn"""
+        return 1
+
+    def ShowCaret(self, args):
+        return 1
+
+    def ExcludeUpdateRgn(self, args):
+        """ExcludeUpdateRgn(hdc, hWnd) - windows are redrawn whole: there is
+        no update region to exclude (SIMPLEREGION)"""
+        return 2 if args[0] in self.dc_state else 0
+
+    def DefDlgProcA(self, args):
+        """DefDlgProcA/W(hDlg, msg, wParam, lParam) - for the window procedure
+        of a private dialog class; the emulated dialogs run their own DefDlgProc
+        defaults, the rest is DefWindowProc"""
+        return self.DefWindowProcA(args)
+
+    def DefDlgProcW(self, args):
+        return self.DefWindowProcW(args)
