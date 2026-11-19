@@ -66,6 +66,7 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - 7-Zip 9.20 (x86, NSIS setup and programs)
 - 7-Zip 26.06 (x86, setup and programs)
 - Ants (setup and program)
+- Microsoft Office 95 (Professional, installer only)
 - Ski32
 
 ## Features
@@ -80,7 +81,7 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
 - Windows file name rules on the virtual drives
-- Apps: Explorer, and Windows Help (winhlp32.exe: sets up Help files for setup programs; it cannot show them yet)
+- Apps: explorer.exe, winhlp32.exe (stub)
 
 ## Versioning
 
