@@ -82,6 +82,11 @@ for src in tests/*.c; do
             LIBS="$LIBS -luuid -lrpcrt4 -lpsapi -lws2_32 -lbcrypt -lversion -lsecur32"
             LIBS="$LIBS -luxtheme -ldwmapi -lcomctl32 -mconsole"
             ;;
+        compat_test)
+            # Console application - file names, devices, system DLL images,
+            # the PEB, static TLS and TLS callbacks
+            LIBS="-lkernel32 -mconsole"
+            ;;
         *)
             # Default: console application - C runtime (msvcrt) and kernel32
             LIBS="-lkernel32 -mconsole"

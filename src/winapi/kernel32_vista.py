@@ -278,6 +278,8 @@ class Kernel32VistaMixin:
         pe = self.emu.pe_loader
         ranges = [(pe.image_base, pe.image_base + pe.pe.OPTIONAL_HEADER.SizeOfImage)]
         ranges += [(m['base'], m['base'] + m['size']) for m in self.emu.dlls.values()]
+        ranges += [(m['base'], m['base'] + m['size'])
+                   for m in self.emu.system_modules.values()]
         return ranges
 
     def _module_at(self, address):

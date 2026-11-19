@@ -50,6 +50,8 @@ Use `-h` parameter for command-line help.
 - Structured exception handling
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
+- Windows file name rules on the drives: case-insensitive names, NUL/CON devices, invalid names rejected
+- PEB loader data and process parameters, in-memory system DLL images (PE headers and exports) and static TLS with TLS callbacks
 - Apps: Explorer only
 
 ## Versioning

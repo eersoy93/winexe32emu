@@ -25,6 +25,7 @@ from unicorn import *
 from .. import config, winapi
 from ..config import DRIVES
 from ..logger import log
+from ..paths import drive_path_error
 
 
 class Kernel32MiscMixin:
@@ -44,8 +45,8 @@ class Kernel32MiscMixin:
         lpFilename = args[1]
         nSize = args[2]
         
-        module = self.emu.find_dll(hModule) if hModule else None
-        filepath = module['path'] if module else self.windows_exe_path()
+        # The EXE, a loaded DLL or an emulated system DLL (other handles: the EXE)
+        filepath = self._module_path(hModule) or self.windows_exe_path()
         data = filepath.encode(config.ANSI_CODEPAGE, errors='replace')
         if nSize == 0:
             return 0
@@ -66,8 +67,8 @@ class Kernel32MiscMixin:
         lpFilename = args[1]
         nSize = args[2]
         
-        module = self.emu.find_dll(hModule) if hModule else None
-        filepath = module['path'] if module else self.windows_exe_path()
+        # The EXE, a loaded DLL or an emulated system DLL (other handles: the EXE)
+        filepath = self._module_path(hModule) or self.windows_exe_path()
         if nSize == 0:
             return 0
         if len(filepath) >= nSize:
@@ -110,29 +111,16 @@ class Kernel32MiscMixin:
         return 1
     
     def GetSystemDirectoryA(self, args):
-        """GetSystemDirectoryA emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        sys_dir = "C:\\Windows\\System32"
-        if len(sys_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, sys_dir.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
-        
-        log.debug(f"GetSystemDirectoryA() -> \"{sys_dir}\"")
-        return len(sys_dir)
-    
+        """GetSystemDirectoryA emulation: the length, or the needed size
+        (with the terminator) when the buffer is too small"""
+        log.debug("GetSystemDirectoryA()")
+        return self._return_text(args[0], args[1], "C:\\Windows\\System32", False)
+
     def GetWindowsDirectoryA(self, args):
-        """GetWindowsDirectoryA emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        win_dir = "C:\\Windows"
-        if len(win_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, win_dir.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
-        
-        log.debug(f"GetWindowsDirectoryA() -> \"{win_dir}\"")
-        return len(win_dir)
-    
+        """GetWindowsDirectoryA emulation (see GetSystemDirectoryA)"""
+        log.debug("GetWindowsDirectoryA()")
+        return self._return_text(args[0], args[1], "C:\\Windows", False)
+
     def GetTempPathW(self, args):
         """GetTempPathW emulation"""
         return self._return_text(args[1], args[0], "C:\\Windows\\Temp\\", True)
@@ -147,17 +135,10 @@ class Kernel32MiscMixin:
         return length
 
     def GetTempPathA(self, args):
-        """GetTempPathA emulation"""
-        nBufferLength = args[0]
-        lpBuffer = args[1]
-        
-        temp_path = "C:\\Windows\\Temp\\"
-        if len(temp_path) < nBufferLength:
-            self.emu.uc.mem_write(lpBuffer, temp_path.encode(config.ANSI_CODEPAGE, errors='replace') + b'\x00')
-        
-        log.debug(f"GetTempPathA() -> \"{temp_path}\"")
-        return len(temp_path)
-    
+        """GetTempPathA emulation (see GetSystemDirectoryA)"""
+        log.debug("GetTempPathA()")
+        return self._return_text(args[1], args[0], "C:\\Windows\\Temp\\", False)
+
     def lstrlenA(self, args):
         """lstrlenA emulation"""
         lpString = args[0]
@@ -221,28 +202,14 @@ class Kernel32MiscMixin:
         return self.GetStartupInfoA(args)
     
     def GetSystemDirectoryW(self, args):
-        """GetSystemDirectoryW emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        sys_dir = "C:\\Windows\\System32"
-        if len(sys_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, sys_dir.encode('utf-16-le') + b'\x00\x00')
-        
-        log.debug(f"GetSystemDirectoryW() -> \"{sys_dir}\"")
-        return len(sys_dir)
-    
+        """GetSystemDirectoryW emulation (see GetSystemDirectoryA)"""
+        log.debug("GetSystemDirectoryW()")
+        return self._return_text(args[0], args[1], "C:\\Windows\\System32", True)
+
     def GetWindowsDirectoryW(self, args):
-        """GetWindowsDirectoryW emulation"""
-        lpBuffer = args[0]
-        uSize = args[1]
-        
-        win_dir = "C:\\Windows"
-        if len(win_dir) < uSize:
-            self.emu.uc.mem_write(lpBuffer, win_dir.encode('utf-16-le') + b'\x00\x00')
-        
-        log.debug(f"GetWindowsDirectoryW() -> \"{win_dir}\"")
-        return len(win_dir)
+        """GetWindowsDirectoryW emulation (see GetSystemDirectoryA)"""
+        log.debug("GetWindowsDirectoryW()")
+        return self._return_text(args[0], args[1], "C:\\Windows", True)
 
     def lstrcpyA(self, args, wide=False):
         """lstrcpyA/W emulation"""
@@ -492,13 +459,17 @@ class Kernel32MiscMixin:
         read-only CD-ROM D:.
         """
         INVALID_HANDLE_VALUE = 0xFFFFFFFF
-        path = self.resolve_drive_path(filename)
-        if path is None:
-            self._last_error = 5  # ERROR_ACCESS_DENIED
-            return INVALID_HANDLE_VALUE
-
         GENERIC_WRITE = 0x40000000
         want_write = bool(dwDesiredAccess & (GENERIC_WRITE | 0x2 | 0x4 | 0x100))
+        device = self.open_device(filename, want_write)
+        if device is not None:
+            return device
+        path = self.resolve_drive_path(filename)
+        if path is None:
+            full = self.full_windows_path(filename)
+            self._last_error = drive_path_error(full) if full else 5  # ERROR_ACCESS_DENIED
+            return INVALID_HANDLE_VALUE
+
         exists = os.path.exists(path)
         if os.path.isdir(path):
             # Directories open only with FILE_FLAG_BACKUP_SEMANTICS (no data)
@@ -891,6 +862,7 @@ class Kernel32MiscMixin:
             self._last_error = 2 if not os.path.exists(path) else 267  # ERROR_DIRECTORY
             return 0
         self.current_directory = full
+        self.emu.update_process_current_directory(full)
         return 1
 
     def SetCurrentDirectoryW(self, args):

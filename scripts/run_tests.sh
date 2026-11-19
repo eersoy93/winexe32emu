@@ -111,6 +111,7 @@ run_args_test registry_test "== 0 failure(s) ==" read
 run_crash_test exception_test fastfail "__fastfail(7)"
 run_crash_test exception_test int3 "Unhandled exception 0x80000003"
 run_test seh_test "== 0 failure(s) =="
+run_test compat_test "== 0 failure(s) =="
 run_crash_test seh_test av "Unhandled exception 0xc0000005"
 
 echo "== ${passed} passed, ${failed} failed =="

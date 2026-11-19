@@ -30,6 +30,7 @@ from . import config
 from .guest import ApiJump, GuestUnwind, QWordResult, X87Result
 from .logger import DebugLogger, log
 from .pe_loader import PELoader
+from .process_env import ProcessEnvironmentMixin
 from .winapi import WinAPIHandler
 
 
@@ -123,9 +124,10 @@ class GuestThread:
         self.python_thread = None
         self.pending_fault = None  # access violation the memory hook saw
         self.dispatch_depth = 0  # exceptions being dispatched (nested ones)
+        self.tls_array = 0  # TEB->ThreadLocalStoragePointer (static TLS blocks)
 
 
-class CPUEmulator:
+class CPUEmulator(ProcessEnvironmentMixin):
     """Unicorn-based x86 CPU emulator"""
     
     # Memory layout constants
@@ -225,7 +227,9 @@ class CPUEmulator:
         self.peb_addr = 0
         self.teb_addr = 0
         self.process_heap = 0
-        
+        self.exe_tls = None  # TLS module info of the EXE (static TLS, callbacks)
+        self._init_process_environment()
+
     # ---------- Threads ----------
 
     @property
@@ -405,6 +409,7 @@ class CPUEmulator:
             return None
         thread.stack = stack
         thread.teb = self._new_teb(tid, stack + size, stack)
+        self.init_thread_tls(thread)
         uc = thread.uc
         self._setup_segments(uc, thread.teb)
         esp = stack + size - 0x100
@@ -425,10 +430,14 @@ class CPUEmulator:
                     self.wait_until(lambda: thread.suspend_count == 0)
                     self._slice_start = time.monotonic()
                     if not (self.stop_emulation or thread.stop):
+                        self.run_tls_callbacks(self.DLL_THREAD_ATTACH)
+                    if not (self.stop_emulation or thread.stop):
                         self.emulate(uc, start, self.THREAD_EXIT_ADDR)
                         if (not thread.exited and
                                 uc.reg_read(UC_X86_REG_EIP) == self.THREAD_EXIT_ADDR):
                             thread.exit_code = uc.reg_read(UC_X86_REG_EAX)
+                            # Returned from its start routine: TLS destructors
+                            self.run_tls_callbacks(self.DLL_THREAD_DETACH)
                 except UcError as e:
                     eip = uc.reg_read(UC_X86_REG_EIP)
                     log.error(f"Emulation error in thread {tid}: {e} (EIP: 0x{eip:08x})")
@@ -443,6 +452,7 @@ class CPUEmulator:
                     if thread.exit_code == 259 and thread.stop is False:
                         thread.exit_code = 0
                     self.threads.pop(tid, None)
+                    self.free_thread_tls(thread)
                     self.heap_free(thread.teb)
                     self.sched.notify_all()
                     log.debug(f"Thread {tid} exited ({thread.exit_code})")
@@ -494,7 +504,18 @@ class CPUEmulator:
         
         # Setup import hooks
         self._setup_import_hooks()
-        
+
+        # Structures programs read from memory: static TLS, the system DLL
+        # images and the PEB's module lists, the process parameters
+        self.init_thread_tls(self.main_thread)
+        self.exe_tls = self.register_image_tls(self.pe_loader.image_base, self.pe_loader.pe)
+        self._setup_loader_data()
+        for dll_name in self.pe_loader.imports:
+            key = dll_name.lower()
+            if self.api_handler.is_system_dll_name(key) and '.' in key:
+                self.system_module(key)
+        self._setup_process_parameters()
+
         # Register hooks
         self._setup_hooks()
         
@@ -936,6 +957,11 @@ class CPUEmulator:
                 self.uc.mem_write(iat, struct.pack('<I', addr))
 
         entry_point = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        self.add_loader_entry(base, size, base + entry_point if entry_point else 0,
+                              windows_path)
+        tls = self.register_image_tls(base, pe)
+        if call_entry and tls:
+            self.run_tls_callbacks(self.DLL_PROCESS_ATTACH, [tls])
         if call_entry and entry_point:
             result = self.call_callback(base + entry_point, [base, 1, 0])  # DLL_PROCESS_ATTACH
             if not result or self.crashed:
@@ -1646,10 +1672,14 @@ class CPUEmulator:
         self._tls.thread = self.main_thread
         self._slice_start = time.monotonic()
         try:
+            # Like the Windows loader, the EXE's TLS callbacks run first
+            if self.exe_tls:
+                self.run_tls_callbacks(self.DLL_PROCESS_ATTACH, [self.exe_tls])
             # The instruction limit is enforced in _hook_code. Passing a count
             # to Unicorn would break nested emu_start calls (callbacks,
             # _initterm, atexit) and can crash the process.
-            self.emulate(self.uc, entry_point, self.PROCESS_EXIT_ADDR)
+            if not self.stop_emulation:
+                self.emulate(self.uc, entry_point, self.PROCESS_EXIT_ADDR)
 
             if (not self.crashed and
                     self.uc.reg_read(UC_X86_REG_EIP) == self.PROCESS_EXIT_ADDR):

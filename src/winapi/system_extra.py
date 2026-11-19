@@ -38,6 +38,8 @@ class SystemExtraMixin:
         modules = [(self.emu.pe_loader.image_base, size, self.windows_exe_path())]
         for base, module in sorted(self.emu.dlls.items()):
             modules.append((base, module['size'], module['path']))
+        for module in sorted(self.emu.system_modules.values(), key=lambda m: m['base']):
+            modules.append((module['base'], module['size'], module['path']))
         return modules
 
     def _module_path(self, handle):
@@ -50,7 +52,8 @@ class SystemExtraMixin:
         for name, fake in self.module_handles.items():
             if fake == handle:
                 return 'C:\\Windows\\System32\\' + name
-        return None
+        name = self._system_module_name(handle)
+        return 'C:\\Windows\\System32\\' + name if name else None
 
     def EnumProcesses(self, args):
         """EnumProcesses(IDs, size, &needed) - this process"""

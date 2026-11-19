@@ -779,6 +779,13 @@ class MsvcrtMixin:
         mode = self.read_string(args[1])
         log.debug(f"fopen(\"{filename}\", \"{mode}\")")
 
+        device = self.open_device_stream(filename, mode)
+        if device is False:
+            self._store_errno(2)  # ENOENT
+            return 0
+        if device is not None:
+            return self._alloc_file_ptr(device, None)
+
         path = self.resolve_drive_path(filename)
         if path is None or (self._crt_mode_writes(mode) and self._write_protected(path)):
             self._last_error = 13  # EACCES
