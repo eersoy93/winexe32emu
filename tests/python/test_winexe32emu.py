@@ -31,8 +31,8 @@ from src import pe_loader  # noqa: E402
 from src.config import C_DRIVE_PATH, DRIVES_PATH, drive_host_path  # noqa: E402
 from src.cpu import CPUEmulator  # noqa: E402
 from src.logger import DebugLogger  # noqa: E402
-from src.paths import (resolve_drive_path, strip_win32_path_prefix,  # noqa: E402
-                       windows_path_of_host)
+from src.paths import (device_name, drive_path_error, resolve_drive_path,  # noqa: E402
+                       strip_win32_path_prefix, windows_path_of_host)
 from src.pe_loader import PELoader  # noqa: E402
 from src.winapi import WinAPIHandler  # noqa: E402
 
@@ -203,6 +203,48 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(windows_path_of_host(os.path.join(DRIVES_PATH, 'D', 'x', 'y.exe')),
                          r'D:\x\y.exe')
         self.assertIsNone(windows_path_of_host('/etc/passwd'))
+
+    def test_case_insensitive_names(self):
+        os.makedirs(C_DRIVE_PATH, exist_ok=True)
+        folder = tempfile.mkdtemp(prefix='CaseTest', dir=C_DRIVE_PATH)
+        try:
+            with open(os.path.join(folder, 'Read.Me'), 'w') as f:
+                f.write('x')
+            name = os.path.basename(folder)
+            expected = os.path.realpath(os.path.join(folder, 'Read.Me'))
+            for spelling in (name.upper(), name.lower()):
+                with self.subTest(spelling=spelling):
+                    self.assertEqual(resolve_drive_path(f'C:\\{spelling}\\READ.ME'), expected)
+                    self.assertEqual(resolve_drive_path(f'c:/{spelling}/read.me'), expected)
+            # A new file keeps its spelling, in the existing folder
+            self.assertEqual(resolve_drive_path(f'C:\\{name.upper()}\\New.Txt'),
+                             os.path.join(os.path.realpath(folder), 'New.Txt'))
+            # Trailing dots and spaces are dropped
+            self.assertEqual(resolve_drive_path(f'C:\\{name}\\read.me. .'), expected)
+            self.assertEqual(resolve_drive_path(f'C:\\{name}.\\read.me'), expected)
+        finally:
+            for entry in os.listdir(folder):
+                os.remove(os.path.join(folder, entry))
+            os.rmdir(folder)
+
+    def test_invalid_names_and_devices(self):
+        for name in (r'C:\x.txt:stream', r'C:\a*b', r'C:\a?b', 'C:\\a<b', 'C:\\a|b',
+                     'C:\\a"b', 'C:\\a\x01b'):
+            with self.subTest(name=name):
+                self.assertIsNone(resolve_drive_path(name))
+                self.assertEqual(drive_path_error(name), 123)  # ERROR_INVALID_NAME
+        for name in ('NUL', 'nul', r'C:\Windows\NUL', r'C:\x\nul.txt', 'con', 'Com1',
+                     r'\\.\NUL', 'LPT9.log', 'C:nul', 'aux '):
+            with self.subTest(name=name):
+                self.assertIsNotNone(device_name(name))
+                self.assertIsNone(resolve_drive_path(name))
+        self.assertEqual(device_name('CONOUT$'), 'CONOUT$')
+        self.assertEqual(device_name(r'C:\x\Nul.txt'), 'NUL')
+        for name in ('null', 'console', 'COM0', 'COM10', r'C:\nul\x.txt', 'conout$.txt',
+                     'a.nul'):
+            with self.subTest(name=name):
+                self.assertIsNone(device_name(name))
+        self.assertEqual(drive_path_error(r'E:\x'), 3)  # ERROR_PATH_NOT_FOUND
 
     def test_win32_prefixes(self):
         self.assertEqual(strip_win32_path_prefix(r'\\?\C:\x'), r'C:\x')

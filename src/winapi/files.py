@@ -14,16 +14,71 @@
 
 """WinAPIHandler mixin: Sandboxed file system, modules (GetModuleHandle, GetProcAddress), command line"""
 
+import io
 import os
 import struct
 
 from unicorn import *
 
-from .. import resources
+from .. import config, resources
 from ..logger import log
 from ..config import READ_ONLY_DRIVES
-from ..paths import drive_letter_of_host, resolve_drive_path, strip_win32_path_prefix
+from ..paths import (device_name, drive_letter_of_host, resolve_drive_path,
+                     strip_win32_path_prefix)
 from ..pe_loader import PELoader
+
+
+class NullDevice(io.RawIOBase):
+    """The NUL device: reads find the end of the file, writes are discarded"""
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def readinto(self, buffer):
+        return 0
+
+    def write(self, data):
+        return len(data)
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        return 0
+
+    def tell(self):
+        return 0
+
+    def truncate(self, size=None):
+        return 0
+
+
+class ConsoleDevice(io.RawIOBase):
+    """CON / CONOUT$ opened as a file (fopen("CON", "w")): writes go to the
+    program's console like its standard output"""
+
+    def __init__(self, handler):
+        super().__init__()
+        self.handler = handler
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        return 0
+
+    def write(self, data):
+        text = bytes(data).decode(config.ANSI_CODEPAGE, errors='replace')
+        log.program_output("STDOUT", text)
+        self.handler.console_output.append(text)
+        self.handler.console_write(text)
+        return len(data)
 
 
 class FilesMixin:
@@ -41,6 +96,43 @@ class FilesMixin:
                 log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
             return None
         return resolve_drive_path(full)
+
+    # Standard handles of the console (GetStdHandle)
+    CONSOLE_INPUT_HANDLE, CONSOLE_OUTPUT_HANDLE = 0x10, 0x11
+
+    def open_device(self, filename, want_write):
+        """Handle for a DOS device name (NUL, CON, CONIN$, CONOUT$...), None
+        for an ordinary file name, or INVALID_HANDLE_VALUE (with the last
+        error) for a device the emulated PC does not have (COM1, LPT1...)"""
+        device = device_name(filename)
+        if device is None:
+            return None
+        if device == 'NUL':
+            handle = self.get_next_handle()
+            self.handles[handle] = {'type': 'file', 'name': filename, 'fp': NullDevice(),
+                                    'path': None, 'device': device}
+        elif device in ('CONIN$', 'CONOUT$', 'CON'):
+            # CON is the input or the output by the access asked for
+            output = device == 'CONOUT$' or (device == 'CON' and want_write)
+            handle = self.CONSOLE_OUTPUT_HANDLE if output else self.CONSOLE_INPUT_HANDLE
+        else:
+            self._last_error = 2  # ERROR_FILE_NOT_FOUND: no serial or printer ports
+            return 0xFFFFFFFF
+        self._last_error = 0
+        log.debug(f"Device \"{filename}\" -> {device} (0x{handle:x})")
+        return handle
+
+    def open_device_stream(self, filename, mode):
+        """Python file object of a device for fopen ("NUL", "CON"), None for
+        an ordinary file name, or False for a device that cannot be opened"""
+        device = device_name(filename)
+        if device is None:
+            return None
+        if device == 'NUL':
+            return NullDevice()
+        if device in ('CON', 'CONOUT$') and self._crt_mode_writes(mode):
+            return ConsoleDevice(self)
+        return False
 
     def _write_protected(self, *host_paths):
         """True, with ERROR_ACCESS_DENIED, if a host path is on a read-only
@@ -247,10 +339,16 @@ class FilesMixin:
             if not load and key not in known:
                 self._last_error = 126  # ERROR_MOD_NOT_FOUND
                 return 0
-            handle = self.get_next_handle()
+            # The base of the DLL's in-memory image (MZ/PE headers, exports)
+            handle = self.emu.system_module(key) or self.get_next_handle()
             self.handles[handle] = {'type': 'module', 'name': key}
             self.module_handles[key] = handle
         return handle
+
+    def _system_module_name(self, base):
+        """Name of the emulated system DLL whose image is at base, or None"""
+        module = self.emu.system_module_at(base)
+        return module['name'] if module is not None and module['base'] == base else None
 
     def is_emulated(self, dll_name, func_name):
         """True if calls to dll_name!func_name can be emulated safely"""
@@ -263,6 +361,10 @@ class FilesMixin:
         lpProcName = args[1]
         
         info = self.handles.get(hModule)
+        system = self.emu.system_modules.get(self._system_module_name(hModule))
+        if info is None and system is not None:
+            # A system DLL base found without GetModuleHandle (PEB->Ldr)
+            info = {'type': 'module', 'name': system['name']}
         module = self.emu.find_dll(hModule)
         if module is not None:
             if lpProcName < 0x10000:

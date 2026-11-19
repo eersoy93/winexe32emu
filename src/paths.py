@@ -36,6 +36,80 @@ def strip_win32_path_prefix(name):
     return None
 
 
+# DOS device names: reserved in every folder and with any extension
+# ("C:\x\nul.txt" is NUL too); CONIN$ and CONOUT$ only as the whole name
+DOS_DEVICES = frozenset(['CON', 'PRN', 'AUX', 'NUL'] + [f'COM{i}' for i in range(1, 10)] +
+                        [f'LPT{i}' for i in range(1, 10)])
+CONSOLE_DEVICES = frozenset(['CONIN$', 'CONOUT$'])
+# Characters a Windows file name cannot contain (wildcards included: only
+# the Find APIs take patterns, and they resolve the folder, not the pattern)
+INVALID_NAME_CHARACTERS = frozenset('<>:"|?*' + ''.join(map(chr, range(32))))
+
+ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED = 2, 3, 5
+ERROR_INVALID_NAME = 123
+
+
+def device_name(filename):
+    """Upper-case DOS device a file name opens ("NUL", "CON", "CONOUT$",
+    "COM1"...), or None for an ordinary file name"""
+    if not filename:
+        return None
+    name = filename.replace('/', '\\')
+    if name[:4] in ('\\\\.\\', '\\\\?\\', '\\??\\'):
+        name = name[4:]
+    last = name.rsplit('\\', 1)[-1]
+    if len(last) >= 2 and last[1] == ':' and '\\' not in name:
+        last = last[2:]  # "C:nul"
+    if last.upper() in CONSOLE_DEVICES:
+        return last.upper()
+    base = last.rstrip(' .').split('.', 1)[0].split(':', 1)[0].rstrip(' ').upper()
+    return base if base in DOS_DEVICES else None
+
+
+def _windows_component(part):
+    """A path component as Windows stores it: trailing dots and spaces are
+    dropped ("a.txt." is "a.txt"). Returns '' for a component that
+    disappears and None for an invalid name."""
+    if part in ('.', '..'):
+        return part
+    if any(ch in INVALID_NAME_CHARACTERS for ch in part):
+        return None
+    return part.rstrip(' .')
+
+
+def _existing_entry(directory, part):
+    """Name of the entry of a host directory that the Windows name part
+    names: Windows file names are case-insensitive, the host's may not
+    be. An exact match wins; None if there is no such entry."""
+    if os.path.lexists(os.path.join(directory, part)):
+        return part
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    folded = part.casefold()
+    matches = sorted(e for e in entries if e.casefold() == folded)
+    return matches[0] if matches else None
+
+
+def drive_path_error(filename):
+    """Win32 error code explaining why resolve_drive_path(filename) is None:
+    ERROR_INVALID_NAME for names Windows rejects (or a device name),
+    ERROR_PATH_NOT_FOUND for a drive that does not exist, otherwise
+    ERROR_ACCESS_DENIED (the name escapes its drive's folder)"""
+    name = strip_win32_path_prefix(filename or '')
+    if not name:
+        return ERROR_PATH_NOT_FOUND
+    name = name.replace('/', '\\')
+    if len(name) >= 2 and name[1] == ':':
+        if name[0].upper() not in DRIVES:
+            return ERROR_PATH_NOT_FOUND
+        name = name[2:]
+    if device_name(filename) or any(_windows_component(p) is None for p in name.split('\\')):
+        return ERROR_INVALID_NAME
+    return ERROR_ACCESS_DENIED
+
+
 def resolve_drive_path(filename):
     """Map a Windows-style filename into the drives/ sandbox.
 
@@ -45,8 +119,16 @@ def resolve_drive_path(filename):
     (via "..", symlinks...) or names a drive that does not exist is
     rejected and this returns None. On success it returns the absolute
     host path, which is guaranteed to live under the drive's folder.
+
+    Like on Windows, names are case-insensitive (C:\\WINDOWS is the host's
+    drives/C/Windows), trailing dots and spaces of each name are dropped,
+    and names with invalid characters (":" of an alternate data stream,
+    wildcards...) or of a DOS device (NUL, CON...: see device_name) never
+    name a host file: None (drive_path_error tells why).
     """
     if not filename:
+        return None
+    if device_name(filename):
         return None
 
     # Normalise Windows path syntax to a relative POSIX-ish path.
@@ -81,7 +163,30 @@ def resolve_drive_path(filename):
     root = os.path.realpath(root)
     if not name:
         return root
-    candidate = os.path.realpath(os.path.join(root, name))
+
+    # Each existing folder or file is looked up case-insensitively; from the
+    # first missing one on, the names stay as given (a file to create)
+    current = root
+    exists = True
+    for part in name.split('/'):
+        part = _windows_component(part)
+        if part is None:
+            return None
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if current == root:
+                log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
+                return None
+            current = os.path.dirname(current)
+            exists = os.path.isdir(current)
+            continue
+        if exists:
+            entry = _existing_entry(current, part)
+            exists = entry is not None
+            part = entry if exists else part
+        current = os.path.join(current, part)
+    candidate = os.path.realpath(current)
 
     if candidate != root and not candidate.startswith(root + os.sep):
         log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")

@@ -418,6 +418,12 @@ class CrtStdioMixin:
         """_wfopen emulation - fopen with wide file name and mode"""
         filename = self.read_wide_string(args[0])
         mode = self.read_wide_string(args[1])
+        device = self.open_device_stream(filename, mode)
+        if device is False:
+            self._store_errno(self.ENOENT)
+            return 0
+        if device is not None:
+            return self._alloc_file_ptr(device, None)
         path = self.resolve_drive_path(filename)
         if path is None or (self._crt_mode_writes(mode) and self._write_protected(path)):
             self._store_errno(self.EACCES)

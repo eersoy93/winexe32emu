@@ -187,8 +187,8 @@ class ExeResourcesMixin:
     def GetFileType(self, args):
         """GetFileType emulation - std handles are the console, CreateFile handles disk files"""
         hFile = args[0]
-        if hFile in (0x10, 0x11, 0x12):
-            result = 2  # FILE_TYPE_CHAR
+        if hFile in (0x10, 0x11, 0x12) or self.handles.get(hFile, {}).get('device'):
+            result = 2  # FILE_TYPE_CHAR (the console, NUL)
         elif self.handles.get(hFile, {}).get('type') == 'file':
             result = 1  # FILE_TYPE_DISK
         else:
