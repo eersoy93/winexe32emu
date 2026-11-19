@@ -1,5 +1,8 @@
-pefile
-colorama
-unicorn>=2.1
-capstone>=5.0
-pygame-ce  # optional (only needed for the pseudo-GUI and sound)
+# Tested versions. Unicorn is pinned: the emulator patches a field of its CPU
+# state (see CPUEmulator._find_exception_state_offset) whose place can move
+# between releases; tests/python checks it is found before an upgrade.
+pefile>=2024.8.26
+colorama>=0.4.6,<1
+unicorn==2.1.4
+capstone>=5.0.9,<6
+pygame-ce>=2.5,<3  # optional (only needed for the pseudo-GUI and sound)

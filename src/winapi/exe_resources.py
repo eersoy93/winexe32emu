@@ -492,17 +492,25 @@ class ExeResourcesMixin:
         
         log.debug(f"VirtualAlloc(0x{lpAddress:08x}, 0x{dwSize:x}, 0x{flAllocationType:x}, 0x{flProtect:x})")
 
-        if dwSize == 0:
+        MEM_COMMIT, MEM_RESERVE = 0x1000, 0x2000
+        if dwSize == 0 or (flAllocationType & MEM_COMMIT and
+                           not self.valid_protection(flProtect)):
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         if lpAddress:
-            # Committing pages of an existing reservation (memory is always backed)
             for base, size in self.virtual_allocs.items():
                 if base <= lpAddress and lpAddress + dwSize <= base + size:
-                    return lpAddress & ~0xFFF
+                    # Committing pages of an existing reservation
+                    start = lpAddress & ~0xFFF
+                    end = (lpAddress + dwSize + 0xFFF) & ~0xFFF
+                    if flAllocationType & MEM_COMMIT:
+                        self.set_protection(start, end, flProtect)
+                    return start
             addr = self._map_virtual_at(lpAddress, dwSize)
             if not addr:
                 self._last_error = 487  # ERROR_INVALID_ADDRESS
+            else:
+                self._protect_new_allocation(addr, flAllocationType, flProtect)
             return addr
 
         size = self.emu._align_size(dwSize, 0x1000)
@@ -511,13 +519,24 @@ class ExeResourcesMixin:
             # so they don't use up the heap
             addr = self._map_big_region(size)
             if addr:
+                self._protect_new_allocation(addr, flAllocationType, flProtect)
                 return addr
         addr = self.emu.heap_alloc(size, alignment=0x10000)  # allocation granularity
         if addr:
             self.virtual_allocs[addr] = size
+            self._protect_new_allocation(addr, flAllocationType, flProtect)
         else:
             self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
         return addr
+
+    def _protect_new_allocation(self, base, allocation_type, protection):
+        """Page protection of a new VirtualAlloc block: reserved pages (not
+        committed) cannot be accessed; the committed ones get protection"""
+        end = base + self.virtual_allocs[base]
+        if not allocation_type & 0x1000:  # MEM_RESERVE only
+            self.set_protection(base, end, 0)
+        elif protection != self.PAGE_EXECUTE_READWRITE:
+            self.set_protection(base, end, protection)
 
     BIG_VIRTUAL_ALLOC = 0x100000
     # Memory reported as "physical" besides the heap: what big allocations may use
@@ -576,12 +595,26 @@ class ExeResourcesMixin:
             if size is None:
                 self._last_error = 487  # ERROR_INVALID_ADDRESS
                 return 0
+            # Whatever reuses the memory gets it fully accessible
+            self.set_protection(lpAddress, lpAddress + size, self.PAGE_EXECUTE_READWRITE)
             if lpAddress in self.mapped_virtual_allocs:
                 self.mapped_virtual_allocs.discard(lpAddress)
                 self.emu.unmap_shared(lpAddress, size)
                 self.emu.mapped_regions.remove((lpAddress, lpAddress + size))
             else:
                 self.emu.heap_free(lpAddress)
+        elif dwFreeType & 0x4000:  # MEM_DECOMMIT: reserved again, zeroed when committed
+            for base, size in self.virtual_allocs.items():
+                if base <= lpAddress < base + size:
+                    start = lpAddress & ~0xFFF
+                    end = base + size if dwSize == 0 else min(
+                        (lpAddress + dwSize + 0xFFF) & ~0xFFF, base + size)
+                    self.emu.uc.mem_write(start, bytes(end - start))
+                    self.set_protection(start, end, 0)
+                    break
+            else:
+                self._last_error = 487
+                return 0
         return 1
     
     def HeapCreate(self, args):

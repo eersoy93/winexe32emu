@@ -14,6 +14,7 @@
 
 """CPU emulation with unicorn: guest threads and the emulator"""
 
+import os
 import struct
 import threading
 import mmap
@@ -125,6 +126,8 @@ class GuestThread:
         self.pending_fault = None  # access violation the memory hook saw
         self.dispatch_depth = 0  # exceptions being dispatched (nested ones)
         self.tls_array = 0  # TEB->ThreadLocalStoragePointer (static TLS blocks)
+        self.protection_index = 0  # Entries of CPUEmulator.protection_log applied
+        self.retry_access = False  # Stale page protection: run the access again
 
 
 class CPUEmulator(ProcessEnvironmentMixin):
@@ -173,6 +176,18 @@ class CPUEmulator(ProcessEnvironmentMixin):
     # A thread that runs this long without blocking lets the others run
     THREAD_TIME_SLICE = 0.02
     
+    # Process and thread ids: one pool for every emulated process, multiples
+    # of 4 like on Windows
+    _next_id = 0x400
+    _id_lock = threading.Lock()
+
+    @classmethod
+    def allocate_id(cls):
+        """A new process or thread id"""
+        with cls._id_lock:
+            cls._next_id += 4
+            return cls._next_id
+
     def __init__(self, pe_loader, gui=None):
         self.pe_loader = pe_loader
         self.gui = gui  # PseudoWindowsGUI reference
@@ -180,9 +195,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # instance; holding the scheduler lock is the right to run guest code
         # (one guest thread at a time), released while a thread blocks
         self._tls = threading.local()
-        self.main_thread = GuestThread(5678)
+        # Process and thread ids are unique among all emulated processes
+        self.process_id = self.allocate_id()
+        self.main_thread = GuestThread(self.allocate_id())
         self.threads = {self.main_thread.tid: self.main_thread}
-        self.next_thread_id = 5682
         self.sched = threading.Condition(threading.RLock())
         self._slice_start = time.monotonic()
         # Process memory shared by the threads' Unicorn instances:
@@ -228,6 +244,13 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.teb_addr = 0
         self.process_heap = 0
         self.exe_tls = None  # TLS module info of the EXE (static TLS, callbacks)
+        self.missing_apis = {}  # (dll, name, how) -> count (see note_missing_api)
+        # Page protection: every change in order as (start, end, Unicorn
+        # permissions); each thread's Unicorn instance applies the ones it
+        # has not seen at its next sync_regions
+        self.protection_log = []
+        self.dep_enabled = False  # NX-compatible EXE: no execution of data pages
+        self.guard_pages = {}  # page -> Windows protection to restore (PAGE_GUARD)
         self._init_process_environment()
 
     # ---------- Threads ----------
@@ -331,6 +354,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
     def unmap_shared(self, base, size):
         """Unmap process memory (other threads drop it at their next sync)"""
+        # Memory mapped here later starts with full access
+        self.protection_log.append((base, base + size, UC_PROT_ALL))
         self.shared_regions.pop(base, None)
         thread = self.current_thread
         if thread.mapped.pop(base, None) is not None:
@@ -348,14 +373,153 @@ class CPUEmulator(ProcessEnvironmentMixin):
             if self.shared_regions.get(base) is not region:
                 thread.uc.mem_unmap(base, region[0])
                 del thread.mapped[base]
+        new_regions = []
         for base, region in list(self.shared_regions.items()):
             if base not in thread.mapped:
                 size, perms, _, ptr = region
                 thread.uc.mem_map_ptr(base, size, perms, ptr)
                 thread.mapped[base] = region
+                new_regions.append((base, base + size))
                 changed = True
+        # Page protections: all of them on memory new to this thread, the
+        # ones it has not seen elsewhere
+        log_ = self.protection_log
+        if thread.protection_index:
+            for start, end, perms in log_:
+                for base, stop in new_regions:
+                    if start < stop and end > base:
+                        self._protect_uc(thread.uc, max(start, base), min(end, stop), perms)
+        for start, end, perms in log_[thread.protection_index:]:
+            if self._protect_uc(thread.uc, start, end, perms):
+                changed = True
+        thread.protection_index = len(log_)
         thread.region_gen = self.region_gen
         return changed
+
+    # ---------- Page protection ----------
+
+    PAGE_NOACCESS, PAGE_GUARD = 0x01, 0x100
+    STATUS_GUARD_PAGE_VIOLATION = 0x80000001
+    # Windows page protection (without PAGE_GUARD and the cache flags) ->
+    # Unicorn permissions; 0 is reserved memory (not committed)
+    _UC_PERMISSIONS = {
+        0x00: UC_PROT_NONE, 0x01: UC_PROT_NONE, 0x02: UC_PROT_READ,
+        0x04: UC_PROT_READ | UC_PROT_WRITE, 0x08: UC_PROT_READ | UC_PROT_WRITE,
+        0x10: UC_PROT_READ | UC_PROT_EXEC, 0x20: UC_PROT_READ | UC_PROT_EXEC,
+        0x40: UC_PROT_ALL, 0x80: UC_PROT_ALL,
+    }
+
+    def uc_permissions(self, protection):
+        """Unicorn permissions of a Windows page protection. Without DEP (an
+        EXE not marked NX-compatible, like on 32-bit Windows by default)
+        readable memory is executable."""
+        if protection & self.PAGE_GUARD:
+            return UC_PROT_NONE
+        perms = self._UC_PERMISSIONS.get(protection & 0xFF, UC_PROT_ALL)
+        if perms & UC_PROT_READ and not self.dep_enabled:
+            perms |= UC_PROT_EXEC
+        return perms
+
+    @staticmethod
+    def _protect_uc(uc, start, end, perms):
+        try:
+            uc.mem_protect(start, end - start, perms)
+        except UcError:
+            return False  # Not (or no longer) mapped in this instance
+        # Unicorn checks the permissions when it fills its TLB: an entry of a
+        # page read before would still allow reads
+        try:
+            uc.ctl(UC_CTL_TLB_FLUSH, UC_CTL_IO_WRITE)
+        except UcError:
+            pass
+        return True
+
+    def protect_range(self, start, end, protection):
+        """Give the pages [start, end) a Windows protection in every thread;
+        False (nothing changed) if they are not all mapped"""
+        perms = self.uc_permissions(protection)
+        if not self._protect_uc(self.uc, start, end, perms):
+            return False
+        for page in range(start, end, 0x1000):
+            if protection & self.PAGE_GUARD:
+                self.guard_pages[page] = protection & ~self.PAGE_GUARD
+            else:
+                self.guard_pages.pop(page, None)
+        self.protection_log.append((start, end, perms))
+        self.region_gen += 1  # The other threads apply it at their next sync
+        if len(self.protection_log) > self.PROTECTION_LOG_LIMIT:
+            self._compact_protection_log()
+        return True
+
+    # Changes kept before the log is replaced by the current memory map
+    PROTECTION_LOG_LIMIT = 1024
+
+    def _compact_protection_log(self):
+        """Replace the protection log by the permissions of every region of
+        this (up to date) thread's memory map; the other threads replay it"""
+        self.sync_regions()
+        self.protection_log = [(start, end + 1, perms)
+                               for start, end, perms in self.uc.mem_regions()]
+        current = self.current_thread
+        for thread in list(self.threads.values()):
+            thread.protection_index = (len(self.protection_log) if thread is current
+                                       else 0)
+
+    def _hook_mem_protect(self, uc, access, address, size, value, user_data):
+        """An access the page protection forbids: an access violation (or a
+        guard page exception) for the program's exception handlers"""
+        thread = self.current_thread
+        # Changed by another thread meanwhile: apply it and run the access again
+        if self.sync_regions():
+            thread.retry_access = True
+            return False
+        page = address & ~0xFFF
+        kind = {UC_MEM_WRITE_PROT: 1, UC_MEM_FETCH_PROT: 8}.get(access, 0)
+        eip = uc.reg_read(UC_X86_REG_EIP)
+        fault_address = address if access == UC_MEM_FETCH_PROT else eip
+        if page in self.guard_pages:
+            # A guard page turns into an ordinary page at its first access
+            protection = self.guard_pages[page]
+            self.protect_range(page, page + 0x1000, protection)
+            if self.api_handler is not None:
+                self.api_handler.record_protection(page, page + 0x1000, protection)
+            thread.pending_fault = (self.STATUS_GUARD_PAGE_VIOLATION,
+                                    [kind, address & 0xFFFFFFFF], fault_address,
+                                    f"guard page: access of 0x{address:08x}")
+            return False
+        what = {UC_MEM_WRITE_PROT: "write", UC_MEM_FETCH_PROT: "execution"}.get(
+            access, "read")
+        log.debug(f"Access violation: {what} of protected 0x{address:08x}, EIP=0x{eip:08x}")
+        thread.pending_fault = (self.STATUS_ACCESS_VIOLATION, [kind, address & 0xFFFFFFFF],
+                                fault_address, f"access violation: {what} of 0x{address:08x}")
+        return False
+
+    # Windows protection of image sections: (execute, read, write) -> PAGE_*
+    _SECTION_PROTECTIONS = {
+        (0, 0, 0): 0x01, (0, 1, 0): 0x02, (0, 0, 1): 0x08, (0, 1, 1): 0x08,
+        (1, 0, 0): 0x10, (1, 1, 0): 0x20, (1, 0, 1): 0x80, (1, 1, 1): 0x80,
+    }
+
+    def protect_image(self, base, pe):
+        """Page protections of a mapped image like the Windows loader gives
+        them: read-only headers, each section by its characteristics
+        (images with sections smaller than a page stay fully accessible)"""
+        opt = pe.OPTIONAL_HEADER
+        if opt.SectionAlignment < 0x1000:
+            return
+        ranges = [(base, base + self._align_size(opt.SizeOfHeaders or 1), 0x02)]
+        for section in pe.sections:
+            size = section.Misc_VirtualSize or section.SizeOfRawData
+            if not size:
+                continue
+            flags = section.Characteristics
+            key = (int(bool(flags & 0x20000000)), int(bool(flags & 0x40000000)),
+                   int(bool(flags & 0x80000000)))
+            start = base + section.VirtualAddress
+            ranges.append((start, start + self._align_size(size), self._SECTION_PROTECTIONS[key]))
+        for start, end, protection in ranges:
+            if self.protect_range(start, end, protection) and self.api_handler is not None:
+                self.api_handler.record_protection(start, end, protection)
 
     def _setup_segments(self, uc, teb):
         """GDT with flat code/data segments and FS -> teb, loaded into uc"""
@@ -391,7 +555,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         data = bytearray(0x1000)
         struct.pack_into('<III', data, 0x00, 0xFFFFFFFF, stack_base, stack_limit)
         struct.pack_into('<I', data, 0x18, teb)
-        struct.pack_into('<I', data, 0x20, 1234)
+        struct.pack_into('<I', data, 0x20, self.process_id)
         struct.pack_into('<I', data, 0x24, tid)
         struct.pack_into('<I', data, 0x30, self.peb_addr)
         self.uc.mem_write(teb, bytes(data))
@@ -399,8 +563,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
     def create_thread(self, start, param, stack_size=0, suspended=False):
         """Start a guest thread at start(param); returns its GuestThread or None"""
-        tid = self.next_thread_id
-        self.next_thread_id += 4
+        tid = self.allocate_id()
         thread = GuestThread(tid, Uc(UC_ARCH_X86, UC_MODE_32))
         self.sync_regions(thread)
         size = self._align_size(min(max(stack_size, 0x40000), 0x400000), 0x10000)
@@ -430,14 +593,14 @@ class CPUEmulator(ProcessEnvironmentMixin):
                     self.wait_until(lambda: thread.suspend_count == 0)
                     self._slice_start = time.monotonic()
                     if not (self.stop_emulation or thread.stop):
-                        self.run_tls_callbacks(self.DLL_THREAD_ATTACH)
+                        self.attach_thread()
                     if not (self.stop_emulation or thread.stop):
                         self.emulate(uc, start, self.THREAD_EXIT_ADDR)
                         if (not thread.exited and
                                 uc.reg_read(UC_X86_REG_EIP) == self.THREAD_EXIT_ADDR):
                             thread.exit_code = uc.reg_read(UC_X86_REG_EAX)
-                            # Returned from its start routine: TLS destructors
-                            self.run_tls_callbacks(self.DLL_THREAD_DETACH)
+                            # Returned from its start routine: like ExitThread
+                            self.detach_thread()
                 except UcError as e:
                     eip = uc.reg_read(UC_X86_REG_EIP)
                     log.error(f"Emulation error in thread {tid}: {e} (EIP: 0x{eip:08x})")
@@ -467,6 +630,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         thread = self.current_thread
         if thread is self.main_thread:
             return False
+        self.detach_thread()
         thread.exit_code = code
         thread.exited = True
         thread.stop = True
@@ -488,6 +652,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         
         # Create API handler (with GUI reference)
         self.api_handler = WinAPIHandler(self, self.gui)
+        # DEP like 32-bit Windows' default (OptIn): only for NX-compatible EXEs
+        self.dep_enabled = bool(
+            self.pe_loader.pe.OPTIONAL_HEADER.DllCharacteristics & 0x0100)
         
         # Setup memory
         if not self._setup_memory():
@@ -502,19 +669,22 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Setup callback return hook region
         self._setup_callback_return_hook()
         
-        # Setup import hooks
-        self._setup_import_hooks()
-
         # Structures programs read from memory: static TLS, the system DLL
         # images and the PEB's module lists, the process parameters
         self.init_thread_tls(self.main_thread)
         self.exe_tls = self.register_image_tls(self.pe_loader.image_base, self.pe_loader.pe)
         self._setup_loader_data()
+
+        # Setup import hooks (and load the program's own DLLs)
+        self._setup_import_hooks()
+
         for dll_name in self.pe_loader.imports:
             key = dll_name.lower()
             if self.api_handler.is_system_dll_name(key) and '.' in key:
                 self.system_module(key)
         self._setup_process_parameters()
+        # The EXE's pages get their section protections once it is bound
+        self.protect_image(self.pe_loader.image_base, self.pe_loader.pe)
 
         # Register hooks
         self._setup_hooks()
@@ -590,20 +760,14 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Allocate memory for main image
         self._map_memory(image_base, image_size)
         
-        # Write PE header
-        header_size = self.pe_loader.pe.OPTIONAL_HEADER.SizeOfHeaders
+        # The image as the Windows loader maps it: headers and sections at
+        # their RVAs (pefile clips raw data to the virtual sizes and zero
+        # fills the rest), never past SizeOfImage
         pe_data = self.pe_loader.pe.get_memory_mapped_image()
-        self.uc.mem_write(image_base, pe_data[:header_size])
-        log.info(f"PE Header loaded: 0x{image_base:08x}")
-        
-        # Load sections
+        self.uc.mem_write(image_base, pe_data[:image_size])
+        log.info(f"PE image loaded: 0x{image_base:08x} - 0x{image_base + image_size:08x}")
         for section in self.pe_loader.sections:
-            va = image_base + section['virtual_address']
-            data = section['data']
-            
-            if len(data) > 0:
-                self.uc.mem_write(va, data)
-                log.info(f"Section '{section['name']}' loaded: 0x{va:08x}")
+            log.info(f"Section '{section['name']}' at 0x{image_base + section['virtual_address']:08x}")
         
         # Allocate memory for stack
         self._map_memory(self.STACK_BASE, self.STACK_SIZE)
@@ -671,7 +835,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # PEB pointer (FS:[0x30])
         struct.pack_into('<I', teb_data, 0x30, self.peb_addr)
         # ProcessId (FS:[0x20])
-        struct.pack_into('<I', teb_data, 0x20, 1234)
+        struct.pack_into('<I', teb_data, 0x20, self.process_id)
         # ThreadId (FS:[0x24])
         struct.pack_into('<I', teb_data, 0x24, self.main_thread.tid)
         
@@ -813,10 +977,30 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Create hook address for each import
         for dll_name, functions in self.pe_loader.imports.items():
             log.info(f"DLL hook: {dll_name}")
-            
+
+            # A DLL of the program (not a Windows DLL): loaded and bound like
+            # Windows does; its DllMain runs when the program starts
+            real = None
+            if not self.api_handler.is_system_dll_name(dll_name):
+                real = self.api_handler.load_real_dll(dll_name, call_entry=False)
+                if real:
+                    real['refs'] += 1
+                else:
+                    log.warning(f"DLL not found: {dll_name} (its imports are not emulated)")
+
             for func_info in functions:
                 func_name = func_info['name']
                 iat_addr = func_info['address']
+
+                if real:
+                    ordinal = func_info.get('ordinal')
+                    addr = (real['exports'].get(func_name) or
+                            (real['ordinals'].get(ordinal) if ordinal is not None else 0))
+                    if not addr:
+                        log.warning(f"Import {dll_name}!{func_name} not found")
+                        addr = self._create_api_stub(dll_name, func_name)
+                    self.uc.mem_write(iat_addr, struct.pack('<I', addr))
+                    continue
 
                 # CRT variables (e.g. _iob) are dereferenced, not called:
                 # point the IAT entry at real memory instead of a hook stub.
@@ -888,7 +1072,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def load_dll(self, host_path, windows_path, call_entry=True):
         """Load a real 32-bit DLL from the drives/ sandbox: map and relocate
         it, bind its imports to the emulated APIs (or other real DLLs) and
-        run DllMain(DLL_PROCESS_ATTACH). Returns its base (HMODULE) or 0."""
+        run its TLS callbacks and DllMain(DLL_PROCESS_ATTACH), after those of
+        the DLLs it imports. Without call_entry they wait in
+        pending_dll_inits (the EXE's imports: initialized when it starts).
+        Returns its base (HMODULE) or 0. The module starts with no reference:
+        the caller takes one (LoadLibrary, an importing image)."""
         for module in self.dlls.values():
             if module['host_path'] == host_path:
                 return module['base']
@@ -917,7 +1105,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.uc.mem_write(base, pe.get_memory_mapped_image()[:size])
         name = ntpath.basename(windows_path).lower()
         module = {'name': name, 'path': windows_path, 'host_path': host_path,
-                  'base': base, 'size': size, 'exports': {}, 'ordinals': {}, 'pe': pe}
+                  'base': base, 'size': size, 'exports': {}, 'ordinals': {}, 'pe': pe,
+                  'refs': 0, 'deps': [], 'initialized': False, 'thread_calls': True,
+                  'ldr_entry': 0, 'tls': None}
         self.dlls[base] = module
         log.info(f"DLL loaded: {windows_path} at 0x{base:08x}")
 
@@ -936,7 +1126,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Imports
         for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', []):
             dll_name = entry.dll.decode('ascii', 'replace')
-            real = self.api_handler.load_real_dll(dll_name)
+            real = self.api_handler.load_real_dll(dll_name, call_entry)
+            if real and real['base'] != base:
+                real['refs'] += 1
+                module['deps'].append(real['base'])
             for imp in entry.imports:
                 # (relocate_image already moved the import addresses to the new base)
                 iat = base + imp.address - pe.OPTIONAL_HEADER.ImageBase
@@ -956,18 +1149,17 @@ class CPUEmulator(ProcessEnvironmentMixin):
                         addr = self._create_api_stub(dll_name, func_name)
                 self.uc.mem_write(iat, struct.pack('<I', addr))
 
+        self.protect_image(base, pe)
         entry_point = pe.OPTIONAL_HEADER.AddressOfEntryPoint
-        self.add_loader_entry(base, size, base + entry_point if entry_point else 0,
-                              windows_path)
-        tls = self.register_image_tls(base, pe)
-        if call_entry and tls:
-            self.run_tls_callbacks(self.DLL_PROCESS_ATTACH, [tls])
-        if call_entry and entry_point:
-            result = self.call_callback(base + entry_point, [base, 1, 0])  # DLL_PROCESS_ATTACH
-            if not result or self.crashed:
-                log.error(f"DllMain of {windows_path} failed")
-                del self.dlls[base]
-                return 0
+        module['entry'] = base + entry_point if entry_point else 0
+        module['ldr_entry'] = self.add_loader_entry(base, size, module['entry'], windows_path)
+        module['tls'] = self.register_image_tls(base, pe)
+        if not call_entry:
+            self.pending_dll_inits.append(module)
+        elif not self.initialize_dll(module):
+            log.error(f"DllMain of {windows_path} failed")
+            self.unload_dll(module)
+            return 0
         return base
 
     def get_api_stub(self, dll_name, func_name):
@@ -1252,8 +1444,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         for address in (self.PROCESS_EXIT_ADDR, self.THREAD_EXIT_ADDR):
             uc.hook_add(UC_HOOK_CODE, self._hook_code, begin=address, end=address)
 
-        # Memory access error hook
+        # Memory access error hooks
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._hook_mem_invalid)
+        uc.hook_add(UC_HOOK_MEM_PROT, self._hook_mem_protect)
         
         # Interrupt hook
         uc.hook_add(UC_HOOK_INTR, self._hook_interrupt)
@@ -1379,6 +1572,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 result = 0
         else:
             log.warning(f"Unemulated API: {func_name}")
+            self.note_missing_api(dll_name, func_name, 'called, returned 0')
             result = 0
 
         if isinstance(result, ApiJump):
@@ -1405,6 +1599,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
             # Unknown stdcall argument count: continuing would corrupt ESP
             log.error(f"Unemulated stdcall API {dll_name}!{func_name}: "
                       f"argument count unknown, stopping emulation")
+            self.note_missing_api(dll_name, func_name,
+                                  'argument count unknown, the program was stopped')
             self.crashed = True
             self.stop_emulation = True
             cleanup = 0
@@ -1460,6 +1656,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 return
             except UcError as e:
                 thread = self.current_thread
+                if thread.retry_access and not (self.stop_emulation or thread.stop):
+                    thread.retry_access = False  # The page protection changed
+                    address = uc.reg_read(UC_X86_REG_EIP)
+                    continue
                 fault, thread.pending_fault = thread.pending_fault, None
                 if fault is None and e.errno == UC_ERR_INSN_INVALID:
                     eip = uc.reg_read(UC_X86_REG_EIP)
@@ -1503,6 +1703,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
     }
     STATUS_ACCESS_VIOLATION = 0xC0000005
     STATUS_STACK_BUFFER_OVERRUN = 0xC0000409  # __fastfail
+    STATUS_DLL_INIT_FAILED = 0xC0000142
     CONTRIBUTORY_EXCEPTIONS = (0x00, 0x08, 0x0A, 0x0B, 0x0C, 0x0D)
 
     # QEMU remembers a contributory CPU exception (#DE, #GP, ...) until it is
@@ -1672,8 +1873,18 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self._tls.thread = self.main_thread
         self._slice_start = time.monotonic()
         try:
-            # Like the Windows loader, the EXE's TLS callbacks run first
-            if self.exe_tls:
+            # Like the Windows loader: the DLLs the EXE imports (dependencies
+            # first), then the EXE's TLS callbacks, then its entry point
+            for module in list(self.pending_dll_inits):
+                if self.stop_emulation:
+                    break
+                if not self.initialize_dll(module):
+                    log.error(f"DLL initialization failed: {module['path']} "
+                              f"(DllMain returned FALSE)")
+                    self._terminate_on_exception(self.uc, self.STATUS_DLL_INIT_FAILED)
+                    break
+            self.pending_dll_inits.clear()
+            if self.exe_tls and not self.stop_emulation:
                 self.run_tls_callbacks(self.DLL_PROCESS_ATTACH, [self.exe_tls])
             # The instruction limit is enforced in _hook_code. Passing a count
             # to Unicorn would break nested emu_start calls (callbacks,
@@ -1684,6 +1895,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
             if (not self.crashed and
                     self.uc.reg_read(UC_X86_REG_EIP) == self.PROCESS_EXIT_ADDR):
                 self.api_handler._set_exit_code(self.uc.reg_read(UC_X86_REG_EAX))
+                # Returning from the entry point ends the process like ExitProcess
+                self.detach_process()
 
         except UcError as e:
             eip = self.uc.reg_read(UC_X86_REG_EIP)
@@ -1704,12 +1917,46 @@ class CPUEmulator(ProcessEnvironmentMixin):
                     self.gui.unregister_process(self.api_handler)
 
         log.header("Emulation Completed")
+        self.report_missing_apis()
         if count_instructions:
             log.info(f"Total instruction count: {self.instruction_count}")
         
         # Show register state
         self._print_registers()
     
+    # ---------- Unemulated APIs ----------
+
+    # --missing-apis: the file every process appends its unemulated APIs to
+    missing_apis_file = None
+    _missing_apis_lock = threading.Lock()
+
+    def note_missing_api(self, dll_name, func_name, how):
+        """Remember an API the program needed but the emulator lacks; how
+        says what happened (returned 0, stopped the program, GetProcAddress
+        returned NULL)"""
+        key = (dll_name.lower(), func_name, how)
+        self.missing_apis[key] = self.missing_apis.get(key, 0) + 1
+
+    def report_missing_apis(self):
+        """Summary of the unemulated APIs at the end of the process (and the
+        --missing-apis file)"""
+        if not self.missing_apis:
+            return
+        lines = [f"{dll}!{name}: {how}" + (f" ({count} times)" if count > 1 else "")
+                 for (dll, name, how), count in sorted(self.missing_apis.items())]
+        log.warning(f"{len(lines)} unemulated API(s) needed by "
+                    f"{os.path.basename(self.pe_loader.filepath)}:")
+        for line in lines:
+            log.warning(f"  {line}")
+        if self.missing_apis_file:
+            program = self.api_handler.windows_exe_path() if self.api_handler else '?'
+            try:
+                with self._missing_apis_lock, open(self.missing_apis_file, 'a',
+                                                   encoding='utf-8') as f:
+                    f.writelines(f"{program}\t{line}\n" for line in lines)
+            except OSError as e:
+                log.error(f"Cannot write {self.missing_apis_file}: {e}")
+
     def _print_registers(self):
         """Print register values"""
         log.header("Register State")

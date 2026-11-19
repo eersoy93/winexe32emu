@@ -77,6 +77,12 @@ class PELoader:
 
         log.success("32-bit PE file verified!")
 
+        # A .NET program (CLI header) needs the .NET runtime, not emulated
+        directories = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        if len(directories) > 14 and directories[14].VirtualAddress:
+            log.error("This is a .NET program: the .NET runtime is not emulated")
+            return False
+
         # Get basic info
         if not self._parse_headers():
             return False
@@ -134,7 +140,8 @@ class PELoader:
         log.header("Sections")
 
         for section in self.pe.sections:
-            name = section.Name.decode('utf-8').rstrip('\x00')
+            # Packers give sections any bytes as names
+            name = section.Name.rstrip(b'\x00').decode('latin-1')
             va = section.VirtualAddress
             vs = section.Misc_VirtualSize
             raw_size = section.SizeOfRawData

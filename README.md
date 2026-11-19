@@ -31,6 +31,8 @@ python3 winexe32emu.py
 
 Use `-h` parameter for command-line help.
 
+To see which APIs a program needs but the emulator does not emulate yet, check the summary at the end of its run, or collect them in a file with `--missing-apis FILE`.
+
 ## Tested Programs
 
 - 7-Zip 4.65 (x86, NSIS setup and program)
@@ -46,7 +48,8 @@ Use `-h` parameter for command-line help.
 - Fake Windows desktop with sound support with Pygame
 - Basic Win32 API support
 - An offline network: Windows Sockets resolve only localhost and create no sockets (currently)
-- Loading the programs' own DLLs
+- Loading the programs' own DLLs (imported or with LoadLibrary): reference counts, FreeLibrary, DllMain notifications
+- Page protections (VirtualProtect, VirtualAlloc reserve/commit, guard pages, image sections) and DEP for NX-compatible programs
 - Structured exception handling
 - A registry shared by the emulated programs
 - Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/

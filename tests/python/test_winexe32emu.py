@@ -181,6 +181,14 @@ class ApiBindingTest(unittest.TestCase):
         self.assertIsNone(handler.stack_cleanup_bytes('kernel32.dll', 'NoSuchApi'))
 
 
+class UnicornStateTest(unittest.TestCase):
+    """The Unicorn internals the emulator depends on (a Unicorn upgrade may
+    move them: requirements.txt pins the version)"""
+
+    def test_exception_state_offset_is_found(self):
+        self.assertIsNotNone(CPUEmulator._find_exception_state_offset())
+
+
 class SandboxTest(unittest.TestCase):
     def test_paths_stay_in_their_drive(self):
         for name, letter in ((r'C:\Windows\..\..\..\etc\passwd', 'C'), (r'..\..\x', 'C'),

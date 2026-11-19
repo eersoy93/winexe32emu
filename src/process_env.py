@@ -51,7 +51,7 @@ class ProcessEnvironmentMixin:
 
     # Slots of TEB->ThreadLocalStoragePointer (one per image with a TLS directory)
     TLS_ARRAY_SLOTS = 64
-    DLL_PROCESS_ATTACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH = 1, 2, 3
+    DLL_PROCESS_DETACH, DLL_PROCESS_ATTACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH = 0, 1, 2, 3
 
     def _init_process_environment(self):
         """State of the mixin (called from CPUEmulator.__init__)"""
@@ -59,6 +59,9 @@ class ProcessEnvironmentMixin:
         self.ldr_addr = 0
         self.process_parameters_addr = 0
         self.tls_modules = []  # [{'base', 'directory', 'index'}] by TLS index
+        self.pending_dll_inits = []  # DLLs the EXE imports: initialized at its start
+        self.initialized_dlls = []  # Real DLLs in initialization order
+        self.process_detached = False
 
     # ---------- System DLL images ----------
 
@@ -156,6 +159,8 @@ class ProcessEnvironmentMixin:
             return 0
         self.mapped_regions.append((base, base + size))
         self.uc.mem_write(base, bytes(image))
+        if self.protect_range(base, base + size, 0x02):  # PAGE_READONLY
+            self.api_handler.record_protection(base, base + size, 0x02)
         module = {'name': key, 'base': base, 'size': size,
                   'exports': dict(exports), 'path': 'C:\\Windows\\System32\\' + key}
         self.system_modules[key] = module
@@ -202,9 +207,10 @@ class ProcessEnvironmentMixin:
 
     def add_loader_entry(self, base, size, entry_point, windows_path, initialized=True):
         """Append a module (LDR_DATA_TABLE_ENTRY) to the PEB loader lists; the
-        EXE is not in the initialization order list"""
+        EXE is not in the initialization order list. Returns the entry (0 if
+        there are no lists yet)."""
         if not self.ldr_addr:
-            return
+            return 0
         entry = self.heap_alloc(0x78)
         fields = bytearray(0x78)
         struct.pack_into('<III', fields, 0x18, base, entry_point, size)
@@ -222,6 +228,124 @@ class ProcessEnvironmentMixin:
             self.uc.mem_write(link, struct.pack('<II', head, last))  # Flink, Blink
             self.uc.mem_write(last, struct.pack('<I', link))  # last->Flink
             self.uc.mem_write(head + 4, struct.pack('<I', link))  # head->Blink
+        return entry
+
+    def remove_loader_entry(self, entry):
+        """Unlink a module's LDR_DATA_TABLE_ENTRY from the PEB loader lists"""
+        if not entry:
+            return
+        for link_offset in (0x00, 0x08, 0x10):
+            link = entry + link_offset
+            flink, blink = struct.unpack('<II', self.uc.mem_read(link, 8))
+            if not flink or flink == link:
+                continue  # Not in this list (the initialization order of the EXE)
+            self.uc.mem_write(blink, struct.pack('<I', flink))  # blink->Flink
+            self.uc.mem_write(flink + 4, struct.pack('<I', blink))  # flink->Blink
+            self.uc.mem_write(link, struct.pack('<II', link, link))
+
+    # ---------- Real DLLs: initialization, references, notifications ----------
+
+    def _call_dll_main(self, module, reason, reserved=0):
+        """DllMain(base, reason, reserved) of a real DLL; True without one"""
+        if not module.get('entry'):
+            return True
+        result = self.call_callback(module['entry'], [module['base'], reason, reserved])
+        return bool(result) and not self.crashed
+
+    def initialize_dll(self, module):
+        """TLS callbacks and DllMain(DLL_PROCESS_ATTACH) of a loaded DLL, once;
+        False if DllMain fails"""
+        if module['initialized']:
+            return True
+        module['initialized'] = True
+        if module['tls']:
+            self.run_tls_callbacks(self.DLL_PROCESS_ATTACH, [module['tls']])
+        if not self._call_dll_main(module, self.DLL_PROCESS_ATTACH):
+            module['initialized'] = False
+            return False
+        self.initialized_dlls.append(module)
+        return True
+
+    def release_dll(self, base):
+        """Drop a reference to a real DLL (FreeLibrary, an unloaded importer);
+        the last one unloads it. Returns False for an unknown module."""
+        module = self.dlls.get(base)
+        if module is None:
+            return False
+        module['refs'] -= 1
+        if module['refs'] <= 0:
+            self.unload_dll(module)
+        return True
+
+    def unload_dll(self, module):
+        """Unload a real DLL: DllMain(DLL_PROCESS_DETACH) and TLS callbacks if
+        it was initialized, then out of the loader lists and memory; the
+        DLLs it imports lose a reference"""
+        base = module['base']
+        if self.dlls.get(base) is not module:
+            return
+        log.info(f"DLL unloaded: {module['path']}")
+        if module['initialized']:
+            self._call_dll_main(module, self.DLL_PROCESS_DETACH)
+            if module['tls']:
+                self.run_tls_callbacks(self.DLL_PROCESS_DETACH, [module['tls']])
+        if module in self.initialized_dlls:
+            self.initialized_dlls.remove(module)
+        if module in self.pending_dll_inits:
+            self.pending_dll_inits.remove(module)
+        if module['tls']:
+            # Its TLS blocks go away in every thread
+            module['tls']['unloaded'] = True
+            for thread in list(self.threads.values()):
+                if thread.tls_array:
+                    slot = thread.tls_array + 4 * module['tls']['index']
+                    block = struct.unpack('<I', self.uc.mem_read(slot, 4))[0]
+                    if block:
+                        self.heap_free(block)
+                        self.uc.mem_write(slot, b'\0\0\0\0')
+        self.remove_loader_entry(module.get('ldr_entry', 0))
+        del self.dlls[base]
+        self.api_handler.record_protection(base, base + module['size'], 0x40)
+        self.unmap_shared(base, module['size'])
+        if (base, base + module['size']) in self.mapped_regions:
+            self.mapped_regions.remove((base, base + module['size']))
+        for dep in module['deps']:
+            self.release_dll(dep)
+
+    def attach_thread(self):
+        """A new thread starts: TLS callbacks and DllMain(DLL_THREAD_ATTACH)
+        of the DLLs (in initialization order)"""
+        self.run_tls_callbacks(self.DLL_THREAD_ATTACH)
+        for module in list(self.initialized_dlls):
+            if self.stop_emulation or self.current_thread.stop:
+                return
+            if module['thread_calls'] and module['base'] in self.dlls:
+                self._call_dll_main(module, self.DLL_THREAD_ATTACH)
+
+    def detach_thread(self):
+        """The calling thread ends (ExitThread or returning): DllMain and TLS
+        callbacks with DLL_THREAD_DETACH, in reverse order, once"""
+        thread = self.current_thread
+        if getattr(thread, 'detached', False) or self.stop_emulation:
+            return
+        thread.detached = True
+        for module in reversed(list(self.initialized_dlls)):
+            if module['thread_calls'] and module['base'] in self.dlls:
+                self._call_dll_main(module, self.DLL_THREAD_DETACH)
+        self.run_tls_callbacks(self.DLL_THREAD_DETACH)
+
+    def detach_process(self):
+        """The process ends (ExitProcess, the entry point returned): the DLLs'
+        DllMain(DLL_PROCESS_DETACH, reserved=1) in reverse initialization
+        order, and the TLS callbacks with DLL_PROCESS_DETACH, once"""
+        if self.process_detached or self.crashed:
+            return
+        self.process_detached = True
+        for module in reversed(list(self.initialized_dlls)):
+            if module['base'] in self.dlls:
+                self._call_dll_main(module, self.DLL_PROCESS_DETACH, 1)
+        self.run_tls_callbacks(self.DLL_PROCESS_DETACH, [
+            m for m in reversed(self.tls_modules)])
 
     # ---------- PEB process parameters ----------
 
@@ -314,7 +438,10 @@ class ProcessEnvironmentMixin:
         return module
 
     def _allocate_tls_block(self, thread, module):
-        """A thread's copy of an image's TLS template (data, then zero fill)"""
+        """A thread's copy of an image's TLS template (data, then zero fill);
+        none for an unloaded image"""
+        if module.get('unloaded'):
+            return
         start, end, _, _, zero_fill = module['directory']
         template = bytes(self.uc.mem_read(start, end - start)) if end > start else b''
         block = self.heap_alloc(len(template) + zero_fill + 4)
@@ -347,6 +474,8 @@ class ProcessEnvironmentMixin:
     def run_tls_callbacks(self, reason, modules=None):
         """Call the TLS callbacks (image base, reason, NULL) of the images"""
         for module in (self.tls_modules if modules is None else modules):
+            if module.get('unloaded'):
+                continue
             callbacks = module['directory'][3]
             while callbacks and not self.stop_emulation:
                 try:

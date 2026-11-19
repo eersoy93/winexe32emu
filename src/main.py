@@ -81,6 +81,10 @@ def main():
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
                         help="Don't run create_drives_environment.sh at startup")
+    parser.add_argument("--missing-apis", metavar="FILE",
+                        help="Append the APIs the programs needed but the emulator "
+                             "does not emulate to FILE (one line per API and program; "
+                             "a summary is always shown at the end)")
     parser.add_argument("--logfile", metavar="FILE",
                         help="Also write the console output to FILE (without colors)")
     verbosity = parser.add_mutually_exclusive_group()
@@ -165,6 +169,9 @@ def main():
     if not 1 <= heap_size_mib <= max_heap_mib:
         log.error(f"Heap size must be between 1 and {max_heap_mib} MiB")
         sys.exit(1)
+
+    if args.missing_apis:
+        CPUEmulator.missing_apis_file = os.path.abspath(args.missing_apis)
 
     # Update heap size
     CPUEmulator.HEAP_SIZE = heap_size_mib * 1024 * 1024

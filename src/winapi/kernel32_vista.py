@@ -261,8 +261,9 @@ class Kernel32VistaMixin:
             self._mem_write(lpContext, struct.pack('<I', value))
         return 1
 
-    # Memory: emulated memory is always readable, writable and executable;
-    # VirtualProtect only remembers the protection for VirtualQuery
+    # Memory: page protections are enforced (CPUEmulator.protect_range);
+    # page_protections remembers them for VirtualQuery. Protection 0 marks
+    # reserved, not committed pages.
 
     PAGE_EXECUTE_READWRITE = 0x40
 
@@ -295,21 +296,57 @@ class Kernel32VistaMixin:
                 return protection
         return self.PAGE_EXECUTE_READWRITE
 
+    def record_protection(self, start, end, protection):
+        """Remember the protection of the pages [start, end) for VirtualQuery
+        (ranges it covers are forgotten, others are cut around it)"""
+        kept = []
+        for r_start, r_end, r_prot in self.page_protections:
+            if r_end <= start or r_start >= end:
+                kept.append((r_start, r_end, r_prot))
+                continue
+            if r_start < start:
+                kept.append((r_start, start, r_prot))
+            if r_end > end:
+                kept.append((end, r_end, r_prot))
+        if protection != self.PAGE_EXECUTE_READWRITE:
+            kept.append((start, end, protection))
+        self.page_protections = kept
+
+    def set_protection(self, start, end, protection):
+        """Enforce and remember a page protection; False if not all mapped"""
+        if not self.emu.protect_range(start, end, protection):
+            return False
+        self.record_protection(start, end, protection)
+        return True
+
+    @staticmethod
+    def valid_protection(protection):
+        """Exactly one PAGE_* access value, with PAGE_GUARD, PAGE_NOCACHE or
+        PAGE_WRITECOMBINE at most"""
+        base = protection & 0xFF
+        return (base in (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80) and
+                not protection & ~0x7FF)
+
     def VirtualProtect(self, args):
-        """VirtualProtect emulation - the old protection; nothing is enforced"""
+        """VirtualProtect emulation - enforced on the pages (an access they
+        forbid is an access violation); returns the old protection"""
         address, size, protection, lpflOldProtect = args[:4]
         if not lpflOldProtect:
             self._last_error = 998  # ERROR_NOACCESS
             return 0
-        if not size or self._memory_region(address) is None:
-            self._last_error = 487  # ERROR_INVALID_ADDRESS
+        if not self.valid_protection(protection):
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         start = address & ~0xFFF
         end = (address + size + 0xFFF) & ~0xFFF
+        if (not size or self._memory_region(address) is None or
+                any(self._page_protection(page) == 0 for page in range(start, end, 0x1000))):
+            self._last_error = 487  # ERROR_INVALID_ADDRESS (or not committed)
+            return 0
         old = self._page_protection(start)
-        self.page_protections = [r for r in self.page_protections
-                                 if not (start <= r[0] and r[1] <= end)]
-        self.page_protections.append((start, end, protection))
+        if not self.set_protection(start, end, protection):
+            self._last_error = 487
+            return 0
         self._mem_write(lpflOldProtect, struct.pack('<I', old))
         return 1
 
@@ -350,8 +387,10 @@ class Kernel32VistaMixin:
                 for edge in (r_start, r_end):
                     if page < edge < end:
                         end = edge
+            protection = self._page_protection(page)
+            state = 0x1000 if protection else 0x2000  # MEM_COMMIT / MEM_RESERVE
             info = (page, allocation_base, self.PAGE_EXECUTE_READWRITE, end - page,
-                    0x1000, self._page_protection(page), kind)  # MEM_COMMIT
+                    state, protection, kind)
         if not self._mem_write(lpBuffer, struct.pack('<7I', *info)):
             self._last_error = 998  # ERROR_NOACCESS
             return 0

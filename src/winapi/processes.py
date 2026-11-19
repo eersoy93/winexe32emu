@@ -29,7 +29,6 @@ class ProcessesMixin:
 
     # Set by main(): (windows_path, command_line, current_directory) -> CPUEmulator or None
     process_starter = None
-    _next_process_id = 0x1000
 
     def _process_image_path(self, app, cmdline):
         """Windows path of the EXE CreateProcess should start, or None"""
@@ -90,15 +89,14 @@ class ProcessesMixin:
         if child is None:
             self._last_error = 193  # ERROR_BAD_EXE_FORMAT
             return 0
-        winapi.WinAPIHandler._next_process_id += 4
-        pid = winapi.WinAPIHandler._next_process_id
+        pid, tid = child.process_id, child.main_thread.tid
         hProcess = self.get_next_handle()
         hThread = self.get_next_handle()
         self.handles[hProcess] = {'type': 'process', 'emulator': child}
         self.handles[hThread] = {'type': 'thread', 'emulator': child}
         if lpProcessInformation:
             self._mem_write(lpProcessInformation,
-                            struct.pack('<4I', hProcess, hThread, pid, pid + 1))
+                            struct.pack('<4I', hProcess, hThread, pid, tid))
         return 1
 
     @staticmethod
@@ -109,7 +107,7 @@ class ProcessesMixin:
     def GetExitCodeProcess(self, args):
         """GetExitCodeProcess emulation - STILL_ACTIVE (259) while it runs"""
         hProcess, lpExitCode = args[0], args[1]
-        if hProcess == 0xFFFFFFFF:
+        if hProcess == 0xFFFFFFFF or self.handles.get(hProcess, {}).get('current'):
             code = 259
         else:
             info = self.handles.get(hProcess)

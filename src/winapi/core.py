@@ -91,6 +91,7 @@ class CoreMixin:
         'FindNextFileA': 2, 'FindNextFileW': 2, 'FindResourceA': 3, 'FlushFileBuffers': 1,
         'FormatMessageA': 7, 'FormatMessageW': 7, 'FreeConsole': 0,
         'FreeEnvironmentStringsA': 1, 'FreeEnvironmentStringsW': 1, 'FreeLibrary': 1,
+        'FreeLibraryAndExitThread': 2, 'DisableThreadLibraryCalls': 1,
         'FreeResource': 1, 'GetACP': 0, 'GetCommandLineA': 0, 'GetCommandLineW': 0,
         'GetComputerNameA': 2, 'GetComputerNameW': 2, 'GetCPInfo': 2,
         'GetCurrentDirectoryA': 2, 'GetCurrentDirectoryW': 2, 'GetCurrentProcess': 0,
