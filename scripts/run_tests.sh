@@ -112,6 +112,10 @@ run_crash_test exception_test fastfail "__fastfail(7)"
 run_crash_test exception_test int3 "Unhandled exception 0x80000003"
 run_test seh_test "== 0 failure(s) =="
 run_test compat_test "== 0 failure(s) =="
+# Two processes: the second one finds the marker the first one's DLL wrote
+# in DllMain(DLL_PROCESS_DETACH) when that process ended
+run_args_test loader_test "== 0 failure(s) =="
+run_args_test loader_test "== 0 failure(s) ==" exitcheck
 run_crash_test seh_test av "Unhandled exception 0xc0000005"
 
 echo "== ${passed} passed, ${failed} failed =="

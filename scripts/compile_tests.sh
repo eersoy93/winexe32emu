@@ -25,9 +25,15 @@ CFLAGS="-Wall -Wextra -Wno-unused-parameter"
 
 failed=0
 
-# Compile each test program with appropriate flags
-for src in tests/*.c; do
+# Compile each test program with appropriate flags; the DLLs first (a
+# program may import one: it links with the DLL)
+for src in tests/*_dll.c tests/*.c; do
+    [ -f "$src" ] || continue
     name=$(basename "$src" .c)
+    case "$src" in
+        tests/*_dll.c) [ -n "${dlls_done:-}" ] && continue ;;
+        *) dlls_done=1 ;;
+    esac
 
     case "$name" in
         *_dll)
@@ -81,6 +87,11 @@ for src in tests/*.c; do
             LIBS="-lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lshlwapi -lole32 -loleaut32"
             LIBS="$LIBS -luuid -lrpcrt4 -lpsapi -lws2_32 -lbcrypt -lversion -lsecur32"
             LIBS="$LIBS -luxtheme -ldwmapi -lcomctl32 -mconsole"
+            ;;
+        loader_test)
+            # Console application - imports loader_test_dll.dll (linked with
+            # the DLL itself), loads copies of it, page protections
+            LIBS="-lkernel32 -mconsole ${OUT_DIR}/loader_test_dll.dll"
             ;;
         compat_test)
             # Console application - file names, devices, system DLL images,

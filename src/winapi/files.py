@@ -294,9 +294,10 @@ class FilesMixin:
                 return candidate, path
         return None
 
-    def load_real_dll(self, name):
-        """Module info of a real (non-emulated) DLL, loading it if needed;
-        None for the emulated system DLLs and missing files"""
+    def load_real_dll(self, name, call_entry=True):
+        """Module info of a real (non-emulated) DLL, loading it if needed (no
+        reference is taken: see CPUEmulator.load_dll); None for the
+        emulated system DLLs and missing files"""
         key = name.replace('/', '\\').rsplit('\\', 1)[-1].lower()
         if '.' not in key:
             key += '.dll'
@@ -308,7 +309,7 @@ class FilesMixin:
         found = self._real_dll_path(name)
         if found is None:
             return None
-        base = self.emu.load_dll(found[1], found[0])
+        base = self.emu.load_dll(found[1], found[0], call_entry)
         return self.emu.dlls.get(base) if base else None
 
     def _module_handle(self, name, load):
@@ -323,10 +324,13 @@ class FilesMixin:
             return self.emu.pe_loader.image_base
         module = self.emu.find_dll(key)
         if module is not None:
+            if load:
+                module['refs'] += 1  # LoadLibrary takes a reference (FreeLibrary)
             return module['base']
         if load and not self._is_system_dll(key):
             module = self.load_real_dll(name)
             if module is not None:
+                module['refs'] += 1
                 return module['base']
             if (self._real_dll_path(name) is not None or '\\' in name or '/' in name or
                     not self.is_system_dll_name(key)):
@@ -387,6 +391,9 @@ class FilesMixin:
             log.debug(f"GetProcAddress(\"{info['name']}\", \"{proc_name}\") -> 0x{addr:08x}")
         if not addr:
             self._last_error = 127  # ERROR_PROC_NOT_FOUND
+            if module is None and info and info.get('type') == 'module':
+                self.emu.note_missing_api(info['name'], proc_name,
+                                          'GetProcAddress returned NULL')
         return addr
     
     def ExitProcess(self, args):
@@ -394,6 +401,8 @@ class FilesMixin:
         exit_code = args[0]
         log.success(f"ExitProcess({exit_code}) called - Terminating program...")
         self._set_exit_code(exit_code)
+        # The DLLs' DllMain(DLL_PROCESS_DETACH) and the TLS callbacks
+        self.emu.detach_process()
         self.process_exited = True
         self.emu.stop_emulation = True
         return 0

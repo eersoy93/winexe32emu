@@ -1090,6 +1090,7 @@ class ComMixin:
         log.debug(f"_exit({code})")
         self._set_exit_code(code)
         self.flush_std_streams()
+        self.emu.detach_process()  # Ends with ExitProcess: the DLLs' DllMain
         self.emu.stop_emulation = True
         return 0
     
@@ -1099,6 +1100,8 @@ class ComMixin:
         log.debug(f"exit({code})")
         self.run_exit_handlers()
         self._set_exit_code(code)
+        self.flush_std_streams()
+        self.emu.detach_process()  # Ends with ExitProcess: the DLLs' DllMain
         self.flush_std_streams()
         self.emu.stop_emulation = True
         return 0

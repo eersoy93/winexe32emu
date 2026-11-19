@@ -105,9 +105,31 @@ class Kernel32MiscMixin:
         return self._module_handle(lib_name, load=True)
     
     def FreeLibrary(self, args):
-        """FreeLibrary emulation - module handles stay valid (no refcounting)"""
+        """FreeLibrary emulation - a real DLL is unloaded with its last
+        reference (DllMain(DLL_PROCESS_DETACH)); the emulated system DLLs
+        stay loaded"""
         hLibModule = args[0]
         log.debug(f"FreeLibrary(0x{hLibModule:x})")
+        if self.emu.release_dll(hLibModule):
+            return 1
+        info = self.handles.get(hLibModule)
+        if (hLibModule == self.emu.pe_loader.image_base or
+                (info and info.get('type') == 'module') or
+                self._system_module_name(hLibModule)):
+            return 1
+        self._last_error = 126  # ERROR_MOD_NOT_FOUND
+        return 0
+
+    def FreeLibraryAndExitThread(self, args):
+        """FreeLibraryAndExitThread(module, exit code)"""
+        self.FreeLibrary(args[:1])
+        return self.ExitThread(args[1:])
+
+    def DisableThreadLibraryCalls(self, args):
+        """DisableThreadLibraryCalls(module) - no DLL_THREAD_ATTACH/DETACH"""
+        module = self.emu.find_dll(args[0])
+        if module is not None:
+            module['thread_calls'] = False
         return 1
     
     def GetSystemDirectoryA(self, args):

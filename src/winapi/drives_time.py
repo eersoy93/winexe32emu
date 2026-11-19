@@ -344,7 +344,11 @@ class DrivesTimeMixin:
         return 1 if info else 0
 
     def OpenProcess(self, args):
-        """OpenProcess emulation - other processes can't be opened"""
+        """OpenProcess emulation - only the own process can be opened"""
+        if args[2] == self.emu.process_id:
+            handle = self.get_next_handle()
+            self.handles[handle] = {'type': 'process', 'current': True}
+            return handle
         self._last_error = 87  # ERROR_INVALID_PARAMETER
         return 0
 
@@ -634,7 +638,7 @@ class DrivesTimeMixin:
     def GetCurrentProcessId(self, args):
         """GetCurrentProcessId emulation"""
         log.debug("GetCurrentProcessId()")
-        return 1234  # Fixed PID
+        return self.emu.process_id
     
     def GetCurrentThreadId(self, args):
         """GetCurrentThreadId emulation"""
