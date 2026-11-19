@@ -1,0 +1,24 @@
+# Project metadata. winexe32emu runs from its repository (python3 winexe32emu.py):
+# the emulated drives (drives/), apps/ and scripts/ live next to src/, so it is
+# not meant to be installed as a package.
+
+[project]
+name = "winexe32emu"
+version = "0.3.0"  # Keep in step with WINEXE32EMU_VERSION (src/config.py)
+description = "32-bit Windows EXE emulator in Python"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Erdem Ersoy" }]
+requires-python = ">=3.11"
+dependencies = [
+    "pefile>=2024.8.26",
+    "colorama>=0.4.6,<1",
+    "unicorn==2.1.4",  # pinned: see requirements.txt
+    "capstone>=5.0.9,<6",
+]
+
+[project.optional-dependencies]
+gui = ["pygame-ce>=2.5,<3"]  # The fake desktop and sound
+
+[project.urls]
+Repository = "https://github.com/eersoy93/winexe32emu"

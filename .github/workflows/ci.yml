@@ -9,13 +9,20 @@ permissions:
 
 jobs:
   lint-and-unit-tests:
-    name: Lint and unit tests
+    name: Lint and unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported version (pyproject.toml) and the newest
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -23,6 +30,10 @@ jobs:
       - name: Lint (ruff.toml)
         run: ruff check .
       - name: Unit tests
+        # The fake desktop's smoke test needs no display (SDL's dummy driver)
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
         run: python -m unittest discover -s tests/python -v
 
   emulator-tests:
@@ -33,10 +44,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      # The MinGW-w64 packages are big: their .deb files are cached between runs
+      - name: Cache the MinGW-w64 packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: mingw-w64-i686-${{ runner.os }}-v1
       - name: Install MinGW-w64 (i686)
         run: |
+          mkdir -p ~/apt-archives/partial
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-i686
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-archives" \
+            gcc-mingw-w64-i686
+          sudo chown -R "$USER" ~/apt-archives
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

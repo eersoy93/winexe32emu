@@ -22,7 +22,12 @@ Fake Windows GUI environment with Pygame
 The code is in the src/ package (see src/__init__.py); this script runs it.
 """
 
-from src.main import main
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("winexe32emu needs Python 3.11 or newer")
+
+from src.main import main  # noqa: E402
 
 if __name__ == "__main__":
     main()
