@@ -373,6 +373,20 @@ class FilesMixin:
             # A system DLL base found without GetModuleHandle (PEB->Ldr)
             info = {'type': 'module', 'name': system['name']}
         module = self.emu.find_dll(hModule)
+        loader = self.emu.pe_loader
+        if module is None and hModule == loader.image_base:
+            # The EXE's own exports (Word 95's WWINTL32.DLL calls back into it)
+            if lpProcName < 0x10000:
+                proc_name = f"Ordinal_{lpProcName}"
+                export = next((e for e in loader.exports if e['ordinal'] == lpProcName), None)
+            else:
+                proc_name = self.read_string(lpProcName)
+                export = next((e for e in loader.exports if e['name'] == proc_name), None)
+            addr = loader.image_base + export['address'] if export else 0
+            log.debug(f"GetProcAddress(EXE, \"{proc_name}\") -> 0x{addr:08x}")
+            if not addr:
+                self._last_error = 127  # ERROR_PROC_NOT_FOUND
+            return addr
         if module is not None:
             if lpProcName < 0x10000:
                 addr = module['ordinals'].get(lpProcName, 0)

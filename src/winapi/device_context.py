@@ -110,13 +110,17 @@ class DeviceContextMixin:
                 return (bmp['width'], bmp['height'])
         return None
 
-    def _add_shape(self, hdc, shape):
+    def _add_shape(self, hdc, shape, mapped=False):
         """Append a GDI shape to the display list of the DC's window.
 
+        The shape is in the DC's logical coordinates (its window and viewport
+        origins and extents), unless mapped says it is in device ones.
         Memory DCs collect shapes in their own list until BitBlt copies them.
         An opaque rect covering the whole bitmap restarts the list, so a
         game loop that fills the background every frame doesn't grow it.
         """
+        if not mapped:
+            shape = self._map_shape(hdc, shape)
         state = self.dc_state.get(hdc)
         if state and state.get('memory'):
             size = self._memdc_size(hdc)

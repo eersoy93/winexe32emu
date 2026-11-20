@@ -22,6 +22,7 @@ from unicorn import UcError
 
 from .. import config, gui
 from ..logger import log
+from .font_files import font_file_faces
 
 
 class GdiMixin:
@@ -113,12 +114,20 @@ class GdiMixin:
 
     # Stock fonts: index -> (face, pixel height)
     STOCK_FONTS = {
-        10: ('courier new', 16),    # OEM_FIXED_FONT
-        11: ('courier new', 16),    # ANSI_FIXED_FONT
-        12: ('ms sans serif', 16),  # ANSI_VAR_FONT
-        16: ('courier new', 16),    # SYSTEM_FIXED_FONT
-        17: ('ms sans serif', 16),  # DEFAULT_GUI_FONT
+        10: ('courier new', 16, False),    # OEM_FIXED_FONT
+        11: ('courier new', 16, False),    # ANSI_FIXED_FONT
+        12: ('ms sans serif', 16, False),  # ANSI_VAR_FONT
+        13: ('system', 16, True),          # SYSTEM_FONT
+        14: ('system', 16, True),          # DEVICE_DEFAULT_FONT
+        16: ('courier new', 16, False),    # SYSTEM_FIXED_FONT
+        17: ('ms sans serif', 16, False),  # DEFAULT_GUI_FONT
     }
+    # DEFAULT_PALETTE: the 20 static colors of a palette display
+    DEFAULT_PALETTE_COLORS = [
+        (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128),
+        (0, 128, 128), (192, 192, 192), (192, 220, 192), (166, 202, 240),
+        (255, 251, 240), (160, 160, 164), (128, 128, 128), (255, 0, 0), (0, 255, 0),
+        (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
 
     def GetStockObject(self, args):
         """GetStockObject emulation"""
@@ -148,11 +157,14 @@ class GdiMixin:
                 obj['style'] = 5  # PS_NULL
             self.gdi_objects[handle] = obj
         elif index in self.STOCK_FONTS:
-            face, height = self.STOCK_FONTS[index]
-            self.gdi_objects[handle] = {'type': 'font', 'height': height, 'bold': False,
+            face, height, bold = self.STOCK_FONTS[index]
+            self.gdi_objects[handle] = {'type': 'font', 'height': height, 'bold': bold,
                                         'italic': False, 'underline': False, 'face': face}
+        elif index == 15:  # DEFAULT_PALETTE
+            self.gdi_objects[handle] = {'type': 'palette', 'entries': [
+                (r, g, b, 0) for r, g, b in self.DEFAULT_PALETTE_COLORS]}
         else:
-            # Fonts and other stock objects: return a generic handle
+            # Other stock objects (DC_BRUSH, DC_PEN): a generic handle
             self.gdi_objects[handle] = {'type': 'other', 'color': (0, 0, 0), 'width': 0}
 
         self._stock_objects[index] = handle
@@ -208,7 +220,10 @@ class GdiMixin:
             if hobj in (state.get('pen'), state.get('brush'), state.get('font'),
                         state.get('bitmap'), state.get('palette')):
                 return 0
-        return 1 if self.gdi_objects.pop(hobj, None) else 0
+        obj = self.gdi_objects.pop(hobj, None)
+        if obj and obj.get('dib'):
+            self.emu.heap_free(obj['dib']['bits'])  # A DIB section's pixels
+        return 1 if obj else 0
 
     def MoveToEx(self, args):
         """MoveToEx emulation - set current position"""
@@ -785,9 +800,15 @@ class GdiMixin:
     # by the emulated programs. The fonts are not loaded: text is drawn with
     # the fake desktop's own fonts.
     font_resources = {}
+    # The fonts in each added file: {lower-case Windows path: [FontFace]}
+    font_resource_faces = {}
+
+    def added_font_faces(self):
+        """The fonts of the font files added with AddFontResource"""
+        return [face for faces in type(self).font_resource_faces.values() for face in faces]
 
     def AddFontResourceA(self, args, wide=False):
-        """AddFontResourceA/W(lpFileName) - the number of fonts added (1), 0 if
+        """AddFontResourceA/W(lpFileName) - the number of fonts added, 0 if
         the file does not exist"""
         name = self._read_text(args[0], wide) if args[0] else ''
         path = self.full_windows_path(name) if name else None
@@ -801,8 +822,12 @@ class GdiMixin:
                 return 0
         counts = type(self).font_resources
         counts[path.lower()] = counts.get(path.lower(), 0) + 1
-        log.debug(f"AddFontResource(\"{name}\") -> \"{path}\"")
-        return 1
+        faces = type(self).font_resource_faces
+        if path.lower() not in faces:
+            faces[path.lower()] = font_file_faces(host)
+        log.debug(f"AddFontResource(\"{name}\") -> \"{path}\": "
+                  f"{sorted({face.name for face in faces[path.lower()]})}")
+        return len(faces[path.lower()]) or 1  # The number of fonts added
 
     def AddFontResourceW(self, args):
         return self.AddFontResourceA(args, wide=True)
@@ -824,6 +849,7 @@ class GdiMixin:
                 counts[path.lower()] -= 1
                 if not counts[path.lower()]:
                     del counts[path.lower()]
+                    type(self).font_resource_faces.pop(path.lower(), None)
                 return 1
         return 0
 
@@ -860,12 +886,12 @@ class GdiMixin:
     def CreateScalableFontResourceW(self, args):
         return self.CreateScalableFontResourceA(args, wide=True)
 
-    # ---------- Mapping modes (only MM_TEXT: one logical unit is one pixel) ----------
+    # ---------- Mapping modes (the transforms: GdiExtraMixin._dc_mapping) ----------
 
     MM_TEXT = 1
 
     def SetMapMode(self, args):
-        """SetMapMode(hdc, mode) - the previous mode; drawing stays in pixels"""
+        """SetMapMode(hdc, mode) - the previous mode"""
         state = self.dc_state.get(args[0])
         if state is None or not 1 <= args[1] <= 8:
             return 0
@@ -878,11 +904,11 @@ class GdiMixin:
         return state.get('map_mode', self.MM_TEXT) if state is not None else 0
 
     def DPtoLP(self, args):
-        """DPtoLP(hdc, lppt, c) - device and logical coordinates are the same"""
-        return 1 if args[0] in self.dc_state else 0
+        """DPtoLP(hdc, lppt, c) - device -> logical coordinates"""
+        return self._convert_points(args, self._dp_to_lp)
 
     def LPtoDP(self, args):
-        return 1 if args[0] in self.dc_state else 0
+        return self._convert_points(args, self._lp_to_dp)
 
     def GetNearestColor(self, args):
         """GetNearestColor(hdc, color) emulation - the display has 32 bits per

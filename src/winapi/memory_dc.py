@@ -21,9 +21,28 @@ from unicorn import UcError
 from .. import config, gui
 from ..config import PYGAME_AVAILABLE
 from ..logger import log
+from .font_files import RASTER_FONTTYPE, TRUETYPE_FONTTYPE, FontFace
 
 if PYGAME_AVAILABLE:
     import pygame
+
+
+BITMAPCOREHEADER_SIZE = 12
+
+
+def core_dib_to_info(data):
+    """A packed DIB with an OS/2-style BITMAPCOREHEADER (12 bytes: WORD sizes,
+    RGBTRIPLE colors) as a BITMAPINFOHEADER one; other DIBs are unchanged"""
+    if len(data) < BITMAPCOREHEADER_SIZE or \
+            struct.unpack_from('<I', data)[0] != BITMAPCOREHEADER_SIZE:
+        return data
+    _, width, height, planes, bpp = struct.unpack_from('<IHHHH', data)
+    count = 1 << bpp if bpp <= 8 else 0
+    triples = data[BITMAPCOREHEADER_SIZE:BITMAPCOREHEADER_SIZE + 3 * count]
+    table = b''.join(triples[i:i + 3] + b'\x00' for i in range(0, len(triples), 3))
+    header = struct.pack('<IiiHHIIiiII', 40, width, height, planes, bpp, 0, 0, 0, 0,
+                         count, 0)
+    return header + table + data[BITMAPCOREHEADER_SIZE + 3 * count:]
 
 
 class MemoryDCMixin:
@@ -61,8 +80,7 @@ class MemoryDCMixin:
         device-dependent bitmap, with the DIB's picture if CBM_INIT"""
         hdc, header, flags, bits, info, usage = args[:6]
         try:
-            width, height = struct.unpack('<ii', self.emu.uc.mem_read(header + 4, 8)) \
-                if header else (0, 0)
+            width, height = self._read_dib_header(header)[1:3] if header else (0, 0)
         except UcError:
             return 0
         rgb = None
@@ -121,6 +139,7 @@ class MemoryDCMixin:
         if rop in (self.BLACKNESS, self.WHITENESS, self.PATCOPY):
             return self.PatBlt([hdcDest, x, y, cx, cy, rop])
 
+        self._refresh_dc_dib_section(hdcSrc)
         src_state = self.dc_state.get(hdcSrc)
         if not src_state or not src_state.get('memory'):
             return 1  # Only memory DC sources carry shapes
@@ -156,13 +175,16 @@ class MemoryDCMixin:
                 shapes = shapes[i:]
                 break
 
+        # Logical coordinates of the destination -> device coordinates
+        shapes = [self._map_shape(hdcDest, s) for s in shapes]
+        x, y = self._lp_to_dp(hdcDest, x, y)
         dest_state = self.dc_state.get(hdcDest)
         if dest_state and dest_state.get('memory'):
             bmp = self.gdi_objects.get(dest_state.get('bitmap', 0))
             if bmp and bmp.get('bpp') == 1:
                 shapes = [self._to_monochrome(s, src_state['bk_color']) for s in shapes]
             for shape in shapes:
-                self._add_shape(hdcDest, shape)
+                self._add_shape(hdcDest, shape, mapped=True)
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
@@ -280,6 +302,7 @@ class MemoryDCMixin:
     def _decode_dib(data):
         """(width, height, top-down RGB bytes) of a packed DIB (BITMAPINFOHEADER,
         color table, bits), or None for unsupported formats"""
+        data = core_dib_to_info(data)
         if len(data) < 40:
             return None
         (hdr_size, width, height, _, bpp, compression, _, _, _,
@@ -538,6 +561,7 @@ class MemoryDCMixin:
         if ws == 0 or hs == 0:
             return 0
 
+        self._refresh_dc_dib_section(hdcSrc)
         src_state = self.dc_state.get(hdcSrc)
         if not src_state or not src_state.get('memory'):
             return 1  # Only memory DC sources carry shapes
@@ -553,6 +577,11 @@ class MemoryDCMixin:
                     continue
             shapes.append(self._scale_shape(shape, xs, ys, xd, yd, scale_x, scale_y))
 
+        # Logical coordinates of the destination -> device coordinates
+        shapes = [self._map_shape(hdcDest, s) for s in shapes]
+        (xd, yd), (x2, y2) = self._lp_to_dp(hdcDest, xd, yd), \
+            self._lp_to_dp(hdcDest, xd + wd, yd + hd)
+        wd, hd = x2 - xd, y2 - yd
         dest_state = self.dc_state.get(hdcDest)
         if dest_state and dest_state.get('memory'):
             dest_state['shapes'].extend(shapes)
@@ -586,13 +615,24 @@ class MemoryDCMixin:
             return [entry[:3] for entry in palette['entries']]
         return []
 
+    def _read_dib_header(self, address):
+        """(header size, width, height, bpp, compression, colors used) of the
+        BITMAPINFOHEADER or BITMAPCOREHEADER at address (UcError if unreadable)"""
+        size = struct.unpack('<I', self.emu.uc.mem_read(address, 4))[0]
+        if size == BITMAPCOREHEADER_SIZE:
+            _, width, height, _, bpp = struct.unpack(
+                '<IHHHH', self.emu.uc.mem_read(address, BITMAPCOREHEADER_SIZE))
+            return size, width, height, bpp, 0, 0
+        (size, width, height, _, bpp, compression, _, _, _, clr_used, _) = struct.unpack(
+            '<IiiHHIIiiII', self.emu.uc.mem_read(address, 40))
+        return size, width, height, bpp, compression, clr_used
+
     def _read_dib(self, hdc, lpbmi, lpBits, usage):
         """(width, height, top-down RGB, bottom_up) of a DIB given as BITMAPINFO
         and bits, or None for unsupported formats"""
         try:
-            header = bytes(self.emu.uc.mem_read(lpbmi, 40))
-            (hdr_size, width, height, _, bpp, compression, _, _, _,
-             clr_used, _) = struct.unpack('<IiiHHIIiiII', header)
+            hdr_size, width, height, bpp, compression, clr_used = self._read_dib_header(lpbmi)
+            quad = 3 if hdr_size == BITMAPCOREHEADER_SIZE else 4  # RGBTRIPLE / RGBQUAD
             if bpp <= 8:
                 count = clr_used or (1 << bpp)
                 if usage == 1:  # DIB_PAL_COLORS: WORD indices into the DC's palette
@@ -603,7 +643,10 @@ class MemoryDCMixin:
                                      (colors[i] if i < len(colors) else (0, 0, 0)
                                       for i in indices))
                 else:
-                    table = bytes(self.emu.uc.mem_read(lpbmi + hdr_size, 4 * count))
+                    table = bytes(self.emu.uc.mem_read(lpbmi + hdr_size, quad * count))
+                    if quad == 3:
+                        table = b''.join(table[i:i + 3] + b'\x00'
+                                         for i in range(0, len(table), 3))
             elif compression == 3:  # BI_BITFIELDS (masks in V4/V5 headers too)
                 count = 0
                 table = bytes(self.emu.uc.mem_read(lpbmi + 40, 12))
@@ -701,6 +744,7 @@ class MemoryDCMixin:
 
     def _bitmap_shapes(self, hbm, bmp):
         """Display list of a bitmap; when selected, the DC has the live drawing"""
+        self._refresh_dib_section(hbm)
         for state in self.dc_state.values():
             if state.get('memory') and state.get('bitmap') == hbm:
                 return state['shapes']
@@ -751,16 +795,17 @@ class MemoryDCMixin:
             return 0
         width, height = bmp['width'], bmp['height']
         try:
-            hdr_size, _, req_height, _, bpp = struct.unpack(
-                '<IiiHH', self.emu.uc.mem_read(lpbmi, 16))
+            hdr_size, _, req_height, bpp = self._read_dib_header(lpbmi)[:4]
         except UcError:
             return 0
+        core = hdr_size == BITMAPCOREHEADER_SIZE
         if not lpvBits:
             if bpp == 0:
                 bpp = 1 if bmp.get('bpp') == 1 else 32
                 stride = ((width * bpp + 31) // 32) * 4
-                header = struct.pack('<IiiHHIIiiII', max(hdr_size, 40), width, height, 1,
-                                     bpp, 0, stride * height, 0, 0, 0, 0)
+                header = struct.pack('<IHHHH', hdr_size, width, height, 1, bpp) if core else \
+                    struct.pack('<IiiHHIIiiII', max(hdr_size, 40), width, height, 1,
+                                bpp, 0, stride * height, 0, 0, 0, 0)
                 if not self._mem_write(lpbmi, header):
                     return 0
             return height
@@ -788,9 +833,11 @@ class MemoryDCMixin:
             if usage == 1:  # DIB_PAL_COLORS
                 table = struct.pack(f'<{len(palette)}H', *range(len(palette)))
             else:
-                table = b''.join(bytes((b, g, r, 0)) for r, g, b in palette)
+                table = b''.join(bytes((b, g, r) if core else (b, g, r, 0))
+                                 for r, g, b in palette)
             self._mem_write(lpbmi + hdr_size, table)
-            self._mem_write(lpbmi + 32, struct.pack('<I', len(palette)))  # biClrUsed
+            if not core:
+                self._mem_write(lpbmi + 32, struct.pack('<I', len(palette)))  # biClrUsed
 
         # Programs often re-read the same picture (e.g. text drawn into a bitmap)
         shapes_key, refs = self._shapes_key(self._bitmap_shapes(hbm, bmp))
@@ -863,16 +910,62 @@ class MemoryDCMixin:
         log.warning(f"CreateDCA({driver!r}, {device!r}): only the display is available")
         return 0
 
-    FONT_FAMILIES = [('Arial', 0x22, 4), ('Courier New', 0x31, 4),
-                     ('Times New Roman', 0x12, 4), ('MS Sans Serif', 0x22, 1),
-                     ('System', 0x22, 1)]
+    FONT_FAMILIES = [FontFace('Arial', 0x22, TRUETYPE_FONTTYPE, 0, 400),
+                     FontFace('Courier New', 0x31, TRUETYPE_FONTTYPE, 0, 400),
+                     FontFace('Times New Roman', 0x12, TRUETYPE_FONTTYPE, 0, 400),
+                     FontFace('MS Sans Serif', 0x22, RASTER_FONTTYPE, 13, 400),
+                     FontFace('System', 0x22, RASTER_FONTTYPE, 16, 700)] + [
+                         # SMALLE.FON's sizes at 96 DPI
+                         FontFace('Small Fonts', 0x22, RASTER_FONTTYPE, height, 400)
+                         for height in (3, 5, 6, 8, 10, 11)]
+
+    def _enumerated_fonts(self, family):
+        """The fonts EnumFontFamilies/EnumFonts report: one per face, or with
+        a face name every size and weight of that face (a raster font has
+        a few). The fonts added with AddFontResource come with them."""
+        fonts = self.FONT_FAMILIES + self.added_font_faces()
+        if family is None:
+            first = {}
+            for face in fonts:
+                first.setdefault(face.name.lower(), face)
+            return list(first.values())
+        unique = {}
+        for face in fonts:
+            if face.name.lower() == family.lower():
+                unique.setdefault((face.height, face.weight), face)
+        return list(unique.values())
+
+    @staticmethod
+    def _enum_font_structs(face):
+        """ENUMLOGFONTA (156 bytes) and NEWTEXTMETRICA (72 bytes) of a font"""
+        truetype = face.font_type == TRUETYPE_FONTTYPE
+        height = face.height or 16
+        ascent = (height * 13 + 8) // 16
+        average = max(1, (height * 7 + 8) // 16)
+        name = face.name.encode(config.ANSI_CODEPAGE, errors='replace')[:31]
+        logfont = (struct.pack('<5i8B', -(height * 13 // 16) if truetype else height, 0, 0, 0,
+                               face.weight, 0, 0, 0, 0, 0, 0,
+                               2 if truetype else 0, face.pitch_family)  # PROOF_QUALITY
+                   + name.ljust(32, b'\x00'))
+        style = b'Bold' if face.weight >= 700 else b'Regular'
+        enum_logfont = logfont + name.ljust(64, b'\x00') + style.ljust(32, b'\x00')
+        # tmPitchAndFamily: TMPF_FIXED_PITCH is set for variable-pitch fonts
+        tm_pitch = (face.pitch_family & 0xF0) | (0 if face.pitch_family & 3 == 1 else 1) | \
+            (4 if truetype else 0)
+        metrics = (struct.pack('<11i9B', height, ascent, height - ascent, 0, 0, average,
+                               average * 2, face.weight, 0, 96, 96,
+                               0x20, 0xFF, 0x1F, 0x20, 0, 0, 0, tm_pitch, 0)
+                   + b'\x00' * 3 + struct.pack('<4I', 0x40 if truetype else 0,
+                                               2048 if truetype else 0, 16, 6))
+        return enum_logfont, metrics
 
     def EnumFontFamiliesA(self, args):
-        """EnumFontFamiliesA emulation - a fixed set of common font families"""
+        """EnumFontFamiliesA emulation - common font families and the fonts
+        added with AddFontResource"""
         hdc, lpszFamily, lpProc, lParam = args[:4]
         family = self.read_string(lpszFamily) if lpszFamily else None
-        fonts = [f for f in self.FONT_FAMILIES
-                 if family is None or f[0].lower() == family.lower()]
+        fonts = self._enumerated_fonts(family)
+        log.debug(f"EnumFontFamilies/EnumFonts({family!r}): {len(fonts)} font(s)")
         if not fonts:
             return 1
         buffer = self.emu.heap_alloc(156 + 72)
@@ -880,18 +973,10 @@ class MemoryDCMixin:
             return 0
         result = 1
         try:
-            for name, pitch_family, font_type in fonts:
-                face = name.encode('ascii')
-                logfont = (struct.pack('<5i8B', -13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0,
-                                       2 if font_type == 4 else 0, pitch_family)
-                           + face.ljust(32, b'\x00'))
-                enum_logfont = logfont + face.ljust(64, b'\x00') + b'Regular'.ljust(32, b'\x00')
-                metrics = (struct.pack('<11i9B', 13, 10, 3, 0, 0, 6, 12, 400, 0, 96, 96,
-                                       0x20, 0xFF, 0x1F, 0x20, 0, 0, 0, pitch_family, 0)
-                           + b'\x00' * 3 + struct.pack('<4I', 0x40 if font_type == 4 else 0,
-                                                       2048 if font_type == 4 else 0, 16, 6))
+            for face in fonts:
+                enum_logfont, metrics = self._enum_font_structs(face)
                 self._mem_write(buffer, enum_logfont + metrics)
-                result = self.emu.call_callback(lpProc, [buffer, buffer + 156, font_type,
+                result = self.emu.call_callback(lpProc, [buffer, buffer + 156, face.font_type,
                                                          lParam])
                 if not result:
                     break

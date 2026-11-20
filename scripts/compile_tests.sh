@@ -97,6 +97,11 @@ for src in tests/*_dll.c tests/*.c; do
             # GUI application - a window, controls and messages on the fake desktop
             LIBS="-lkernel32 -luser32 -lgdi32 -mconsole"
             ;;
+        ole_storage_test)
+            # Console application - compound files, monikers, the OLE clipboard
+            # and the gdi32/kernel32 APIs of Word 95
+            LIBS="-lkernel32 -luser32 -lgdi32 -lole32 -luuid -mconsole"
+            ;;
         compat_test)
             # Console application - file names, devices, system DLL images,
             # the PEB, static TLS and TLS callbacks

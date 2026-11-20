@@ -560,13 +560,16 @@ class User32MiscMixin:
     # ---------- Clipboard (shared by the emulated programs) ----------
 
     clipboard_data = {}
-    clipboard_formats = {}
+    clipboard_formats = {}  # lower-case name -> format
+    clipboard_format_names = {}  # format -> name as first registered
+    clipboard_owner = 0  # the window that emptied the clipboard last
 
     def RegisterClipboardFormatA(self, args, wide=False):
         name = self._read_text(args[0], wide)
         formats = winapi.WinAPIHandler.clipboard_formats
         if name.lower() not in formats:
             formats[name.lower()] = 0xC100 + len(formats)
+            winapi.WinAPIHandler.clipboard_format_names[formats[name.lower()]] = name
         return formats[name.lower()]
 
     def RegisterClipboardFormatW(self, args):
@@ -574,6 +577,7 @@ class User32MiscMixin:
 
     def OpenClipboard(self, args):
         self.clipboard_open = True
+        self.clipboard_window = args[0]
         return 1
 
     def CloseClipboard(self, args):
@@ -582,6 +586,7 @@ class User32MiscMixin:
 
     def EmptyClipboard(self, args):
         winapi.WinAPIHandler.clipboard_data = {}
+        winapi.WinAPIHandler.clipboard_owner = getattr(self, 'clipboard_window', 0)
         return 1
 
     def SetClipboardData(self, args):

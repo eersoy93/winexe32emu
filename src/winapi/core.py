@@ -477,6 +477,65 @@ class CoreMixin:
         'WriteProfileSectionA': 2, 'WriteProfileSectionW': 2, 'WriteProfileStringA': 3,
         'WriteProfileStringW': 3, '_hread': 3, '_hwrite': 3, '_lclose': 1, '_lcreat': 2,
         '_llseek': 3, '_lopen': 2, '_lread': 3, '_lwrite': 3, 'lstrcpynW': 3,
+        # Word 95: kernel32, user32 and winspool (WindowsExtraMixin)
+        'TerminateThread': 2, 'DebugBreak': 0, 'QueryDosDeviceA': 3, 'QueryDosDeviceW': 3,
+        'BeginDeferWindowPos': 1, 'DeferWindowPos': 8, 'EndDeferWindowPos': 1,
+        'ArrangeIconicWindows': 1, 'ScrollWindow': 5, 'ScrollWindowEx': 8, 'ScrollDC': 7,
+        'ChangeMenuA': 5, 'ChangeMenuW': 5, 'CallMsgFilterA': 2, 'CallMsgFilterW': 2,
+        'GetCaretBlinkTime': 0, 'GetClipboardOwner': 0, 'GetClipboardFormatNameA': 3,
+        'GetClipboardFormatNameW': 3, 'CreateAcceleratorTableA': 2,
+        'OpenPrinterA': 3, 'OpenPrinterW': 3, 'ClosePrinter': 1, 'GetPrinterA': 5,
+        'GetPrinterW': 5, 'GetPrinterDriverA': 6, 'GetPrinterDriverW': 6,
+        'DocumentPropertiesA': 6, 'DocumentPropertiesW': 6, 'DeviceCapabilitiesA': 5,
+        'DeviceCapabilitiesW': 5,
+        # Word 95: gdi32 (GdiExtraMixin)
+        'SetWindowOrgEx': 4, 'SetViewportOrgEx': 4, 'SetWindowExtEx': 4, 'SetViewportExtEx': 4,
+        'GetWindowOrgEx': 2, 'GetViewportOrgEx': 2, 'GetWindowExtEx': 2, 'GetViewportExtEx': 2,
+        'OffsetViewportOrgEx': 4, 'OffsetWindowOrgEx': 4, 'ScaleViewportExtEx': 6,
+        'SetBrushOrgEx': 4, 'GetBrushOrgEx': 2, 'GetBkMode': 1, 'RectVisible': 2,
+        'GdiFlush': 0, 'UnrealizeObject': 1, 'GetObjectType': 1, 'SetRectRgn': 5,
+        'OffsetRgn': 3, 'CreatePolygonRgn': 3, 'FillRgn': 3, 'InvertRgn': 2,
+        'CreateBitmapIndirect': 1, 'GetBitmapBits': 3, 'SetBitmapBits': 3,
+        'SetBitmapDimensionEx': 4, 'GetBitmapDimensionEx': 2, 'SetDIBitsToDevice': 12,
+        'GetTextFaceA': 3, 'GetTextFaceW': 3, 'GetKerningPairsA': 3, 'GetKerningPairsW': 3,
+        'GetOutlineTextMetricsA': 3, 'GetOutlineTextMetricsW': 3, 'GetGlyphOutlineA': 7,
+        'GetGlyphOutlineW': 7, 'CreateICA': 4, 'ResetDCA': 2, 'ResetDCW': 2, 'StartDocA': 2,
+        'StartDocW': 2, 'EndDoc': 1, 'StartPage': 1, 'EndPage': 1, 'AbortDoc': 1,
+        'SetAbortProc': 2, 'Escape': 5, 'ExtEscape': 6, 'CreateMetaFileA': 1,
+        'CreateMetaFileW': 1, 'CloseMetaFile': 1, 'SetMetaFileBitsEx': 2,
+        'GetMetaFileBitsEx': 3, 'DeleteMetaFile': 1, 'PlayMetaFile': 2, 'EnumMetaFile': 4,
+        'PlayMetaFileRecord': 4,
+        # Word 95: ole32 structured storage (OleStorageMixin)
+        'StgCreateDocfile': 4, 'StgOpenStorage': 6, 'StgIsStorageFile': 1,
+        'CreateStreamOnHGlobal': 3, 'GetHGlobalFromStream': 2, 'WriteClassStm': 2,
+        'ReadClassStm': 2, 'WriteClassStg': 2, 'ReadClassStg': 2, 'WriteFmtUserTypeStg': 3,
+        'ReadFmtUserTypeStg': 3, 'GetConvertStg': 1, 'SetConvertStg': 2, 'OleSave': 3,
+        'OleSaveToStream': 2,
+        # Word 95: more of ole32 (OleMiscMixin)
+        'OleBuildVersion': 0, 'CoIsOle1Class': 1, 'CoDisconnectObject': 2,
+        'OleQueryCreateFromData': 1, 'OleQueryLinkFromData': 1, 'CoGetTreatAsClass': 2,
+        'CoTreatAsClass': 2, 'OleRegGetMiscStatus': 3, 'OleRegEnumVerbs': 2,
+        'OleRegEnumFormatEtc': 3, 'OleRun': 1, 'OleIsRunning': 1, 'OleCreate': 7,
+        'OleCreateFromFile': 8, 'OleCreateLink': 7, 'OleCreateLinkToFile': 7,
+        'OleCreateFromData': 7, 'OleCreateLinkFromData': 7, 'OleLoad': 4,
+        'OleCreateDefaultHandler': 4, 'CreateDataCache': 4, 'OleConvertOLESTREAMToIStorage': 3,
+        'OleConvertIStorageToOLESTREAM': 2, 'OleCreateMenuDescriptor': 2,
+        'OleDestroyMenuDescriptor': 1, 'OleSetMenuDescriptor': 5, 'OleTranslateAccelerator': 3,
+        'OleDuplicateData': 3, 'OleSetClipboard': 1, 'OleFlushClipboard': 0,
+        'OleIsCurrentClipboard': 1, 'OleGetClipboard': 1, 'CreateDataAdviseHolder': 1,
+        'CreateOleAdviseHolder': 1, 'CreateBindCtx': 2, 'GetRunningObjectTable': 2,
+        'CreateFileMoniker': 2, 'CreateItemMoniker': 3, 'CreateGenericComposite': 3,
+        'MkParseDisplayName': 4,
+        # Word 95's MSO95.DLL
+        'CreateDIBSection': 6, 'CreateHalftonePalette': 1, 'GetPaletteEntries': 4,
+        'GetNearestPaletteIndex': 2, 'GetSystemPaletteEntries': 4, 'GetSystemPaletteUse': 1,
+        'GetCurrentObject': 2, 'SetTextCharacterExtra': 2, 'GetTextCharacterExtra': 1,
+        'GetTextExtentExPointA': 7, 'GetTextExtentExPointW': 7, 'GetMetaFileA': 1,
+        'GetMetaFileW': 1, 'SetWinMetaFileBits': 4, 'GetEnhMetaFileA': 1, 'GetEnhMetaFileW': 1,
+        'DeleteEnhMetaFile': 1, 'GetEnhMetaFilePaletteEntries': 3, 'PlayEnhMetaFile': 3,
+        'GetBinaryTypeA': 2, 'GetBinaryTypeW': 2, 'CreateIconFromResourceEx': 7,
+        'CreateIconFromResource': 4, 'CreateIconIndirect': 1, 'PostThreadMessageA': 4,
+        'PostThreadMessageW': 4, 'WindowFromDC': 1, 'OleGetIconOfClass': 3,
         # ntdll
         'NtClose': 1, 'NtDelayExecution': 2, 'NtQuerySystemTime': 1,
         'NtSetInformationFile': 5, 'NtYieldExecution': 0,
@@ -884,6 +943,8 @@ class CoreMixin:
         self._dialog_fonts = {}  # (face, size) of a dialog template -> GDI font handle
         self.accelerators = {}
         self.clipboard_open = False
+        self.clipboard_window = 0  # OpenClipboard's window
+        self._metafile_tables = {}  # EnumMetaFile handle table -> object handles
         self.mapping_views = {}  # id(file mapping info) -> its address here
 
         # Registry: predefined HKEY -> key node (shared by the emulated

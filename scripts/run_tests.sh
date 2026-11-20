@@ -130,6 +130,7 @@ run_gui_test() {
 
 run_test seh_test "== 0 failure(s) =="
 run_test compat_test "== 0 failure(s) =="
+run_test ole_storage_test "== 0 failure(s) =="
 run_gui_test gui_test "== 0 failure(s) =="
 # Two processes: the second one finds the marker the first one's DLL wrote
 # in DllMain(DLL_PROCESS_DETACH) when that process ended

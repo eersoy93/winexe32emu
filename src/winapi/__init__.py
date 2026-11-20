@@ -66,6 +66,10 @@ from .system_extra import SystemExtraMixin
 from .network import NetworkMixin
 from .dde import DdeMixin
 from .lz32 import Lz32Mixin
+from .windows_extra import WindowsExtraMixin
+from .gdi_extra import GdiExtraMixin
+from .ole_storage import OleStorageMixin
+from .ole_misc import OleMiscMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -83,5 +87,6 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     CrtMixin, CrtStdioMixin, CrtMiscMixin, VersionInfoMixin,
                     ShlwapiMixin, SecurityMixin, Kernel32ExtraMixin, User32ExtraMixin,
                     ShellExtraMixin, SystemExtraMixin, NetworkMixin, DdeMixin,
-                    Lz32Mixin):
+                    Lz32Mixin, WindowsExtraMixin, GdiExtraMixin,
+                    OleStorageMixin, OleMiscMixin):
     """Windows API emulation"""

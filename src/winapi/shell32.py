@@ -382,6 +382,9 @@ class Shell32Mixin:
         return 0x00040101  # DRAGDROP_S_CANCEL
 
     def ReleaseStgMedium(self, args):
+        """ReleaseStgMedium(pmedium) - see OleMiscMixin._release_stgmedium"""
+        if args[0]:
+            self._release_stgmedium(args[0])
         return 0
 
     # ---------- advapi32 ----------
