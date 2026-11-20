@@ -336,6 +336,32 @@ class PageProtectionTest(unittest.TestCase):
         self.assertEqual(len(protections), 8)
 
 
+class HeapResizeTest(unittest.TestCase):
+    def _heap(self):
+        emu = CPUEmulator.__new__(CPUEmulator)
+        emu.HEAP_BASE, emu.HEAP_SIZE = 0x10000000, 0x100000
+        emu.heap_current = emu.HEAP_BASE
+        emu.heap_blocks, emu.heap_free_bins, emu.heap_free_ends = {}, {}, {}
+        emu.heap_class_map = None
+        fake_uc = type('FakeUc', (), {'mem_write': lambda self, addr, data: None})()
+        emu._tls = threading.local()
+        emu.main_thread = type('FakeThread', (), {'uc': fake_uc})()
+        return emu
+
+    def test_shrinking_never_moves(self):
+        # Office 95 Setup's INF reader keeps its old end pointer after a
+        # GlobalReAlloc that shrinks the buffer, as Windows shrinks in place
+        emu = self._heap()
+        block = emu.heap_alloc(0x1000)
+        later = emu.heap_alloc(0x10)
+        self.assertTrue(emu.heap_resize(block, 0x400))
+        self.assertEqual(emu.heap_block_size(block), 0x400)
+        self.assertFalse(emu.heap_resize(block, 0x2000))  # not the last block
+        self.assertEqual(emu.heap_alloc(0xC00), block + 0x400)  # the freed tail
+        self.assertTrue(emu.heap_resize(later, 0x100))  # the last block grows
+        self.assertTrue(emu.heap_free(block))
+
+
 class MissingApiReportTest(unittest.TestCase):
     def test_report_file(self):
         class Loader:

@@ -965,14 +965,23 @@ class CPUEmulator(ProcessEnvironmentMixin):
         """Requested size of a heap_alloc() block, or None if unknown."""
         return self.heap_blocks.get(addr)
 
-    def heap_resize_last(self, addr, new_size):
-        """Grow/shrink the most recent block in place. Returns True on success."""
+    def heap_resize(self, addr, new_size):
+        """Resize a block in place: the most recent block grows or shrinks,
+        any other only shrinks (its tail becomes a free block), as Windows
+        never moves a shrinking block. Returns True on success."""
         old_size = self.heap_blocks.get(addr)
         if old_size is None:
             return False
-        if addr + self._align_size(max(old_size, 1), 16) != self.heap_current:
-            return False
+        old_end = addr + self._align_size(max(old_size, 1), 16)
         new_end = addr + self._align_size(max(new_size, 1), 16)
+        if old_end != self.heap_current:
+            if new_size > old_size or not self._forget_small_block(addr):
+                return False
+            if new_end < old_end:
+                self.heap_free_bins.setdefault(old_end - new_end, set()).add(new_end)
+                self.heap_free_ends[old_end] = new_end
+            self.heap_blocks[addr] = new_size
+            return True
         if new_end > self.HEAP_BASE + self.HEAP_SIZE:
             return False
         if not self._forget_small_block(addr):

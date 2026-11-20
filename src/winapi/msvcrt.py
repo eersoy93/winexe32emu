@@ -1256,7 +1256,7 @@ class MsvcrtMixin:
             return 0
 
         old_size = self.emu.heap_block_size(ptr)
-        if old_size is not None and self.emu.heap_resize_last(ptr, size):
+        if old_size is not None and self.emu.heap_resize(ptr, size):
             log.debug(f"realloc(0x{ptr:08x}, {size}) -> 0x{ptr:08x} (in place)")
             return ptr
 

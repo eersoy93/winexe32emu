@@ -597,7 +597,7 @@ class Kernel32ExtraMixin:
         if old_size is None:
             self._last_error = 6  # ERROR_INVALID_HANDLE
             return 0
-        if self.emu.heap_resize_last(memory, size):
+        if self.emu.heap_resize(memory, size):
             new = memory
         elif not flags & 0x2:  # LMEM_MOVEABLE: may not move without it
             if size <= old_size:

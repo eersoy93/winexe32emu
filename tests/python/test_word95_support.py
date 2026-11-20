@@ -197,7 +197,7 @@ class FakeEmulator:
     def heap_block_size(self, address):
         return self.blocks.get(address)
 
-    def heap_resize_last(self, address, size):
+    def heap_resize(self, address, size):
         return False
 
 

@@ -682,7 +682,7 @@ class ExeResourcesMixin:
         if not lpMem:
             return 0
         old_size = self.emu.heap_block_size(lpMem)
-        if old_size is not None and self.emu.heap_resize_last(lpMem, dwBytes):
+        if old_size is not None and self.emu.heap_resize(lpMem, dwBytes):
             addr = lpMem
         elif dwFlags & 0x10:  # HEAP_REALLOC_IN_PLACE_ONLY
             self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
