@@ -255,26 +255,75 @@ class MouseMixin:
             self.open_combo = None
             return False
 
-        drop, item_rects = self._combo_dropdown_rects(control)
-        if drop is not None and drop.collidepoint(pos):
-            if button == 1:
-                for i, rect in enumerate(item_rects):
-                    if rect.collidepoint(pos):
-                        control.sel_index = i
-                        if control.style & 0x3 in (1, 2):
-                            control.text = control.items[i]
-                            control.select_all()
-                        self.open_combo = None
-                        win = self.windows.get(control.parent_hwnd)
-                        if win and self.winapi:
-                            self._post_control_command(win, control,
-                                                       self.winapi.CBN_SELCHANGE)
-                        return True
+        geo = self._combo_dropdown_rects(control)
+        if geo is not None and geo['drop'].collidepoint(pos):
+            count = len(control.items)
+            if button in (4, 5):  # Mouse wheel scrolls the list
+                self._list_scroll(control, geo['rows'], 3 if button == 5 else -3)
+                return True
+            if button != 1:
+                return True
+            if self._list_scrollbar_click(control, geo, pos):
+                return True
+            for i, rect in geo['items']:
+                if rect.collidepoint(pos) and i < count:
+                    control.sel_index = i
+                    if control.style & 0x3 in (1, 2):
+                        control.text = control.items[i]
+                        control.select_all()
+                    self.open_combo = None
+                    win = self.windows.get(control.parent_hwnd)
+                    if win and self.winapi:
+                        self._post_control_command(win, control,
+                                                   self.winapi.CBN_SELCHANGE)
+                    return True
             return True  # Click inside dropdown chrome: swallow
 
         # Click elsewhere: close the dropdown, then process the click normally
         self.open_combo = None
         return False
+
+    @staticmethod
+    def _list_scroll(control, rows, delta):
+        """Scroll a list (LISTBOX or open combobox list) showing rows by delta rows"""
+        control.top_index = max(0, min(control.top_index + delta, len(control.items) - rows))
+
+    def _list_scrollbar_click(self, control, geo, pos):
+        """Left click on a list's scroll bar; True if it hit the bar"""
+        if geo['bar'] is None or not geo['bar'].collidepoint(pos):
+            return False
+        rows = geo['rows']
+        if geo['up'].collidepoint(pos):
+            self._list_scroll(control, rows, -1)
+        elif geo['down'].collidepoint(pos):
+            self._list_scroll(control, rows, 1)
+        elif geo['thumb'].collidepoint(pos):
+            self.dragging_list_thumb = (control.hwnd, pos[1] - geo['thumb'].y)
+        elif pos[1] < geo['thumb'].y:
+            self._list_scroll(control, rows, -rows)
+        else:
+            self._list_scroll(control, rows, rows)
+        return True
+
+    def _drag_list_thumb_to(self, pos):
+        """Track a thumb drag in a list's (or open combobox list's) scroll bar"""
+        hwnd, grab = self.dragging_list_thumb
+        control = self.controls.get(hwnd)
+        geo = None
+        if control is not None and control.class_name == "LISTBOX":
+            geo = self._listbox_rects(control)
+        elif control is not None and self.open_combo == hwnd:
+            geo = self._combo_dropdown_rects(control)
+        if geo is None or geo['bar'] is None:
+            self.dragging_list_thumb = None
+            return
+        track, thumb = geo['track'], geo['thumb']
+        span = len(control.items) - geo['rows']
+        free = track.height - thumb.height
+        if free <= 0:
+            return
+        offset = max(0, min(pos[1] - grab - track.y, free))
+        control.top_index = (offset * span + free // 2) // free
 
     def _capture_target(self):
         """Window that currently captures the mouse (SetCapture), or None."""
@@ -599,15 +648,18 @@ class MouseMixin:
                                     self._post_button_command(win, control)
                             return
                         elif control.class_name == "LISTBOX":
+                            geo = self._listbox_rects(control, (ctrl_x, ctrl_y))
+                            if geo is None:
+                                return
                             if button in (4, 5):  # Mouse wheel
-                                rows = max(1, (control.height - 2) // self.LISTBOX_ITEM_H)
-                                step = 3 if button == 5 else -3
-                                control.top_index = max(0, min(control.top_index + step,
-                                                               len(control.items) - rows))
+                                self._list_scroll(control, geo['rows'],
+                                                  3 if button == 5 else -3)
                             elif button == 1:
                                 self.focused_control = None
-                                index = ((y - ctrl_y - 1) // self.LISTBOX_ITEM_H
-                                         + control.top_index)
+                                if self._list_scrollbar_click(control, geo, pos):
+                                    return
+                                index = next((i for i, r in geo['items']
+                                              if r.collidepoint(pos)), -1)
                                 if 0 <= index < len(control.items):
                                     control.sel_index = index
                                     if self.winapi:

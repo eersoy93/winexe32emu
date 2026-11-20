@@ -124,6 +124,8 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
 
         # Open combobox dropdown: control hwnd or None
         self.open_combo = None
+        self.combo_shown = None  # Open combo whose list was scrolled to its selection
+        self.dragging_list_thumb = None  # (list or combo hwnd, grab offset) of a thumb drag
 
         # Open submenus of the open menu bar dropdown (item index per level),
         # popup menu of TrackPopupMenu (dict) and open ComboBoxEx list (hwnd)
@@ -309,9 +311,11 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
                 # Release drag / resize; forward release to app if neither
                 was_interacting = (self.dragging_window is not None or
                                    self.resizing_window is not None or
-                                   self.dragging_scrollbar is not None)
+                                   self.dragging_scrollbar is not None or
+                                   self.dragging_list_thumb is not None)
                 if self.dragging_scrollbar is not None:
                     self._end_scrollbar_drag()
+                self.dragging_list_thumb = None
                 self.dragging_window = None
                 self.resizing_window = None
                 self.resize_edge = None
@@ -322,6 +326,8 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
                 # Scrollbar thumb dragging grabs the mouse first
                 if self.dragging_scrollbar is not None:
                     self._drag_scrollbar_to(event.pos)
+                elif self.dragging_list_thumb is not None:
+                    self._drag_list_thumb_to(event.pos)
                 # Window resizing (takes priority over dragging)
                 elif self.resizing_window and self.resizing_window in self.windows:
                     self._resize_window_to(self.windows[self.resizing_window], event.pos)

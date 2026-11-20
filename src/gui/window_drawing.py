@@ -376,35 +376,123 @@ class WindowDrawingMixin:
                          lambda hmenu, index: self._post_init_menu(win, hmenu, index))
         self._draw_menu_panels(self._menu_panels(items, x, y, self.menu_path))
 
+    COMBO_DEFAULT_ROWS = 8  # Rows shown when the template height leaves no room for a list
+
+    def _combo_visible_rows(self, control):
+        """Rows the open dropdown list shows (from the control's height, which includes it)"""
+        count = max(1, len(control.items))
+        box_h = min(control.height, 24)
+        rows = (control.height - box_h - 2) // self.LISTBOX_ITEM_H
+        if rows < 1:
+            rows = self.COMBO_DEFAULT_ROWS
+        return max(1, min(rows, count))
+
     def _combo_dropdown_rects(self, control):
-        """Dropdown rect and item rects of an open combobox (screen coords)."""
+        """Geometry of an open combobox dropdown (screen coords), or None.
+
+        A dict with 'drop' (the whole list), 'items' as (index, rect) pairs of
+        the visible rows, 'rows', and the scroll bar's 'bar', 'up', 'down',
+        'track' and 'thumb' rects ('bar' is None when every item fits).
+        """
         win = self.windows.get(control.parent_hwnd)
         if not win or not win.visible or win.minimized:
-            return None, []
+            return None
         ox, oy = self.client_origin(win)
         box_h = min(control.height, 24)
         item_h = self.LISTBOX_ITEM_H
-        count = max(1, len(control.items))
-        drop = pygame.Rect(ox + control.x, oy + control.y + box_h,
-                           control.width, count * item_h + 2)
-        rects = [pygame.Rect(drop.x + 1, drop.y + 1 + i * item_h,
-                             drop.width - 2, item_h)
-                 for i in range(len(control.items))]
-        return drop, rects
+        count = len(control.items)
+        top_y = oy + control.y + box_h
+        rows = self._combo_visible_rows(control)
+        # Keep the list on screen (above the taskbar)
+        room = (self.height - self.TASKBAR_H - top_y - 2) // item_h
+        rows = max(1, min(rows, room)) if room >= 1 else rows
+        top = max(0, min(control.top_index, count - rows))
+        control.top_index = top
+        drop = pygame.Rect(ox + control.x, top_y, control.width, rows * item_h + 2)
+        geo = self._list_geometry(drop, count, rows, top)
+        geo['drop'] = drop
+        return geo
+
+    def _list_geometry(self, frame, count, rows, top):
+        """Rows and vertical scroll bar inside a list's 1-pixel frame (screen coords).
+
+        A dict with 'items' as (index, rect) pairs of the visible rows, 'rows',
+        and the scroll bar's 'bar', 'up', 'down', 'track' and 'thumb' rects
+        ('bar' is None when every item fits).
+        """
+        item_h = self.LISTBOX_ITEM_H
+        scroll = count > rows
+        body_w = frame.width - 2 - (self.SCROLL_BTN if scroll else 0)
+        items = [(i, pygame.Rect(frame.x + 1, frame.y + 1 + (i - top) * item_h, body_w, item_h))
+                 for i in range(top, min(count, top + rows))]
+        geo = {'items': items, 'rows': rows, 'bar': None}
+        if scroll:
+            btn = self.SCROLL_BTN
+            bar = pygame.Rect(frame.right - 1 - btn, frame.y + 1, btn, frame.height - 2)
+            b = min(btn, bar.height // 2)
+            track = pygame.Rect(bar.x, bar.y + b, btn, max(0, bar.height - 2 * b))
+            thumb_h = max(self.SCROLL_MIN_THUMB, track.height * rows // count)
+            thumb_h = min(thumb_h, track.height)
+            thumb_y = track.y + (track.height - thumb_h) * top // max(1, count - rows)
+            geo.update(bar=bar, up=pygame.Rect(bar.x, bar.y, btn, b),
+                       down=pygame.Rect(bar.x, bar.bottom - b, btn, b), track=track,
+                       thumb=pygame.Rect(bar.x, thumb_y, btn, thumb_h))
+        return geo
+
+    def _listbox_rects(self, control, abs_pos=None):
+        """Geometry of a LISTBOX at abs_pos (default: its screen position; see
+        _list_geometry), or None"""
+        abs_pos = abs_pos or self._scrollbar_abs_pos(control)
+        if abs_pos is None:
+            return None
+        frame = pygame.Rect(abs_pos[0], abs_pos[1], control.width, control.height)
+        rows = max(1, (control.height - 2) // self.LISTBOX_ITEM_H)
+        count = len(control.items)
+        control.top_index = max(0, min(control.top_index, count - rows))
+        geo = self._list_geometry(frame, count, rows, control.top_index)
+        geo['drop'] = frame
+        return geo
+
+    def _draw_list_scrollbar(self, geo, hwnd):
+        """Draw the scroll bar of a list geometry (if it has one)"""
+        if geo['bar'] is None:
+            return
+        pygame.draw.rect(self.screen, (224, 224, 224), geo['track'])
+        self._draw_button_3d(geo['up'], "", small=True, arrow='up')
+        self._draw_button_3d(geo['down'], "", small=True, arrow='down')
+        if geo['track'].height >= self.SCROLL_MIN_THUMB:
+            dragging = (self.dragging_list_thumb is not None and
+                        self.dragging_list_thumb[0] == hwnd)
+            self._draw_button_3d(geo['thumb'], "", pressed=dragging)
+
+    def _combo_scroll_to_selection(self, control):
+        """Scroll the dropdown list so the selected item is visible"""
+        rows = self._combo_visible_rows(control)
+        sel = control.sel_index
+        if 0 <= sel < len(control.items):
+            if sel < control.top_index:
+                control.top_index = sel
+            elif sel >= control.top_index + rows:
+                control.top_index = sel - rows + 1
 
     def _draw_open_combo(self):
         """Draw the open combobox dropdown on top of everything"""
         if not self.open_combo:
+            self.combo_shown = None
             return
         control = self.controls.get(self.open_combo)
         if not control or not control.visible:
             self.open_combo = None
             return
 
-        drop, item_rects = self._combo_dropdown_rects(control)
-        if drop is None:
+        if self.combo_shown != control.hwnd:  # Just opened: show the selection
+            self.combo_shown = control.hwnd
+            self._combo_scroll_to_selection(control)
+        geo = self._combo_dropdown_rects(control)
+        if geo is None:
             self.open_combo = None
             return
+        drop = geo['drop']
 
         shadow = pygame.Rect(drop.x + 3, drop.y + 3, drop.width, drop.height)
         pygame.draw.rect(self.screen, (64, 64, 64), shadow)
@@ -412,11 +500,16 @@ class WindowDrawingMixin:
         pygame.draw.rect(self.screen, (128, 128, 128), drop, 1)
 
         mouse_pos = pygame.mouse.get_pos()
-        for i, (item, rect) in enumerate(zip(control.items, item_rects, strict=False)):
+        prev_clip = self.screen.get_clip()
+        for i, rect in geo['items']:
             hovered = rect.collidepoint(mouse_pos)
             selected = (i == control.sel_index)
             if hovered or selected:
                 pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
             color = self.COLOR_TITLE_TEXT if (hovered or selected) else self.COLOR_TEXT
-            text = self.font.render(item, True, color)
+            text = self.font.render(control.items[i], True, color)
+            self.screen.set_clip(rect)
             self.screen.blit(text, (rect.x + 3, rect.y + 1))
+            self.screen.set_clip(prev_clip)
+
+        self._draw_list_scrollbar(geo, control.hwnd)

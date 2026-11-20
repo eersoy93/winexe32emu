@@ -343,23 +343,19 @@ class ControlDrawingMixin:
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG, rect)
             pygame.draw.rect(self.screen, (128, 128, 128), rect, 1)
 
-            # Items with the selected one highlighted
+            # Items with the selected one highlighted, and the scroll bar
+            geo = self._listbox_rects(control, (abs_x, abs_y))
             prev_clip = self.screen.get_clip()
-            self.screen.set_clip(rect)
-            item_h = self.LISTBOX_ITEM_H
-            top = min(control.top_index, max(0, len(control.items) - 1))
-            for i, item in enumerate(control.items[top:], top):
-                item_rect = pygame.Rect(abs_x + 1, abs_y + 1 + (i - top) * item_h,
-                                        control.width - 2, item_h)
-                if item_rect.top > rect.bottom:
-                    break
+            for i, item_rect in geo['items']:
                 selected = (i == control.sel_index)
                 if selected:
                     pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, item_rect)
                 color = self.COLOR_TITLE_TEXT if selected else self.COLOR_TEXT
-                text = self.font.render(item, True, color)
+                text = self.font.render(control.items[i], True, color)
+                self.screen.set_clip(item_rect.clip(prev_clip))
                 self.screen.blit(text, (item_rect.x + 3, item_rect.y + 1))
-            self.screen.set_clip(prev_clip)
+                self.screen.set_clip(prev_clip)
+            self._draw_list_scrollbar(geo, control.hwnd)
 
         elif control.class_name == "COMBOBOX":
             box_h = min(control.height, 24)
