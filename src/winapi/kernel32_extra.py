@@ -1042,6 +1042,43 @@ class Kernel32ExtraMixin:
         self.CloseHandle(args)
         return 0
 
+    def NtSetInformationFile(self, args):
+        """NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        Length, FileInformationClass) - FileBasicInformation (the times and
+        the read-only attribute); the other classes are not implemented"""
+        handle, iosb, buf, length, info_class = args[:5]
+        STATUS_INVALID_HANDLE, STATUS_INFO_LENGTH_MISMATCH = 0xC0000008, 0xC0000004
+        STATUS_ACCESS_DENIED, STATUS_NOT_IMPLEMENTED = 0xC0000022, 0xC0000002
+        if info_class != 4:  # FileBasicInformation
+            return STATUS_NOT_IMPLEMENTED
+        info = self.handles.get(handle)
+        if not info or info.get('type') != 'file' or not info.get('path'):
+            return STATUS_INVALID_HANDLE
+        if length < 40:
+            return STATUS_INFO_LENGTH_MISMATCH
+        try:
+            times = struct.unpack('<4Q', bytes(self.emu.uc.mem_read(buf, 32)))
+            attributes = self._read_u32(buf + 32)
+        except UcError:
+            return 0xC0000005  # STATUS_ACCESS_VIOLATION
+        path = info['path']
+        if self._write_protected(path):
+            return STATUS_ACCESS_DENIED
+        # 0 leaves a time unchanged, -1 only stops its automatic updates
+        pointers = [buf + 8 * i if times[i] not in (0, 0xFFFFFFFFFFFFFFFF) else 0
+                    for i in range(3)]
+        if any(pointers) and not self.SetFileTime([handle] + pointers):
+            return STATUS_ACCESS_DENIED
+        if attributes and not os.path.isdir(path):
+            try:
+                mode = os.stat(path).st_mode
+                os.chmod(path, mode & ~0o222 if attributes & 1 else mode | 0o200)
+            except OSError:
+                return STATUS_ACCESS_DENIED
+        if iosb:
+            self._mem_write(iosb, struct.pack('<II', 0, 0))
+        return 0
+
     def NtQuerySystemTime(self, args):
         self.GetSystemTimeAsFileTime(args)
         return 0

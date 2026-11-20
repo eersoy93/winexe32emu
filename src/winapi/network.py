@@ -568,6 +568,70 @@ class NetworkMixin:
         drives are local"""
         return self.ERROR_NOT_CONNECTED
 
+    def WNetAddConnection2W(self, args):
+        return self.ERROR_NO_NETWORK
+
+    WNetAddConnectionW = WNetAddConnection3A = WNetAddConnection3W = WNetAddConnection2W
+    WNetUseConnectionA = WNetUseConnectionW = WNetAddConnection2W
+
+    def WNetCancelConnection2W(self, args):
+        return self.ERROR_NOT_CONNECTED
+
+    WNetCancelConnectionW = WNetGetConnectionW = WNetCancelConnection2W
+
+    ERROR_BAD_NET_NAME = 67  # ERROR_NO_MORE_ITEMS and ERROR_INVALID_HANDLE: RegistryMixin
+
+    def WNetOpenEnumA(self, args):
+        """WNetOpenEnum(A/W)(dwScope, dwType, dwUsage, lpNetResource,
+        lphEnum) - an enumeration of the network finds nothing (the
+        "Network" folders are empty)"""
+        if not args[4]:
+            return 87  # ERROR_INVALID_PARAMETER
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'wnet_enum'}
+        if not self._mem_write(args[4], struct.pack('<I', handle)):
+            del self.handles[handle]
+            return 487  # ERROR_INVALID_ADDRESS
+        return 0
+
+    WNetOpenEnumW = WNetOpenEnumA
+
+    def WNetEnumResourceA(self, args):
+        """WNetEnumResource(A/W)(hEnum, lpcCount, lpBuffer, lpBufferSize)"""
+        info = self.handles.get(args[0])
+        if not info or info.get('type') != 'wnet_enum':
+            return self.ERROR_INVALID_HANDLE
+        if args[1]:
+            self._mem_write(args[1], struct.pack('<I', 0))
+        return self.ERROR_NO_MORE_ITEMS
+
+    WNetEnumResourceW = WNetEnumResourceA
+
+    def WNetCloseEnum(self, args):
+        info = self.handles.get(args[0])
+        if not info or info.get('type') != 'wnet_enum':
+            return self.ERROR_INVALID_HANDLE
+        del self.handles[args[0]]
+        return 0
+
+    def WNetGetResourceParentA(self, args):
+        """WNetGetResourceParent(A/W) and WNetGetResourceInformation(A/W) -
+        no network resource exists"""
+        return self.ERROR_BAD_NET_NAME
+
+    WNetGetResourceParentW = WNetGetResourceInformationA = WNetGetResourceParentA
+    WNetGetResourceInformationW = WNetGetResourceParentA
+
+    def WNetGetLastErrorW(self, args):
+        """WNetGetLastErrorW - no network error happened"""
+        if args[0]:
+            self._mem_write(args[0], struct.pack('<I', 0))
+        if args[1] and args[2]:
+            self._mem_write(args[1], b'\x00\x00')
+        if args[3] and args[4]:
+            self._mem_write(args[3], b'\x00\x00')
+        return 0
+
     def WNetGetLastErrorA(self, args):
         """WNetGetLastErrorA(lpError, lpErrorBuf, nErrorBufSize, lpNameBuf,
         nNameBufSize) - no network error happened"""

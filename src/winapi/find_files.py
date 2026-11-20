@@ -136,8 +136,53 @@ class FindFilesMixin:
     def FindNextFileW(self, args):
         return self.FindNextFileA(args, wide=True)
 
+    # WIN32_FIND_STREAM_DATA: LARGE_INTEGER StreamSize, WCHAR cStreamName[MAX_PATH + 36]
+    _STREAM_NAME_BYTES = (260 + 36) * 2
+
+    def _write_stream_data(self, address, size, name):
+        raw = name.encode('utf-16-le')[:self._STREAM_NAME_BYTES - 2]
+        self.emu.uc.mem_write(address, struct.pack('<Q', size) +
+                              raw.ljust(self._STREAM_NAME_BYTES, b'\x00'))
+
+    def FindFirstStreamW(self, args):
+        """FindFirstStreamW(lpFileName, InfoLevel, lpFindStreamData, dwFlags) -
+        host files have only their unnamed data stream ("::$DATA"), and
+        directories none (ERROR_HANDLE_EOF)"""
+        INVALID_HANDLE_VALUE = 0xFFFFFFFF
+        name = self._read_text(args[0], True)
+        if args[1] != 0 or not args[2]:  # FindStreamInfoStandard only
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return INVALID_HANDLE_VALUE
+        full = self.full_windows_path(name)
+        path = self.resolve_drive_path(full) if full is not None else None
+        if path is None:
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return INVALID_HANDLE_VALUE
+        if os.path.isdir(path):
+            self._last_error = 38  # ERROR_HANDLE_EOF
+            return INVALID_HANDLE_VALUE
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self._last_error = 2 if os.path.isdir(os.path.dirname(path)) else 3
+            return INVALID_HANDLE_VALUE
+        self._write_stream_data(args[2], size, '::$DATA')
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'find', 'streams': True, 'entries': [], 'index': 0}
+        self._last_error = 0
+        return handle
+
+    def FindNextStreamW(self, args):
+        """FindNextStreamW(hFindStream, lpFindStreamData) - no more streams"""
+        info = self.handles.get(args[0])
+        if not info or not info.get('streams'):
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        self._last_error = 38  # ERROR_HANDLE_EOF
+        return 0
+
     def FindClose(self, args):
-        """FindClose emulation"""
+        """FindClose emulation (FindFirstFile and FindFirstStreamW handles)"""
         info = self.handles.get(args[0])
         if not info or info.get('type') != 'find':
             self._last_error = 6
