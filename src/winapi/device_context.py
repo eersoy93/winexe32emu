@@ -154,18 +154,29 @@ class DeviceContextMixin:
             shape['clip'] = clip
         self._add_shape(hdc, shape)
 
+    WM_ERASEBKGND = 0x0014
+
     def BeginPaint(self, args):
         """BeginPaint emulation"""
         hWnd = args[0]
         lpPaint = args[1]
 
         log.debug(f"BeginPaint(0x{hWnd:x})")
+        self.paint_pending.discard(hWnd)  # BeginPaint validates the update region
 
         hdc = self._create_dc(hWnd)
 
         # Painting starts fresh: clear the window's retained display lists
         if self.gui:
             self.gui.clear_drawings(hWnd)
+
+        # Like Windows, the window procedure erases the background first
+        # (Word's dialogs paint their gray face there); fErase tells WM_PAINT
+        # whether it is still to do. The whole window is painted again (its
+        # drawings were cleared), so it is erased every time.
+        erase = 0
+        if self.gui and hWnd in self.gui.windows and hWnd not in self.gui.consoles:
+            erase = 0 if self.SendMessageA([hWnd, self.WM_ERASEBKGND, hdc, 0]) else 1
 
         # Fill PAINTSTRUCT structure
         if lpPaint:
@@ -175,7 +186,7 @@ class DeviceContextMixin:
                 win = self.gui.windows[hWnd]
                 right, bottom = self.gui.client_size(win)
             # hdc, fErase, rcPaint(4 int), fRestore, fIncUpdate, rgbReserved[32]
-            paint_data = struct.pack("<II", hdc, 0)  # First 8 bytes
+            paint_data = struct.pack("<II", hdc, erase)  # First 8 bytes
             paint_data += struct.pack("<iiii", 0, 0, right, bottom)  # rcPaint
             paint_data += b'\x00' * (64 - len(paint_data))  # Rest
             self.emu.uc.mem_write(lpPaint, paint_data[:64])

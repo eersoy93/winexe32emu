@@ -430,8 +430,9 @@ class User32Mixin:
             else:
                 old = store.get(nIndex, 0)
             return old & 0xFFFFFFFF
-        if nIndex == -8 and not set_value:  # GWL_HWNDPARENT
-            return self._parent_of(hWnd) & 0xFFFFFFFF
+        if nIndex == -8 and not set_value:  # GWL_HWNDPARENT: the parent or owner
+            owner = win.owner_hwnd if win is not None and not win.parent else 0
+            return (self._parent_of(hWnd) or owner) & 0xFFFFFFFF
         if nIndex == -6 and not set_value:  # GWL_HINSTANCE: the module that created it
             return (store.get(nIndex) or self.emu.pe_loader.image_base) & 0xFFFFFFFF
         if nIndex == GWL_STYLE:
@@ -458,6 +459,12 @@ class User32Mixin:
                 store[nIndex] = new_value
                 if win is not None and win.native == 'LISTVIEW':
                     win.nstate['dirty'] = True
+            return old & 0xFFFFFFFF
+        if nIndex == GWL_EXSTYLE and win is not None and not win.parent:
+            # A top-level window's extended style decides its taskbar button
+            old = store.get(nIndex, win.ex_style)
+            if set_value:
+                store[nIndex] = win.ex_style = new_value
             return old & 0xFFFFFFFF
         if nIndex in (GWL_EXSTYLE, GWL_USERDATA):
             old = store.get(nIndex, 0)
@@ -694,10 +701,10 @@ class User32Mixin:
         win = self.gui.windows.get(hWnd)
         if win is not None and win.parent:
             return win.parent
-        dialog = self.dialogs.get(hWnd)
-        if dialog is None or win is None or not win.style & self.WS_POPUP:
+        if win is None or not win.style & self.WS_POPUP:
             return 0
-        return dialog['owner'] or 0
+        dialog = self.dialogs.get(hWnd)
+        return (dialog['owner'] if dialog else 0) or win.owner_hwnd or 0
 
     def SetParent(self, args):
         """SetParent emulation - previous parent"""
@@ -1000,7 +1007,9 @@ class User32Mixin:
                 return children[0] if children else 0
             if uCmd == self.GW_OWNER:
                 dialog = self.dialogs.get(hWnd)
-                return dialog['owner'] if dialog else 0
+                win = self.gui.windows.get(hWnd)
+                return ((dialog['owner'] if dialog else 0) or
+                        (win.owner_hwnd if win is not None and not win.parent else 0))
             control = self.gui.controls.get(hWnd)
             win = self.gui.windows.get(hWnd)
             if control is not None:

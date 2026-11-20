@@ -139,10 +139,54 @@ class ShellFoldersMixin:
             self.pidls[pidl] = path
         return pidl
 
+    def _pidl_path(self, pidl):
+        """Windows path an item ID list stands for: '' for the empty list
+        (the desktop), None if unknown. The PIDLs made here have one item
+        holding a full path; copies the program made of them (with IMalloc,
+        or a parent's items in front) are read from memory: the last item."""
+        if not pidl:
+            return None
+        path = self.pidls.get(pidl)
+        if path is not None:
+            return path
+        last, position = None, pidl
+        for _ in range(64):
+            try:
+                cb = struct.unpack('<H', self.emu.uc.mem_read(position, 2))[0]
+                data = bytes(self.emu.uc.mem_read(position + 2, cb - 2)) if cb >= 4 else b''
+            except UcError:
+                return None
+            if cb == 0:
+                return '' if last is None else last
+            if cb < 6 or cb % 2 or data[-2:] != b'\x00\x00':
+                return None
+            try:
+                text = data[:-2].decode('utf-16-le')
+            except UnicodeDecodeError:
+                return None
+            if text != self.MY_COMPUTER_PATH and not (len(text) >= 2 and text[1] == ':'):
+                return None  # Not an item of ours
+            last = text
+            position += cb
+        return None
+
+    def _make_empty_pidl(self):
+        """The empty item ID list: the desktop, the root of the namespace"""
+        pidl = self.emu.heap_alloc(2)
+        if pidl:
+            self._mem_write(pidl, b'\x00\x00')
+            self.pidls[pidl] = ''
+        return pidl
+
+    def _pidl_file_path(self, pidl):
+        """Like _pidl_path, the desktop as its folder in the file system"""
+        path = self._pidl_path(pidl)
+        return self._shell_folder(0) if path == '' else path
+
     def SHGetPathFromIDListA(self, args, wide=False):
         """SHGetPathFromIDListA/W emulation (PIDLs of SHBrowseForFolder)"""
         pidl, pszPath = args[0], args[1]
-        path = self.pidls.get(pidl)
+        path = self._pidl_file_path(pidl)
         if path is None or self._is_my_computer(path) or not pszPath:
             if pszPath:
                 self._write_units(pszPath, [], wide)
@@ -151,6 +195,8 @@ class ShellFoldersMixin:
 
     def SHGetPathFromIDListW(self, args):
         return self.SHGetPathFromIDListA(args, wide=True)
+
+    SHGetPathFromIDList = SHGetPathFromIDListA  # The ANSI export without A
 
     def CoTaskMemAlloc(self, args):
         """CoTaskMemAlloc emulation"""
@@ -233,7 +279,8 @@ class ShellFoldersMixin:
         if not self.gui or not self.gui.running:
             return 0
         title = self._read_text(lpszTitle, wide) if lpszTitle else ''
-        root = self.pidls.get(pidlRoot, 'C:\\').rstrip('\\') if pidlRoot else 'C:'
+        # (the desktop, the empty list, is the root of everything: C:)
+        root = (self._pidl_path(pidlRoot) or 'C:\\').rstrip('\\') if pidlRoot else 'C:'
         # Rooted at My Computer, the top level lists the drives (LOGICAL_DRIVES)
         computer = self.MY_COMPUTER_PATH
         if self._is_my_computer(root):

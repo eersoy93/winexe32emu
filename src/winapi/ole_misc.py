@@ -412,7 +412,7 @@ class OleMiscMixin:
             self.emu.heap_free(text)
         metafile = self.CloseMetaFile([hdc])
         width = max(32, self._text_extent(0, label)[0]) if label else 32
-        block = self.GlobalAlloc([0x2, 16])
+        block = self.GlobalAlloc([0, 16])  # (fixed: written here)
         if not block:
             return 0
         # MM_ANISOTROPIC, the size in 0.01 mm (96 pixels per inch)
@@ -525,13 +525,14 @@ class OleMiscMixin:
             copy = self.get_next_handle()
             self.gdi_objects[copy] = dict(obj, shapes=list(obj.get('shapes', [])))
             return copy
-        size = self.emu.heap_block_size(handle)
-        if size is None:
+        size = self._hglobal_size(handle)
+        if not size:
             return 0
-        copy = self.GlobalAlloc([0x2, size])
+        copy = self.GlobalAlloc([0, size])  # (fixed: written here)
         if not copy:
             return 0
-        self._mem_write(copy, bytes(self.emu.uc.mem_read(handle, size)))
+        self._mem_write(copy, bytes(self.emu.uc.mem_read(self._hglobal_pointer(handle),
+                                                         size)))
         if fmt == self.CF_METAFILEPICT and size >= 16:
             metafile = self._read_u32(handle + 12)
             meta = self.gdi_objects.get(metafile)
@@ -573,10 +574,10 @@ class OleMiscMixin:
                 if self._guest_method(data_object, 3, [formatetc, medium]):  # GetData
                     continue
                 tymed, handle, _ = struct.unpack('<III', self.emu.uc.mem_read(medium, 12))
-                size = self.emu.heap_block_size(handle) if tymed == self.TYMED_HGLOBAL else None
+                size = self._hglobal_size(handle) if tymed == self.TYMED_HGLOBAL else None
                 if size is not None:
                     winapi.WinAPIHandler.clipboard_data[fmt & 0xFFFF] = bytes(
-                        self.emu.uc.mem_read(handle, size))
+                        self.emu.uc.mem_read(self._hglobal_pointer(handle), size)) if size else b''
                 self._release_stgmedium(medium)
             self._release(enum)
         finally:
@@ -638,7 +639,7 @@ class OleMiscMixin:
             if method == 'QueryGetData':
                 return self.S_OK
             data = clipboard[fmt]
-            handle = self.GlobalAlloc([0x2, max(len(data), 1)])
+            handle = self.GlobalAlloc([0, max(len(data), 1)])  # (fixed: written here)
             if not handle:
                 return 0x8007000E  # E_OUTOFMEMORY
             self._mem_write(handle, data)

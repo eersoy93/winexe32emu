@@ -55,7 +55,8 @@ class MessagesMixin:
         if Msg == WM_SETTEXT and self._text_wndproc(hWnd):
             # A program's window class (a custom static text, say) sees its new
             # text and repaints; DefWindowProc stores it
-            return self._call_proc(self._text_wndproc(hWnd), hWnd, Msg, wParam, lParam)
+            return self._call_proc(self._text_wndproc(hWnd), hWnd, Msg, wParam, lParam,
+                                   wide)
         if Msg == WM_SETTEXT:
             return self.SetWindowTextA([hWnd, lParam], wide)
         if Msg == WM_GETTEXT:
@@ -78,7 +79,7 @@ class MessagesMixin:
         # Other messages: deliver synchronously to the window's WndProc
         wndproc = self._find_wndproc_for_hwnd(hWnd)
         if wndproc:
-            return self._call_proc(wndproc, hWnd, Msg, wParam, lParam)
+            return self._call_proc(wndproc, hWnd, Msg, wParam, lParam, wide)
         return 0
 
     SS_BITMAP, SS_REALSIZECONTROL, SS_CENTERIMAGE = 0xE, 0x40, 0x200
@@ -675,6 +676,7 @@ class MessagesMixin:
                     and window.owner is self and matches(hwnd, self.WM_PAINT)):
                 if remove:
                     self.painted_windows.add(hwnd)
+                    self.paint_pending.add(hwnd)
                 return (hwnd, self.WM_PAINT, 0, 0)
 
         # Owner-draw controls paint after their (painted, visible) parent
@@ -794,7 +796,21 @@ class MessagesMixin:
         return 1
 
     def DispatchMessageA(self, args):
-        """DispatchMessageA emulation - Call WndProc"""
+        """DispatchMessageA emulation - Call WndProc. The update region of a
+        WM_PAINT lasts while its window procedure runs (GetUpdateRect sees
+        it) unless BeginPaint or ValidateRect empties it first."""
+        try:
+            return self._dispatch_message(args)
+        finally:
+            if self.paint_pending:
+                try:
+                    hwnd, message = struct.unpack('<II', self.emu.uc.mem_read(args[0], 8))
+                except UcError:
+                    hwnd = message = 0
+                if message == self.WM_PAINT:
+                    self.paint_pending.discard(hwnd)
+
+    def _dispatch_message(self, args):
         lpMsg = args[0]
         log.debug("DispatchMessageA()")
 
@@ -895,6 +911,11 @@ class MessagesMixin:
             return self._default_set_cursor(hWnd, wParam, lParam)
         if Msg == self.WM_NCCREATE:
             return 1  # Continue creating the window
+        if Msg == self.WM_ERASEBKGND:
+            # The class brush erases it (the desktop draws the window's
+            # background color); a class without one leaves it to WM_PAINT
+            win = self.gui.windows.get(hWnd) if self.gui else None
+            return 1 if win is not None and not win.transparent else 0
         if Msg in (self.WM_CONTEXTMENU, self.WM_MOUSEWHEEL) and self.gui:
             # A child window passes them on to its parent
             win = self.gui.windows.get(hWnd)

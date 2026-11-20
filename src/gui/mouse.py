@@ -413,6 +413,8 @@ class MouseMixin:
             if self.open_menu == (win.hwnd, index):
                 self.open_menu = None
             else:
+                if self.open_menu is None:
+                    self._post_enter_menu(win)
                 self.open_menu = (win.hwnd, index)
                 self._post_init_menu(win, item.get('hmenu', 0), index)
         else:
@@ -467,8 +469,7 @@ class MouseMixin:
                 if win.visible and not win.minimized and win.contains_point(x, y):
                     # Make window active and bring to front
                     self.active_window = hwnd
-                    self.z_order.remove(hwnd)
-                    self.z_order.append(hwnd)
+                    self.raise_window(hwnd)
                     border, caption = self.window_frame(win)
 
                     # Caption buttons (the rects they are drawn at; dialogs only have close)
@@ -498,6 +499,7 @@ class MouseMixin:
                     # otherwise dragging starts (if not maximized)
                     if caption and win.y + border <= y <= win.y + caption:
                         if (button == 1 and not win.is_dialog
+                                and not self._popup_without_size_boxes(win)
                                 and self._double_click(('title', hwnd))):
                             self.dragging_window = None
                             win.maximize(self.width, self.height, self.TASKBAR_H)

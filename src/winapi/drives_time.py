@@ -427,7 +427,7 @@ class DrivesTimeMixin:
 
     def GlobalSize(self, args):
         """GlobalSize emulation - size of a GlobalAlloc block"""
-        size = self.emu.heap_block_size(args[0]) if args[0] else None
+        size = self._hglobal_size(args[0]) if args[0] else None
         if size is None:
             self._last_error = 6  # ERROR_INVALID_HANDLE
             return 0

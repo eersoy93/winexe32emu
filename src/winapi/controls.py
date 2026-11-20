@@ -18,6 +18,8 @@ import struct
 
 from unicorn import UcError
 
+from .. import config
+
 
 class ControlsMixin:
     """Common controls (native child windows) and image lists"""
@@ -63,12 +65,13 @@ class ControlsMixin:
             return None
         return win
 
-    def _call_proc(self, proc, hwnd, msg, wParam, lParam):
-        """Call a window procedure; the emulator's own one directly"""
+    def _call_proc(self, proc, hwnd, msg, wParam, lParam, wide=True):
+        """Call a window procedure; the emulator's own one directly (wide:
+        the text of WM_SETTEXT/WM_GETTEXT is UTF-16, as CallWindowProcW passes)"""
         if not proc:
             return 0
         if proc == self._native_stub():
-            return self._native_message(hwnd, msg, wParam, lParam)
+            return self._native_message(hwnd, msg, wParam, lParam, wide)
         return self.emu.call_wndproc(proc, hwnd, msg, wParam, lParam)
 
     def _send(self, hwnd, msg, wParam=0, lParam=0):
@@ -80,12 +83,12 @@ class ControlsMixin:
         proc = self.window_longs.get(hwnd, {}).get(-4, 0)
         return proc if proc and proc != self._native_stub() else 0
 
-    def CallWindowProcA(self, args):
+    def CallWindowProcA(self, args, wide=False):
         """CallWindowProcA/W emulation"""
-        return self._call_proc(args[0], args[1], args[2], args[3], args[4])
+        return self._call_proc(args[0], args[1], args[2], args[3], args[4], wide)
 
     def CallWindowProcW(self, args):
-        return self.CallWindowProcA(args)
+        return self.CallWindowProcA(args, wide=True)
 
     def _parent_of(self, hwnd):
         if not self.gui:
@@ -165,10 +168,10 @@ class ControlsMixin:
 
     COMBOBOX_BOX_H = 22
 
-    def _native_message(self, hwnd, msg, wParam, lParam):
+    def _native_message(self, hwnd, msg, wParam, lParam, wide=True):
         """Default processing of a message by an emulated control"""
         if self.gui and hwnd in self.gui.controls:
-            return self._control_default(hwnd, msg, wParam, lParam)
+            return self._control_default(hwnd, msg, wParam, lParam, wide)
         win = self.gui.windows.get(hwnd) if self.gui else None
         if win is None or win.native is None:
             return self.DefWindowProcA([hwnd, msg, wParam, lParam])
@@ -202,9 +205,19 @@ class ControlsMixin:
             return 0 if msg != 0x14 else 1
         return self.DefWindowProcA([hwnd, msg, wParam, lParam])
 
-    def _control_default(self, hwnd, msg, wParam, lParam):
+    def _control_default(self, hwnd, msg, wParam, lParam, wide=True):
         """Default procedure of a FakeControl (subclassed controls call it)"""
         control = self.gui.controls[hwnd]
+        # The text messages a subclassing procedure passes on (SendMessage
+        # gives them to it first)
+        if msg == 0x000C:  # WM_SETTEXT
+            self.gui.set_window_text(hwnd, self._read_text(lParam, wide) if lParam else '')
+            return 1
+        if msg == 0x000D:  # WM_GETTEXT
+            return self.GetWindowTextA([hwnd, lParam, wParam], wide)
+        if msg == 0x000E:  # WM_GETTEXTLENGTH
+            text = self._window_text(hwnd)
+            return len(text if wide else text.encode(config.ANSI_CODEPAGE, errors='replace'))
         parent = self.gui.windows.get(control.parent_hwnd)
         if (control.class_name == 'EDIT' and parent is not None and parent.native == 'LISTVIEW'
                 and msg == self.WM_KEYDOWN and wParam in (0x0D, 0x1B)):
@@ -354,8 +367,29 @@ class ControlsMixin:
     def ImageList_SetBkColor(self, args):
         return 0xFFFFFFFF  # CLR_NONE
 
-    def ImageList_Draw(self, args):
+    def _imagelist_draw(self, himl, index, hdc, x, y, cx=0, cy=0):
+        """Draw image index of an image list at (x, y) of a DC (cx, cy:
+        the image's size if 0); the system list's icons are not drawn"""
+        imagelist = self._imagelist(himl)
+        if not imagelist or index >= len(imagelist['images']) or hdc not in self.dc_state:
+            return 0
+        image = imagelist['images'][index]
+        if (isinstance(image, tuple) and len(image) == 3 and isinstance(image[2], bytes)
+                and image[0] > 0 and image[1] > 0):
+            self._add_shape(hdc, {'type': 'icon', 'pos': (x, y), 'image': image,
+                                  'size': (cx or image[0], cy or image[1])})
         return 1
+
+    def ImageList_Draw(self, args):
+        """ImageList_Draw(himl, i, hdc, x, y, fStyle)"""
+        x, y = self._read_signed_args(args, 3, 2)
+        return self._imagelist_draw(args[0], args[1], args[2], x, y)
+
+    def ImageList_DrawEx(self, args):
+        """ImageList_DrawEx(himl, i, hdc, x, y, dx, dy, rgbBk, rgbFg, fStyle) -
+        dx, dy 0: the image's size (the colors and blending are ignored)"""
+        x, y, dx, dy = self._read_signed_args(args, 3, 4)
+        return self._imagelist_draw(args[0], args[1], args[2], x, y, max(dx, 0), max(dy, 0))
 
     def ImageList_GetIcon(self, args):
         return self.get_next_handle()

@@ -212,7 +212,8 @@ class ShellExtraMixin:
         if not args[0]:
             return 0
         if args[0] in self.pidls:
-            return self._make_pidl(self.pidls[args[0]])
+            path = self.pidls[args[0]]
+            return self._make_pidl(path) if path else self._make_empty_pidl()
         size = self._pidl_size(args[0])
         copy = self.emu.heap_alloc(size)
         self._mem_write(copy, self.emu.uc.mem_read(args[0], size))
@@ -340,6 +341,7 @@ class ShellExtraMixin:
         return 0
 
     def _drop_files(self, hdrop):
+        hdrop = self._hglobal_pointer(hdrop)  # (a program may make a moveable one)
         try:
             offset, _, _, _, wide = struct.unpack('<IiiII', self.emu.uc.mem_read(hdrop, 20))
         except UcError:

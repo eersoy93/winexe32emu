@@ -43,6 +43,9 @@ class FakeWindow:
         self.enabled = True
         self.parent = None
         self.children = []
+        # Owner of a top-level window (hWndParent without WS_CHILD): owned
+        # windows stay above their owner and have no taskbar button
+        self.owner_hwnd = 0
         self.size_state = None  # (SIZE_* kind, client w, h) last told to the app (WM_SIZE)
         self.controls = []  # Buttons, text boxes, etc.
         self.wndproc = 0

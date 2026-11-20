@@ -13,8 +13,9 @@
 # limitations under the License.
 
 """Unit tests of the parts Microsoft Word 95 needs that work without an
-emulated program: compound files, OS/2 bitmap headers, raster font files
-and the logical -> device mapping of DCs.
+emulated program: compound files, OS/2 bitmap headers, raster font files,
+the logical -> device mapping of DCs, moveable memory handles, item ID
+lists, window menus, character sets and the OBM_* system bitmaps.
 
 Run from the repository root:
     python3 -m unittest discover -s tests/python -v
@@ -24,7 +25,10 @@ import os
 import struct
 import sys
 import tempfile
+import types
 import unittest
+
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_32
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 from src.winapi import WinAPIHandler, compound_file  # noqa: E402
@@ -168,6 +172,154 @@ class MappingTest(unittest.TestCase):
     def test_fixed_modes_grow_upwards(self):
         # MM_LOENGLISH: 0.01 inch per unit, 96 pixels per inch
         self.assertEqual(self.handler(map_mode=4)._lp_to_dp(1, 100, 100), (96, -96))
+
+
+class FakeEmulator:
+    """Just enough of CPUEmulator for the handlers: memory and a heap"""
+    BASE = 0x100000
+
+    def __init__(self):
+        self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
+        self.uc.mem_map(self.BASE, 0x100000)
+        self.next = self.BASE
+        self.blocks = {}
+        self.current_thread = types.SimpleNamespace(last_error=0)
+
+    def heap_alloc(self, size, alignment=16):
+        address = self.next
+        self.next += (max(size, 1) + 15) & ~15
+        self.blocks[address] = size
+        return address
+
+    def heap_free(self, address):
+        return self.blocks.pop(address, None) is not None
+
+    def heap_block_size(self, address):
+        return self.blocks.get(address)
+
+    def heap_resize_last(self, address, size):
+        return False
+
+
+def handler_with_memory():
+    handler = WinAPIHandler.__new__(WinAPIHandler)
+    handler.emu = FakeEmulator()
+    handler.moveable_handles = {}
+    handler.moveable_by_pointer = {}
+    handler.pidls = {}
+    handler.dc_state = {}
+    return handler
+
+
+class MoveableMemoryTest(unittest.TestCase):
+    GMEM_MOVEABLE, GHND = 0x2, 0x42
+
+    def setUp(self):
+        self.handler = handler_with_memory()
+        self.uc = self.handler.emu.uc
+
+    def dword(self, address):
+        return struct.unpack('<I', self.uc.mem_read(address, 4))[0]
+
+    def test_handle_points_to_its_block(self):
+        # The Office 95 spelling checker reads a block through its handle
+        h = self.handler.GlobalAlloc([self.GHND, 100])
+        pointer = self.handler.GlobalLock([h])
+        self.assertNotEqual(h, pointer)
+        self.assertEqual(self.dword(h), pointer)
+        self.assertEqual(bytes(self.uc.mem_read(pointer, 100)), b'\x00' * 100)
+        self.assertEqual(self.handler.GlobalSize([h]), 100)
+        self.assertEqual(self.handler.GlobalHandle([pointer]), h)
+        self.assertEqual(self.handler.LocalFlags([h]), 1)  # Lock count
+        self.assertEqual(self.handler.GlobalUnlock([h]), 0)
+        self.assertEqual(self.handler.GlobalFree([h]), 0)
+        self.assertNotIn(pointer, self.handler.emu.blocks)
+
+    def test_realloc_keeps_the_handle(self):
+        h = self.handler.LocalAlloc([self.GMEM_MOVEABLE, 8])
+        old = self.handler.LocalLock([h])
+        self.uc.mem_write(old, b'abcdefgh')
+        self.assertEqual(self.handler.LocalReAlloc([h, 64, self.GMEM_MOVEABLE]), h)
+        new = self.dword(h)
+        self.assertNotEqual(new, old)
+        self.assertEqual(bytes(self.uc.mem_read(new, 8)), b'abcdefgh')
+        self.assertEqual(self.handler.LocalSize([h]), 64)
+
+    def test_discarded_block(self):
+        h = self.handler.GlobalAlloc([self.GMEM_MOVEABLE, 0])
+        self.assertEqual(self.dword(h), 0)
+        self.assertEqual(self.handler.GlobalLock([h]), 0)
+        self.assertEqual(self.handler.GlobalFlags([h]) & 0x4000, 0x4000)  # GMEM_DISCARDED
+        self.assertEqual(self.handler.GlobalReAlloc([h, 16, self.GMEM_MOVEABLE]), h)
+        self.assertNotEqual(self.handler.GlobalLock([h]), 0)
+
+    def test_fixed_block_is_its_handle(self):
+        h = self.handler.GlobalAlloc([0x40, 32])
+        self.assertEqual(self.handler.GlobalLock([h]), h)
+        self.assertEqual(self.handler.GlobalHandle([h]), h)
+        self.assertEqual(self.handler._hglobal_pointer(h), h)
+
+
+class ShellItemIdListTest(unittest.TestCase):
+    def test_copied_and_combined_lists(self):
+        handler = handler_with_memory()
+        pidl = handler._make_pidl('C:\\Users')
+        self.assertEqual(handler._pidl_path(pidl), 'C:\\Users')
+        # A copy the program made (not in handler.pidls), with a parent item in front
+        item = bytes(handler.emu.uc.mem_read(pidl, struct.unpack(
+            '<H', handler.emu.uc.mem_read(pidl, 2))[0]))
+        child = handler._make_pidl('C:\\Users\\Public')
+        child_item = bytes(handler.emu.uc.mem_read(child, len(item) + 14))
+        copy = handler.emu.heap_alloc(256)
+        handler.emu.uc.mem_write(copy, item + child_item[:struct.unpack('<H', child_item[:2])[0]]
+                                 + b'\x00\x00')
+        self.assertEqual(handler._pidl_path(copy), 'C:\\Users\\Public')
+
+    def test_desktop_is_the_empty_list(self):
+        handler = handler_with_memory()
+        empty = handler.emu.heap_alloc(2)
+        handler.emu.uc.mem_write(empty, b'\x00\x00')
+        self.assertEqual(handler._pidl_path(empty), '')
+        self.assertEqual(handler._pidl_path(handler._make_empty_pidl()), '')
+        junk = handler.emu.heap_alloc(16)
+        handler.emu.uc.mem_write(junk, struct.pack('<H', 8) + b'abcdef' + b'\x00\x00')
+        self.assertIsNone(handler._pidl_path(junk))
+
+
+class WindowMenuTest(unittest.TestCase):
+    def test_child_window_menu_has_switch_to(self):
+        # Word 6/95 turn "Switch To..." into "Next Window" in their document
+        # windows' menus and fail to start without it
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        items = handler._standard_system_menu(child=True)
+        self.assertEqual(sum(1 for item in items if item['flags'] & handler.MF_SEPARATOR), 2)
+        self.assertEqual(items[-1]['id'], 0xF130)  # SC_TASKLIST
+        self.assertNotIn(0xF130, [item['id'] for item in handler._standard_system_menu()])
+
+    def test_backspace_starts_the_shortcut(self):
+        self.assertEqual(WinAPIHandler._menu_label('Undo Typing\bCtrl+Z'),
+                         ('Undo Typing', 'Ctrl+Z'))
+        self.assertEqual(WinAPIHandler._menu_label('&Find...\t\bCtrl+F'), ('Find...', 'Ctrl+F'))
+
+
+class CharsetAndBitmapTest(unittest.TestCase):
+    def test_translate_charset_info(self):
+        handler = handler_with_memory()
+        out = handler.emu.heap_alloc(32)
+        self.assertEqual(handler.TranslateCharsetInfo([162, out, 1]), 1)  # TCI_SRCCHARSET
+        charset, codepage = struct.unpack('<II', handler.emu.uc.mem_read(out, 8))
+        self.assertEqual((charset, codepage), (162, 1254))
+        self.assertEqual(handler.TranslateCharsetInfo([1251, out, 2]), 1)  # TCI_SRCCODEPAGE
+        self.assertEqual(struct.unpack('<I', handler.emu.uc.mem_read(out, 4))[0], 204)
+        self.assertEqual(handler.TranslateCharsetInfo([99, out, 1]), 0)
+
+    def test_system_bitmaps(self):
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        for name, size in ((32738, (7, 4)), (32759, (52, 39)), (32753, (16, 16))):
+            width, height, rgb = handler._system_bitmap(name)
+            self.assertEqual((width, height), size)
+            self.assertEqual(len(rgb), width * height * 3)
+        self.assertIsNone(handler._system_bitmap(1))
 
 
 if __name__ == '__main__':

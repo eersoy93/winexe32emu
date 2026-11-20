@@ -385,13 +385,90 @@ class MemoryDCMixin:
             rows.append(bytes(out))
         return width, height, b''.join(rows)
 
+    # OBM_* system bitmaps drawn here: glyphs as rows of '#' (black) on the 3D face
+    OBM_GLYPHS = {
+        32738: ['#######', ' ##### ', '  ###  ', '   #   '],                # OBM_COMBO
+        32739: ['#   ', '##  ', '### ', '####', '### ', '##  ', '#   '],   # OBM_MNARROW
+        32760: ['      #', '     ##', '#   ###', '## ### ', '#####  ', ' ###   ',
+                '  #    '],                                                # OBM_CHECK
+    }
+    OBM_ARROWS = {32753: 'up', 32752: 'down', 32751: 'right', 32750: 'left',
+                  32743: 'up', 32742: 'down', 32741: 'right', 32740: 'left'}
+    OBM_CHECKBOXES = 32759
+
+    def _system_bitmap(self, name):
+        """(width, height, RGB bytes) of an OBM_* system bitmap, or None"""
+        face, black, white = (212, 208, 200), (0, 0, 0), (255, 255, 255)
+        shadow, dark = (128, 128, 128), (64, 64, 64)
+        if name in self.OBM_GLYPHS:
+            rows = self.OBM_GLYPHS[name]
+            pixels = [[black if c == '#' else face for c in row] for row in rows]
+        elif name in self.OBM_ARROWS:
+            # A 16x16 raised (pushed: sunken) scroll bar button with its arrow
+            size, pushed = 16, name <= 32743
+            pixels = [[face] * size for _ in range(size)]
+            for i in range(size):
+                top_left, bottom_right = (shadow, shadow) if pushed else (white, dark)
+                pixels[0][i] = pixels[i][0] = top_left
+                pixels[size - 1][i] = pixels[i][size - 1] = bottom_right
+            glyph = ['   #   ', '  ###  ', ' ##### ', '#######']
+            kind = self.OBM_ARROWS[name]
+            for y, row in enumerate(glyph):
+                for x, c in enumerate(row):
+                    if c != '#':
+                        continue
+                    px, py = {'up': (x, y), 'down': (x, 3 - y), 'left': (y, x),
+                              'right': (3 - y, x)}[kind]
+                    if kind in ('up', 'down'):
+                        pixels[6 + py][4 + px] = black
+                    else:
+                        pixels[4 + py][6 + px] = black
+        elif name == self.OBM_CHECKBOXES:
+            # 4 x 3 images of 13x13: check boxes (unchecked, checked, pushed,
+            # pushed and checked), radio buttons, three-state boxes
+            pixels = [[face] * 52 for _ in range(39)]
+            check = self.OBM_GLYPHS[32760]
+            for row in range(3):
+                for col in range(4):
+                    ox, oy = col * 13, row * 13
+                    fill = face if col >= 2 else white
+                    for y in range(13):
+                        for x in range(13):
+                            edge = x == 0 or y == 0 or x == 12 or y == 12
+                            inner = x == 1 or y == 1 or x == 11 or y == 11
+                            if row == 1 and (x - 6) ** 2 + (y - 6) ** 2 > 36:
+                                continue  # Radio buttons are round
+                            pixels[oy + y][ox + x] = (shadow if edge and (x == 0 or y == 0)
+                                                      else white if edge else
+                                                      dark if inner and (x == 1 or y == 1)
+                                                      else face if inner else fill)
+                    if col % 2:  # Checked
+                        if row == 1:
+                            for y in range(5, 8):
+                                for x in range(5, 8):
+                                    pixels[oy + y][ox + x] = black
+                        else:
+                            for y, line in enumerate(check):
+                                for x, c in enumerate(line):
+                                    if c == '#':
+                                        pixels[oy + 3 + y][ox + 3 + x] = \
+                                            shadow if row == 2 else black
+        else:
+            return None
+        rgb = b''.join(bytes(color) for line in pixels for color in line)
+        return len(pixels[0]), len(pixels), rgb
+
     def LoadBitmapA(self, args):
-        """LoadBitmapA emulation - a bitmap resource of the program"""
+        """LoadBitmapA emulation - a bitmap resource of the program, or (no
+        hInstance) one of the OBM_* system bitmaps"""
         hInstance, lpBitmapName = args[0], args[1]
         name = self._resource_key(lpBitmapName)
         if not hInstance:
-            log.warning(f"LoadBitmapA: system bitmap {name} is not available")
-            return 0
+            system = self._system_bitmap(name)
+            if system is None:
+                log.warning(f"LoadBitmapA: system bitmap {name} is not available")
+                return 0
+            return self._new_bitmap(*system[:2], 32, system[2])
         resource = self._find_resource(2, name, hInstance)  # RT_BITMAP
         decoded = None
         if resource:
@@ -992,4 +1069,5 @@ class MemoryDCMixin:
         """ValidateRect emulation - mark the window as painted"""
         hWnd = args[0]
         self.painted_windows.add(hWnd)
+        self.paint_pending.discard(hWnd)
         return 1

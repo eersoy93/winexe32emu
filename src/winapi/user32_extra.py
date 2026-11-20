@@ -1000,7 +1000,8 @@ class User32ExtraMixin:
 
     def GetUpdateRect(self, args):
         """GetUpdateRect(hwnd, rect, erase) - the client area until it is painted"""
-        pending = self.IsWindow([args[0]]) and args[0] not in self.painted_windows
+        pending = self.IsWindow([args[0]]) and (args[0] not in self.painted_windows or
+                                                 args[0] in self.paint_pending)
         if args[1]:
             if pending:
                 self.GetClientRect([args[0], args[1]])
@@ -1010,7 +1011,8 @@ class User32ExtraMixin:
 
     def GetUpdateRgn(self, args):
         """GetUpdateRgn(hwnd, region, erase) - NULLREGION or SIMPLEREGION"""
-        return 2 if self.IsWindow([args[0]]) and args[0] not in self.painted_windows else 1
+        return 2 if self.IsWindow([args[0]]) and (args[0] not in self.painted_windows or
+                                                  args[0] in self.paint_pending) else 1
 
     def GetWindowDC(self, args):
         return self.GetDC(args)
@@ -1077,32 +1079,292 @@ class User32ExtraMixin:
     def InvertRect(self, args):
         return 1
 
+    BF_LEFT, BF_TOP, BF_RIGHT, BF_BOTTOM, BF_RECT = 0x1, 0x2, 0x4, 0x8, 0xF
+    BF_MIDDLE, BF_ADJUST, BF_FLAT, BF_MONO = 0x800, 0x2000, 0x4000, 0x8000
+    EDGE_RAISED, EDGE_SUNKEN = 0x5, 0xA
+
+    def _fill(self, hdc, rect, color):
+        left, top, right, bottom = rect
+        if right > left and bottom > top:
+            self._add_shape(hdc, {'type': 'rect', 'rect': rect, 'fill': color, 'pen': None})
+
+    def _edge(self, hdc, rect, edge, flags):
+        """Draw the 3D border of DrawEdge; returns the rectangle inside it"""
+        left, top, right, bottom = rect
+        color = lambda index: self.SYS_COLORS[index]  # noqa: E731
+        if flags & self.BF_MONO:
+            rings = [((0, 0, 0), (0, 0, 0))] if edge & 0xF else []
+        elif flags & self.BF_FLAT:
+            rings = [(color(16), color(16))] if edge & 0xF else []
+        else:
+            rings = []
+            # Outer ring, then inner: (top-left color, bottom-right color)
+            if edge & 0x1:  # BDR_RAISEDOUTER
+                rings.append((color(22), color(21)))
+            elif edge & 0x2:  # BDR_SUNKENOUTER
+                rings.append((color(16), color(20)))
+            if edge & 0x4:  # BDR_RAISEDINNER
+                rings.append((color(20), color(16)))
+            elif edge & 0x8:  # BDR_SUNKENINNER
+                rings.append((color(21), color(22)))
+        for top_left, bottom_right in rings:
+            if flags & self.BF_LEFT:
+                self._fill(hdc, (left, top, left + 1, bottom), top_left)
+            if flags & self.BF_TOP:
+                self._fill(hdc, (left, top, right, top + 1), top_left)
+            if flags & self.BF_RIGHT:
+                self._fill(hdc, (right - 1, top, right, bottom), bottom_right)
+            if flags & self.BF_BOTTOM:
+                self._fill(hdc, (left, bottom - 1, right, bottom), bottom_right)
+            left += 1 if flags & self.BF_LEFT else 0
+            top += 1 if flags & self.BF_TOP else 0
+            right -= 1 if flags & self.BF_RIGHT else 0
+            bottom -= 1 if flags & self.BF_BOTTOM else 0
+        if flags & self.BF_MIDDLE:
+            self._fill(hdc, (left, top, right, bottom), color(15))
+        return left, top, right, bottom
+
     def DrawEdge(self, args):
-        """DrawEdge(hdc, rect, edge, flags) - BF_ADJUST shrinks the rectangle"""
+        """DrawEdge(hdc, rect, edge, flags) - the 3D border (and with
+        BF_MIDDLE the face); BF_ADJUST shrinks the rectangle to its inside"""
         rect = self._read_rect(args[1])
         if rect is None:
             return 0
-        if args[3] & 0x2000:  # BF_ADJUST
-            width = (1 if args[2] & 0x3 else 0) + (1 if args[2] & 0xC else 0)
-            left, top, right, bottom = rect
-            flags = args[3]
-            left += width if flags & 0x1 else 0
-            top += width if flags & 0x2 else 0
-            right -= width if flags & 0x4 else 0
-            bottom -= width if flags & 0x8 else 0
-            self._write_rect(args[1], left, top, right, bottom)
+        if args[0] in self.dc_state:
+            inside = self._edge(args[0], rect, args[2], args[3])
+        else:
+            inside = self._edge_inside(rect, args[2], args[3])
+        if args[3] & self.BF_ADJUST:
+            self._write_rect(args[1], *inside)
         return 1
 
+    def _edge_inside(self, rect, edge, flags):
+        width = (1 if edge & 0x3 else 0) + (1 if edge & 0xC else 0)
+        if flags & (self.BF_FLAT | self.BF_MONO):
+            width = 1 if edge & 0xF else 0
+        left, top, right, bottom = rect
+        return (left + (width if flags & self.BF_LEFT else 0),
+                top + (width if flags & self.BF_TOP else 0),
+                right - (width if flags & self.BF_RIGHT else 0),
+                bottom - (width if flags & self.BF_BOTTOM else 0))
+
+    DFC_CAPTION, DFC_MENU, DFC_SCROLL, DFC_BUTTON = 1, 2, 3, 4
+    DFCS_INACTIVE, DFCS_PUSHED, DFCS_CHECKED = 0x100, 0x200, 0x400
+    DFCS_ADJUSTRECT, DFCS_FLAT, DFCS_MONO = 0x2000, 0x4000, 0x8000
+
+    def _glyph(self, hdc, rect, kind, color):
+        """A small glyph centered in a rectangle: arrows, the check mark, the close X"""
+        left, top, right, bottom = rect
+        cx, cy = (left + right) // 2, (top + bottom) // 2
+        size = max(2, min(right - left, bottom - top) // 4)
+        if kind in ('up', 'down', 'left', 'right'):
+            points = {'up': [(cx - size, cy + size // 2), (cx + size, cy + size // 2),
+                             (cx, cy - size // 2 - 1)],
+                      'down': [(cx - size, cy - size // 2), (cx + size, cy - size // 2),
+                               (cx, cy + size // 2 + 1)],
+                      'left': [(cx + size // 2, cy - size), (cx + size // 2, cy + size),
+                               (cx - size // 2 - 1, cy)],
+                      'right': [(cx - size // 2, cy - size), (cx - size // 2, cy + size),
+                                (cx + size // 2 + 1, cy)]}[kind]
+            self._add_shape(hdc, {'type': 'polygon', 'points': points, 'fill': color,
+                                  'pen': (color, 1)})
+        elif kind == 'check':
+            self._add_shape(hdc, {'type': 'polyline', 'pen': (color, 2), 'points': [
+                (cx - size, cy), (cx - size // 2, cy + size // 2 + 1), (cx + size, cy - size)]})
+        elif kind == 'close':
+            for a, b in (((cx - size, cy - size), (cx + size, cy + size)),
+                         ((cx - size, cy + size), (cx + size, cy - size))):
+                self._add_shape(hdc, {'type': 'polyline', 'points': [a, b], 'pen': (color, 2)})
+        elif kind == 'dot':
+            self._add_shape(hdc, {'type': 'ellipse', 'rect': (cx - 2, cy - 2, cx + 2, cy + 2),
+                                  'fill': color, 'pen': None})
+
     def DrawFrameControl(self, args):
-        return 1
+        """DrawFrameControl(hdc, rect, type, state) - push buttons, check boxes,
+        radio buttons, scroll arrows and caption buttons in the 3D look"""
+        hdc, lprc, kind, state = args[:4]
+        rect = self._read_rect(lprc) if lprc else None
+        if rect is None or hdc not in self.dc_state:
+            return 0
+        style = state & 0xFF
+        text = self.SYS_COLORS[17] if state & self.DFCS_INACTIVE else self.SYS_COLORS[18]
+        pushed = state & self.DFCS_PUSHED
+
+        def button_face():
+            if state & (self.DFCS_FLAT | self.DFCS_MONO):
+                flags = self.BF_RECT | self.BF_MIDDLE | (
+                    self.BF_FLAT if state & self.DFCS_FLAT else self.BF_MONO)
+                return self._edge(hdc, rect, self.EDGE_RAISED, flags)
+            return self._edge(hdc, rect, self.EDGE_SUNKEN if pushed else self.EDGE_RAISED,
+                              self.BF_RECT | self.BF_MIDDLE)
+
+        if kind == self.DFC_BUTTON and style & 0x10:  # DFCS_BUTTONPUSH
+            inside = button_face()
+            if state & self.DFCS_ADJUSTRECT:
+                self._write_rect(lprc, *inside)
+            return 1
+        if kind == self.DFC_BUTTON:
+            left, top, right, bottom = rect
+            side = min(right - left, bottom - top)
+            box = (left, top + (bottom - top - side) // 2, left + side,
+                   top + (bottom - top - side) // 2 + side)
+            white = self.SYS_COLORS[15] if state & (self.DFCS_INACTIVE | self.DFCS_PUSHED) \
+                else self.SYS_COLORS[5]
+            if style & 0x4 or style in (0x1, 0x2):  # DFCS_BUTTONRADIO(IMAGE/MASK)
+                self._add_shape(hdc, {'type': 'ellipse', 'rect': box, 'fill': white,
+                                      'pen': (self.SYS_COLORS[16], 1)})
+                if state & self.DFCS_CHECKED:
+                    self._glyph(hdc, box, 'dot', text)
+                return 1
+            inside = self._edge(hdc, box, self.EDGE_SUNKEN, self.BF_RECT)
+            self._fill(hdc, inside, white)
+            if state & self.DFCS_CHECKED:
+                self._glyph(hdc, inside, 'check', text)
+            return 1
+        if kind == self.DFC_SCROLL:
+            glyphs = {0: 'up', 1: 'down', 2: 'left', 3: 'right', 5: 'down'}
+            if style in glyphs:
+                inside = button_face()
+                if pushed:
+                    inside = tuple(v + 1 for v in inside)
+                self._glyph(hdc, inside, glyphs[style], text)
+            return 1
+        if kind == self.DFC_CAPTION:
+            inside = button_face()
+            glyph = {0: 'close'}.get(style)
+            if glyph:
+                self._glyph(hdc, inside, glyph, text)
+            elif style == 1:  # DFCS_CAPTIONMIN
+                left, top, right, bottom = inside
+                self._fill(hdc, (left + 3, bottom - 4, right - 5, bottom - 2), text)
+            elif style in (2, 3):  # DFCS_CAPTIONMAX / DFCS_CAPTIONRESTORE
+                left, top, right, bottom = inside
+                self._add_shape(hdc, {'type': 'rect', 'rect': (left + 2, top + 2, right - 2,
+                                                               bottom - 2),
+                                      'fill': None, 'pen': (text, 1)})
+            return 1
+        if kind == self.DFC_MENU:
+            glyph = {0: 'right', 1: 'check', 2: 'dot', 3: 'dot'}.get(style)
+            if glyph:
+                self._glyph(hdc, rect, glyph, text)
+            return 1
+        return 0
 
     def DrawCaption(self, args):
         return 1
 
-    def GrayStringA(self, args):
+    # DrawState image types and states
+    DST_COMPLEX, DST_TEXT, DST_PREFIXTEXT, DST_ICON, DST_BITMAP = range(5)
+    DSS_UNION, DSS_DISABLED, DSS_MONO, DSS_HIDEPREFIX, DSS_PREFIXONLY, DSS_RIGHT = (
+        0x10, 0x20, 0x80, 0x200, 0x400, 0x8000)
+
+    def _draw_state_text(self, hdc, text, x, y, cx, cy, draw_flags, color):
+        """Text of DrawState/GrayString at (x, y) in a color, on a transparent
+        background (DrawText formatting: draw_flags)"""
+        state = self.dc_state.get(hdc)
+        if state is None:
+            return 0
+        if not cx or not cy:
+            width, height = self._text_extent(hdc, self._strip_prefixes(text)[0]
+                                              if not draw_flags & self.DT_NOPREFIX else text)
+            cx, cy = cx or width, cy or height
+        rect = self.emu.heap_alloc(16)
+        if not rect:
+            return 0
+        saved = {key: state.get(key) for key in ('text_color', 'bk_mode')}
+        try:
+            state['text_color'], state['bk_mode'] = color, 1  # TRANSPARENT
+            self._write_rect(rect, x, y, x + cx, y + cy)
+            self._draw_text(hdc, text, rect, draw_flags | self.DT_SINGLELINE | self.DT_NOCLIP)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    state.pop(key, None)
+                else:
+                    state[key] = value
+            self.emu.heap_free(rect)
         return 1
 
-    GrayStringW = DrawStateA = DrawStateW = GrayStringA
+    def _call_offset(self, hdc, x, y, func, args):
+        """Call a program's drawing callback with the DC's origin moved to (x, y)"""
+        self.OffsetViewportOrgEx([hdc, x & 0xFFFFFFFF, y & 0xFFFFFFFF, 0])
+        try:
+            return self.emu.call_callback(func, args)
+        finally:
+            self.OffsetViewportOrgEx([hdc, -x & 0xFFFFFFFF, -y & 0xFFFFFFFF, 0])
+
+    def DrawStateA(self, args, wide=False):
+        """DrawStateA/W(hdc, hbrFore, lpOutputFunc, lData, wData, x, y, cx, cy,
+        uFlags) - text (DST_TEXT, DST_PREFIXTEXT with its & mnemonics), an
+        icon, a bitmap or the program's own drawing (DST_COMPLEX), normal or
+        disabled (embossed gray)"""
+        hdc, _, func, data, length = args[:5]
+        x, y, cx, cy = self._read_signed_args(args, 5, 4)
+        flags = args[9]
+        kind = flags & 0xF
+        disabled = flags & (self.DSS_DISABLED | self.DSS_UNION)
+        if hdc not in self.dc_state:
+            return 0
+        if kind == self.DST_COMPLEX and func:
+            self._call_offset(hdc, x, y, func, [hdc, data, length, cx, cy])
+            return 1
+        if kind in (self.DST_TEXT, self.DST_PREFIXTEXT) or (kind == self.DST_COMPLEX and data):
+            text = self._read_text(data, wide) if data else ''
+            if 0 < length < len(text):
+                text = text[:length]
+            draw_flags = self.DT_RIGHT if flags & self.DSS_RIGHT else 0
+            if kind != self.DST_PREFIXTEXT:
+                draw_flags |= self.DT_NOPREFIX
+            if flags & self.DSS_HIDEPREFIX:
+                draw_flags |= self.DT_HIDEPREFIX
+            if flags & self.DSS_PREFIXONLY:
+                draw_flags |= self.DT_PREFIXONLY
+            if disabled:
+                # Embossed: a white copy one pixel down-right under a gray one
+                self._draw_state_text(hdc, text, x + 1, y + 1, cx, cy, draw_flags,
+                                      (255, 255, 255))
+                return self._draw_state_text(hdc, text, x, y, cx, cy, draw_flags,
+                                             (128, 128, 128))
+            color = self.dc_state[hdc].get('text_color') or (0, 0, 0)
+            return self._draw_state_text(hdc, text, x, y, cx, cy, draw_flags, color)
+        if kind == self.DST_ICON:
+            return 1 if self._draw_icon(hdc, x, y, data, max(cx, 0), max(cy, 0)) else 0
+        if kind == self.DST_BITMAP:
+            bitmap = self.gdi_objects.get(data)
+            if bitmap is None or bitmap.get('type') != 'bitmap':
+                return 0
+            cx, cy = cx or bitmap['width'], cy or bitmap['height']
+            memory = self.CreateCompatibleDC([hdc])
+            if not memory:
+                return 0
+            previous = self.SelectObject([memory, data])
+            self.BitBlt([hdc, x & 0xFFFFFFFF, y & 0xFFFFFFFF, cx, cy, memory, 0, 0,
+                         0x00CC0020])  # SRCCOPY
+            self.SelectObject([memory, previous])
+            self.DeleteDC([memory])
+            return 1
+        return 0
+
+    def DrawStateW(self, args):
+        return self.DrawStateA(args, wide=True)
+
+    def GrayStringA(self, args, wide=False):
+        """GrayStringA/W(hdc, hBrush, lpOutputFunc, lpData, nCount, X, Y, nWidth,
+        nHeight) - gray text, or the program's output function's drawing"""
+        hdc, _, func, data, count = args[:5]
+        x, y, cx, cy = self._read_signed_args(args, 5, 4)
+        if hdc not in self.dc_state:
+            return 0
+        if func:
+            return 1 if self._call_offset(hdc, x, y, func, [hdc, data, count]) else 0
+        text = self._read_text(data, wide) if data else ''
+        if 0 < count < len(text):
+            text = text[:count]
+        return self._draw_state_text(hdc, text, x, y, cx, cy, self.DT_NOPREFIX,
+                                     (128, 128, 128))
+
+    def GrayStringW(self, args):
+        return self.GrayStringA(args, wide=True)
 
     # ---------- Dialogs ----------
 

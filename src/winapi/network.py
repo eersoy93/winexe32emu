@@ -622,6 +622,13 @@ class NetworkMixin:
     WNetGetResourceParentW = WNetGetResourceInformationA = WNetGetResourceParentA
     WNetGetResourceInformationW = WNetGetResourceParentA
 
+    def WNetGetNetworkInformationA(self, args):
+        """WNetGetNetworkInformation(A/W)(lpProvider, lpNetInfoStruct) -
+        there is no network provider"""
+        return self.ERROR_NO_NETWORK
+
+    WNetGetNetworkInformationW = WNetGetNetworkInformationA
+
     def WNetGetLastErrorW(self, args):
         """WNetGetLastErrorW - no network error happened"""
         if args[0]:

@@ -60,6 +60,7 @@ class CoreMixin:
         'CreateStatusWindowA': 4, 'CreateStatusWindowW': 4, 'CreateToolbarEx': 13,
         'DllGetVersion': 1, 'ImageList_Add': 3, 'ImageList_AddMasked': 3,
         'ImageList_Create': 5, 'ImageList_Destroy': 1, 'ImageList_Draw': 6,
+        'ImageList_DrawEx': 10,
         'ImageList_GetIcon': 3, 'ImageList_GetIconSize': 3, 'ImageList_GetImageCount': 1,
         'ImageList_Remove': 2, 'ImageList_ReplaceIcon': 3, 'ImageList_SetBkColor': 2,
         'ImageList_SetImageCount': 2, 'InitCommonControls': 0, 'InitCommonControlsEx': 1,
@@ -222,6 +223,9 @@ class CoreMixin:
         'VariantInit': 1,
         # shell32
         'ExtractIconA': 3, 'ExtractIconExA': 5, 'ExtractIconExW': 5, 'SHBrowseForFolderA': 1,
+        # (the shell32 names without A/W are the ANSI functions)
+        'ExtractIconEx': 5, 'SHGetFileInfo': 5, 'SHGetPathFromIDList': 2,
+        'DllGetClassObject': 3, 'DllCanUnloadNow': 0,
         'SHBrowseForFolderW': 1, 'SHChangeNotify': 4, 'ShellExecuteA': 6,
         'ShellExecuteExA': 1, 'ShellExecuteExW': 1, 'ShellExecuteW': 6, 'SHFileOperationA': 1,
         'SHFileOperationW': 1, 'SHGetDesktopFolder': 1, 'SHGetFileInfoA': 5,
@@ -311,6 +315,7 @@ class CoreMixin:
         'WNetOpenEnumW': 5, 'WNetEnumResourceA': 4, 'WNetEnumResourceW': 4,
         'WNetCloseEnum': 1, 'WNetGetResourceParentA': 3, 'WNetGetResourceParentW': 3,
         'WNetGetResourceInformationA': 4, 'WNetGetResourceInformationW': 4,
+        'WNetGetNetworkInformationA': 2, 'WNetGetNetworkInformationW': 2,
         'VerFindFileA': 8, 'VerInstallFileA': 8,
         'CreateDIBitmap': 6, 'CreateDiscardableBitmap': 3, 'CreateScalableFontResourceA': 4,
         'CreateScalableFontResourceW': 4, 'DPtoLP': 3, 'GetMapMode': 1, 'LPtoDP': 3,
@@ -497,6 +502,7 @@ class CoreMixin:
         'OffsetRgn': 3, 'CreatePolygonRgn': 3, 'FillRgn': 3, 'InvertRgn': 2,
         'CreateBitmapIndirect': 1, 'GetBitmapBits': 3, 'SetBitmapBits': 3,
         'SetBitmapDimensionEx': 4, 'GetBitmapDimensionEx': 2, 'SetDIBitsToDevice': 12,
+        'TranslateCharsetInfo': 3,
         'GetTextFaceA': 3, 'GetTextFaceW': 3, 'GetKerningPairsA': 3, 'GetKerningPairsW': 3,
         'GetOutlineTextMetricsA': 3, 'GetOutlineTextMetricsW': 3, 'GetGlyphOutlineA': 7,
         'GetGlyphOutlineW': 7, 'CreateICA': 4, 'ResetDCA': 2, 'ResetDCW': 2, 'StartDocA': 2,
@@ -851,6 +857,9 @@ class CoreMixin:
         self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
         self.sent_messages = {}  # Guest thread id -> SendMessage requests from other threads
         self.painted_windows = set()  # Windows that received WM_PAINT
+        # Windows whose WM_PAINT is being handled before BeginPaint or
+        # ValidateRect: their update region is still the client area
+        self.paint_pending = set()
         self.dirty_controls = {}  # Owner-draw controls waiting for WM_DRAWITEM (ordered)
         self._drawitem_buf = 0
         self.quit_requested = False
@@ -930,6 +939,11 @@ class CoreMixin:
 
         # Shell item ID lists (SHBrowseForFolder): PIDL address -> Windows path
         self.pidls = {}
+        # GMEM_MOVEABLE/LMEM_MOVEABLE blocks: handle -> {'ptr', 'locks'}. Like
+        # Windows, a moveable handle points to its block's address (code such
+        # as the Office 95 spelling checker reads the block through it).
+        self.moveable_handles = {}
+        self.moveable_by_pointer = {}
 
         # Common controls: image lists (handle -> {'cx', 'cy', 'images'}),
         # the system image lists, icons, accelerator tables

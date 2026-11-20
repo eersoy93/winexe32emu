@@ -469,14 +469,16 @@ class OleStorageMixin:
         info = state['info']
         data = state['entry'].data
         handle = info['hglobal']
-        size = self.emu.heap_block_size(handle) if handle else None
+        size = self._hglobal_size(handle) if handle else None
         if size is None or size < len(data):
+            # (a moveable block keeps its handle)
             new = self.GlobalReAlloc([handle, max(len(data), 1), 0x2]) if handle else \
                 self.GlobalAlloc([0x2, max(len(data), 1)])
             if not new:
                 return False
             info['hglobal'] = new
-        return self._mem_write(info['hglobal'], bytes(data)) if data else True
+        return self._mem_write(self._hglobal_pointer(info['hglobal']), bytes(data)) if data \
+            else True
 
     def _com_stream(self, method, wide, args):
         """IStream methods: a docfile stream or a stream on global memory"""
@@ -611,10 +613,11 @@ class OleStorageMixin:
             return self.E_INVALIDARG
         entry = compound_file.Entry('', False)
         if handle:
-            size = self.emu.heap_block_size(handle)
+            size = self._hglobal_size(handle)
             if size is None:
                 return self.E_INVALIDARG
-            entry.data = bytearray(self.emu.uc.mem_read(handle, size))
+            entry.data = bytearray(self.emu.uc.mem_read(self._hglobal_pointer(handle), size)) \
+                if size else bytearray()
         else:
             handle = self.GlobalAlloc([0x2, 1])  # GMEM_MOVEABLE
             if not handle:

@@ -173,6 +173,13 @@ class MenusMixin:
             return None
         return win.menu[index].get('items') or [], rects[index].x, rects[index].bottom, win
 
+    def _post_enter_menu(self, win):
+        """The menu bar's menu mode starts: WM_INITMENU with the menu bar
+        (Word, for one, decides there which commands are available)"""
+        if win is not None and win.owner is not None and self._is_app_window(win.hwnd):
+            win.owner.post_window_message(win.hwnd, winapi.WinAPIHandler.WM_INITMENU,
+                                          win.menu_handle, 0)
+
     def _post_init_menu(self, win, hmenu, index):
         if hmenu and win is not None and win.owner is not None and self._is_app_window(win.hwnd):
             win.owner.post_window_message(win.hwnd, winapi.WinAPIHandler.WM_INITMENUPOPUP, hmenu,

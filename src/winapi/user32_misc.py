@@ -401,20 +401,31 @@ class User32MiscMixin:
             self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
             return 0
         handle = self.system_menus.get(hwnd)
+        child = bool(self.gui.windows[hwnd].parent)
         if bRevert:
             if handle:
-                self.menus[handle] = self._standard_system_menu()
+                self.menus[handle] = self._standard_system_menu(child)
             return 0
         if handle is None:
             handle = self.get_next_handle()
-            self.menus[handle] = self._standard_system_menu()
+            self.menus[handle] = self._standard_system_menu(child)
             self.system_menus[hwnd] = handle
         return handle
 
-    def _standard_system_menu(self):
+    SC_TASKLIST = 0xF130
+
+    def _standard_system_menu(self, child=False):
+        """Items of the standard window menu. A child window's (the document
+        windows of Word's own MDI) is the Windows 3.x one, with "Switch To...":
+        Word 6/95 turn that item into "Next Window" and fail without it."""
         items = [('&Restore', self.SC_RESTORE), ('&Move', self.SC_MOVE),
                  ('&Size', self.SC_SIZE), ('Mi&nimize', self.SC_MINIMIZE),
-                 ('Ma&ximize', self.SC_MAXIMIZE), (None, 0), ('&Close\tAlt+F4', self.SC_CLOSE)]
+                 ('Ma&ximize', self.SC_MAXIMIZE), (None, 0)]
+        if child:
+            items += [('&Close\tCtrl+F4', self.SC_CLOSE), (None, 0),
+                      ('S&witch To...\tCtrl+Esc', self.SC_TASKLIST)]
+        else:
+            items.append(('&Close\tAlt+F4', self.SC_CLOSE))
         return [{'flags': self.MF_SEPARATOR if text is None else 0, 'id': cmd,
                  'text': text or '', 'submenu': 0} for text, cmd in items]
 
@@ -592,10 +603,11 @@ class User32MiscMixin:
     def SetClipboardData(self, args):
         """SetClipboardData emulation - copies the global memory block"""
         fmt, handle = args[0], args[1]
-        size = self.emu.heap_block_size(handle) if handle else None
+        size = self._hglobal_size(handle) if handle else None
         if size is None:
             return 0
-        winapi.WinAPIHandler.clipboard_data[fmt] = bytes(self.emu.uc.mem_read(handle, size))
+        winapi.WinAPIHandler.clipboard_data[fmt] = bytes(
+            self.emu.uc.mem_read(self._hglobal_pointer(handle), size)) if size else b''
         return handle
 
     def GetClipboardData(self, args):

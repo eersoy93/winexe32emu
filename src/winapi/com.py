@@ -410,7 +410,9 @@ class ComMixin:
             if not ppv:
                 return self.E_POINTER
             self._mem_write(ppv, struct.pack('<I', 0))
-            path = self.pidls.get(pidl)
+            path = self._pidl_path(pidl)
+            if path == '':  # The empty list: this folder itself
+                return self._com_query_new(self._shell_folder_object(state['path']), riid, ppv)
             if self._is_my_computer(path):
                 return self._com_query_new(self._shell_folder_object(self.MY_COMPUTER_PATH),
                                            riid, ppv)
@@ -426,8 +428,8 @@ class ComMixin:
             self._mem_write(ppenum, struct.pack('<I', enum))
             return self.S_OK
         if method == 'CompareIDs':
-            first = self.pidls.get(args[2], '').lower()
-            second = self.pidls.get(args[3], '').lower()
+            first = (self._pidl_path(args[2]) or '').lower()
+            second = (self._pidl_path(args[3]) or '').lower()
             return (first > second) - (first < second) & 0xFFFF
         if method == 'GetAttributesOf':
             _, count, apidl, inout = args[:4]
@@ -435,7 +437,7 @@ class ComMixin:
                 return self.E_INVALIDARG
             wanted = struct.unpack('<I', self.emu.uc.mem_read(inout, 4))[0]
             for pidl in self._read_struct(apidl, f'<{count}I') if count else ():
-                wanted &= self._shell_item_attributes(self.pidls.get(pidl, ''))
+                wanted &= self._shell_item_attributes(self._pidl_file_path(pidl) or '')
             self._mem_write(inout, struct.pack('<I', wanted))
             return self.S_OK
         if method == 'GetUIObjectOf':
@@ -443,7 +445,7 @@ class ComMixin:
             if not ppv:
                 return self.E_POINTER
             self._mem_write(ppv, struct.pack('<I', 0))
-            paths = [self.pidls.get(pidl) for pidl in
+            paths = [self._pidl_file_path(pidl) for pidl in
                      (self._read_struct(apidl, f'<{count}I') if count and apidl else ())]
             if not paths or None in paths:
                 return self.E_INVALIDARG
@@ -457,9 +459,11 @@ class ComMixin:
             return self._com_query_new(pointers[self.IID_IUNKNOWN], riid, ppv)
         if method == 'GetDisplayNameOf':
             _, pidl, flags, strret = args[:4]
-            path = self.pidls.get(pidl)
+            path = self._pidl_path(pidl)
             if path is None or not strret:
                 return self.E_INVALIDARG
+            if path == '':  # The desktop
+                path = state['path'] or self._shell_folder(0)
             # SHGDN_FORPARSING without SHGDN_INFOLDER: the full path
             if flags & 0x8000 and not flags & 0x1:
                 name = path
@@ -705,7 +709,7 @@ class ComMixin:
             self._mem_write(args[1], struct.pack('<I', pidl))
             return self.S_OK if pidl else self.S_FALSE
         if method == 'SetIDList':
-            path = self.pidls.get(args[1])
+            path = self._pidl_file_path(args[1])
             if path is None:
                 return self.E_INVALIDARG
             state['path'], state['dirty'] = path, True

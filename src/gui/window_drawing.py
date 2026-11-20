@@ -99,11 +99,19 @@ class WindowDrawingMixin:
         y = bar.y + (bar.height - h) // 2
         close = pygame.Rect(bar.right - 2 - w, y, w, h)
         rects = {'close': close}
-        if not window.is_dialog:
+        if not window.is_dialog and not self._popup_without_size_boxes(window):
             # Maximize and minimize sit together, two pixels left of close
             rects['max'] = pygame.Rect(close.x - 2 - w, y, w, h)
             rects['min'] = pygame.Rect(close.x - 2 - 2 * w, y, w, h)
         return rects
+
+    WS_MINIMIZEBOX, WS_MAXIMIZEBOX = 0x20000, 0x10000  # (WS_POPUP: PseudoWindowsGUI)
+
+    def _popup_without_size_boxes(self, window):
+        """A program's popup window without WS_MINIMIZEBOX and WS_MAXIMIZEBOX
+        (a dialog it made itself, such as Word's): only the close button"""
+        return (window.owner is not None and window.style & self.WS_POPUP and
+                not window.style & (self.WS_MINIMIZEBOX | self.WS_MAXIMIZEBOX))
 
     def _draw_title_bar(self, window, is_active):
         """Draw a window's caption: a gradient bar, the program icon, the title
@@ -170,7 +178,8 @@ class WindowDrawingMixin:
         """Draw the small program icon at the left of a title bar (dialogs have
         none); returns the x where the title text starts"""
         bar = self._title_rect(window)
-        if window.is_dialog:
+        if window.is_dialog or (window.owner is not None and window.style & self.WS_POPUP and
+                                window.ex_style & self.WS_EX_DLGMODALFRAME):
             return bar.x + 4
         icon = self._exe_icon(window.icon_path, self.CAPTION_ICON_SIZE)[0]
         self.screen.blit(icon, (bar.x + 2, bar.centery - self.CAPTION_ICON_SIZE // 2))

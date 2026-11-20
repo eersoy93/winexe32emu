@@ -140,6 +140,28 @@ class WindowManagerMixin:
             self.open_menu = None
 
     @gui_locked
+    def raise_window(self, hwnd):
+        """Bring a top-level window to the top of the Z order, with the
+        windows it owns (directly or not) above it, like Windows"""
+        if hwnd not in self.z_order:
+            return
+        self.z_order.remove(hwnd)
+        self.z_order.append(hwnd)
+        raised = {hwnd}
+        for other in list(self.z_order[:-1]):
+            win = self.windows.get(other)
+            owner = win.owner_hwnd if win is not None else 0
+            seen = set()
+            while owner and owner not in raised and owner not in seen:
+                seen.add(owner)
+                owner_win = self.windows.get(owner)
+                owner = owner_win.owner_hwnd if owner_win is not None else 0
+            if owner in raised:
+                self.z_order.remove(other)
+                self.z_order.append(other)
+                raised.add(other)
+
+    @gui_locked
     def get_next_hwnd(self):
         """Get new HWND"""
         hwnd = self.next_hwnd

@@ -253,6 +253,9 @@ class User32WindowsMixin:
             # Save class_name to window (for finding WndProc)
             if hwnd in self.gui.windows:
                 self.gui.windows[hwnd].class_name = class_name
+                if not dwStyle & self.WS_CHILD:
+                    self.gui.windows[hwnd].ex_style = dwExStyle
+                    self.gui.windows[hwnd].owner_hwnd = self._top_level_window(hWndParent)
                 if hInstance:  # GWL_HINSTANCE (a DLL finds its resources with it)
                     self.window_longs.setdefault(hwnd, {})[-6] = hInstance
                 # Like Windows, the class the module hInstance registered comes
@@ -309,6 +312,26 @@ class User32WindowsMixin:
             hwnd = self.get_next_handle()
 
         return hwnd
+
+    def _top_level_window(self, hwnd):
+        """The top-level window a window or control belongs to (the owner
+        Windows records for hWndParent of a top-level window); 0 if none"""
+        if not self.gui:
+            return 0
+        seen = set()
+        while hwnd and hwnd not in seen:
+            seen.add(hwnd)
+            control = self.gui.controls.get(hwnd)
+            if control is not None:
+                hwnd = control.parent_hwnd
+                continue
+            win = self.gui.windows.get(hwnd)
+            if win is None:
+                return 0
+            if not win.parent:
+                return hwnd
+            hwnd = win.parent
+        return 0
 
     def CreateWindowExW(self, args):
         return self.CreateWindowExA(args, wide=True)

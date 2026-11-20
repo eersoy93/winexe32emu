@@ -37,12 +37,23 @@ class TaskbarMixin:
         return pygame.Rect(self.width - width - 2, self.height - self.TASKBAR_H + 3,
                            width, self.TASKBAR_H - 6)
 
+    WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = 0x80, 0x40000
+
+    def _has_taskbar_button(self, win):
+        """Like Windows: owned windows (an application's message boxes and
+        dialogs) and tool windows have no taskbar button, unless they have
+        WS_EX_APPWINDOW"""
+        if win.ex_style & self.WS_EX_APPWINDOW:
+            return True
+        return not win.owner_hwnd and not win.ex_style & self.WS_EX_TOOLWINDOW
+
     def _taskbar_buttons(self):
         """[(hwnd, window, rect)] of the taskbar buttons: top-level windows
         (not dialogs) in creation order, so the buttons keep their places"""
         top_level = set(self.z_order)
         windows = [(hwnd, win) for hwnd, win in self.windows.items()
-                   if hwnd in top_level and win.visible and not win.is_dialog]
+                   if hwnd in top_level and win.visible and not win.is_dialog and
+                   self._has_taskbar_button(win)]
         if not windows:
             return []
         left = self._start_button_rect().right + 6
@@ -199,8 +210,7 @@ class TaskbarMixin:
                 self._activate_next_window(skip_dialogs=True)
                 return
             self.active_window = hwnd
-            self.z_order.remove(hwnd)
-            self.z_order.append(hwnd)
+            self.raise_window(hwnd)
             return
 
     def _activate_next_window(self, skip_dialogs=False):

@@ -307,38 +307,103 @@ class Kernel32MiscMixin:
     def lstrcmpiW(self, args):
         return self.lstrcmpA(args, wide=True, ignore_case=True)
 
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GMEM_DISCARDED = 0x0002, 0x0040, 0x4000
+
     def GlobalAlloc(self, args):
-        """GlobalAlloc emulation"""
+        """GlobalAlloc/LocalAlloc emulation: a fixed block is its own handle;
+        a moveable one gets a handle whose first DWORD is the block's address
+        (0 for a discarded, zero-size block), like on Windows"""
         uFlags = args[0]
         dwBytes = args[1]
 
-        addr = self.emu.heap_alloc(dwBytes)
+        addr = self.emu.heap_alloc(dwBytes) if dwBytes or not uFlags & self.GMEM_MOVEABLE \
+            else 0
 
         # Zero memory if GMEM_ZEROINIT (0x0040) flag is set
-        if addr and uFlags & 0x0040:
+        if addr and uFlags & self.GMEM_ZEROINIT:
             self.emu.uc.mem_write(addr, b'\x00' * dwBytes)
+
+        if uFlags & self.GMEM_MOVEABLE and (addr or not dwBytes):
+            handle = self.emu.heap_alloc(8)
+            if not handle:
+                if addr:
+                    self.emu.heap_free(addr)
+                return 0
+            self._mem_write(handle, struct.pack('<II', addr, 0))
+            self.moveable_handles[handle] = {'ptr': addr, 'locks': 0}
+            if addr:
+                self.moveable_by_pointer[addr] = handle
+            log.debug(f"GlobalAlloc(0x{uFlags:x}, {dwBytes}) -> 0x{handle:08x} "
+                      f"(block 0x{addr:08x})")
+            return handle
 
         log.debug(f"GlobalAlloc(0x{uFlags:x}, {dwBytes}) -> 0x{addr:08x}")
         return addr
+
+    def _hglobal_pointer(self, handle):
+        """Address of the block of an HGLOBAL/HLOCAL (a fixed block's
+        handle is its address); 0 for a discarded moveable block"""
+        info = self.moveable_handles.get(handle)
+        return handle if info is None else info['ptr']
+
+    def _hglobal_size(self, handle):
+        """Bytes of an HGLOBAL's block (0 when discarded), None if invalid"""
+        info = self.moveable_handles.get(handle)
+        if info is not None and not info['ptr']:
+            return 0
+        pointer = self._hglobal_pointer(handle)
+        return self.emu.heap_block_size(pointer) if pointer else None
+
+    def _set_moveable_pointer(self, handle, pointer):
+        """A moveable block moved (or was discarded)"""
+        info = self.moveable_handles[handle]
+        if info['ptr']:
+            self.moveable_by_pointer.pop(info['ptr'], None)
+        info['ptr'] = pointer
+        if pointer:
+            self.moveable_by_pointer[pointer] = handle
+        self._mem_write(handle, struct.pack('<I', pointer))
 
     def GlobalFree(self, args):
         """GlobalFree emulation"""
         hMem = args[0]
         log.debug(f"GlobalFree(0x{hMem:08x})")
+        info = self.moveable_handles.pop(hMem, None)
+        if info is not None:
+            if info['ptr']:
+                self.moveable_by_pointer.pop(info['ptr'], None)
+                self.emu.heap_free(info['ptr'])
+            self.emu.heap_free(hMem)
+            return 0
         # NULL on success, the handle on failure
         return 0 if not hMem or self.emu.heap_free(hMem) else hMem
 
     def GlobalLock(self, args):
-        """GlobalLock emulation"""
+        """GlobalLock emulation - the block's address"""
         hMem = args[0]
         log.debug(f"GlobalLock(0x{hMem:08x})")
-        return hMem  # Return same address
+        info = self.moveable_handles.get(hMem)
+        if info is None:
+            return hMem  # A fixed block
+        if not info['ptr']:
+            self._last_error = 158  # ERROR_DISCARDED
+            return 0
+        info['locks'] = min(info['locks'] + 1, 0xFF)
+        return info['ptr']
 
     def GlobalUnlock(self, args):
-        """GlobalUnlock emulation"""
+        """GlobalUnlock emulation - nonzero while the block stays locked"""
         hMem = args[0]
         log.debug(f"GlobalUnlock(0x{hMem:08x})")
-        return 1
+        info = self.moveable_handles.get(hMem)
+        if info is None:
+            return 1
+        self._last_error = 0
+        if info['locks']:
+            info['locks'] -= 1
+        else:
+            self._last_error = 158  # ERROR_NOT_LOCKED
+        return 1 if info['locks'] else 0
 
     def LocalAlloc(self, args):
         """LocalAlloc emulation"""

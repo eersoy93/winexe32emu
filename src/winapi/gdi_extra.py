@@ -466,6 +466,34 @@ class GdiExtraMixin:
 
     GetGlyphOutlineW = GetGlyphOutlineA
 
+    # (character set, ANSI code page, bit of FONTSIGNATURE.fsCsb[0])
+    CHARSETS = [(0, 1252, 0), (238, 1250, 1), (204, 1251, 2), (161, 1253, 3),
+                (162, 1254, 4), (177, 1255, 5), (178, 1256, 6), (186, 1257, 7),
+                (163, 1258, 8), (222, 874, 16), (128, 932, 17), (134, 936, 18),
+                (129, 949, 19), (136, 950, 20), (130, 1361, 21), (2, 42, 31)]
+    TCI_SRCCHARSET, TCI_SRCCODEPAGE, TCI_SRCFONTSIG = 1, 2, 3
+
+    def TranslateCharsetInfo(self, args):
+        """TranslateCharsetInfo(lpSrc, lpCs, dwFlags) - CHARSETINFO
+        (ciCharset, ciACP, FONTSIGNATURE) of a character set, code page
+        (lpSrc is the value itself) or font signature (lpSrc: its fsCsb)"""
+        source, out, flags = args[:3]
+        if flags == self.TCI_SRCFONTSIG:
+            try:
+                source = struct.unpack('<I', self.emu.uc.mem_read(source, 4))[0]
+            except UcError:
+                return 0
+            found = [entry for entry in self.CHARSETS if source & (1 << entry[2])]
+        else:
+            column = {self.TCI_SRCCHARSET: 0, self.TCI_SRCCODEPAGE: 1}.get(flags)
+            found = [entry for entry in self.CHARSETS
+                     if column is not None and entry[column] == source]
+        if not found or not out:
+            return 0
+        charset, codepage, bit = found[0]
+        return 1 if self._mem_write(out, struct.pack('<II4I2I', charset, codepage,
+                                                     0, 0, 0, 0, 1 << bit, 0)) else 0
+
     # ---------- Printing: the computer has no printer ----------
 
     SP_ERROR = 0xFFFFFFFF

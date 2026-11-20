@@ -565,10 +565,34 @@ class Kernel32ExtraMixin:
     # ---------- Memory ----------
 
     def LocalReAlloc(self, args):
-        """LocalReAlloc/GlobalReAlloc(memory, size, flags)"""
+        """LocalReAlloc/GlobalReAlloc(memory, size, flags) - a moveable
+        block keeps its handle"""
         memory, size, flags = args[0], args[1], args[2]
         if flags & 0x80:  # LMEM_MODIFY / GMEM_MODIFY: only the flags change
             return memory
+        info = self.moveable_handles.get(memory)
+        if info is not None:
+            if not info['ptr']:  # Discarded: a new block
+                new = self.emu.heap_alloc(size) if size else 0
+                if size and not new:
+                    self._last_error = 8
+                    return 0
+                if new and flags & 0x40:
+                    self._mem_write(new, b'\x00' * size)
+            elif not size:  # Discard it
+                self.moveable_by_pointer.pop(info['ptr'], None)
+                self.emu.heap_free(info['ptr'])
+                new = 0
+            else:
+                new = self._realloc_block(info['ptr'], size, flags | 0x2)
+                if not new:
+                    return 0
+            self._set_moveable_pointer(memory, new)
+            return memory
+        return self._realloc_block(memory, size, flags)
+
+    def _realloc_block(self, memory, size, flags):
+        """Resize a heap block (it may move with LMEM_MOVEABLE); its new address or 0"""
         old_size = self.emu.heap_block_size(memory) if memory else None
         if old_size is None:
             self._last_error = 6  # ERROR_INVALID_HANDLE
@@ -598,28 +622,38 @@ class Kernel32ExtraMixin:
     def LocalSize(self, args):
         return self.GlobalSize(args)
 
-    def LocalLock(self, args):
-        return self.GlobalLock(args)
-
-    def LocalUnlock(self, args):
-        """LocalUnlock/GlobalUnlock - FALSE: the block is not locked any more"""
-        self._last_error = 0
-        return 0
-
     def LocalFlags(self, args):
+        """LocalFlags/GlobalFlags - lock count (and LMEM_DISCARDED) of a block"""
+        info = self.moveable_handles.get(args[0])
+        if info is not None:
+            return info['locks'] | (0 if info['ptr'] else self.GMEM_DISCARDED)
         if not args[0] or self.emu.heap_block_size(args[0]) is None:
             self._last_error = 6
             return 0x8000  # LMEM_INVALID_HANDLE
         return 0
 
+    def LocalHandle(self, args):
+        """LocalHandle/GlobalHandle - the handle of a block's address"""
+        if args[0] in self.moveable_handles:
+            return args[0]
+        return self.moveable_by_pointer.get(args[0], args[0])
+
+    def LocalLock(self, args):
+        return self.GlobalLock(args)
+
+    def LocalUnlock(self, args):
+        """LocalUnlock - FALSE when the block is not locked any more (a
+        fixed block never is)"""
+        if args[0] in self.moveable_handles:
+            return self.GlobalUnlock(args)
+        self._last_error = 0
+        return 0
+
     def GlobalFlags(self, args):
         return self.LocalFlags(args)
 
-    def LocalHandle(self, args):
-        return args[0]
-
     def GlobalHandle(self, args):
-        return args[0]
+        return self.LocalHandle(args)
 
     def LocalCompact(self, args):
         return self._memory_status()[1]

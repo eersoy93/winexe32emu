@@ -116,7 +116,7 @@ class Shell32Mixin:
         pszPath, attributes, psfi, cbFileInfo, flags = args[:5]
         SHGFI_USEFILEATTRIBUTES, SHGFI_PIDL = 0x10, 0x8
         if flags & SHGFI_PIDL:
-            path = self.pidls.get(pszPath, '')
+            path = self._pidl_file_path(pszPath) or ''
         else:
             path = self._read_text(pszPath, wide) if pszPath else ''
         if self._is_my_computer(path):
@@ -181,6 +181,10 @@ class Shell32Mixin:
     def SHGetSpecialFolderLocation(self, args):
         """SHGetSpecialFolderLocation emulation - a PIDL of the folder path"""
         csidl, ppidl = args[1], args[2]
+        if csidl & 0xFF == 0:  # CSIDL_DESKTOP: the root of the namespace
+            pidl = self._make_empty_pidl()
+            self._mem_write(ppidl, struct.pack('<I', pidl))
+            return 0 if pidl else 0x8007000E  # E_OUTOFMEMORY
         if csidl & 0xFF == self.CSIDL_DRIVES:
             folder = self.MY_COMPUTER_PATH
         else:
@@ -207,6 +211,21 @@ class Shell32Mixin:
 
     def ExtractIconExW(self, args):
         return self.ExtractIconExA(args)
+
+    # shell32 also exports the ANSI functions under their names without A
+    # (Office 95 looks them up so with GetProcAddress)
+    ExtractIconEx = ExtractIconExA
+    SHGetFileInfo = SHGetFileInfoA
+
+    def DllGetClassObject(self, args):
+        """shell32 DllGetClassObject(rclsid, riid, ppv) - its COM classes
+        are made with CoCreateInstance only"""
+        if args[2]:
+            self._mem_write(args[2], struct.pack('<I', 0))
+        return 0x80040111  # CLASS_E_CLASSNOTAVAILABLE
+
+    def DllCanUnloadNow(self, args):
+        return 1  # S_FALSE: the emulated DLLs stay loaded
 
     def _shell_execute(self, verb, file, params, directory, hwnd):
         """ShellExecute(Ex): run an EXE of the sandbox; returns (code > 32 on
@@ -251,7 +270,7 @@ class Shell32Mixin:
         verb = self._read_text(lpVerb, wide) if lpVerb else ''
         file = self._read_text(lpFile, wide) if lpFile else ''
         if mask & 0xC and not file:  # SEE_MASK_IDLIST / SEE_MASK_INVOKEIDLIST
-            file = self.pidls.get(self._read_struct(info, '<I' * 10)[9], '')
+            file = self._pidl_file_path(self._read_struct(info, '<I' * 10)[9]) or ''
         params = self._read_text(lpParameters, wide) if lpParameters else ''
         directory = self._read_text(lpDirectory, wide) if lpDirectory else ''
         code, child = self._shell_execute(verb, file, params, directory, hwnd)

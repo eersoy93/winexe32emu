@@ -71,9 +71,11 @@ class MenusMixin:
     @staticmethod
     def _menu_label(text):
         """(label, shortcut) of a menu item text: "&Open\\tEnter" -> ("Open", "Enter");
-        "&" marks the mnemonic and "&&" is a literal "&"""
+        "&" marks the mnemonic and "&&" is a literal "&". A "\\b" ("\\a" in a
+        resource script: the rest is right-aligned) also starts the shortcut."""
         if not isinstance(text, str):
             return '', ''
+        text = text.replace('\b', '') if '\t' in text else text.replace('\b', '\t')
         label, _, shortcut = text.partition('\t')
         label = '&'.join(part.replace('&', '') for part in label.split('&&'))
         return label, shortcut
@@ -138,7 +140,7 @@ class MenusMixin:
     MF_GRAYED, MF_DISABLED, MF_CHECKED, MF_BYPOSITION = 0x1, 0x2, 0x8, 0x400
     MFT_RADIOCHECK, MF_DEFAULT = 0x200, 0x1000
     MF_MENUBARBREAK, MF_MENUBREAK = 0x20, 0x40
-    WM_INITMENUPOPUP = 0x0117
+    WM_INITMENU, WM_INITMENUPOPUP = 0x0116, 0x0117
 
     def _new_menu(self, items=None):
         handle = self.get_next_handle()
@@ -538,6 +540,8 @@ class MenusMixin:
         x, y = self._read_signed_args(args, 2, 2)
         if hmenu not in self.menus or not self.gui or not self.gui.running:
             return 0
+        # Like Windows: WM_INITMENU when the menu mode starts, then the popup's
+        self._send(hwnd, self.WM_INITMENU, hmenu, 0)
         self._send(hwnd, self.WM_INITMENUPOPUP, hmenu, 0)
         popup = {'hmenu': hmenu, 'tree': self._build_menu_tree(hmenu), 'x': x, 'y': y,
                  'owner': self, 'hwnd': hwnd, 'result': None, 'done': False, 'open': []}
