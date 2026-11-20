@@ -353,8 +353,11 @@ class User32MiscMixin:
         win = self.gui.windows.get(hwnd)
         wndclass = getattr(win, 'wndclass', None) or self.registered_classes.get(name)
         if wndclass is None:
-            # The system classes: SetClassLong changes them for this process
-            wndclass = self.system_class_data.setdefault(name.upper(), {'style': 0x8})
+            # The system classes: SetClassLong changes them for this process;
+            # their window procedure is the emulated controls' one, as
+            # GetClassInfo and GetWindowLong(GWL_WNDPROC) give it
+            wndclass = self.system_class_data.setdefault(
+                name.upper(), {'style': 0x8, 'wndproc': self._native_stub()})
         return wndclass
 
     def _class_long(self, args, set_value=False):

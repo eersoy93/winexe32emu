@@ -260,6 +260,17 @@ static void test_user32(void)
     check(GetClassNameA(hwnd, buf, sizeof(buf)) == 12 && strcmp(buf, "ApiTestClass") == 0,
           "GetClassNameA");
     check(GetWindowTextLengthA(hwnd) == 8, "GetWindowTextLengthA");
+    {
+        /* Office 95 Setup saves the class procedures of its dialog's controls
+           and gives up when they are NULL */
+        WNDCLASSA button_class;
+        HWND button = CreateWindowExA(0, "BUTTON", "OK", WS_CHILD, 0, 0, 50, 20, hwnd, NULL,
+                                      wc.hInstance, NULL);
+        check(GetClassInfoA(NULL, "BUTTON", &button_class) && button_class.lpfnWndProc &&
+              GetClassLongA(button, GCL_WNDPROC) == (DWORD)(ULONG_PTR)button_class.lpfnWndProc,
+              "GetClassLongA (GCL_WNDPROC of a system class)");
+        DestroyWindow(button);
+    }
     ShowWindow(hwnd, SW_SHOW);
     check(BringWindowToTop(hwnd), "BringWindowToTop");
     check(SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd, "SetForegroundWindow");

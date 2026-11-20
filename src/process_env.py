@@ -305,6 +305,7 @@ class ProcessEnvironmentMixin:
                         self.uc.mem_write(slot, b'\0\0\0\0')
         self.remove_loader_entry(module.get('ldr_entry', 0))
         del self.dlls[base]
+        self.resource_ranges.pop(base, None)
         self.api_handler.record_protection(base, base + module['size'], 0x40)
         self.unmap_shared(base, module['size'])
         if (base, base + module['size']) in self.mapped_regions:

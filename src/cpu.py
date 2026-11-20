@@ -260,6 +260,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.protection_log = []
         self.dep_enabled = False  # NX-compatible EXE: no execution of data pages
         self.guard_pages = {}  # page -> Windows protection to restore (PAGE_GUARD)
+        self.resource_ranges = {}  # image base -> pages [start, end) of its resources
         self._init_process_environment()
 
     # ---------- Threads ----------
@@ -407,7 +408,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
     # ---------- Page protection ----------
 
-    PAGE_NOACCESS, PAGE_GUARD = 0x01, 0x100
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_WRITECOPY, PAGE_GUARD = 0x01, 0x02, 0x08, 0x100
     STATUS_GUARD_PAGE_VIOLATION = 0x80000001
     # Windows page protection (without PAGE_GUARD and the cache flags) ->
     # Unicorn permissions; 0 is reserved memory (not committed)
@@ -474,6 +475,13 @@ class CPUEmulator(ProcessEnvironmentMixin):
             thread.protection_index = (len(self.protection_log) if thread is current
                                        else 0)
 
+    def _writable_resource_page(self, page):
+        """A page of an image's resources that is still read-only as loaded"""
+        if not any(start <= page < end for start, end in self.resource_ranges.values()):
+            return False
+        return (self.api_handler is None or
+                self.api_handler._page_protection(page) == self.PAGE_READONLY)
+
     def _hook_mem_protect(self, uc, access, address, size, value, user_data):
         """An access the page protection forbids: an access violation (or a
         guard page exception) for the program's exception handlers"""
@@ -486,6 +494,15 @@ class CPUEmulator(ProcessEnvironmentMixin):
         kind = {UC_MEM_WRITE_PROT: 1, UC_MEM_FETCH_PROT: 8}.get(access, 0)
         eip = uc.reg_read(UC_X86_REG_EIP)
         fault_address = address if access == UC_MEM_FETCH_PROT else eip
+        if access == UC_MEM_WRITE_PROT and self._writable_resource_page(page):
+            # Like Windows, a write to a read-only resource page of an image
+            # (programs patch the bitmaps and dialogs that LockResource gives
+            # them) makes the page copy-on-write instead of faulting
+            self.protect_range(page, page + 0x1000, self.PAGE_WRITECOPY)
+            if self.api_handler is not None:
+                self.api_handler.record_protection(page, page + 0x1000, self.PAGE_WRITECOPY)
+            thread.retry_access = True
+            return False
         if page in self.guard_pages:
             # A guard page turns into an ordinary page at its first access
             protection = self.guard_pages[page]
@@ -529,6 +546,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
         for start, end, protection in ranges:
             if self.protect_range(start, end, protection) and self.api_handler is not None:
                 self.api_handler.record_protection(start, end, protection)
+        resources = opt.DATA_DIRECTORY[2] if len(opt.DATA_DIRECTORY) > 2 else None
+        if resources is not None and resources.VirtualAddress and resources.Size:
+            start = base + (resources.VirtualAddress & ~0xFFF)
+            self.resource_ranges[base] = (
+                start, base + self._align_size(resources.VirtualAddress + resources.Size))
 
     def _setup_segments(self, uc, teb):
         """GDT with flat code/data segments and FS -> teb, loaded into uc"""
