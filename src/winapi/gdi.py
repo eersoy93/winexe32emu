@@ -989,6 +989,47 @@ class GdiMixin:
     def GetTextExtentPointW(self, args):
         return self.GetTextExtentPoint32A(args, wide=True)
 
+    def _char_widths(self, hdc, first, last, wide):
+        """Advance widths of the characters first..last in the DC's font (None
+        for a bad range); an ANSI code that is no character measures like "?"."""
+        if last < first or last - first >= 0x10000 or (not wide and last > 0xFF):
+            return None
+        widths = []
+        for code in range(first, last + 1):
+            ch = chr(code) if wide else self._ansi_char(code)
+            widths.append(self._text_extent(hdc, ch if ch else '?')[0])
+        return widths
+
+    def GetCharWidthA(self, args, wide=False):
+        """GetCharWidth(32)A/W(hdc, iFirst, iLast, lpBuffer): an INT width per
+        character"""
+        hdc, first, last, buffer = args[:4]
+        widths = self._char_widths(hdc, first, last, wide)
+        if widths is None or not buffer:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        return 1 if self._mem_write(buffer, struct.pack(f'<{len(widths)}i', *widths)) else 0
+
+    def GetCharWidthW(self, args):
+        return self.GetCharWidthA(args, wide=True)
+
+    GetCharWidth32A = GetCharWidthA
+    GetCharWidth32W = GetCharWidthW
+
+    def GetCharABCWidthsA(self, args, wide=False):
+        """GetCharABCWidthsA/W(hdc, uFirst, uLast, lpABC): the fonts are drawn
+        without overhangs, so A and C are 0 and B is the advance width"""
+        hdc, first, last, buffer = args[:4]
+        widths = self._char_widths(hdc, first, last, wide)
+        if widths is None or not buffer:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        data = b''.join(struct.pack('<iIi', 0, w, 0) for w in widths)
+        return 1 if self._mem_write(buffer, data) else 0
+
+    def GetCharABCWidthsW(self, args):
+        return self.GetCharABCWidthsA(args, wide=True)
+
     def _text_extent(self, hdc, text):
         """(width, height) of text in the DC's font, measured with the font the
         GUI draws it with; without the GUI the font is close to 8x16 per character"""

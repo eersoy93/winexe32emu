@@ -134,6 +134,20 @@ class StatusBarMixin:
         except UnicodeDecodeError:
             return None
 
+    @staticmethod
+    def _ansi_case(ch, convert):
+        """ch in the other case, or unchanged if that case is not one character
+        of the ANSI code page (cp1252 "ƒ" -> "Ƒ", "µ" -> "Μ", "ß" -> "SS")"""
+        converted = convert(ch)
+        if converted == ch or len(converted) != 1:
+            return ch
+        try:
+            if len(converted.encode(config.ANSI_CODEPAGE)) == len(ch.encode(config.ANSI_CODEPAGE)):
+                return converted
+        except UnicodeEncodeError:
+            pass
+        return ch
+
     def _char_case_common(self, lpsz, upper, wide=False):
         """CharUpper/CharLower A/W: a single char (HIWORD 0) or an in-place string"""
         convert = str.upper if upper else str.lower
@@ -144,7 +158,7 @@ class StatusBarMixin:
             ch = self._ansi_char(lpsz)
             if ch is None:
                 return lpsz
-            converted = convert(ch).encode(config.ANSI_CODEPAGE, errors='replace')
+            converted = self._ansi_case(ch, convert).encode(config.ANSI_CODEPAGE)
             return converted[0] if len(converted) == 1 else lpsz
         if wide:
             units = self._read_units(lpsz, True)
@@ -155,7 +169,8 @@ class StatusBarMixin:
             return lpsz
         raw = self.read_cstring(lpsz)
         text = raw.decode(config.ANSI_CODEPAGE, errors='surrogateescape')
-        data = convert(text).encode(config.ANSI_CODEPAGE, errors='surrogateescape')
+        data = ''.join(self._ansi_case(ch, convert) for ch in text).encode(
+            config.ANSI_CODEPAGE, errors='surrogateescape')
         if len(data) == len(raw):  # never change the buffer length in place
             self.emu.uc.mem_write(lpsz, data)
         return lpsz

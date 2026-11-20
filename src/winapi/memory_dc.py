@@ -899,6 +899,10 @@ class MemoryDCMixin:
             self.emu.heap_free(buffer)
         return result
 
+    # EnumFontsA(hdc, lpFaceName, lpProc, lParam): the same callback arguments
+    # (an ENUMLOGFONT starts with the LOGFONT)
+    EnumFontsA = EnumFontFamiliesA
+
     def ValidateRect(self, args):
         """ValidateRect emulation - mark the window as painted"""
         hWnd = args[0]
