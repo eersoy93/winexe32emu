@@ -256,6 +256,15 @@ class SandboxTest(unittest.TestCase):
         self.assertIsNone(strip_win32_path_prefix(r'\\?\UNC\server\x'))
         self.assertEqual(strip_win32_path_prefix(r'C:\x'), r'C:\x')
 
+        # The emulated PC has no network: a UNC path is not on the current drive
+        # The emulated PC has no network: "\\\\" is not the current drive's root
+        for name in ('\\\\', r'\\server\share\x', '//server/share', r'\\?\UNC\server\x'):
+            with self.subTest(name=name):
+                self.assertIsNone(strip_win32_path_prefix(name))
+                self.assertIsNone(resolve_drive_path(name))
+                self.assertEqual(drive_path_error(name), 53)  # ERROR_BAD_NETPATH
+        self.assertEqual(strip_win32_path_prefix(r'\x'), r'\x')
+
 
 class SymlinkSandboxTest(unittest.TestCase):
     def test_symlink_out_of_a_drive_is_blocked(self):

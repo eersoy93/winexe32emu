@@ -25,7 +25,7 @@ from .. import config, resources
 from ..logger import log
 from ..config import READ_ONLY_DRIVES
 from ..paths import (device_name, drive_letter_of_host, resolve_drive_path,
-                     strip_win32_path_prefix)
+                     strip_win32_path_prefix, is_unc_path)
 from ..pe_loader import PELoader
 
 
@@ -93,7 +93,9 @@ class FilesMixin:
         relative to the current directory."""
         full = self.full_windows_path(filename)
         if full is None:
-            if filename:
+            if filename and is_unc_path(filename):
+                log.debug(f"No network for the UNC path \"{filename}\"")
+            elif filename:
                 log.warning(f"Blocked sandbox escape attempt: \"{filename}\"")
             return None
         return resolve_drive_path(full)

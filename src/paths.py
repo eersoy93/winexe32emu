@@ -24,12 +24,22 @@ from .config import (C_DRIVE_PATH, DEFAULT_ENVIRONMENT, DRIVES, DRIVES_PATH,
 from .logger import log
 
 
+def is_unc_path(name):
+    """Is name a network path ("\\\\server\\share", "\\\\?\\UNC\\...")?"""
+    name = (name or '').replace('/', '\\')
+    if name[:8].upper() == '\\\\?\\UNC\\':
+        return True
+    return name.startswith('\\\\') and name[:4] not in ('\\\\?\\', '\\\\.\\')
+
+
 def strip_win32_path_prefix(name):
     """Drop a Win32 file namespace prefix ("\\\\?\\C:\\x", "\\\\.\\C:\\x", "\\??\\C:\\x")
     in front of a drive path. Returns name unchanged without a prefix, or
-    None for prefixed paths that are not on a drive (UNC shares, devices)."""
-    if name[:4].replace('/', '\\') not in ('\\\\?\\', '\\\\.\\', '\\??\\'):
-        return name
+    None for paths that are not on a drive: UNC shares ("\\\\server\\share",
+    "\\\\?\\UNC\\...": the emulated PC has no network) and devices."""
+    head = name[:4].replace('/', '\\')
+    if head not in ('\\\\?\\', '\\\\.\\', '\\??\\'):
+        return None if head.startswith('\\\\') else name
     rest = name[4:]
     if len(rest) >= 2 and rest[1] == ':' and rest[0].isalpha():
         return rest
@@ -47,6 +57,7 @@ INVALID_NAME_CHARACTERS = frozenset('<>:"|?*' + ''.join(map(chr, range(32))))
 
 ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED = 2, 3, 5
 ERROR_INVALID_NAME = 123
+ERROR_BAD_NETPATH = 53
 
 
 def device_name(filename):
@@ -95,8 +106,11 @@ def _existing_entry(directory, part):
 def drive_path_error(filename):
     """Win32 error code explaining why resolve_drive_path(filename) is None:
     ERROR_INVALID_NAME for names Windows rejects (or a device name),
-    ERROR_PATH_NOT_FOUND for a drive that does not exist, otherwise
-    ERROR_ACCESS_DENIED (the name escapes its drive's folder)"""
+    ERROR_PATH_NOT_FOUND for a drive that does not exist, ERROR_BAD_NETPATH
+    for a UNC path (there is no network), otherwise ERROR_ACCESS_DENIED (the
+    name escapes its drive's folder)"""
+    if is_unc_path(filename):
+        return ERROR_BAD_NETPATH
     name = strip_win32_path_prefix(filename or '')
     if not name:
         return ERROR_PATH_NOT_FOUND
