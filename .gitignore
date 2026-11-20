@@ -16,6 +16,7 @@ venv/
 # Temporary files
 *.log
 *.tmp
+missing_apis.txt
 
 # Executables
 *.exe

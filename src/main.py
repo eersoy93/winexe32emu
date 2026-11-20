@@ -36,6 +36,17 @@ from .sound import SoundPlayer
 from .winapi import WinAPIHandler
 
 
+# The --missing-apis file when the option has no FILE
+DEFAULT_MISSING_APIS_FILE = "missing_apis.txt"
+
+
+def looks_like_program(name):
+    """Is a command-line argument the name of a program to run ("X.EXE",
+    "C:\\path\\...") rather than a host file name?"""
+    return (name.lower().endswith(('.exe', '.com', '.scr')) or
+            (len(name) >= 3 and name[0].isalpha() and name[1] == ':' and name[2] in '\\/'))
+
+
 def main():
     """Main function"""
     import argparse
@@ -84,9 +95,11 @@ def main():
     parser.add_argument("--no-create-environment", "--no_create_environment",
                         action="store_true",
                         help="Don't run create_drives_environment.sh at startup")
-    parser.add_argument("--missing-apis", metavar="FILE",
+    parser.add_argument("--missing-apis", metavar="FILE", nargs="?",
+                        const=DEFAULT_MISSING_APIS_FILE,
                         help="Append the APIs the programs needed but the emulator "
-                             "does not emulate to FILE (one line per API and program; "
+                             "does not emulate to FILE (default: "
+                             f"{DEFAULT_MISSING_APIS_FILE}; one line per API and program; "
                              "a summary is always shown at the end)")
     parser.add_argument("--logfile", metavar="FILE",
                         help="Also write the console output to FILE (without colors)")
@@ -97,6 +110,11 @@ def main():
                            help="Show only program output, warnings and errors")
 
     args = parser.parse_args()
+    if args.missing_apis and looks_like_program(args.missing_apis):
+        # "--missing-apis PROGRAM.EXE": the program, not the file to write
+        if args.exe is not None:
+            args.program_args = [args.exe] + args.program_args
+        args.exe, args.missing_apis = args.missing_apis, DEFAULT_MISSING_APIS_FILE
 
     if args.logfile:
         try:

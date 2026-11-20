@@ -1955,6 +1955,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         """Summary of the unemulated APIs at the end of the process (and the
         --missing-apis file)"""
         if not self.missing_apis:
+            if self.missing_apis_file:
+                log.info(f"No unemulated API needed by "
+                         f"{os.path.basename(self.pe_loader.filepath)}")
             return
         lines = [f"{dll}!{name}: {how}" + (f" ({count} times)" if count > 1 else "")
                  for (dll, name, how), count in sorted(self.missing_apis.items())]
@@ -1968,6 +1971,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 with self._missing_apis_lock, open(self.missing_apis_file, 'a',
                                                    encoding='utf-8') as f:
                     f.writelines(f"{program}\t{line}\n" for line in lines)
+                log.info(f"Unemulated APIs appended to {self.missing_apis_file}")
             except OSError as e:
                 log.error(f"Cannot write {self.missing_apis_file}: {e}")
 

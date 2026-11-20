@@ -266,6 +266,17 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(strip_win32_path_prefix(r'\x'), r'\x')
 
 
+class MissingApisOptionTest(unittest.TestCase):
+    def test_missing_apis_takes_a_program_as_the_exe(self):
+        from src.main import looks_like_program
+        for name in (r'C:\MSOffice\Winword\WINWORD.EXE', 'api_test.exe', 'X.COM', 'd:/setup'):
+            with self.subTest(name=name):
+                self.assertTrue(looks_like_program(name))
+        for name in ('missing.txt', 'out/apis.log', 'C:'):
+            with self.subTest(name=name):
+                self.assertFalse(looks_like_program(name))
+
+
 class SymlinkSandboxTest(unittest.TestCase):
     def test_symlink_out_of_a_drive_is_blocked(self):
         os.makedirs(C_DRIVE_PATH, exist_ok=True)
