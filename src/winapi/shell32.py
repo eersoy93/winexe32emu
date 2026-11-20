@@ -270,7 +270,7 @@ class Shell32Mixin:
         verb = self._read_text(lpVerb, wide) if lpVerb else ''
         file = self._read_text(lpFile, wide) if lpFile else ''
         if mask & 0xC and not file:  # SEE_MASK_IDLIST / SEE_MASK_INVOKEIDLIST
-            file = self._pidl_file_path(self._read_struct(info, '<I' * 10)[9]) or ''
+            file = self._pidl_file_path(self._read_struct(info, '<10I')[9]) or ''
         params = self._read_text(lpParameters, wide) if lpParameters else ''
         directory = self._read_text(lpDirectory, wide) if lpDirectory else ''
         code, child = self._shell_execute(verb, file, params, directory, hwnd)
