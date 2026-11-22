@@ -56,4 +56,4 @@ Open an issue and include:
 - Python 3.11 or newer; lines of at most 100 columns; `ruff check .` must pass
 - Every new file starts with the Apache License header of the existing files
 - Comments and messages are in English and explain why, not what
-- An emulated API behaves like the documented Windows API, including its error codes
+- An emulated API behaves like the Windows API, including its error codes
