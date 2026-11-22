@@ -1,20 +1,64 @@
 # winexe32emu
 
-32-bit Windows EXE emulator in Python. Written with GitHub Copilot and Claude AI.
+[![CI](https://github.com/eersoy93/winexe32emu/actions/workflows/ci.yml/badge.svg)](https://github.com/eersoy93/winexe32emu/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
+
+**A 32-bit Windows EXE emulator written in Python.** It loads classic Windows programs, runs their code on an emulated x86 CPU and shows their windows on its own fake Windows desktop — no Windows needed.
+
+Written with GitHub Copilot and Claude AI.
 
 ![winexe32emu 0.3.0 Fake Desktop Image](doc/winexe32emu_0_3_0.png)
 
-## Installation
+## Contents
 
-winexe32emu needs Python 3.11 or newer. It runs from its repository folder (it is not installed as a package):
+- [Features](#features)
+- [Supported Programs](#supported-programs)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [Running the Tests](#running-the-tests)
+- [Not Supported (Currently)](#not-supported-currently)
+- [Versioning](#versioning)
+- [Disclaimer](#disclaimer)
+- [Copyright and License](#copyright-and-license)
+
+## Features
+
+- 🖥️ **Fake Windows desktop** with a taskbar, a Start menu, windows, dialogs and sound
+- 📦 **Runs real programs**: setups and applications, several of them side by side
+- 💾 **Virtual drives**: A: (floppy disk), C: (hard disk) and D: (CD-ROM) are plain folders in `drives/`
+- 🔒 **Sandboxed**: programs can only reach the files inside their virtual drives
+- 🗂️ **A shared registry** that the emulated programs keep between runs
+- 🌐 **Offline by design**: programs see a PC without a network
+- 🧩 **Built-in apps**: Explorer (`explorer.exe`) and a Windows Help stub (`winhlp32.exe`)
+- 🔍 **Missing API report**: see what a program needs that is not emulated yet
+
+## Supported Programs
+
+These are playable, but may not be supported 100%:
+
+| Program | What works |
+| --- | --- |
+| 7-Zip 4.65 (x86) | NSIS setup and programs |
+| 7-Zip 9.20 (x86) | NSIS setup and programs |
+| 7-Zip 26.06 (x86) | Setup and programs |
+| Ants | Setup and program |
+| Microsoft Office 95 Professional | Installer only |
+| Ski32 | Program |
+
+## Getting Started
+
+You need **Python 3.11 or newer**. winexe32emu runs from its repository folder; it is not installed as a package.
 
 ```bash
+git clone https://github.com/eersoy93/winexe32emu.git
+cd winexe32emu
 pip install -r requirements.txt
 ```
 
 Pygame (`pygame-ce`) is optional: it is only needed for the fake desktop and sound.
 
-The apps (like Explorer) and the test programs are compiled with the 32-bit MinGW-w64 toolchain (`i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`):
+The built-in apps (like Explorer) and the test programs are compiled with the 32-bit MinGW-w64 toolchain:
 
 | System | Command |
 | --- | --- |
@@ -25,26 +69,45 @@ The apps (like Explorer) and the test programs are compiled with the 32-bit MinG
 
 ## Usage
 
-Put your EXE files in drives/A (virtual floppy disk), or drives/C (virtual hard disk) or drives/D (virtual CD-ROM), and then:
+1. Put your EXE files in one of the virtual drives:
 
-```bash
-python3 winexe32emu.py
-```
+   | Folder | Drive |
+   | --- | --- |
+   | `drives/A` | A: (floppy disk) |
+   | `drives/C` | C: (hard disk) |
+   | `drives/D` | D: (CD-ROM, read-only for the programs) |
 
-Use `-h` parameter for command-line help.
+2. Start the fake desktop and run your programs from the Start menu:
 
-To see which APIs a program needs but the emulator does not emulate yet, check the summary at the end of its run, or collect them in a file with `--missing-apis FILE`.
+   ```bash
+   python3 winexe32emu.py
+   ```
+
+   Or run a program directly:
+
+   ```bash
+   python3 winexe32emu.py myprogram.exe
+   ```
+
+Useful options:
+
+| Option | What it does |
+| --- | --- |
+| `-h` | Shows all the options |
+| `--no-gui` | Runs a console program without the fake desktop |
+| `--codepage cp1254` | Uses another ANSI code page (e.g. Turkish) |
+| `--missing-apis [FILE]` | Collects the APIs a program needs but the emulator lacks |
+| `--clean` | Deletes the virtual drives (asks first) |
 
 ## Running the Tests
 
 ```bash
-# Lint and unit tests (no MinGW-w64 needed; the fake desktop's test uses SDL's dummy driver)
+# Lint and unit tests (no MinGW-w64 needed)
 pip install ruff
 ruff check .
 SDL_VIDEODRIVER=dummy python3 -m unittest discover -s tests/python -v
 
-# Emulator tests: compiles the C programs in tests/ into C:\Windows\Tests and runs each
-# one (exit code: number of failures)
+# Emulator tests: compiles the C programs in tests/ and runs each one
 python3 winexe32emu.py --tests
 ```
 
@@ -53,39 +116,20 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 ## Not Supported (Currently)
 
 - 64-bit (x64) programs, and 16-bit DOS and Windows 3.x programs
-- .NET programs (the .NET runtime is not emulated)
-- DirectX, OpenGL and other hardware graphics; the fake desktop draws with GDI only
-- A real network: Windows Sockets only resolve localhost and create no sockets
+- .NET programs
+- DirectX, OpenGL and other hardware graphics
+- A real network
 - Drivers, services and other system components
-- APIs the emulator lacks: a program that calls one gets 0 (see `--missing-apis`), and one with an unknown calling convention stops the program
-- Execution protection (DEP) of the heap: `malloc` memory stays executable even for NX-compatible programs (`VirtualAlloc` and `VirtualProtect` memory is protected)
-
-## Supported Programs (playable but may not be supported 100%)
-
-- 7-Zip 4.65 (x86, NSIS setup and programs)
-- 7-Zip 9.20 (x86, NSIS setup and programs)
-- 7-Zip 26.06 (x86, setup and programs)
-- Ants (setup and program)
-- Microsoft Office 95 (Professional, installer only)
-- Ski32
-
-## Features
-
-- PE file loading and analysis
-- x86 CPU emulation (Unicorn)
-- Fake Windows desktop with sound support with Pygame
-- Basic Win32 API support
-- An offline network: sockets resolve only localhost and create no sockets (currently)
-- Page protections and DEP for NX-compatible programs
-- Structured Exception Handling
-- A registry shared by the emulated programs
-- Emulated drives: A: (floppy disk), C: and D: (CD-ROM) in drives/
-- Windows file name rules on the virtual drives
-- Apps: explorer.exe, winhlp32.exe (stub)
+- APIs the emulator does not emulate yet (see `--missing-apis`)
 
 ## Versioning
 
-- First version is 0.0.1, every major changes version is bumped to 0.0.5, 0.0.10, 0.0.15 etc, every minor changes version is bumped to 0.0.16, 0.0.17, etc. Every bigger changes version is bumped to 0.1.0, 0.2.0 etc. Every biggest changes for each stable version is bumped to 1.0.0, 2.0.0 etc.
+| Change | Version examples |
+| --- | --- |
+| Minor | 0.0.16, 0.0.17… |
+| Major | 0.0.5, 0.0.10, 0.0.15… |
+| Bigger | 0.1.0, 0.2.0… |
+| Stable release | 1.0.0, 2.0.0… |
 
 ## Disclaimer
 
@@ -95,14 +139,4 @@ This project is not endorsed by, affiliated with, or sponsored by Microsoft Corp
 
 Copyright 2025-2026 Erdem Ersoy (eersoy93)
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Licensed under the [Apache License, Version 2.0](LICENSE). The software is distributed on an "AS IS" basis, without warranties or conditions of any kind.
