@@ -19,6 +19,7 @@ Written with GitHub Copilot and Claude AI.
 - [Running the Tests](#running-the-tests)
 - [Not Supported (Currently)](#not-supported-currently)
 - [Versioning](#versioning)
+- [Contributing](#contributing)
 - [Disclaimer](#disclaimer)
 - [Copyright and License](#copyright-and-license)
 
@@ -130,6 +131,10 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 | Major | 0.0.5, 0.0.10, 0.0.15… |
 | Bigger | 0.1.0, 0.2.0… |
 | Stable release | 1.0.0, 2.0.0… |
+
+## Contributing
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions must be based only on legally obtained information, never on Windows source code. The changes of each version are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Disclaimer
 

@@ -1,0 +1,60 @@
+# Changelog
+
+The notable changes of winexe32emu, newest first. The version numbers follow the scheme in [README.md](README.md#versioning).
+
+## Unreleased
+
+### Added
+
+- Microsoft Office 95 Setup runs to the end: dialog frames, owner-drawn controls, the progress bar, Jet, the Change Folder dialog
+- Word 95 starts, opens and edits documents: font APIs, compound files (OLE storage), its dialogs and menus
+- The network and stream APIs 7-Zip File Manager needs; `\\server` paths are network paths
+- More API groups: shlwapi, security, crypto, psapi, sockets (offline), themes
+- Scroll bars for list boxes and the lists of combo boxes
+- Page protections and DEP for NX-compatible programs; a reworked DLL loader; unique process ids
+- A 32-bit Windows without WOW64; the known folders (`C:\Users`, `C:\ProgramData`...) are created at start
+- `--missing-apis` works without a FILE (`missing_apis.txt`)
+- `pyproject.toml`, more unit tests, and CI that caches its downloads
+- `CHANGELOG.md` and `CONTRIBUTING.md`
+
+### Changed
+
+- The fake desktop's code (`gui.py`) is a package of smaller modules
+- Lint also checks the pycodestyle and bugbear rules (100 columns)
+- Heap blocks shrink in place, like on Windows
+- README.md is restructured
+
+### Fixed
+
+- Windows file name rules, path buffer sizes, the PEB, system DLL images and static TLS
+- `GetDlgItem`, `GCL_WNDPROC`, `CharUpperA` on cp1252, the `=C:` environment variables
+- The `lpIDList` read of `ShellExecuteEx`
+- Several window bugs
+
+## 0.3.0 - 2026-11-18
+
+### Added
+
+- The drives A: (floppy disk) and D: (CD-ROM, read-only) next to C:
+- Explorer (`explorer.exe`) with a folder tree, file operations and a My Computer drive list
+- TreeView control; My Computer as a virtual shell folder
+- The shell's context menu of files; list view grid lines and column resizing
+- The Desktop folder's shortcuts on the fake desktop
+- The 7-Zip 9.20 and 4.65 NSIS setups run end to end
+
+### Changed
+
+- `c_drive/` became `drives/C` (moved automatically at the first start)
+- The desktop has the classic Windows 2000 look
+- The single `winexe32emu.py` is split into the `src/` package
+- Small `malloc`/`free` calls run as guest code; the API call path is faster
+
+### Fixed
+
+- A program's message boxes are closed when it exits
+- `WM_SETCURSOR` goes to the child window under the mouse
+- The msvcrt variables older MinGW-w64 versions import
+
+## 0.2.0 and older
+
+The versions 0.0.1, 0.0.5, 0.0.10, 0.0.15, 0.0.20, 0.1.0, 0.1.5 and 0.2.0 were made before this changelog was kept; their changes are not recorded here. A screenshot of each one is in [doc/](doc/).
