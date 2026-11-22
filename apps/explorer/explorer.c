@@ -1679,7 +1679,10 @@ static void on_command(int id)
     case IDM_ABOUT:
         MessageBoxA(hMain, "My Computer for winexe32emu\n\n"
                     "Browse the drives A: (floppy disk), C: and D: (CD-ROM, read-only), "
-                    "run programs and copy, move, rename or delete files.",
+                    "run programs and copy, move, rename or delete files.\n\n"
+                    "This project is not endorsed by, affiliated with, or sponsored by "
+                    "Microsoft Corporation in any way. Windows, Win32, and related "
+                    "trademarks are the property of Microsoft Corporation.",
                     "About My Computer", MB_OK | MB_ICONINFORMATION);
         break;
     }
