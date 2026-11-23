@@ -120,6 +120,7 @@ class DialogsMixin:
             self.dialogs[hwnd] = {'proc': proc, 'handler': handler, 'owner': owner,
                                   'result': 0, 'ended': False}
             self._set_dialog_instance(hwnd, template)
+            self._cbt_create_dialog(hwnd, template, parent, style, ex_style)
             self._create_dialog_items(hwnd, template, bx, by)
             return hwnd
         border, caption = gui.PseudoWindowsGUI.frame_size(template['style'], dialog=True)
@@ -145,8 +146,24 @@ class DialogsMixin:
         self.dialogs[hwnd] = {'proc': proc, 'handler': handler, 'owner': owner,
                               'result': 0, 'ended': False}
         self._set_dialog_instance(hwnd, template)
+        self._cbt_create_dialog(hwnd, template, owner, template['style'], template['ex_style'])
         self._create_dialog_items(hwnd, template, bx, by)
         return hwnd
+
+    def _cbt_create_dialog(self, hwnd, template, parent, style, ex_style):
+        """WH_CBT HCBT_CREATEWND of a program's dialog, before its controls and
+        WM_INITDIALOG (MFC attaches its CDialog and subclasses the dialog)"""
+        if self.dialogs[hwnd]['handler'] or not self._hook_chain(self.WH_CBT):
+            return
+        win = self.gui.windows[hwnd]
+        cs_addr = self._build_createstruct(0, template.get('module') or 0, 0, parent,
+                                           win.height, win.width, win.y, win.x, style,
+                                           0, 0x8002, ex_style)  # The #32770 atom
+        try:
+            if self.cbt_create_window(hwnd, cs_addr):
+                log.debug(f"A WH_CBT hook refused dialog 0x{hwnd:x} (ignored)")
+        finally:
+            self.emu.heap_free(cs_addr)
 
     def _set_dialog_instance(self, hwnd, template):
         """GWL_HINSTANCE of a dialog (the module of its template) and its
@@ -296,13 +313,34 @@ class DialogsMixin:
             return 0
         if dialog['handler']:
             return dialog['handler'](message, wParam, lParam) or 0
-        result = self.emu.call_wndproc(dialog['proc'], dlg, message, wParam, lParam)
+        subclass = self._dialog_subclass(dlg)
+        if subclass:
+            # A subclassed dialog (SetWindowLong GWL_WNDPROC, MFC's AfxWndProc):
+            # its procedure passes on to DefDlgProc, which calls the dialog's
+            result = self.emu.call_wndproc(subclass, dlg, message, wParam, lParam)
+        else:
+            result = self.emu.call_wndproc(dialog['proc'], dlg, message, wParam, lParam)
         if message == self.WM_CLOSE and not result and dlg in self.dialogs:
             # DefDlgProc: closing a dialog clicks its Cancel button
             cancel = self._dialog_button(dlg, 2)
             self.emu.call_wndproc(dialog['proc'], dlg, self.WM_COMMAND, 2,
                                   cancel.hwnd if cancel else 0)
         return result
+
+    def _is_def_dlg_proc(self, proc):
+        """Is proc a stub of DefDlgProcA/W (the window procedure of a dialog)?"""
+        hook = self.emu.api_hooks.get(proc)
+        return hook is not None and hook['name'] in ('DefDlgProcA', 'DefDlgProcW')
+
+    def dialog_window_proc(self):
+        """GWL_WNDPROC of a dialog that is not subclassed: DefDlgProc"""
+        return self.emu.get_api_stub('user32.dll', 'DefDlgProcA')
+
+    def _dialog_subclass(self, dlg):
+        """Window procedure a program subclassed a dialog with, or 0"""
+        win = self.gui.windows.get(dlg) if self.gui else None
+        proc = win.wndproc if win is not None else 0
+        return proc if proc and not self._is_def_dlg_proc(proc) else 0
 
     def _owner_draw_type(self, control):
         """ODT_* type of an owner-draw control, or 0"""
@@ -464,6 +502,15 @@ class DialogsMixin:
                     # The dialog manager selects the text of the edit it moves to
                     self.gui.controls[self.gui.focused_control].select_all()
                 return 0
+            if hwnd != dlg:
+                # A control of the dialog: its own (possibly subclassed) procedure
+                # gets what was posted to it (BM_CLICK, its WM_TIMER, the keys)
+                if message == self.WM_CHAR and wParam in (0x09, 0x0D, 0x1B):
+                    return 0  # The dialog manager took Tab, Enter and Escape
+                subclass = self._control_subclass(hwnd)
+                if subclass:
+                    return self.emu.call_wndproc(subclass, hwnd, message, wParam, lParam)
+                return self._control_default(hwnd, message, wParam, lParam)
             return self._dialog_message(dlg, message, wParam, lParam)
         wndproc = self._find_wndproc_for_hwnd(hwnd)
         return self.emu.call_wndproc(wndproc, hwnd, message, wParam, lParam) if wndproc else 0

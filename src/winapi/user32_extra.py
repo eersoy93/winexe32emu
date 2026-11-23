@@ -263,7 +263,13 @@ class User32ExtraMixin:
     def EnumPropsExW(self, args):
         return self.EnumPropsExA(args, wide=True)
 
-    # ---------- Hooks: accepted, but never called ----------
+    # ---------- Hooks ----------
+    # WH_CBT is called for window creation and destruction (MFC attaches
+    # its CWnd objects to new windows in its CBT hook); the others are kept
+    # but never called
+
+    WH_CBT = 5
+    HCBT_CREATEWND, HCBT_DESTROYWND = 3, 4
 
     def SetWindowsHookExA(self, args):
         """SetWindowsHookExA/W(id, proc, module, thread) - a hook handle"""
@@ -271,7 +277,8 @@ class User32ExtraMixin:
             self._last_error = 1428  # ERROR_HOOK_NEEDS_HMOD
             return 0
         handle = self.get_next_handle()
-        self.handles[handle] = {'type': 'hook', 'id': args[0], 'proc': args[1]}
+        self.handles[handle] = {'type': 'hook', 'id': self._signed32(args[0]), 'proc': args[1],
+                                'thread': args[3]}
         return handle
 
     SetWindowsHookExW = SetWindowsHookExA
@@ -291,13 +298,63 @@ class User32ExtraMixin:
 
     def UnhookWindowsHook(self, args):
         for handle, info in list(self.handles.items()):
-            if info.get('type') == 'hook' and info['id'] == args[0] and info['proc'] == args[1]:
+            if (info.get('type') == 'hook' and info['id'] == self._signed32(args[0]) and
+                    info['proc'] == args[1]):
                 del self.handles[handle]
                 return 1
         return 0
 
+    def _hook_chain(self, hook_id):
+        """Handles of the hooks of a kind for the calling thread, the most
+        recently installed first (like Windows calls them)"""
+        tid = self.emu.current_thread.tid
+        return [handle for handle, info in reversed(list(self.handles.items()))
+                if info.get('type') == 'hook' and info['id'] == hook_id and
+                info.get('thread', 0) in (0, tid)]
+
+    def _call_hook(self, handle, code, wParam, lParam):
+        info = self.handles.get(handle)
+        if info is None:
+            return 0
+        return self.emu.call_callback(info['proc'], [code, wParam, lParam])
+
+    def call_hooks(self, hook_id, code, wParam, lParam):
+        """Call the first hook of a chain (it calls the next ones with
+        CallNextHookEx); 0 without hooks"""
+        chain = self._hook_chain(hook_id)
+        return self._call_hook(chain[0], code, wParam, lParam) if chain else 0
+
+    def cbt_create_window(self, hwnd, create_struct):
+        """WH_CBT HCBT_CREATEWND for a new window (before WM_NCCREATE): True
+        if a hook refuses the window"""
+        if not self._hook_chain(self.WH_CBT):
+            return False
+        cbt = self.emu.heap_alloc(8)  # CBT_CREATEWND: lpcs, hwndInsertAfter
+        try:
+            self._mem_write(cbt, struct.pack('<II', create_struct, 0))
+            return bool(self.call_hooks(self.WH_CBT, self.HCBT_CREATEWND, hwnd, cbt))
+        finally:
+            self.emu.heap_free(cbt)
+
+    def cbt_destroy_window(self, hwnd):
+        """WH_CBT HCBT_DESTROYWND (before WM_DESTROY): True if a hook refuses"""
+        if not self._hook_chain(self.WH_CBT):
+            return False
+        return bool(self.call_hooks(self.WH_CBT, self.HCBT_DESTROYWND, hwnd, 0))
+
     def CallNextHookEx(self, args):
-        return 0
+        """CallNextHookEx(hook, code, wParam, lParam) - the next hook of the
+        chain, or 0 at its end"""
+        info = self.handles.get(args[0])
+        if not info or info.get('type') != 'hook':
+            return 0
+        chain = self._hook_chain(info['id'])
+        if args[0] not in chain:
+            return 0
+        position = chain.index(args[0])
+        if position + 1 >= len(chain):
+            return 0
+        return self._call_hook(chain[position + 1], args[1], args[2], args[3])
 
     def SetWinEventHook(self, args):
         """SetWinEventHook(min, max, module, proc, process, thread, flags)"""
@@ -1761,11 +1818,24 @@ class User32ExtraMixin:
         no update region to exclude (SIMPLEREGION)"""
         return 2 if args[0] in self.dc_state else 0
 
-    def DefDlgProcA(self, args):
-        """DefDlgProcA/W(hDlg, msg, wParam, lParam) - for the window procedure
-        of a private dialog class; the emulated dialogs run their own DefDlgProc
-        defaults, the rest is DefWindowProc"""
-        return self.DefWindowProcA(args)
+    def DefDlgProcA(self, args, wide=False):
+        """DefDlgProcA/W(hDlg, msg, wParam, lParam) - the window procedure of
+        the dialogs: the dialog procedure of an emulated dialog (a procedure
+        that subclassed it passes on to here); the emulated dialogs run their
+        own DefDlgProc defaults. Private dialog classes get DefWindowProc."""
+        dialog = self.dialogs.get(args[0])
+        key = (args[0], args[1])
+        active = self.__dict__.setdefault('_def_dlg_proc_calls', set())
+        # A dialog procedure that calls DefDlgProc itself gets DefWindowProc
+        if dialog is not None and not dialog['handler'] and dialog['proc'] and \
+                key not in active:
+            active.add(key)
+            try:
+                return self.emu.call_wndproc(dialog['proc'], args[0], args[1], args[2],
+                                             args[3])
+            finally:
+                active.discard(key)
+        return self.DefWindowProcW(args) if wide else self.DefWindowProcA(args)
 
     def DefDlgProcW(self, args):
-        return self.DefWindowProcW(args)
+        return self.DefDlgProcA(args, wide=True)

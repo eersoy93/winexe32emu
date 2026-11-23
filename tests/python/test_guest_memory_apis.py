@@ -14,12 +14,14 @@
 
 """Unit tests of API handlers that read and write guest memory: the
 scanf engine, _strupr/_strlwr, VerQueryValue, RegGetValue, list box item
-data, the import table of the PE loader and aligned heap blocks.
+data, the import table of the PE loader and aligned heap blocks; the
+characters of keystrokes and the console input of ReadFile.
 
 Run from the repository root:
     python3 -m unittest discover -s tests/python -v
 """
 
+import io
 import os
 import struct
 import sys
@@ -28,7 +30,9 @@ import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from src import config  # noqa: E402
 from src.cpu import CPUEmulator  # noqa: E402
+from src.gui.keyboard import KeyboardMixin  # noqa: E402
 from src.pe_loader import PELoader  # noqa: E402
 from src.windows import FakeControl  # noqa: E402
 from src.winapi import WinAPIHandler  # noqa: E402
@@ -178,6 +182,67 @@ class FailureResultTest(unittest.TestCase):
         self.assertEqual(failure('IStorage::Release'), 0)
         self.assertEqual(failure('RegisterClassA'), 0)  # An ATOM: 0 is failure
         self.assertEqual(failure('CreateFileA'), 0)
+
+
+class SubclassedControlTextTest(MemoryHandlerTest):
+    def test_ansi_text_through_call_window_proc(self):
+        # CallWindowProcA from an ANSI subclass: the text is ANSI, not UTF-16
+        box = FakeControl(1, 'LISTBOX', '', 0, 0, 100, 100)
+        self.handler.gui = types.SimpleNamespace(controls={1: box}, windows={})
+        self.handler._control_default(1, self.handler.LB_ADDSTRING, 0,
+                                      self.put('çalış\x00'.encode('cp1254')), wide=False)
+        old_codepage = config.ANSI_CODEPAGE
+        try:
+            config.ANSI_CODEPAGE = 'cp1254'
+            self.handler._control_default(1, self.handler.LB_ADDSTRING, 0,
+                                          self.put('şey\x00'.encode('cp1254')), wide=False)
+        finally:
+            config.ANSI_CODEPAGE = old_codepage
+        self.assertEqual(box.items[1], 'şey')
+
+
+class CharacterMessageTest(unittest.TestCase):
+    def test_ansi_characters(self):
+        # GetMessageA: WM_CHAR in the ANSI code page ('ş' is 0xFE in cp1254)
+        old_codepage = config.ANSI_CODEPAGE
+        try:
+            config.ANSI_CODEPAGE = 'cp1254'
+            self.assertEqual(WinAPIHandler._ansi_char_code(ord('ş')), 0xFE)
+            self.assertEqual(WinAPIHandler._ansi_char_code(ord('a')), ord('a'))
+            self.assertEqual(WinAPIHandler._ansi_char_code(0x4E2D), 0x3F)  # No ANSI character: '?'
+        finally:
+            config.ANSI_CODEPAGE = old_codepage
+
+    def key_char(self, unicode, vk, **keys):
+        gui = types.SimpleNamespace(key_states=keys.get('states', {}),
+                                    CONTROL_KEY_CHARS=KeyboardMixin.CONTROL_KEY_CHARS)
+        return KeyboardMixin._key_char(gui, types.SimpleNamespace(unicode=unicode), vk)
+
+    def test_control_keys(self):
+        # Enter, Backspace, Tab and Escape give WM_CHAR too (TranslateMessage)
+        self.assertEqual(self.key_char('\r', 0x0D), 0x0D)
+        self.assertEqual(self.key_char('\x08', 0x08), 0x08)
+        self.assertEqual(self.key_char('', 0x09), 0x09)
+        self.assertEqual(self.key_char('\x1b', 0x1B), 0x1B)
+        self.assertEqual(self.key_char('z', 0x5A, states={0x11: True}), 26)  # Ctrl+Z
+        # AltGr (Ctrl+Alt) types its character
+        self.assertEqual(self.key_char('@', 0x51, states={0x11: True, 0x12: True}), ord('@'))
+        self.assertEqual(self.key_char('ş', 0xBA), ord('ş'))
+        self.assertIsNone(self.key_char('', 0x25))  # Left arrow: no character
+
+
+class ConsoleReadFileTest(unittest.TestCase):
+    def test_lines_in_parts(self):
+        # A line that does not fit is kept for the next ReadFile
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        handler.gui = None
+        stdin = sys.stdin
+        sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(b'hello world\n'))
+        try:
+            parts = [handler._read_console_input_bytes(5) for _ in range(4)]
+        finally:
+            sys.stdin = stdin
+        self.assertEqual(parts, [b'hello', b' worl', b'd\r\n', b''])
 
 
 class DuplicateImportDescriptorTest(unittest.TestCase):

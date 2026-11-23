@@ -399,7 +399,9 @@ class User32Mixin:
         store = self.window_longs.setdefault(hWnd, {})
 
         if nIndex == GWL_WNDPROC:
-            if win:
+            if win and hWnd in self.dialogs and not self.dialogs[hWnd]['handler']:
+                old = win.wndproc or self.dialog_window_proc()  # DefDlgProc
+            elif win:
                 old = win.wndproc or self._find_wndproc_for_hwnd(hWnd)
             elif self.gui and hWnd in self.gui.controls:
                 old = store.get(nIndex) or self._native_stub()
@@ -722,12 +724,12 @@ class User32Mixin:
         return 0
 
     def IsWindowVisible(self, args):
-        """IsWindowVisible emulation"""
+        """IsWindowVisible emulation - WS_VISIBLE (a minimized window is
+        visible, like on Windows: IsIconic tells it apart)"""
         hWnd = args[0]
         if self.gui:
             if hWnd in self.gui.windows:
-                win = self.gui.windows[hWnd]
-                return 1 if (win.visible and not win.minimized) else 0
+                return 1 if self.gui.windows[hWnd].visible else 0
             if hWnd in self.gui.controls:
                 return 1 if self.gui.controls[hWnd].visible else 0
         return 0

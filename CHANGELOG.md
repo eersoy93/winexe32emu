@@ -39,6 +39,12 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 - Owner-draw list boxes and combo boxes without `*S_HASSTRINGS`; `LB_GETITEMDATA`, `LB_SETITEMDATA`, `LB_FINDSTRING(EXACT)`
 - `GetObject` of a DIB section: its own format and bits, and `DIBSECTION`
 - A failing registry API or COM method no longer reports success
+- `SetWindowsHookEx(WH_CBT)` hooks are called (`HCBT_CREATEWND`, `HCBT_DESTROYWND`, `CallNextHookEx`), and a subclassed dialog's messages go through its new window procedure to `DefDlgProc`, as MFC needs
+- ANSI text in subclassed controls (`CallWindowProcA`); messages posted to a dialog's control reach the control
+- Posted and input messages come before `WM_PAINT`; Enter, Backspace, Tab, Esc and Ctrl+letter give `WM_CHAR`, in the ANSI code page for `GetMessageA`
+- `ShowWindow`: minimizing and showing without activation, the previous visibility; `IsWindowVisible` of a minimized window
+- `CreateFile`: `ERROR_ALREADY_EXISTS`, share modes (`ERROR_SHARING_VIOLATION`), `ERROR_PATH_NOT_FOUND`; `ReadFile` reads the console input and fails for invalid handles
+- A thread that spins without API calls no longer keeps the other threads from running
 
 ## 0.3.0 - 2026-11-18
 

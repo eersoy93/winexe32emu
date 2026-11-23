@@ -784,18 +784,25 @@ class Kernel32ExtraMixin:
 
     HFILE_ERROR = 0xFFFFFFFF
 
-    def _open_hfile(self, address, access, disposition):
+    def _open_hfile(self, address, access, disposition, share_mode=7):
         name = self.read_string(address)
-        handle = self._create_file_common(name, access, disposition)
+        handle = self._create_file_common(name, access, disposition, share_mode)
         return self.HFILE_ERROR if handle == 0xFFFFFFFF else handle
 
     @staticmethod
     def _of_access(mode):
         return {0: 0x80000000, 1: 0x40000000, 2: 0xC0000000}.get(mode & 3, 0x80000000)
 
+    @staticmethod
+    def _of_share_mode(mode):
+        """FILE_SHARE_* of OF_SHARE_EXCLUSIVE/DENY_WRITE/DENY_READ/DENY_NONE
+        (OF_SHARE_COMPAT: shared)"""
+        return {0x10: 0, 0x20: 1, 0x30: 2, 0x40: 3}.get(mode & 0x70, 7)
+
     def _lopen(self, args):
         """_lopen(path, OF_READ/OF_WRITE/OF_READWRITE | sharing)"""
-        return self._open_hfile(args[0], self._of_access(args[1]), 3)
+        return self._open_hfile(args[0], self._of_access(args[1]), 3,
+                                self._of_share_mode(args[1]))
 
     def _lcreat(self, args):
         """_lcreat(path, attributes) - created or truncated, read/write"""
@@ -863,7 +870,8 @@ class Kernel32ExtraMixin:
         if style & 0x1000:  # OF_CREATE
             handle = self._open_hfile(address, 0xC0000000, 2)
         else:
-            handle = self._open_hfile(address, self._of_access(style), 3)
+            handle = self._open_hfile(address, self._of_access(style), 3,
+                                      self._of_share_mode(style))
         if handle == self.HFILE_ERROR:
             report(self._last_error)
             return self.HFILE_ERROR

@@ -402,8 +402,29 @@ class FindFilesMixin:
     def SetConsoleTitleW(self, args):
         return self.SetConsoleTitleA(args, wide=True)
 
+    def _read_console_input_bytes(self, count):
+        """Bytes of the console input for ReadFile: a typed line (CR LF at its
+        end); what does not fit is kept for the next read. b'' at the end of
+        the input."""
+        pending = getattr(self, '_console_input_pending', b'')
+        if not pending:
+            if self.gui:
+                line = self.console_read_line()
+                pending = b'' if line is None else \
+                    (line + '\r\n').encode(config.ANSI_CODEPAGE, errors='replace')
+            else:
+                try:
+                    pending = sys.stdin.buffer.readline()
+                except (OSError, ValueError):
+                    pending = b''
+                if pending.endswith(b'\n') and not pending.endswith(b'\r\n'):
+                    pending = pending[:-1] + b'\r\n'
+        self._console_input_pending = pending[count:]
+        return pending[:count]
+
     def ReadFile(self, args):
-        """ReadFile emulation - reads from a real sandboxed file"""
+        """ReadFile emulation - reads from a real sandboxed file, or from
+        the console input (statically linked C runtimes read stdin so)"""
         hFile = args[0]
         lpBuffer = args[1]
         nNumberOfBytesToRead = args[2]
@@ -411,13 +432,22 @@ class FindFilesMixin:
 
         log.debug(f"ReadFile(0x{hFile:x}, {nNumberOfBytesToRead} bytes)")
 
-        data = b''
+        if lpNumberOfBytesRead:  # Set first, like Windows (also when it fails)
+            self._mem_write(lpNumberOfBytesRead, struct.pack('<I', 0))
         info = self.handles.get(hFile)
-        if info and info.get('fp'):
+        if info is None and hFile == self.CONSOLE_INPUT_HANDLE and \
+                self._is_console_handle(hFile):
+            data = self._read_console_input_bytes(nNumberOfBytesToRead)
+        elif info is None or info.get('fp') is None:
+            # A directory handle has no data; anything else is no file
+            self._last_error = 1 if info and info.get('directory') else 6
+            return 0  # ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE
+        else:
             try:
                 data = info['fp'].read(nNumberOfBytesToRead)
             except OSError as e:
                 log.error(f"ReadFile error: {e}")
+                self._last_error = 5  # ERROR_ACCESS_DENIED (a write-only handle)
                 return 0
 
         if data:
@@ -425,6 +455,7 @@ class FindFilesMixin:
                 self.emu.uc.mem_write(lpBuffer, data)
             except UcError as e:
                 log.error(f"ReadFile mem_write error: {e}")
+                self._last_error = 998  # ERROR_NOACCESS
                 return 0
 
         if lpNumberOfBytesRead != 0:

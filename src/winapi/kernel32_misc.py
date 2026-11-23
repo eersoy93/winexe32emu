@@ -532,8 +532,9 @@ class Kernel32MiscMixin:
         dwDesiredAccess = args[1]
         dwCreationDisposition = args[4]
         log.debug(f"CreateFileA(\"{filename}\", access=0x{dwDesiredAccess:x}, "
-                  f"disp={dwCreationDisposition})")
-        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition)
+                  f"share={args[2]}, disp={dwCreationDisposition})")
+        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition,
+                                        args[2])
 
     def CreateFileW(self, args):
         """CreateFileW emulation - wide-char CreateFile"""
@@ -541,15 +542,58 @@ class Kernel32MiscMixin:
         dwDesiredAccess = args[1]
         dwCreationDisposition = args[4]
         log.debug(f"CreateFileW(\"{filename}\", access=0x{dwDesiredAccess:x}, "
-                  f"disp={dwCreationDisposition})")
-        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition)
+                  f"share={args[2]}, disp={dwCreationDisposition})")
+        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition,
+                                        args[2])
 
-    def _create_file_common(self, filename, dwDesiredAccess, dwCreationDisposition):
+    # Access rights that count as reading, writing or deleting for the share
+    # modes (bits like FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE)
+    _SHARE_ACCESS = ((0x1, 0x80000000 | 0x20000000 | 0x10000000 | 0x1 | 0x20),
+                     (0x2, 0x40000000 | 0x10000000 | 0x2 | 0x4),
+                     (0x4, 0x10000000 | 0x10000))
+
+    @classmethod
+    def _share_kinds(cls, access):
+        """FILE_SHARE_* bits of the kinds of access in an access mask"""
+        return sum(bit for bit, rights in cls._SHARE_ACCESS if access & rights)
+
+    def _sharing_violation(self, path, kinds, share_mode):
+        """Does an open handle of path refuse this access, or does this share
+        mode refuse the access of an open handle?"""
+        key = os.path.normcase(os.path.abspath(path))
+        for info in list(self.handles.values()):
+            if (info.get('type') != 'file' or info.get('directory') or not info.get('path')
+                    or os.path.normcase(os.path.abspath(info['path'])) != key):
+                continue
+            held, held_share = info.get('share_kinds', 0), info.get('share_mode', 7)
+            if kinds & ~held_share & 7 or held & ~share_mode & 7:
+                return True
+        return False
+
+    @staticmethod
+    def _missing_file_error(path):
+        """ERROR_FILE_NOT_FOUND, or ERROR_PATH_NOT_FOUND if its folder is missing too"""
+        return 2 if os.path.isdir(os.path.dirname(path) or '.') else 3
+
+    def _os_error_code(self, error, path):
+        """Win32 error code of an OSError of a file operation"""
+        if isinstance(error, (PermissionError, IsADirectoryError)):
+            return 5  # ERROR_ACCESS_DENIED
+        if isinstance(error, FileNotFoundError):
+            return self._missing_file_error(path)
+        if isinstance(error, FileExistsError):
+            return 80  # ERROR_FILE_EXISTS
+        return {28: 112, 36: 206}.get(error.errno, 5)  # ERROR_DISK_FULL, ERROR_FILENAME_EXCED_RANGE
+
+    def _create_file_common(self, filename, dwDesiredAccess, dwCreationDisposition,
+                            share_mode=7):
         """Shared CreateFile opener used by the A/W variants.
 
         Honours the sandbox: names that escape their drive's folder get
         INVALID_HANDLE_VALUE and ERROR_ACCESS_DENIED, like changes on the
-        read-only CD-ROM D:.
+        read-only CD-ROM D:. The share modes apply between the handles of the
+        process (ERROR_SHARING_VIOLATION); OPEN_ALWAYS and CREATE_ALWAYS of
+        an existing file succeed with ERROR_ALREADY_EXISTS.
         """
         INVALID_HANDLE_VALUE = 0xFFFFFFFF
         GENERIC_WRITE = 0x40000000
@@ -577,6 +621,11 @@ class Kernel32MiscMixin:
 
         # CreationDisposition: CREATE_NEW=1, CREATE_ALWAYS=2, OPEN_EXISTING=3,
         # OPEN_ALWAYS=4, TRUNCATE_EXISTING=5
+        kinds = self._share_kinds(dwDesiredAccess)
+        if exists and dwCreationDisposition != 1 and \
+                self._sharing_violation(path, kinds, share_mode & 7):
+            self._last_error = 32  # ERROR_SHARING_VIOLATION
+            return INVALID_HANDLE_VALUE
         if (want_write or dwCreationDisposition in (1, 2, 5) or
                 (dwCreationDisposition == 4 and not exists)):
             if dwCreationDisposition in (3, 5) and not exists:
@@ -593,27 +642,29 @@ class Kernel32MiscMixin:
                 fp = open(path, 'w+b')
             elif dwCreationDisposition == 3:    # OPEN_EXISTING
                 if not exists:
-                    self._last_error = 2  # ERROR_FILE_NOT_FOUND
+                    self._last_error = self._missing_file_error(path)
                     return INVALID_HANDLE_VALUE
                 fp = open(path, 'r+b' if want_write else 'rb')
             elif dwCreationDisposition == 4:    # OPEN_ALWAYS
                 fp = open(path, 'r+b') if exists else open(path, 'w+b')
             elif dwCreationDisposition == 5:    # TRUNCATE_EXISTING
                 if not exists:
-                    self._last_error = 2
+                    self._last_error = self._missing_file_error(path)
                     return INVALID_HANDLE_VALUE
                 fp = open(path, 'w+b')
             else:
                 fp = open(path, 'r+b' if want_write else 'rb')
         except OSError as e:
             log.error(f"CreateFile(\"{filename}\") failed: {e}")
-            self._last_error = 2
+            self._last_error = self._os_error_code(e, path)
             return INVALID_HANDLE_VALUE
 
         handle = self.get_next_handle()
         self.handles[handle] = {'type': 'file', 'name': filename,
-                                'fp': fp, 'path': path}
-        self._last_error = 0
+                                'fp': fp, 'path': path,
+                                'share_kinds': kinds, 'share_mode': share_mode & 7}
+        # Success; OPEN_ALWAYS and CREATE_ALWAYS tell that the file existed
+        self._last_error = 183 if exists and dwCreationDisposition in (2, 4) else 0
         return handle
 
     def GetFileSize(self, args):

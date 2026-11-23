@@ -233,7 +233,8 @@ class ControlsMixin:
         if msg in (self.WM_KEYDOWN, self.WM_CHAR, self.WM_KEYUP, self.WM_LBUTTONDOWN,
                    self.WM_LBUTTONUP, self.WM_MOUSEMOVE, self.WM_SETFOCUS, self.WM_KILLFOCUS):
             return 0
-        return self._control_message(control, msg, wParam, lParam, True)
+        # CallWindowProcA of an ANSI subclass passes ANSI text (LB_ADDSTRING...)
+        return self._control_message(control, msg, wParam, lParam, wide)
 
     def _read_struct(self, address, fmt):
         return struct.unpack(fmt, self.emu.uc.mem_read(address, struct.calcsize(fmt)))
