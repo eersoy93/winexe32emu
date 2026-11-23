@@ -183,7 +183,9 @@ class PELoader:
 
         for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
             dll_name = entry.dll.decode('utf-8')
-            self.imports[dll_name] = []
+            # A DLL can be named by several descriptors (Delphi and Borland EXEs
+            # import kernel32.dll more than once): each adds to its list
+            self.imports.setdefault(dll_name, [])
 
             log.info(f"DLL: {Fore.GREEN}{dll_name}{Style.RESET_ALL}")
 

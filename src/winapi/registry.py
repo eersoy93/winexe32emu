@@ -640,6 +640,9 @@ class RegistryMixin:
         name = self._read_text(args[2], wide) if args[2] else ""
         if data_addr and not size_addr:
             return self.ERROR_INVALID_PARAMETER
+        # The caller's buffer size: _registry_store_data replaces *size with
+        # the size needed, which RRF_ZEROONFAILURE must not zero
+        buffer_size = self._read_u32(size_addr) if data_addr and size_addr else 0
         node, error = self._registry_walk(hkey, subkey)
         value = node['values'].get(name.lower()) if node is not None else None
         if node is not None and value is None:
@@ -659,7 +662,7 @@ class RegistryMixin:
                 error = self._registry_store_data({'type': value_type, 'data': data}, wide,
                                                   type_addr, data_addr, size_addr)
         if error and flags & 0x20000000 and data_addr and size_addr:  # RRF_ZEROONFAILURE
-            self._mem_write(data_addr, b'\x00' * self._read_u32(size_addr))
+            self._mem_write(data_addr, b'\x00' * buffer_size)
         return error
 
     def RegGetValueW(self, args):

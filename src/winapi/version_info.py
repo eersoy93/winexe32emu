@@ -103,6 +103,8 @@ class VersionInfoMixin:
         length, value_length, value_type = struct.unpack_from('<HHH', block, offset)
         end = offset + 6
         while block[end:end + 2] != b'\x00\x00':
+            if end + 2 > len(block):  # A malformed block: its key never ends
+                raise IndexError('version node key past the end of the block')
             end += 2
         key = block[offset + 6:end].decode('utf-16-le', 'replace')
         value = (end + 2 + 3) & ~3

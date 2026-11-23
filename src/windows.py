@@ -154,6 +154,7 @@ class FakeControl:
         self.drawn_shapes = []  # GDI drawing on the control's DC (owner-draw)
         self.region = None  # SetWindowRgn rectangles (window coordinates)
         self.items = []       # For Listbox/Combobox (LB_ADDSTRING, CB_ADDSTRING)
+        self.item_data = []   # The items' data (LB_SETITEMDATA, CB_SETITEMDATA)
         self.sel_index = -1   # Selected item index (-1 = none)
         self.top_index = 0    # First visible LISTBOX item (mouse wheel scrolling)
         # Scrollbar state (SCROLLBAR class)

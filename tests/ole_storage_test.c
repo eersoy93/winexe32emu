@@ -281,6 +281,30 @@ static void test_gdi(void)
           bitmap.bmWidth == 4, "CreateDIBSection");
     check(GetObjectType(dc) == OBJ_MEMDC, "GetObjectType of a memory DC");
     DeleteObject(section);
+
+    {
+        /* An 8 bpp top-down DIB section: GetObject reports its own format */
+        struct { BITMAPINFOHEADER header; RGBQUAD colors[256]; } info8;
+        DIBSECTION ds;
+        memset(&info8, 0, sizeof(info8));
+        info8.header.biSize = sizeof(info8.header);
+        info8.header.biWidth = 10;
+        info8.header.biHeight = -6;
+        info8.header.biPlanes = 1;
+        info8.header.biBitCount = 8;
+        section = CreateDIBSection(dc, (BITMAPINFO *)&info8, DIB_RGB_COLORS, &bits, NULL, 0);
+        check(section && GetObjectA(section, sizeof(bitmap), &bitmap) == sizeof(bitmap) &&
+              bitmap.bmBitsPixel == 8 && bitmap.bmWidthBytes == 12 &&
+              bitmap.bmHeight == 6 && bitmap.bmBits == bits,
+              "GetObject of an 8 bpp DIB section: BITMAP with its format and bits");
+        memset(&ds, 0, sizeof(ds));
+        check(GetObjectA(section, sizeof(ds), &ds) == sizeof(ds) &&
+              ds.dsBm.bmBits == bits && ds.dsBm.bmWidthBytes == 12 &&
+              ds.dsBmih.biSize == sizeof(BITMAPINFOHEADER) && ds.dsBmih.biHeight == -6 &&
+              ds.dsBmih.biBitCount == 8 && ds.dsBmih.biClrUsed == 256,
+              "GetObject of a DIB section: DIBSECTION");
+        DeleteObject(section);
+    }
     DeleteDC(dc);
 }
 

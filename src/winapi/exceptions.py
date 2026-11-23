@@ -465,8 +465,10 @@ class ExceptionsMixin:
                 elif self._memory_region(handler) is not None:
                     # Another compiler's (or a hand-written) handler:
                     # EXCEPTION_DISPOSITION handler(record, frame, context, dispatcher)
+                    # It may unwind and continue in its frame's except
+                    # block without returning (watch_escape)
                     disposition = self.emu.call_callback(
-                        handler, [exc['record'], node, exc['context'], 0])
+                        handler, [exc['record'], node, exc['context'], 0], watch_escape=True)
                     if disposition == 0:  # ExceptionContinueExecution
                         return self._continue_execution(exc)
                     # ExceptionContinueSearch, ExceptionNestedException, ...

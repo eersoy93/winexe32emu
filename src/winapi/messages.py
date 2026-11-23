@@ -231,6 +231,39 @@ class MessagesMixin:
             self.SendMessageA([parent, self.WM_COMMAND, wParam, control.hwnd])
         return 0
 
+    @staticmethod
+    def _list_has_strings(control):
+        """False for an owner-draw list box or combo box without
+        LBS_HASSTRINGS/CBS_HASSTRINGS: its items are data, not strings"""
+        if not control.style & 0x30:  # *S_OWNERDRAWFIXED, *S_OWNERDRAWVARIABLE
+            return True
+        return bool(control.style & (0x200 if control.class_name == 'COMBOBOX' else 0x40))
+
+    @staticmethod
+    def _list_item_data(control):
+        """The item data of a list, one per item (items can be set without it)"""
+        data = control.item_data
+        count = len(control.items)
+        return data[:count] if len(data) >= count else data + [0] * (count - len(data))
+
+    def _find_list_item(self, control, wParam, lParam, wide, exact):
+        """LB_FINDSTRING(EXACT)/CB_FINDSTRING(EXACT): the first item after
+        wParam (-1: from the start) that starts with or equals lParam; lists
+        without strings compare their item data"""
+        count = len(control.items)
+        start = wParam + 1 if wParam < 0x80000000 else 0
+        start = start if start < count else 0
+        order = list(range(start, count)) + list(range(0, start))
+        if not self._list_has_strings(control):
+            data = self._list_item_data(control)
+            return next((i for i in order if data[i] == lParam), self.LB_ERR)
+        text = self._read_text(lParam, wide).lower()
+        for index in order:
+            item = control.items[index].lower()
+            if item == text or (not exact and item.startswith(text)):
+                return index
+        return self.LB_ERR
+
     def _control_message(self, control, Msg, wParam, lParam, wide=False):
         """Handle a message sent to a child control (emulation thread).
 
@@ -289,25 +322,46 @@ class MessagesMixin:
             return self._click_button(control)
 
         # ----- Listbox messages -----
-        if Msg == self.LB_ADDSTRING:
-            control.items = items + [self._read_text(lParam, wide)]
-            return len(control.items) - 1
-        if Msg == self.LB_INSERTSTRING:
-            index = len(items) if wParam >= len(items) else wParam
-            control.items = items[:index] + [self._read_text(lParam, wide)] + items[index:]
+        if Msg in (self.LB_ADDSTRING, self.LB_INSERTSTRING):
+            # An owner-draw list without LBS_HASSTRINGS/CBS_HASSTRINGS keeps
+            # lParam as the item's data: it is no string pointer
+            has_strings = self._list_has_strings(control)
+            text = self._read_text(lParam, wide) if has_strings else ''
+            data = self._list_item_data(control)
+            index = len(items)
+            if Msg == self.LB_INSERTSTRING and wParam < len(items):
+                index = wParam
+            control.items = items[:index] + [text] + items[index:]
+            control.item_data = data[:index] + [0 if has_strings else lParam] + data[index:]
             return index
         if Msg == self.LB_DELETESTRING:
             if wParam >= len(items):
                 return self.LB_ERR
+            data = self._list_item_data(control)
             control.items = items[:wParam] + items[wParam + 1:]
+            control.item_data = data[:wParam] + data[wParam + 1:]
             if control.sel_index >= len(control.items):
                 control.sel_index = -1
             return len(control.items)
         if Msg == self.LB_RESETCONTENT:
             control.items = []
+            control.item_data = []
             control.sel_index = -1
             control.top_index = 0
             return 0
+        if Msg == self.LB_GETITEMDATA:
+            if wParam >= len(items):
+                return self.LB_ERR
+            return self._list_item_data(control)[wParam]
+        if Msg == self.LB_SETITEMDATA:
+            data = self._list_item_data(control)
+            if wParam == 0xFFFFFFFF:  # -1: every item
+                control.item_data = [lParam] * len(items)
+                return 1
+            if wParam >= len(items):
+                return self.LB_ERR
+            control.item_data = data[:wParam] + [lParam] + data[wParam + 1:]
+            return 1
         if Msg == self.LB_GETCOUNT:
             return len(items)
         if Msg == self.LB_GETCURSEL:
@@ -330,6 +384,12 @@ class MessagesMixin:
         if Msg == self.LB_GETTEXT:
             if wParam >= len(items):
                 return self.LB_ERR
+            if not self._list_has_strings(control):
+                # Without strings the "text" is the item's data (a DWORD)
+                if lParam:
+                    self.emu.uc.mem_write(lParam, struct.pack(
+                        '<I', self._list_item_data(control)[wParam] & 0xFFFFFFFF))
+                return 4
             text = items[wParam]
             if lParam:
                 if wide:
@@ -339,7 +399,12 @@ class MessagesMixin:
                     self.emu.uc.mem_write(lParam, data + b'\x00')
             return len(text)
         if Msg == self.LB_GETTEXTLEN:
-            return len(items[wParam]) if wParam < len(items) else self.LB_ERR
+            if wParam >= len(items):
+                return self.LB_ERR
+            return len(items[wParam]) if self._list_has_strings(control) else 4
+        if Msg in (self.LB_FINDSTRING, self.LB_FINDSTRINGEXACT):
+            return self._find_list_item(control, wParam, lParam, wide,
+                                        Msg == self.LB_FINDSTRINGEXACT)
 
         # ----- Combobox messages (same item list as listbox) -----
         combo_to_list = {
@@ -363,23 +428,11 @@ class MessagesMixin:
             if Msg == 0x014A:  # CB_INSERTSTRING
                 return self._control_message(control, self.LB_INSERTSTRING, wParam, lParam, wide)
             if Msg in (0x014C, 0x0158):  # CB_FINDSTRING, CB_FINDSTRINGEXACT
-                text = self._read_text(lParam, wide).lower()
-                start = wParam + 1 if wParam < 0x80000000 else 0
-                order = list(range(start, len(control.items))) + list(range(0, start))
-                for index in order:
-                    item = control.items[index].lower()
-                    if item == text or (Msg == 0x014C and item.startswith(text)):
-                        return index
-                return self.CB_ERR
+                return self._find_list_item(control, wParam, lParam, wide, Msg == 0x0158)
             if Msg == 0x0150:  # CB_GETITEMDATA
-                return getattr(control, 'item_data', {}).get(wParam, 0)
+                return self._control_message(control, self.LB_GETITEMDATA, wParam, lParam, wide)
             if Msg == 0x0151:  # CB_SETITEMDATA
-                if wParam >= len(control.items):
-                    return self.CB_ERR
-                if not hasattr(control, 'item_data'):
-                    control.item_data = {}
-                control.item_data[wParam] = lParam
-                return 1
+                return self._control_message(control, self.LB_SETITEMDATA, wParam, lParam, wide)
             if Msg == 0x014F:  # CB_SHOWDROPDOWN
                 if self.gui:
                     self.gui.open_combo = control.hwnd if wParam else None

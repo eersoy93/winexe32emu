@@ -127,6 +127,7 @@ class GuestThread:
         self.handle = 0  # Thread handle (0: main thread)
         self.teb = 0
         self.stack = 0
+        self.gdt = 0  # The thread's GDT (heap block)
         self.suspend_count = 0
         self.exited = False
         self.exit_code = 259  # STILL_ACTIVE
@@ -553,7 +554,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 start, base + self._align_size(resources.VirtualAddress + resources.Size))
 
     def _setup_segments(self, uc, teb):
-        """GDT with flat code/data segments and FS -> teb, loaded into uc"""
+        """GDT with flat code/data segments and FS -> teb, loaded into uc;
+        returns the GDT's address"""
         def create_gdt_entry(base, limit, access, flags):
             entry = bytearray(8)
             entry[0] = limit & 0xFF
@@ -579,6 +581,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         uc.reg_write(UC_X86_REG_SS, 0x10)
         uc.reg_write(UC_X86_REG_FS, 0x18)
         uc.reg_write(UC_X86_REG_GS, 0x00)
+        return gdt_addr
 
     def _new_teb(self, tid, stack_base, stack_limit):
         """Allocate and fill a TEB for a thread"""
@@ -605,7 +608,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
         thread.teb = self._new_teb(tid, stack + size, stack)
         self.init_thread_tls(thread)
         uc = thread.uc
-        self._setup_segments(uc, thread.teb)
+        thread.gdt = self._setup_segments(uc, thread.teb)
         esp = stack + size - 0x100
         uc.mem_write(esp, struct.pack('<II', self.THREAD_EXIT_ADDR, param))
         uc.reg_write(UC_X86_REG_ESP, esp)
@@ -647,7 +650,16 @@ class CPUEmulator(ProcessEnvironmentMixin):
                         thread.exit_code = 0
                     self.threads.pop(tid, None)
                     self.free_thread_tls(thread)
-                    self.heap_free(thread.teb)
+                    # Like Windows, the thread's stack is freed with it. A
+                    # program that keeps starting threads would run out of
+                    # heap otherwise.
+                    for block in (thread.teb, thread.gdt, thread.stack):
+                        if block:
+                            self.heap_free(block)
+                    thread.teb = thread.gdt = thread.stack = 0
+                    # Its Unicorn instance too: the handle can outlive the
+                    # thread (GetExitCodeThread), the CPU state is not needed
+                    thread.uc = None
                     self.sched.notify_all()
                     log.debug(f"Thread {tid} exited ({thread.exit_code})")
 
@@ -903,9 +915,16 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def heap_alloc(self, size, alignment=16):
         """Allocate zeroed heap memory, reusing freed blocks. Returns 0 when exhausted."""
         span = self._align_size(max(size, 1), 16)
-        free_bin = self.heap_free_bins.get(span) if alignment <= 16 else None
+        free_bin = self.heap_free_bins.get(span)
+        addr = None
         if free_bin:
-            addr = free_bin.pop()
+            if alignment <= 16:
+                addr = free_bin.pop()
+            else:  # A freed block that is aligned (thread stacks)
+                addr = next((a for a in free_bin if a % alignment == 0), None)
+                if addr is not None:
+                    free_bin.discard(addr)
+        if addr is not None:
             del self.heap_free_ends[addr + span]
             self.uc.mem_write(addr, b'\x00' * span)
         else:
@@ -1346,7 +1365,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
         for name, value in (jump.regs or {}).items():
             uc.reg_write(self.JUMP_REGISTERS[name], value & 0xFFFFFFFF)
 
-    def call_callback(self, callback_addr, args, return_handler=None, regs=None):
+    def call_callback(self, callback_addr, args, return_handler=None, regs=None,
+                      watch_escape=False):
         """
         Call callback function (WndProc, EnumWindowsProc, etc.)
 
@@ -1354,6 +1374,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
             callback_addr: Address of callback function
             args: Callback arguments (list)
             return_handler: Function to call when callback finishes (optional)
+            watch_escape: The callback may continue in the frames of its
+                caller without returning (an exception handler that unwinds
+                and jumps to its __except block): see _escaped_callback
 
         Returns:
             Callback return value (EAX)
@@ -1378,6 +1401,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
             'addr': callback_addr,
             'args': args,
             'return_handler': return_handler,
+            'watch_escape': watch_escape,
             'saved_state': {
                 'esp': saved_esp,
                 'eip': saved_eip,
@@ -1536,12 +1560,39 @@ class CPUEmulator(ProcessEnvironmentMixin):
         hook_info = self.api_hooks.get(address)
         if hook_info:
             thread = self.current_thread
+            if self._escaped_callback(uc, address):
+                return
             self.maybe_yield()
             if thread.region_gen != self.region_gen:
                 self.sync_regions(thread)
             self._handle_api_call(hook_info, uc, thread)
             if self.stop_emulation or thread.stop:
                 uc.emu_stop()
+
+    def _escaped_callback(self, uc, address):
+        """Has a watched callback left its frames without returning? An
+        exception handler of another compiler (Delphi's _HandleAnyException,
+        a static _except_handler4) calls RtlUnwind and then jumps to the
+        except block of its frame, which is in the stack of the code that
+        called the callback (above the stack pointer it was called at). Its
+        nested emulation would never end and each exception would nest one
+        level deeper. So the API call it makes there is made again on the
+        level that waits for it: the nested emulation stops (True)."""
+        stack = self.callback_stack
+        if not stack or not stack[-1]['watch_escape']:
+            return False
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        if esp <= stack[-1]['saved_state']['esp']:
+            return False
+        regs = {name: uc.reg_read(reg) for name, reg in self.JUMP_REGISTERS.items()}
+        self.pending_unwind = ApiJump(address, esp, uc.reg_read(UC_X86_REG_EAX),
+                                      ebp=uc.reg_read(UC_X86_REG_EBP), regs=regs)
+        log.debug(f"Callback 0x{stack[-1]['addr']:08x} continued in its caller's frames "
+                  f"(ESP 0x{esp:08x}): the API call at 0x{address:08x} is made outside it")
+        # Leave like a callback that returns (an emu_stop here would also end
+        # the emulation level that resumes the call)
+        uc.reg_write(UC_X86_REG_EIP, self.callback_return_addr)
+        return True
 
     _UNRESOLVED = object()
 
@@ -1614,7 +1665,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 if DebugLogger.level <= DebugLogger.DEBUG:
                     import traceback
                     traceback.print_exc()
-                result = 0
+                result = self.api_handler.failure_result(func_name)
         else:
             log.warning(f"Unemulated API: {func_name}")
             self.note_missing_api(dll_name, func_name, 'called, returned 0')

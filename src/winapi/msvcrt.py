@@ -222,23 +222,23 @@ class MsvcrtMixin:
             log.warning(f"String function: cannot write to 0x{s_addr:08x}")
         return s_addr
 
-    def _strlwr(self, args):
-        """_strlwr emulation - lowercase in place"""
-        s_addr = args[0]
-        s = self.read_string(s_addr)
-        data = s.lower().encode(config.ANSI_CODEPAGE, errors='replace')
+    def _str_case_map(self, s_addr, upper):
+        """_strupr/_strlwr: change the case of a string in place, byte for
+        byte like the "C" locale (only A-Z and a-z). Text case mapping can
+        change the length ('ß' -> 'SS') and would write past the string."""
+        data = self.read_cstring(s_addr)
+        data = data.upper() if upper else data.lower()  # bytes: ASCII letters only
         if not self._mem_write(s_addr, data + b'\x00'):
             log.warning(f"String function: cannot write to 0x{s_addr:08x}")
         return s_addr
 
+    def _strlwr(self, args):
+        """_strlwr emulation - lowercase in place"""
+        return self._str_case_map(args[0], False)
+
     def _strupr(self, args):
         """_strupr emulation - uppercase in place"""
-        s_addr = args[0]
-        s = self.read_string(s_addr)
-        data = s.upper().encode(config.ANSI_CODEPAGE, errors='replace')
-        if not self._mem_write(s_addr, data + b'\x00'):
-            log.warning(f"String function: cannot write to 0x{s_addr:08x}")
-        return s_addr
+        return self._str_case_map(args[0], True)
 
     def _strdup(self, args):
         """_strdup emulation - allocate a copy of the string"""
@@ -653,8 +653,9 @@ class MsvcrtMixin:
                 if not suppress:
                     ptr = next_arg()
                     if ptr:
-                        fmt = '<d' if length in ('l', 'L') else '<f'
-                        self._mem_write(ptr, struct.pack(fmt, value))
+                        # Not fmt: that is the format being walked
+                        packing = '<d' if length in ('l', 'L') else '<f'
+                        self._mem_write(ptr, struct.pack(packing, value))
                     assigned += 1
             elif conv in 'cCsS[':
                 as_wide = self._wide_spec(conv if conv != '[' else 's', length, wide_fmt)

@@ -548,6 +548,8 @@ class MemoryDCMixin:
         if obj is None:
             return 0
         kind = obj['type']
+        if kind == 'bitmap' and obj.get('dib'):
+            return self._get_dib_section_object(obj, cbBuffer, lpvObject)
         if kind == 'bitmap':
             bpp = obj.get('bpp', 32)
             width, height = obj['width'], obj['height']
@@ -577,6 +579,43 @@ class MemoryDCMixin:
         if not lpvObject:
             return len(data)
         data = data[:cbBuffer]
+        return len(data) if self._mem_write(lpvObject, data) else 0
+
+    DIBSECTION_SIZE = 84  # BITMAP, BITMAPINFOHEADER, dsBitfields[3], dshSection, dsOffset
+
+    def _get_dib_section_object(self, obj, cbBuffer, lpvObject):
+        """GetObject of a CreateDIBSection bitmap: a BITMAP with the DIB's own
+        format and bmBits, or a DIBSECTION if the buffer has room for one"""
+        dib = obj['dib']
+        header = dib['header']
+        size = struct.unpack_from('<I', header)[0]
+        colors = 0
+        if size == BITMAPCOREHEADER_SIZE:
+            width, height, _, bpp = struct.unpack_from('<HHHH', header, 4)
+            compression = 0
+        else:
+            width, height, _, bpp, compression = struct.unpack_from('<iiHHI', header, 4)
+            colors = struct.unpack_from('<I', header, 32)[0]
+        stride = ((width * bpp + 31) // 32) * 4  # DIB rows are DWORD-aligned
+        bitmap = struct.pack('<iiiiHHI', 0, width, abs(height), stride, 1, bpp, dib['bits'])
+        if not lpvObject:
+            return len(bitmap)
+        if cbBuffer < self.DIBSECTION_SIZE:
+            data = bitmap[:cbBuffer]
+            return len(data) if self._mem_write(lpvObject, data) else 0
+        if bpp <= 8:
+            colors = colors or (1 << bpp)
+        if compression == 3:  # BI_BITFIELDS: the masks follow (or end) a BITMAPINFOHEADER
+            masks = struct.unpack_from('<III', header, 40)
+        elif bpp == 16:
+            masks = (0x7C00, 0x03E0, 0x001F)  # 5-5-5
+        elif bpp == 32:
+            masks = (0xFF0000, 0x00FF00, 0x0000FF)
+        else:
+            masks = (0, 0, 0)
+        info = struct.pack('<IiiHHIIiiII', 40, width, height, 1, bpp, compression,
+                           dib['size'], 0, 0, colors, 0)
+        data = bitmap + info + struct.pack('<5I', *masks, 0, 0)
         return len(data) if self._mem_write(lpvObject, data) else 0
 
     @staticmethod

@@ -170,6 +170,19 @@ static void test_threads(void)
     CloseHandle(mutex);
     DeleteCriticalSection(&cs);
     TlsFree(tls_index);
+
+    /* 200 threads with 1 MB stacks one after the other: more than the
+       emulator's heap (128 MB) unless an ended thread's stack is freed */
+    for (i = 0; i < 200; i++) {
+        thread = CreateThread(NULL, 0x100000, exit_thread, NULL, 0, &id);
+        if (!thread)
+            break;
+        WaitForSingleObject(thread, 10000);
+        if (!GetExitCodeThread(thread, &code) || code != 77)
+            break;
+        CloseHandle(thread);
+    }
+    check(i == 200, "the stacks of ended threads are freed (200 threads)");
 }
 
 static void test_named_objects(void)
