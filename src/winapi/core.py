@@ -775,6 +775,10 @@ class CoreMixin:
     LB_GETTEXT = 0x0189
     LB_GETTEXTLEN = 0x018A
     LB_GETCOUNT = 0x018B
+    LB_FINDSTRING = 0x018F
+    LB_GETITEMDATA = 0x0199
+    LB_SETITEMDATA = 0x019A
+    LB_FINDSTRINGEXACT = 0x01A2
     LB_ERR = 0xFFFFFFFF  # -1 as unsigned
 
     # Combobox control messages
@@ -1075,6 +1079,29 @@ class CoreMixin:
         'odbc32.dll', 'avrt.dll', 'xinput1_3.dll', 'shfolder.dll', 'sensapi.dll',
         'shcore.dll',
     }
+
+    # Registry APIs of shlwapi that return a Win32 error code (LSTATUS)
+    SHLWAPI_REGISTRY_APIS = frozenset(
+        f'{name}{suffix}' for name in ('SHGetValue', 'SHSetValue', 'SHQueryValueEx',
+                                       'SHDeleteValue', 'SHDeleteKey', 'SHDeleteEmptyKey',
+                                       'SHEnumKeyEx', 'SHEnumValue', 'SHQueryInfoKey',
+                                       'SHCopyKey', 'SHRegGetValue', 'SHRegSetValue')
+        for suffix in ('A', 'W'))
+
+    @classmethod
+    def failure_result(cls, func_name):
+        """EAX of an API whose handler failed with an emulator error. 0 is
+        success for the APIs that return an error code, which would make the
+        program use outputs that were never written: the registry APIs
+        (LSTATUS) get ERROR_NOACCESS, like Windows answers an unusable
+        buffer; COM interface methods (HRESULT) get E_FAIL."""
+        if '::' in func_name:
+            method = func_name.rsplit('::', 1)[1]
+            return 0 if method in ('AddRef', 'Release') else 0x80004005  # E_FAIL
+        if ((func_name.startswith('Reg') and not func_name.startswith('Register')) or
+                func_name in cls.SHLWAPI_REGISTRY_APIS):
+            return 998  # ERROR_NOACCESS
+        return 0
 
     def is_system_dll_name(self, dll_name):
         """Is dll_name a Windows DLL (whose exports the emulator may emulate)?

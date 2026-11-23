@@ -76,6 +76,9 @@ int __cdecl seh4_common_dummy(void)
 DWORD seh3_try(int kind);
 DWORD seh4_try(int kind);
 DWORD custom_continue(void);
+DWORD unwind_try(int kind);
+/* The frame of unwind_try (its except block restores them) */
+DWORD unwind_frame_esp, unwind_frame_ebp;
 
 /*
 do_fault(kind): 0 = read of address 0, 1 = write of address 0,
@@ -226,6 +229,59 @@ __asm__(
     "    pop ebx\n"
     "    ret\n"
 
+    /*
+    DWORD unwind_try(int kind): a frame whose handler works like Delphi's
+    (_HandleAnyException): it calls RtlUnwind and then jumps to the except
+    block of its frame without returning
+    */
+    ".globl _unwind_try\n"
+    "_unwind_try:\n"
+    "    push ebp\n"
+    "    mov ebp, esp\n"
+    "    push ebx\n"
+    "    push esi\n"
+    "    push edi\n"
+    "    push offset _unwind_handler\n"
+    "    push dword ptr fs:[0]\n"
+    "    mov dword ptr fs:[0], esp\n"
+    "    mov dword ptr [_unwind_frame_esp], esp\n"
+    "    mov dword ptr [_unwind_frame_ebp], ebp\n"
+    "    push dword ptr [ebp+8]\n"
+    "    call _do_fault\n"
+    "    add esp, 4\n"
+    "    xor eax, eax\n"                     /* no exception */
+    "    jmp _unwind_leave\n"
+    "_unwind_except:\n"
+    "    call dword ptr [__imp__GetTickCount@0]\n"  /* an API call in the except block */
+    "    mov eax, dword ptr [_seh_code]\n"
+    "_unwind_leave:\n"
+    "    pop dword ptr fs:[0]\n"
+    "    add esp, 4\n"
+    "    pop edi\n"
+    "    pop esi\n"
+    "    pop ebx\n"
+    "    pop ebp\n"
+    "    ret\n"
+    /* EXCEPTION_DISPOSITION unwind_handler(record, frame, context, dispatcher) */
+    "_unwind_handler:\n"
+    "    mov eax, dword ptr [esp+4]\n"
+    "    test dword ptr [eax+4], 6\n"       /* EXCEPTION_UNWINDING, EXCEPTION_EXIT_UNWIND */
+    "    jnz _unwind_handler_search\n"
+    "    mov ecx, dword ptr [eax]\n"
+    "    mov dword ptr [_seh_code], ecx\n"
+    "    mov ecx, dword ptr [esp+8]\n"
+    "    push 0\n"                           /* ReturnValue */
+    "    push eax\n"                         /* ExceptionRecord */
+    "    push offset _unwind_except\n"      /* TargetIp */
+    "    push ecx\n"                         /* TargetFrame */
+    "    call dword ptr [__imp__RtlUnwind@16]\n"
+    "    mov esp, dword ptr [_unwind_frame_esp]\n"
+    "    mov ebp, dword ptr [_unwind_frame_ebp]\n"
+    "    jmp _unwind_except\n"
+    "_unwind_handler_search:\n"
+    "    mov eax, 1\n"                       /* ExceptionContinueSearch */
+    "    ret\n"
+
     ".data\n"
     "_seh3_table:\n"
     "    .long -1, _seh_filter, _seh_handler\n"  /* level 0: __except */
@@ -322,6 +378,22 @@ int main(int argc, char **argv)
 
     check(custom_continue() == 0x1234 + 0x5678,
           "ExceptionContinueExecution continues with the changed CONTEXT");
+
+    {
+        /* More exceptions than the emulator's nesting limit (8): each
+           handler continues in its frame without returning */
+        DWORD head = seh_head();
+        int i, ok = 1;
+        for (i = 0; i < 20; i++) {
+            int kind = i % 2 ? 3 : 0;
+            DWORD expected = kind == 3 ? 0xE0001234 : EXCEPTION_ACCESS_VIOLATION;
+            seh_code = 0;
+            if (unwind_try(kind) != expected)
+                ok = 0;
+        }
+        check(ok && seh_head() == head,
+              "20 exceptions taken by handlers that unwind and do not return");
+    }
 
     veh = AddVectoredExceptionHandler(1, breakpoint_veh);
     __asm__ volatile("int3");

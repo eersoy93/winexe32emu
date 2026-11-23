@@ -30,6 +30,15 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 - `GetDlgItem`, `GCL_WNDPROC`, `CharUpperA` on cp1252, the `=C:` environment variables
 - The `lpIDList` read of `ShellExecuteEx`
 - Several window bugs
+- EXEs that import a DLL in several import descriptors (Delphi, Borland) get all their imports bound
+- Exception handlers that unwind and continue in their frame without returning (Delphi) no longer use up the exception nesting limit
+- Ended threads free their stack, TEB and GDT; freed aligned heap blocks are reused
+- `scanf` with a float conversion before other conversions; `_strupr`/`_strlwr` keep the string's length ("C" locale)
+- `VerQueryValue` no longer hangs on a malformed version block
+- `RegGetValue` with `RRF_ZEROONFAILURE` zeroes only the caller's buffer
+- Owner-draw list boxes and combo boxes without `*S_HASSTRINGS`; `LB_GETITEMDATA`, `LB_SETITEMDATA`, `LB_FINDSTRING(EXACT)`
+- `GetObject` of a DIB section: its own format and bits, and `DIBSECTION`
+- A failing registry API or COM method no longer reports success
 
 ## 0.3.0 - 2026-11-18
 
