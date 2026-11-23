@@ -19,6 +19,9 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 ### Changed
 
+- The fake desktop keeps the texts it rendered instead of rendering them again every frame
+- 16 and 32 bpp DIBs with color masks (`BI_BITFIELDS`, 16 bpp DIB sections) decode about 10 times faster
+- More unit tests: wildcards, time conversions, INI files, the printf engine, `VerQueryValue`, share modes, the DIB decoder
 - The fake desktop's code (`gui.py`) is a package of smaller modules
 - Lint also checks the pycodestyle and bugbear rules (100 columns)
 - Heap blocks shrink in place, like on Windows
@@ -45,6 +48,8 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 - `ShowWindow`: minimizing and showing without activation, the previous visibility; `IsWindowVisible` of a minimized window
 - `CreateFile`: `ERROR_ALREADY_EXISTS`, share modes (`ERROR_SHARING_VIOLATION`), `ERROR_PATH_NOT_FOUND`; `ReadFile` reads the console input and fails for invalid handles
 - A thread that spins without API calls no longer keeps the other threads from running
+- `CreateHardLink` cannot link files of the read-only D: or across drives (`ERROR_NOT_SAME_DEVICE`)
+- Opening a file without read, write or delete access takes no part in the share modes
 
 ## 0.3.0 - 2026-11-18
 

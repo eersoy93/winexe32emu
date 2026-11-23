@@ -559,13 +559,18 @@ class Kernel32MiscMixin:
 
     def _sharing_violation(self, path, kinds, share_mode):
         """Does an open handle of path refuse this access, or does this share
-        mode refuse the access of an open handle?"""
+        mode refuse the access of an open handle? Handles without read, write
+        or delete access (attributes only) take no part, like on Windows."""
+        if not kinds:
+            return False
         key = os.path.normcase(os.path.abspath(path))
         for info in list(self.handles.values()):
             if (info.get('type') != 'file' or info.get('directory') or not info.get('path')
                     or os.path.normcase(os.path.abspath(info['path'])) != key):
                 continue
             held, held_share = info.get('share_kinds', 0), info.get('share_mode', 7)
+            if not held:
+                continue
             if kinds & ~held_share & 7 or held & ~share_mode & 7:
                 return True
         return False
