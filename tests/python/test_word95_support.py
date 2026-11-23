@@ -322,5 +322,120 @@ class CharsetAndBitmapTest(unittest.TestCase):
         self.assertIsNone(handler._system_bitmap(1))
 
 
+class RasterOperationTest(unittest.TestCase):
+    """The carets and selections Word draws with XOR raster operations"""
+
+    def test_rop3_effects(self):
+        effect = WinAPIHandler.rop3_effect
+        for pattern in (0, 1):
+            for source in (0, 1):
+                self.assertEqual(effect(0x00550009, pattern, source), 'invert')  # DSTINVERT
+        self.assertEqual(effect(0x005A0049, 1, 0), 'invert')  # PATINVERT, white brush
+        self.assertEqual(effect(0x005A0049, 0, 0), 'keep')  # PATINVERT, black brush
+        self.assertEqual(effect(0x00CC0020, 0, 1), 'white')  # SRCCOPY
+        self.assertEqual(effect(0x00CC0020, 0, 0), 'black')
+        # Word's caret: PDSxxn with a black brush inverts under the black pixels
+        self.assertEqual(effect(0x00690145, 0, 0), 'invert')
+        self.assertEqual(effect(0x00690145, 0, 1), 'keep')
+
+    def test_masked_invert_of_an_image(self):
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        black, white = b'\x00\x00\x00', b'\xff\xff\xff'
+        image = {'type': 'image', 'pos': (5, 6), 'dim': (2, 1), 'size': (2, 1),
+                 'data': black + white, 'rop': 0x00690145}
+        shapes = handler._rop3_shapes(image, 0x00690145, 0)
+        self.assertEqual(shapes, [{'type': 'invert', 'rect': (5, 6, 7, 7),
+                                   'mask': (2, 1, b'\xff\x00')}])
+
+    def test_inverting_twice_cancels(self):
+        from src.gui import PseudoWindowsGUI
+        text = {'type': 'text', 'pos': (0, 0), 'text': 'x'}
+        caret = {'type': 'invert', 'rect': (1, 2, 3, 4)}
+        shapes = PseudoWindowsGUI.add_to_display_list([text], dict(caret))
+        self.assertEqual(len(shapes), 2)
+        self.assertEqual(PseudoWindowsGUI.add_to_display_list(shapes, dict(caret)), [text])
+
+
+class FontAndToolbarTest(unittest.TestCase):
+    def test_pitch_and_family(self):
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        # TMPF_FIXED_PITCH (set for variable pitch), TMPF_VECTOR, TMPF_TRUETYPE
+        self.assertEqual(handler._tm_pitch_and_family({'face': 'Times New Roman'}), 0x17)
+        self.assertEqual(handler._tm_pitch_and_family({'face': 'Courier New'}) & 0x01, 0)
+        self.assertEqual(handler._tm_pitch_and_family({'face': 'MS Sans Serif'}), 0x21)
+
+    def test_buttons_fit_their_bitmaps(self):
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        win = types.SimpleNamespace(nstate={'bitmap_size': (16, 16), 'button_size': (16, 16),
+                                            'buttons': [], 'strings': [], 'max_text_rows': 1})
+        self.assertEqual(handler._tb_button_size(win), (23, 23))
+        win.nstate['button_size'] = (30, 28)
+        self.assertEqual(handler._tb_button_size(win), (30, 28))
+
+
+class CreateProcessCommandLineTest(unittest.TestCase):
+    def test_unquoted_program_path_with_spaces(self):
+        handler = WinAPIHandler.__new__(WinAPIHandler)
+        program = 'C:\\Program Files\\Shared\\MSinfo\\msinfo32.exe'
+        handler._image_path_of = lambda name: name if name.lower() == program.lower() else None
+        self.assertEqual(handler._requested_image_path('', program + ' /x'), program)
+        self.assertEqual(handler._quote_program_name(program), f'"{program}"')
+        self.assertEqual(handler._quote_program_name(program + ' /x'), f'"{program}" /x')
+        self.assertEqual(handler._quote_program_name('notepad.exe a b'), 'notepad.exe a b')
+
+
+class ListViewHitTestTest(unittest.TestCase):
+    def hit_test(self, msg):
+        handler = handler_with_memory()
+        handler._lv_hit = lambda win, x, y: (2, 1)
+        win = types.SimpleNamespace(nstate={'items': []})
+        info = handler.emu.heap_alloc(24)
+        handler.emu.uc.mem_write(info, struct.pack('<iiIiiI', 5, 6, 0, 0, 0, 0xDEADBEEF))
+        self.assertEqual(handler._listview_message(win, msg, 0, info), 2)
+        return struct.unpack('<iiIiiI', handler.emu.uc.mem_read(info, 24))
+
+    def test_hit_test_leaves_the_subitem_alone(self):
+        # Office 95's File Open passes a 16-byte LVHITTESTINFO on the stack:
+        # writing iSubItem overwrote the saved EBP and Word crashed when a
+        # file was double-clicked
+        self.assertEqual(self.hit_test(0x1012), (5, 6, 0x4, 2, 0, 0xDEADBEEF))
+
+    def test_subitem_hit_test_fills_the_subitem(self):
+        self.assertEqual(self.hit_test(0x1039), (5, 6, 0x4, 2, 1, 0xDEADBEEF))
+
+
+class MouseButtonKeyStateTest(unittest.TestCase):
+    WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x200, 0x201, 0x202
+
+    def setUp(self):
+        import threading
+        self.handler = handler_with_memory()
+        self.handler.message_queue = []
+        self.handler.message_lock = threading.Lock()
+        self.handler.mouse_buttons = set()
+        self.handler.gui = types.SimpleNamespace(key_states={})
+
+    def left(self):
+        return self.handler.GetKeyState([0x01])
+
+    def test_button_held_as_of_the_last_message_taken(self):
+        # Word's selection drag asks GetKeyState(VK_LBUTTON) on
+        # WM_LBUTTONDOWN, when the GUI may already have seen the release
+        handler = self.handler
+        handler.message_queue.append({'message': self.WM_LBUTTONUP})
+        handler._track_mouse_buttons(self.WM_LBUTTONDOWN, 1)
+        self.assertEqual(self.left() & 0xFFFF, 0xFF80)
+        handler._track_mouse_buttons(self.WM_LBUTTONUP, 0)
+        self.assertEqual(self.left(), 0)
+        handler._track_mouse_buttons(self.WM_MOUSEMOVE, 0x1)  # MK_LBUTTON
+        handler.gui.key_states[0x01] = True
+        self.assertNotEqual(self.left(), 0)
+
+    def test_release_without_a_message(self):
+        # Released over the frame or another program: no WM_LBUTTONUP comes
+        self.handler._track_mouse_buttons(self.WM_LBUTTONDOWN, 1)
+        self.assertEqual(self.left(), 0)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -705,6 +705,45 @@ class MessagesMixin:
                                    int(time.time() * 1000) & 0xFFFFFFFF, x, y)
             self.emu.uc.mem_write(lpMsg, msg_data)
 
+    # Mouse messages -> (virtual key, held after it); WM_MOUSEMOVE tells all
+    # three buttons in its MK_* wParam
+    MOUSE_BUTTON_MESSAGES = {
+        0x201: (0x01, True), 0x203: (0x01, True), 0x202: (0x01, False),  # L down/dblclk/up
+        0x204: (0x02, True), 0x206: (0x02, True), 0x205: (0x02, False),  # R
+        0x207: (0x04, True), 0x209: (0x04, True), 0x208: (0x04, False),  # M
+    }
+    MK_BUTTONS = ((0x0001, 0x01), (0x0002, 0x02), (0x0010, 0x04))  # MK_* -> VK_*
+
+    def _track_mouse_buttons(self, message, wParam):
+        """Like Windows, GetKeyState sees a mouse button change when the
+        program takes the mouse message from its queue (not when the user
+        pressed it): Word's selection drag asks GetKeyState(VK_LBUTTON) right
+        after WM_LBUTTONDOWN, when the GUI may already have seen the release"""
+        if message == 0x200:  # WM_MOUSEMOVE
+            self.mouse_buttons = {vk for mk, vk in self.MK_BUTTONS if wParam & mk}
+        elif message in self.MOUSE_BUTTON_MESSAGES:
+            vk, down = self.MOUSE_BUTTON_MESSAGES[message]
+            if down:
+                self.mouse_buttons.add(vk)
+            else:
+                self.mouse_buttons.discard(vk)
+
+    def _mouse_button_held(self, vk):
+        """GetKeyState of a mouse button (see _track_mouse_buttons)"""
+        if vk not in self.mouse_buttons:
+            return False
+        if self.gui and not self.gui.key_states.get(vk):
+            # Released: its button-up message is still queued, unless the GUI
+            # sent none (released over another program or the window frame)
+            ups = {m for m, (v, down) in self.MOUSE_BUTTON_MESSAGES.items()
+                   if v == vk and not down}
+            with self.message_lock:
+                if not any(m['message'] in ups or m['message'] == 0x200
+                           for m in self.message_queue):
+                    self.mouse_buttons.discard(vk)
+                    return False
+        return True
+
     def _next_message(self, remove=True, hwnd_filter=0, msg_min=0, msg_max=0):
         """Single non-blocking scan for a pending message.
 
@@ -739,9 +778,15 @@ class MessagesMixin:
         with self.message_lock:
             for index, msg in enumerate(self.message_queue):
                 if matches(msg['hwnd'], msg['message']):
+                    key = (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
                     if remove:
                         del self.message_queue[index]
-                    return (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
+                        self._track_mouse_buttons(msg['message'], msg['wParam'])
+                        if 'char' in msg:
+                            # The latest one of a key: an older untranslated
+                            # keystroke must not give its character
+                            self.key_chars[key] = msg['char']
+                    return key
 
         # Send WM_PAINT for visible windows not yet painted
         windows = []
@@ -858,11 +903,33 @@ class MessagesMixin:
         """PeekMessageW emulation"""
         return self.PeekMessageA(args, wide=True)
 
+    KEY_MESSAGES = (0x0100, 0x0101, 0x0104, 0x0105)  # WM_(SYS)KEYDOWN, WM_(SYS)KEYUP
+
     def TranslateMessage(self, args):
-        """TranslateMessage emulation"""
-        lpMsg = args[0]
+        """TranslateMessage(lpMsg) - post the WM_CHAR / WM_SYSCHAR of a key-down
+        message, to be retrieved next. Programs handle some keystrokes
+        themselves without translating them: Word's Ctrl+B must not also
+        type a ^B. Nonzero for the key messages."""
         log.debug("TranslateMessage()")
+        try:
+            hwnd, message, wParam, lParam = struct.unpack('<4I', self.emu.uc.mem_read(args[0], 16))
+        except UcError:
+            return 0
+        if message not in self.KEY_MESSAGES:
+            return 0
+        self._translate_key(hwnd, message, wParam, lParam)
         return 1
+
+    def _translate_key(self, hwnd, message, wParam, lParam):
+        """Post the character of a key-down message taken from the queue in
+        front of the other messages (TranslateMessage, dialog loops)"""
+        char = self.key_chars.pop((hwnd, message, wParam, lParam), None)
+        if char is None:
+            return False
+        with self.message_lock:
+            self.message_queue.insert(0, {'hwnd': hwnd, 'message': char[0],
+                                          'wParam': char[1], 'lParam': lParam})
+        return True
 
     def DispatchMessageA(self, args):
         """DispatchMessageA emulation - Call WndProc. The update region of a
@@ -980,6 +1047,11 @@ class MessagesMixin:
             return self._default_set_cursor(hWnd, wParam, lParam)
         if Msg == self.WM_NCCREATE:
             return 1  # Continue creating the window
+        if Msg == 0x0047:  # WM_WINDOWPOSCHANGED: WM_SIZE if the client size changed
+            self._send_size(hWnd)
+            return 0
+        if Msg == 0x0055 and lParam == 3:  # WM_NOTIFYFORMAT, NF_QUERY
+            return 2 if wide else 1  # NFR_UNICODE for a Unicode window, else NFR_ANSI
         if Msg == self.WM_ERASEBKGND:
             # The class brush erases it (the desktop draws the window's
             # background color); a class without one leaves it to WM_PAINT

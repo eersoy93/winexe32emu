@@ -166,9 +166,11 @@ class User32Mixin:
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             X, Y, nWidth, nHeight = self._read_signed_args(args, 1, 4)
+            before = (win.x, win.y, win.width, win.height)
             win.x, win.y = X, Y
             win.width, win.height = max(nWidth, 0), max(nHeight, 0)
             self._native_moved(win)
+            self._send_window_pos_changed(win, before, 0 if bRepaint else self.SWP_NOREDRAW)
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
@@ -176,6 +178,38 @@ class User32Mixin:
              control.height) = self._read_signed_args(args, 1, 4)
 
         return 1
+
+    WM_WINDOWPOSCHANGED = 0x0047
+    SWP_NOSIZE, SWP_NOMOVE, SWP_NOREDRAW = 0x0001, 0x0002, 0x0008
+
+    def _send_window_pos_changed(self, win, before, flags, insert_after=0):
+        """WM_WINDOWPOSCHANGED (with its WINDOWPOS) after MoveWindow or
+        SetWindowPos moved or sized a window; DefWindowProc turns it into
+        WM_SIZE. Word lays out its document window's ruler, text and scroll
+        bars there, not in WM_SIZE."""
+        if (win.x, win.y, win.width, win.height) == before:
+            return
+        if (win.width, win.height) != before[2:] and not flags & self.SWP_NOREDRAW:
+            # A resized window is painted again (its display list ends at
+            # the old size: Word's text area left a gray band when it grew)
+            self.painted_windows.discard(win.hwnd)
+        wndproc = self._find_wndproc_for_hwnd(win.hwnd)
+        if not wndproc or self._is_native_proc(wndproc):
+            return
+        if (win.x, win.y) == before[:2]:
+            flags |= self.SWP_NOMOVE
+        if (win.width, win.height) == before[2:]:
+            flags |= self.SWP_NOSIZE
+        address = self.emu.heap_alloc(28)
+        if not address:
+            return
+        try:
+            self._mem_write(address, struct.pack('<IIiiiiI', win.hwnd, insert_after & 0xFFFFFFFF,
+                                                 win.x, win.y, win.width, win.height,
+                                                 flags & 0xFFFFFFFF))
+            self.emu.call_wndproc(wndproc, win.hwnd, self.WM_WINDOWPOSCHANGED, 0, address)
+        finally:
+            self.emu.heap_free(address)
 
     def _native_moved(self, win):
         """Emulated controls that size themselves: a rebar's height follows its
@@ -206,6 +240,7 @@ class User32Mixin:
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             X, Y, cx, cy = self._read_signed_args(args, 2, 4)
+            before = (win.x, win.y, win.width, win.height)
             with self.gui.lock:
                 if not (uFlags & 0x0002):  # SWP_NOMOVE
                     win.x, win.y = X, Y
@@ -229,6 +264,7 @@ class User32Mixin:
                         and win.visible and not win.minimized):
                     self.gui.active_window = hWnd
             self._native_moved(win)
+            self._send_window_pos_changed(win, before, uFlags, hWndInsertAfter)
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
@@ -377,6 +413,8 @@ class User32Mixin:
     def GetDlgCtrlID(self, args):
         """GetDlgCtrlID emulation - return a control's ID"""
         hwndCtl = args[0]
+        if self._combo_of_edit(hwndCtl) is not None:
+            return 1001  # The edit field of a combo box
         if self.gui and hwndCtl in self.gui.controls:
             return self.gui.controls[hwndCtl].control_id
         if self.gui and hwndCtl in self.gui.windows:
@@ -579,7 +617,12 @@ class User32Mixin:
         return 0
 
     def GetKeyState(self, args):
-        """GetKeyState emulation (same as GetAsyncKeyState in the emulator)"""
+        """GetKeyState emulation: the mouse buttons as of the last mouse
+        message taken from the queue (like Windows), the keys as they are now"""
+        vKey = args[0] & 0xFF
+        if vKey in (0x01, 0x02, 0x04):  # VK_LBUTTON, VK_RBUTTON, VK_MBUTTON
+            # SHORT -128 (0xFF80, sign-extended), as Windows returns it
+            return 0xFFFFFF80 if self._mouse_button_held(vKey) else 0
         return self.GetAsyncKeyState(args)
 
     def GetCursorPos(self, args):
@@ -700,6 +743,8 @@ class User32Mixin:
             return 0
         if hWnd in self.gui.controls:
             return self.gui.controls[hWnd].parent_hwnd or 0
+        if self._combo_of_edit(hWnd) is not None:
+            return self.combo_edits[hWnd]
         win = self.gui.windows.get(hWnd)
         if win is not None and win.parent:
             return win.parent
@@ -719,9 +764,38 @@ class User32Mixin:
     def IsWindow(self, args):
         """IsWindow emulation"""
         hWnd = args[0]
-        if self.gui and (hWnd in self.gui.windows or hWnd in self.gui.controls):
+        if self.gui and (hWnd in self.gui.windows or hWnd in self.gui.controls or
+                         self._combo_of_edit(hWnd)):
             return 1
         return 0
+
+    def _combo_edit(self, hwnd):
+        """The handle of the edit field of a CBS_DROPDOWN / CBS_SIMPLE combo box
+        control (its child window on Windows, found with GetWindow GW_CHILD
+        or GetComboBoxInfo), 0 for other windows. The combo box draws and
+        edits the text itself; the handle answers the window queries."""
+        control = self.gui.controls.get(hwnd) if self.gui else None
+        if control is None or control.class_name != 'COMBOBOX' or \
+                control.style & 0x3 not in (1, 2):
+            return 0
+        edit = getattr(control, 'edit_hwnd', 0)
+        if not edit:
+            with self.gui.lock:
+                edit = control.edit_hwnd = self.gui.get_next_hwnd()
+            self.combo_edits[edit] = hwnd
+        return edit
+
+    def _combo_of_edit(self, hwnd):
+        """The combo box control whose edit field handle hwnd is, or None"""
+        combo = self.combo_edits.get(hwnd)
+        control = self.gui.controls.get(combo) if combo and self.gui else None
+        if control is None:
+            self.combo_edits.pop(hwnd, None)
+        return control
+
+    def _combo_edit_rect(self, control):
+        """Window rect of a combo box's edit field, in its client coordinates"""
+        return (3, 3, max(3, control.width - 20), max(3, min(control.height, 22) - 3))
 
     def IsWindowVisible(self, args):
         """IsWindowVisible emulation - WS_VISIBLE (a minimized window is
@@ -839,8 +913,13 @@ class User32Mixin:
             if hwnd in self.gui.consoles:
                 return "ConsoleWindowClass"
             return getattr(self.gui.windows[hwnd], 'class_name', None) or "#32770"
+        if self._combo_of_edit(hwnd) is not None:
+            return "Edit"
         if hwnd in self.gui.controls:
-            name = self.gui.controls[hwnd].class_name
+            control = self.gui.controls[hwnd]
+            if getattr(control, 'superclass_name', None):
+                return control.superclass_name
+            name = control.class_name
             return self.CONTROL_CLASS_NAMES.get(name, name)
         return None
 
@@ -906,7 +985,10 @@ class User32Mixin:
             if hWnd in self.gui.z_order:
                 self.gui.z_order.remove(hWnd)
                 self.gui.z_order.append(hWnd)
-            if self.gui.windows[hWnd].visible:
+            win = self.gui.windows[hWnd]
+            # Only a top-level window is active: Word's status bar prompt
+            # (a child) took the keystrokes after saving and crashed on them
+            if win.visible and not win.parent:
                 self.gui.active_window = hWnd
         return 1
 
@@ -1003,10 +1085,14 @@ class User32Mixin:
         hWnd, uCmd = args[0], args[1]
         if not self.gui:
             return 0
+        if self._combo_of_edit(hWnd) is not None:
+            return 0  # A combo box's edit field: no children, siblings or owner
         with self.gui.lock:
             if uCmd == self.GW_CHILD:
                 children = self._child_handles(hWnd)
-                return children[0] if children else 0
+                if not children:
+                    return self._combo_edit(hWnd)
+                return children[0]
             if uCmd == self.GW_OWNER:
                 dialog = self.dialogs.get(hWnd)
                 win = self.gui.windows.get(hWnd)

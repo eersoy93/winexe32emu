@@ -738,14 +738,24 @@ class GdiMixin:
         x, y, w, h = self._read_signed_args(args, 1, 4)
         rop = args[5]
 
+        log.debug(f"PatBlt(0x{hdc:x}, {x}, {y}, {w}, {h}, rop=0x{rop:08x})")
         if rop == 0x00000042:        # BLACKNESS
             color = (0, 0, 0)
         elif rop == 0x00FF0062:      # WHITENESS
             color = (255, 255, 255)
-        else:                        # PATCOPY and others: current brush
+        else:
             color = self._dc_brush(hdc)
-
-        log.debug(f"PatBlt(0x{hdc:x}, {x}, {y}, {w}, {h}, rop=0x{rop:08x})")
+            # DSTINVERT, PATINVERT with a white brush etc.: what they do to
+            # the destination (a text selection, a dragged splitter bar)
+            pattern = 1 if color is not None and sum(color) >= 384 else 0
+            effect = self.rop3_effect(rop, pattern, 0)
+            if effect == 'keep':
+                return 1
+            if effect == 'invert':
+                if w > 0 and h > 0:
+                    self._add_shape(hdc, {'type': 'invert', 'rect': (x, y, x + w, y + h)})
+                return 1
+            # PATCOPY and the others: the current brush
         if color is not None and w > 0 and h > 0:
             self._add_shape(hdc, {'type': 'rect', 'rect': (x, y, x + w, y + h),
                                   'fill': color, 'pen': None})

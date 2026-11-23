@@ -520,6 +520,8 @@ class Kernel32MiscMixin:
 
         path = self.resolve_drive_path(filename)
         if path is None or not os.path.exists(path):
+            # Office's file dialogs save to a name only if it is not found
+            self._last_error = 3 if path is None else self._missing_file_error(path)
             return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
         read_only = 0x01 if self._host_read_only(path) else 0  # FILE_ATTRIBUTE_READONLY
         if os.path.isdir(path):

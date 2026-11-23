@@ -37,6 +37,7 @@ class ListViewMixin:
     LVN_ITEMCHANGED, LVN_INSERTITEM, LVN_DELETEITEM = -101, -102, -103
     LVN_DELETEALLITEMS, LVN_COLUMNCLICK, LVN_BEGINDRAG = -104, -108, -109
     LVN_ITEMACTIVATE, LVN_KEYDOWN, LVN_GETDISPINFOW = -114, -155, -177
+    LVN_GETDISPINFOA = -150
     NM_CLICK, NM_DBLCLK, NM_RETURN, NM_RCLICK = -2, -3, -4, -5
     NM_SETFOCUS, NM_KILLFOCUS = -7, -8
 
@@ -231,19 +232,22 @@ class ListViewMixin:
         return text
 
     def _lv_dispinfo(self, win, index, sub, want_text, want_image):
-        """LVN_GETDISPINFOW -> (text or None, image or None)"""
+        """LVN_GETDISPINFOW (LVN_GETDISPINFOA for an ANSI parent) -> (text or
+        None, image or None)"""
         item = win.nstate['items'][index]
+        ansi = self._notify_ansi(win)
         buf_chars = 520
         text_buf = self.emu.heap_alloc(buf_chars * 2)
         mask = (self.LVIF_TEXT if want_text else 0) | (self.LVIF_IMAGE if want_image else 0)
         payload = struct.pack('<IiiIIIiiIi', mask, index, sub, item['state'], 0, text_buf,
                               buf_chars, 0, item['param'], 0) + b'\x00' * 16
-        _, buf = self._notify(win, self.LVN_GETDISPINFOW, payload)
+        _, buf = self._notify(win, self.LVN_GETDISPINFOA if ansi else self.LVN_GETDISPINFOW,
+                              payload)
         text = image = None
         try:
             _, _, _, _, _, text_ptr, _, image_value, _ = self._read_struct(buf + 12, '<IiiIIIiiI')
             if want_text:
-                text = self.read_wide_string(text_ptr, 1024) if text_ptr else ''
+                text = (self._read_text(text_ptr, not ansi) if text_ptr else '')
             if want_image:
                 image = image_value
         except UcError:
@@ -371,6 +375,7 @@ class ListViewMixin:
         return 0
 
     LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW = -175, -176
+    LVN_BEGINLABELEDITA, LVN_ENDLABELEDITA = -105, -106
 
     def _lv_begin_edit(self, win, index):
         """LVM_EDITLABEL: an edit control over the item's label; returns its hwnd"""
@@ -381,7 +386,8 @@ class ListViewMixin:
         text = self._lv_item_text(win, index, 0)
         payload = struct.pack('<IiiIIIiiIi', self.LVIF_TEXT, index, 0, 0, 0, 0, 0, 0,
                               st['items'][index]['param'], 0) + b'\x00' * 16
-        if self._notify_simple(win, self.LVN_BEGINLABELEDITW, payload):
+        if self._notify_simple(win, self.LVN_BEGINLABELEDITA if self._notify_ansi(win)
+                               else self.LVN_BEGINLABELEDITW, payload):
             return 0
         self._lv_ensure_visible(win, index)
         left, top, right, bottom = self.lv_item_rect(win, index)
@@ -412,12 +418,14 @@ class ListViewMixin:
         self.gui.destroy_control(edit)
         if not 0 <= index < len(st['items']):
             return
+        ansi = self._notify_ansi(win)
         buf = self.emu.heap_alloc((len(text) + 1) * 2) if accept else 0
         if buf:
-            self._write_text(buf, text, True)
+            self._write_text(buf, text, not ansi)
         payload = struct.pack('<IiiIIIiiIi', self.LVIF_TEXT, index, 0, 0, 0, buf, 260 if buf else 0,
                               0, st['items'][index]['param'], 0) + b'\x00' * 16
-        result = self._notify_simple(win, self.LVN_ENDLABELEDITW, payload)
+        result = self._notify_simple(win, self.LVN_ENDLABELEDITA if ansi
+                                     else self.LVN_ENDLABELEDITW, payload)
         if buf:
             if (result and index < len(st['items']) and
                     st['items'][index]['texts'].get(0) is not None):
@@ -810,10 +818,14 @@ class ListViewMixin:
         if msg == 0x1011:  # LVM_GETSTRINGWIDTH
             return self._native_text_width(self._read_text(lParam, wide))
         if msg == 0x1012:  # LVM_HITTEST
+            # Only flags and iItem: iSubItem came with comctl32 4.70 and
+            # older callers (Office 95's File Open) pass a 16-byte
+            # LVHITTESTINFO on the stack, so writing it overwrites their
+            # saved EBP. comctl32 writes iSubItem only for LVM_SUBITEMHITTEST.
             x, y = self._read_struct(lParam, '<ii')
-            index, sub = self._lv_hit(win, x, y)
-            self._mem_write(lParam + 8, struct.pack('<Iii', 0x4 if index >= 0 else 0x1,
-                                                    index, sub))
+            index, _ = self._lv_hit(win, x, y)
+            self._mem_write(lParam + 8, struct.pack('<Ii', 0x4 if index >= 0 else 0x1,
+                                                    index))
             return index & 0xFFFFFFFF
         if msg == 0x1039:  # LVM_SUBITEMHITTEST
             x, y = self._read_struct(lParam, '<ii')

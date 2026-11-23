@@ -44,10 +44,14 @@ class ToolbarMixin:
         return rects
 
     def _tb_button_size(self, win):
+        """(width, height) of the buttons: the set size, but never smaller than
+        the bitmap and its 3D border, like comctl32 (Office's file dialogs ask
+        for 16x16 buttons of 16x16 bitmaps and get 23x23 ones)"""
         st = win.nstate
-        if st['button_size']:
-            return st['button_size']
         bw, bh = st['bitmap_size']
+        if st['button_size']:
+            width, height = st['button_size']
+            return (max(width, bw + 7), max(height, bh + 7))
         texts = [self._tb_text(win, b) for b in st['buttons']]
         texts = [t for t in texts if t]
         if texts and st['max_text_rows']:
@@ -71,6 +75,44 @@ class ToolbarMixin:
                 win.x, win.y, win.width = 0, 0, width
             win.height = height
         return height
+
+    HINST_COMMCTRL = 0xFFFFFFFF
+    TB_MASK_COLOR = (192, 192, 192)  # Light gray: the background of toolbar bitmaps
+
+    def _tb_add_bitmap(self, win, count, hinst, nid):
+        """TB_ADDBITMAP: count button images of a bitmap resource of module
+        hinst, a bitmap handle (hinst 0) or comctl32's standard bitmaps
+        (HINST_COMMCTRL, drawn by the GUI); returns the first one's index"""
+        st = win.nstate
+        index = sum(n for n, _ in st['bitmaps'])
+        st['bitmaps'] = st['bitmaps'] + [(count, (hinst, nid))]
+        hbm = 0
+        if hinst == 0:
+            hbm = nid if self.gdi_objects.get(nid, {}).get('type') == 'bitmap' else 0
+        elif hinst != self.HINST_COMMCTRL:
+            hbm = self.LoadBitmapA([hinst, nid])
+        st['bitmap_sources'] = st.get('bitmap_sources', []) + [(count, hbm)]
+        self._tb_split_bitmaps(win)
+        return index
+
+    def _tb_split_bitmaps(self, win):
+        """Cut the TB_ADDBITMAP bitmaps into an image list of the bitmap
+        size (st['bitmap_list']); the light gray background is transparent"""
+        st = win.nstate
+        sources = st.get('bitmap_sources')
+        if not sources or not any(hbm for _, hbm in sources):
+            return
+        width, height = st['bitmap_size']
+        images = []
+        layout = {'cx': width or 16, 'cy': height or 15}
+        for count, hbm in sources:
+            part = self._split_bitmap(layout, hbm, mask_color=self.TB_MASK_COLOR) if hbm else []
+            images += (part + [None] * count)[:count]
+        handle = st.get('bitmap_list')
+        if handle is None:
+            handle = st['bitmap_list'] = self.get_next_handle()
+        self.imagelists[handle] = {'cx': layout['cx'], 'cy': layout['cy'], 'flags': 0,
+                                   'images': images}
 
     def _tb_index(self, win, command):
         for i, button in enumerate(win.nstate['buttons']):
@@ -161,9 +203,7 @@ class ToolbarMixin:
             return buttons[index]['state'] if index >= 0 else 0xFFFFFFFF
         if msg == 0x413:  # TB_ADDBITMAP
             hinst, nid = self._read_struct(lParam, '<II')
-            index = sum(count for count, _ in st['bitmaps'])
-            st['bitmaps'] = st['bitmaps'] + [(wParam, (hinst, nid))]
-            return index
+            return self._tb_add_bitmap(win, wParam, hinst, nid)
         if msg == 0x414:  # TB_ADDBUTTONS
             st['buttons'] = buttons + self._tb_read_buttons(win, lParam, wParam, wide)
             return 1
@@ -215,6 +255,7 @@ class ToolbarMixin:
             return 1
         if msg == 0x420:  # TB_SETBITMAPSIZE
             st['bitmap_size'] = (lParam & 0xFFFF, lParam >> 16)
+            self._tb_split_bitmaps(win)
             return 1
         if msg == 0x421:  # TB_AUTOSIZE
             self._tb_autosize(win)
@@ -327,7 +368,7 @@ class ToolbarMixin:
             st['bitmap_size'] = (dx_bitmap, dy_bitmap)
         if dx_button and dy_button:
             st['button_size'] = (dx_button, dy_button)
-        st['bitmaps'] = [(num_bitmaps, (bm_inst, bm_id))]
+        self._tb_add_bitmap(win, num_bitmaps, bm_inst, bm_id)
         if lp_buttons and num_buttons:
             st['buttons'] = self._tb_read_buttons(win, lp_buttons, num_buttons, False)
         self._tb_autosize(win)

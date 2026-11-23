@@ -282,9 +282,12 @@ class User32MiscMixin:
                       wndclass['cursor'], wndclass['background'], 0, lpClassName)
             atom = wndclass['atom']
         elif name and name.upper() in self.SYSTEM_CLASSES:
-            fields = (0x8, self._native_stub(), 0, 0, 0, 0, self._system_cursor(self.IDC_ARROW),
-                      0, 0, lpClassName)
+            fields = (0x8, self._class_proc_stub(name), 0, 0, 0, 0,
+                      self._system_cursor(self.IDC_ARROW), 0, 0, lpClassName)
             atom = 0xC000 + self.SYSTEM_CLASSES.index(name.upper())
+            # Superclassing: the program registers this WNDCLASS again under
+            # its own name and window procedure (see RegisterClassA)
+            self.superclass_buffers[lpWndClass] = name.upper()
         else:
             self._last_error = 1411  # ERROR_CLASS_DOES_NOT_EXIST
             return 0

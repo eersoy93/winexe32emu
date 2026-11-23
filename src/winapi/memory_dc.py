@@ -147,6 +147,10 @@ class MemoryDCMixin:
         if not src_state or not src_state.get('memory'):
             return 1  # Only memory DC sources carry shapes
 
+        # The source's shapes are in device coordinates: map its logical
+        # origin (Word draws a line at its document y in a one-line bitmap
+        # whose viewport origin is moved up by that y)
+        sx, sy = self._lp_to_dp(hdcSrc, sx, sy)
         dx, dy = x - sx, y - sy
         shapes = []
         for shape in src_state['shapes']:
@@ -164,6 +168,14 @@ class MemoryDCMixin:
                     shape = dict(shape, rect=(max(left, sx), max(top, sy),
                                               min(right, sx + cx), min(bottom, sy + cy)))
             shapes.append(self._translate_shape(shape, dx, dy))
+
+        if rop not in self._IMAGE_ROPS or (rop == self.SRCINVERT and all(
+                s['type'] != 'image' or self._is_monochrome(s) for s in shapes)):
+            # Raster operations that depend on the destination (a caret
+            # blitted with PDSxxn, SRCINVERT of a black and white bitmap)
+            pattern = 1 if sum(self._dc_brush_color(hdcDest)) >= 384 else 0
+            shapes = [part for shape in shapes
+                      for part in self._rop3_shapes(shape, rop, pattern)]
 
         if rop in (self.DSPDXAX, self.PSDPXAX):
             # The source is a mask: its white (DSPDxax) or black (PSDPxax)
@@ -222,6 +234,77 @@ class MemoryDCMixin:
     PATCOPY = 0x00F00021
     BLACKNESS = 0x00000042
     WHITENESS = 0x00FF0062
+
+    # Raster operations image shapes are drawn with as they are (see
+    # PseudoWindowsGUI._rop_blend and _image_surface, and BitBlt's masks)
+    _IMAGE_ROPS = (SRCCOPY, SRCPAINT, SRCAND, SRCINVERT, NOTSRCCOPY, DSNA, DSPDXAX,
+                   PSDPXAX, MERGEPAINT)
+
+    @staticmethod
+    def rop3_effect(rop, pattern, source):
+        """What a ternary raster operation does to the destination where the
+        pattern (brush) and source bits are pattern and source (0 or 1):
+        'keep', 'invert', 'black' (all bits 0) or 'white' (all bits 1).
+        Bit P*4 + S*2 + D of the ROP index is the result for P, S, D."""
+        index = (rop >> 16) & 0xFF
+        base = pattern * 4 + source * 2
+        result = ((index >> base) & 1, (index >> (base + 1)) & 1)  # For D = 0, 1
+        return {(0, 1): 'keep', (1, 0): 'invert', (0, 0): 'black',
+                (1, 1): 'white'}[result]
+
+    @staticmethod
+    def _is_monochrome(shape):
+        """Has an image shape only black and white pixels?"""
+        return not bytes(shape['data']).translate(None, b'\x00\xff')
+
+    def _rop3_shapes(self, shape, rop, pattern):
+        """Display list entries drawing shape with raster operation rop, where
+        the pattern bit is pattern: source pixels lighter than mid-gray are 1
+        bits. Inverted parts become 'invert' shapes (with a mask of their
+        pixels), black and white ones color-keyed images."""
+        if shape['type'] != 'image':
+            effect = self.rop3_effect(rop, pattern, 1)
+            if effect == 'keep':
+                return []
+            if effect == 'invert' and shape['type'] == 'rect' and shape.get('fill') is not None:
+                return [{'type': 'invert', 'rect': shape['rect']}]
+            return [shape]
+        if shape['size'] != shape['dim']:
+            return [shape]  # Stretched: drawn as a copy
+        effects = (self.rop3_effect(rop, pattern, 0), self.rop3_effect(rop, pattern, 1))
+        (x, y), (w, h) = shape['pos'], shape['dim']
+        rect = (x, y, x + w, y + h)
+        if effects[0] == effects[1]:
+            return self._rop3_part(effects[0], rect, None)
+        # 0xFF where the source bit is 1 (its red channel is light)
+        ones = bytes(shape['data'][0::3]).translate(bytes(0xFF if v >= 128 else 0
+                                                          for v in range(256)))
+        zeros = ones.translate(bytes(range(255, -1, -1)))
+        parts = []
+        for effect, mask in zip(effects, (zeros, ones), strict=True):
+            parts.extend(self._rop3_part(effect, rect, (w, h, mask)))
+        return parts
+
+    @staticmethod
+    def _rop3_part(effect, rect, mask):
+        """Shapes doing effect ('keep', 'invert', 'black', 'white') in rect,
+        only on the pixels set in mask ((w, h, one 0/0xFF byte a pixel) or
+        None for all of them)"""
+        if effect == 'keep' or (mask is not None and not mask[2].strip(b'\x00')):
+            return []
+        if effect == 'invert':
+            return [{'type': 'invert', 'rect': rect, 'mask': mask}]
+        color = (0, 0, 0) if effect == 'black' else (255, 255, 255)
+        if mask is None:
+            return [{'type': 'rect', 'rect': rect, 'fill': color, 'pen': None}]
+        w, h, bits = mask
+        # The other color is transparent
+        key = (255, 255, 255) if effect == 'black' else (0, 0, 0)
+        plane = bits.translate(bytes(color[0] if b else key[0] for b in range(256)))
+        rgb = bytearray(len(plane) * 3)
+        rgb[0::3] = rgb[1::3] = rgb[2::3] = plane
+        return [{'type': 'image', 'pos': rect[:2], 'dim': (w, h), 'size': (w, h),
+                 'data': bytes(rgb), 'rop': MemoryDCMixin.SRCCOPY, 'colorkey': key}]
 
     def _crop_image(self, shape, sx, sy, cx, cy, rop):
         """Part of an image shape inside the source rect (sx, sy, cx, cy), or None.
@@ -692,6 +775,9 @@ class MemoryDCMixin:
             scaled['to'] = (tx(x), ty(y))
         if 'points' in scaled:
             scaled['points'] = [(tx(x), ty(y)) for x, y in scaled['points']]
+        if 'dx' in scaled:
+            scaled['dx'] = [int(round(d * scale_x)) for d in scaled['dx']]
+            scaled.pop('_surface', None)
         if 'radius' in scaled:
             scale_avg = (abs(scale_x) + abs(scale_y)) / 2.0
             scaled['radius'] = max(0, int(round(scaled['radius'] * scale_avg)))
@@ -728,6 +814,12 @@ class MemoryDCMixin:
         if not src_state or not src_state.get('memory'):
             return 1  # Only memory DC sources carry shapes
 
+        # The source rect in the device coordinates its shapes are in
+        (xs, ys), (xs2, ys2) = self._lp_to_dp(hdcSrc, xs, ys), \
+            self._lp_to_dp(hdcSrc, xs + ws, ys + hs)
+        ws, hs = xs2 - xs, ys2 - ys
+        if ws == 0 or hs == 0:
+            return 0
         scale_x = wd / ws
         scale_y = hd / hs
         shapes = []
@@ -920,7 +1012,7 @@ class MemoryDCMixin:
         for shape in shapes:
             items = []
             for name, value in shape.items():
-                if name == '_surface':
+                if name in ('_surface', '_mask'):
                     continue
                 if name == 'data':
                     refs.append(value)

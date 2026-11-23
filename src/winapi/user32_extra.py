@@ -407,6 +407,11 @@ class User32ExtraMixin:
     def SetMessageExtraInfo(self, args):
         return 0
 
+    def SetMessageQueue(self, args):
+        """SetMessageQueue(cMessagesMax) - Win16's queue size; Win32 queues grow
+        by themselves (MSINFO32 still calls it)"""
+        return 1
+
     def WaitMessage(self, args):
         """WaitMessage - returns when a message is waiting"""
         self._wait_ms(10000, until=lambda: not self._message_pending())
@@ -1134,6 +1139,13 @@ class User32ExtraMixin:
         return 1
 
     def InvertRect(self, args):
+        """InvertRect(hdc, lprc) - inverts the colors in the rectangle"""
+        rect = self._read_rect(args[1]) if args[1] else None
+        if rect is None or args[0] not in self.dc_state:
+            return 0
+        left, top, right, bottom = rect
+        if left < right and top < bottom:
+            self._add_shape(args[0], {'type': 'invert', 'rect': rect})
         return 1
 
     BF_LEFT, BF_TOP, BF_RIGHT, BF_BOTTOM, BF_RECT = 0x1, 0x2, 0x4, 0x8, 0xF
@@ -1524,7 +1536,7 @@ class User32ExtraMixin:
             return 0
         data = struct.pack('<I8iI3I', 52, 0, 0, control.width, control.height,
                            max(0, control.width - 18), 0, control.width, control.height,
-                           0, args[0], 0, 0)
+                           0, args[0], self._combo_edit(args[0]), 0)
         return 1 if self._mem_write(args[1], data) else 0
 
     # ---------- Menus ----------

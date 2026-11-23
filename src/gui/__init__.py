@@ -295,6 +295,9 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
         except (AttributeError, pygame.error):
             pass  # pygame without the Window API
 
+    # pygame mouse button -> VK_LBUTTON, VK_MBUTTON, VK_RBUTTON (key_states)
+    MOUSE_BUTTON_VKS = {1: 0x01, 2: 0x04, 3: 0x02}
+
     def _process_frame(self):
         """Handle pending input events and redraw the screen"""
         # Process Pygame events
@@ -308,8 +311,12 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
                 else:
                     self.running = False
             elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button in self.MOUSE_BUTTON_VKS:
+                    self.key_states[self.MOUSE_BUTTON_VKS[event.button]] = True
                 self._handle_mouse_click(event.pos, event.button)
             elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button in self.MOUSE_BUTTON_VKS:
+                    self.key_states[self.MOUSE_BUTTON_VKS[event.button]] = False
                 # Release drag / resize; forward release to app if neither
                 was_interacting = (self.dragging_window is not None or
                                    self.resizing_window is not None or

@@ -280,10 +280,10 @@ class _ProcessRouter:
     def __getattr__(self, name):
         return getattr(winapi.WinAPIHandler, name)
 
-    def post_window_message(self, hwnd, message, wParam, lParam):
+    def post_window_message(self, hwnd, message, wParam, lParam, char=None):
         owner = self._gui.window_owner(hwnd)
         if owner is not None and not owner.process_exited:
-            owner.post_window_message(hwnd, message, wParam, lParam)
+            owner.post_window_message(hwnd, message, wParam, lParam, char=char)
 
     @property
     def capture_hwnd(self):

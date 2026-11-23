@@ -126,6 +126,10 @@ class DisplayListMixin:
     def add_to_display_list(cls, shapes, shape):
         """shapes plus shape, without recent entries the new shape fully hides
         (keeps redraw-in-place game loops from growing the list)"""
+        if shape['type'] == 'invert' and shapes and shapes[-1]['type'] == 'invert' and \
+                shapes[-1]['rect'] == shape['rect'] and shapes[-1].get('mask') == shape.get('mask'):
+            # Inverting the same area twice (a blinking caret) changes nothing
+            return shapes[:-1]
         cover = None
         if shape['type'] == 'rect' and shape.get('fill') is not None:
             cover = cls.shape_bbox(shape)

@@ -32,14 +32,50 @@ class ProcessesMixin:
 
     def _process_image_path(self, app, cmdline):
         """Windows path of the EXE CreateProcess should start, or None"""
+        return self._requested_image_path(app, cmdline)
+
+    def _quote_program_name(self, cmdline):
+        """The command line with its program name quoted if that is an
+        unquoted path with spaces. On Windows 95 such a registered path is an
+        8.3 one (C:\\PROGRA~1\\...), which the sandbox has none of: Office
+        Setup registered MSINFO32 under its long path, and the C runtime of
+        the child took "Files\\Common" for its first argument."""
+        stripped = cmdline.lstrip()
+        if stripped.startswith('"') or ' ' not in stripped:
+            return cmdline
+        words = stripped.split(' ')
+        for count in range(1, len(words) + 1):
+            name = ' '.join(words[:count])
+            if count > 1 and not any(sep in name for sep in '\\/:'):
+                break
+            if self._image_path_of(name) is not None:
+                if count == 1:
+                    return cmdline
+                rest = ' '.join(words[count:])
+                return f'"{name}"' + (' ' + rest if rest else '')
+        return cmdline
+
+    def _requested_image_path(self, app, cmdline):
+        """Windows path of the EXE app or the command line names, or None. Like
+        Windows, an unquoted command line with spaces tries the longer names
+        up to each space in turn ("C:\\Program Files\\...\\msinfo32.exe" of Word)"""
         if app:
-            name = app
-        else:
-            cmdline = cmdline.lstrip()
-            if cmdline.startswith('"'):
-                name = cmdline[1:].split('"', 1)[0]
-            else:
-                name = cmdline.split(None, 1)[0] if cmdline.strip() else ''
+            return self._image_path_of(app)
+        cmdline = cmdline.lstrip()
+        if cmdline.startswith('"'):
+            return self._image_path_of(cmdline[1:].split('"', 1)[0])
+        words = cmdline.split(' ')
+        for count in range(1, len(words) + 1):
+            name = ' '.join(words[:count]).rstrip()
+            if count > 1 and not any(sep in name for sep in '\\/:'):
+                break  # Only a path may contain spaces
+            path = self._image_path_of(name)
+            if path is not None:
+                return path
+        return None
+
+    def _image_path_of(self, name):
+        """Windows path of the EXE name names (searched like CreateProcess), or None"""
         if not name:
             return None
         candidates = [name] if name.lower().endswith('.exe') else [name, name + '.exe']
@@ -85,6 +121,8 @@ class ProcessesMixin:
                 current += '\\'
         if not cmdline.strip():
             cmdline = f'"{path}"' if ' ' in path else path
+        elif not app:
+            cmdline = self._quote_program_name(cmdline)
         child = starter(path, cmdline, current)
         if child is None:
             self._last_error = 193  # ERROR_BAD_EXE_FORMAT

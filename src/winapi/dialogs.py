@@ -546,6 +546,7 @@ class DialogsMixin:
                 if msg[1] == self.WM_QUIT:
                     self.quit_requested = True
                     break
+                self._translate_key(*msg)
                 self._dispatch(*msg)
             else:
                 result = dialog['result']
@@ -691,6 +692,7 @@ class DialogsMixin:
             return 0
         if self._dialog_of(hwnd) != hDlg:
             return 0
+        self._translate_key(hwnd, message, wParam, lParam)  # Like Windows' IsDialogMessage
         self._dispatch(hwnd, message, wParam, lParam)
         return 1
 

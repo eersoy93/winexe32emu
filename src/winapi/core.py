@@ -289,7 +289,8 @@ class CoreMixin:
         'LoadAcceleratorsA': 2, 'LoadAcceleratorsW': 2, 'LoadBitmapW': 2, 'LoadMenuA': 2,
         'LoadMenuW': 2, 'LoadStringW': 4, 'MapDialogRect': 2, 'MapVirtualKeyA': 2,
         'MapVirtualKeyW': 2, 'ModifyMenuW': 5, 'MonitorFromPoint': 3, 'MonitorFromRect': 2,
-        'MonitorFromWindow': 2, 'NativeWndProc': 4, 'OpenClipboard': 1,
+        'MonitorFromWindow': 2, 'NativeWndProc': 4, 'NativeEditProc': 4, 'NativeButtonProc': 4,
+        'NativeStaticProc': 4, 'NativeListBoxProc': 4, 'NativeComboBoxProc': 4, 'OpenClipboard': 1,
         'RegisterClipboardFormatA': 1, 'RegisterClipboardFormatW': 1, 'RemoveMenu': 3,
         'SendDlgItemMessageA': 5, 'SendDlgItemMessageW': 5, 'SetClipboardData': 2,
         'SetMenuItemInfoA': 4, 'SetMenuItemInfoW': 4, 'SetParent': 2,
@@ -348,7 +349,7 @@ class CoreMixin:
         'GetFileVersionInfoSizeW': 2, 'GetFileVersionInfoW': 4, 'VerQueryValueA': 4,
         'VerQueryValueW': 4,
         # winmm
-        'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciSendCommandA': 4, 'PlaySoundA': 3,
+        'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciSendCommandA': 4, 'PlaySoundA': 3, 'PlaySound': 3,
         'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2, 'timeBeginPeriod': 1,
         'timeEndPeriod': 1, 'timeGetTime': 0, 'waveOutClose': 1, 'waveOutGetPosition': 3,
         'waveOutOpen': 6, 'waveOutPause': 1, 'waveOutPrepareHeader': 3, 'waveOutReset': 1,
@@ -683,7 +684,8 @@ class CoreMixin:
         'UnhookWinEvent': 1, 'UnhookWindowsHook': 2, 'UnhookWindowsHookEx': 1,
         'UnloadKeyboardLayout': 1, 'UnregisterHotKey': 2, 'UpdateLayeredWindow': 9,
         'ValidateRgn': 2, 'VkKeyScanA': 1, 'VkKeyScanExA': 2, 'VkKeyScanExW': 2,
-        'VkKeyScanW': 1, 'WaitForInputIdle': 2, 'WaitMessage': 0, 'keybd_event': 4,
+        'VkKeyScanW': 1, 'WaitForInputIdle': 2, 'WaitMessage': 0, 'SetMessageQueue': 1,
+        'keybd_event': 4,
         'mouse_event': 5, 'wvsprintfW': 3,
         # uxtheme
         'BeginBufferedPaint': 5, 'BufferedPaintInit': 0, 'BufferedPaintUnInit': 0,
@@ -859,6 +861,18 @@ class CoreMixin:
         # Message queue system
         self.message_queue = []
         self.message_lock = threading.Lock()  # Guards message_queue (GUI thread is producer)
+        # (hwnd, message, wParam, lParam) of the key-down messages taken from
+        # the queue -> the (WM_CHAR or WM_SYSCHAR, code) TranslateMessage posts
+        self.key_chars = {}
+        # Mouse buttons (VK_LBUTTON/VK_RBUTTON/VK_MBUTTON) held as of the last
+        # mouse message taken from the queue: GetKeyState's view of them
+        self.mouse_buttons = set()
+        # WNDCLASS(EX) buffers GetClassInfo(Ex) filled for a system class -> its name
+        self.superclass_buffers = {}
+        self.combo_edits = {}  # Edit field handle -> its combo box control (see _combo_edit)
+        # Plain windows of a class found to superclass a control while they
+        # were created (see _class_proc): CreateWindowEx makes them that control
+        self.superclass_windows = set()
         self.sent_messages = {}  # Guest thread id -> SendMessage requests from other threads
         self.painted_windows = set()  # Windows that received WM_PAINT
         # Windows whose WM_PAINT is being handled before BeginPaint or

@@ -20,6 +20,7 @@ from unicorn import UcError
 
 from .. import gui
 from ..logger import log
+from .font_files import TRUETYPE_FONTTYPE
 
 
 class DeviceContextMixin:
@@ -137,9 +138,10 @@ class DeviceContextMixin:
         if self.gui and hwnd:
             self.gui.add_shape(hwnd, shape)
 
-    def _add_text(self, hdc, text, x, y, clip=None):
+    def _add_text(self, hdc, text, x, y, clip=None, dx=None):
         """Append a text item to the DC's display list (window or memory DC);
-        clip (left, top, right, bottom) cuts it off outside a rectangle"""
+        clip (left, top, right, bottom) cuts it off outside a rectangle, dx
+        (ExtTextOut's lpDx) gives the distance from each character to the next"""
         state = self.dc_state.get(hdc, {})
         shape = {
             'type': 'text',
@@ -152,6 +154,8 @@ class DeviceContextMixin:
         }
         if clip is not None:
             shape['clip'] = clip
+        if dx:
+            shape['dx'] = dx
         self._add_shape(hdc, shape)
 
     WM_ERASEBKGND = 0x0014
@@ -325,12 +329,14 @@ class DeviceContextMixin:
 
     ETO_OPAQUE = 0x2
     ETO_CLIPPED = 0x4
+    ETO_PDY = 0x2000
 
     def ExtTextOutA(self, args, wide=False):
         """ExtTextOutA/W(hdc, x, y, options, lprect, lpString, c, lpDx) - TextOut
         that can first fill a rectangle with the background color (ETO_OPAQUE)
-        and keep the text inside it (ETO_CLIPPED); the character spacing (lpDx)
-        is ignored"""
+        and keep the text inside it (ETO_CLIPPED); lpDx places the characters
+        (Word lays its lines out with the widths of its formatting device and
+        draws each character where that layout put it)"""
         hdc, options, lprect, lpString, c = args[0], args[3], args[4], args[5], args[6]
         x, y = self._signed32(args[1]), self._signed32(args[2])
         text = self._read_text(lpString, wide)[:c] if lpString and c else ''
@@ -349,8 +355,22 @@ class DeviceContextMixin:
                                       'pen': None})
         if self.gui and text:
             clip = rect if options & self.ETO_CLIPPED else None
-            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y), clip=clip)
+            dx = self._read_text_dx(args[7], len(text), options & self.ETO_PDY)
+            self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y, dx), clip=clip,
+                           dx=dx)
         return 1
+
+    def _read_text_dx(self, address, count, pairs):
+        """ExtTextOut's lpDx: the x advance of each of count characters (with
+        ETO_PDY the array has an x, y pair each), or None"""
+        if not address or not count:
+            return None
+        try:
+            values = struct.unpack(f'<{count * (2 if pairs else 1)}i',
+                                   self.emu.uc.mem_read(address, 4 * count * (2 if pairs else 1)))
+        except UcError:
+            return None
+        return list(values[0::2] if pairs else values)
 
     def ExtTextOutW(self, args):
         return self.ExtTextOutA(args, wide=True)
@@ -565,12 +585,15 @@ class DeviceContextMixin:
         state['text_align'] = align
         return prev
 
-    def _aligned_text_pos(self, hdc, text, x, y):
-        """Top-left position of TextOut text for the DC's text alignment"""
+    def _aligned_text_pos(self, hdc, text, x, y, dx=None):
+        """Top-left position of TextOut text for the DC's text alignment (dx:
+        the advances of its characters, if given)"""
         align = self.dc_state.get(hdc, {}).get('text_align', 0)
         if not align & ~self.TA_UPDATECP:
             return x, y
         width, height = self._text_extent(hdc, text)
+        if dx:
+            width = sum(dx)
         if align & self.TA_CENTER == self.TA_CENTER:
             x -= width // 2
         elif align & self.TA_RIGHT:
@@ -592,10 +615,22 @@ class DeviceContextMixin:
             return 0
         font = self._dc_font(hdc) or {}
         ave_width, height = self._text_extent(hdc, 'x')
-        ascent = self._text_ascent(height)
+        ascent, leading = self._text_ascent(height), 0
+        if self.gui and self.gui.font is not None and font:
+            # The drawn font's own metrics: the cell is taller than the
+            # character (em) height by the internal leading. Word picks the
+            # screen font from tmHeight - tmInternalLeading of the font on
+            # its formatting DC, so a leading of 0 made its text too big.
+            with self.gui.lock:
+                render_font = self.gui._get_render_font(font)
+                em = getattr(render_font, 'point_size', None)
+                if render_font.get_height() == height:
+                    ascent = min(height, render_font.get_ascent())
+                if em and 0 < em <= height:
+                    leading = height - em
         data = struct.pack('<11i9B',
                            height, ascent, height - ascent,
-                           0,                       # tmInternalLeading
+                           leading,                 # tmInternalLeading
                            0,                       # tmExternalLeading
                            ave_width, ave_width * 2,
                            700 if font.get('bold') else 400,
@@ -604,9 +639,31 @@ class DeviceContextMixin:
                            1 if font.get('italic') else 0,
                            1 if font.get('underline') else 0,
                            0,                       # tmStruckOut
-                           0x22,                    # VARIABLE_PITCH | FF_SWISS
+                           self._tm_pitch_and_family(font),
                            0)                       # ANSI_CHARSET
         return 1 if self._mem_write(lptm, data + b'\x00' * 3) else 0
+
+    # Faces drawn with fixed-pitch (monospaced) fonts
+    FIXED_PITCH_FACES = ('courier', 'courier new', 'fixedsys', 'terminal', 'lucida console',
+                         'consolas', 'system fixed')
+
+    def _tm_pitch_and_family(self, font):
+        """TEXTMETRIC's tmPitchAndFamily of a font dict: the family, and
+        TMPF_FIXED_PITCH (0x01), which is set for a *variable*-pitch font
+        (without it Word laid every character out as wide as an "x"),
+        TMPF_VECTOR | TMPF_TRUETYPE (0x06) for a TrueType face"""
+        face = (font.get('face') or '').lower()
+        known = {f.name.lower(): f for f in self.FONT_FAMILIES + self.added_font_faces()}
+        info = known.get(face)
+        family = info.pitch_family & 0xF0 if info else 0x20  # FF_SWISS
+        if face in self.FIXED_PITCH_FACES:
+            family = 0x30  # FF_MODERN
+            pitch = 0
+        else:
+            pitch = 1
+        if info is not None and info.font_type == TRUETYPE_FONTTYPE:
+            pitch |= 0x06
+        return family | pitch
 
     def SetROP2(self, args):
         """SetROP2 emulation - the mix mode is stored, drawing always copies the pen"""

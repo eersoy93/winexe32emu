@@ -15,8 +15,12 @@
 
 # Compiles each app in apps/ (apps/NAME/*.c, and apps/NAME/*.rc resources like
 # the icon) into C:\Windows\NAME.exe of the emulated C drive
-# (C:\Windows\explorer.exe). An app whose EXE is newer than its files and
-# this script is up to date and not compiled again (--force compiles all).
+# (C:\Windows\explorer.exe). An app with an install_dir file goes to the
+# folder of C: that file names instead, where Windows keeps that program
+# (apps/msinfo32: Windows/System32); an EXE of the same name in another
+# letter case there is replaced.
+# An app whose EXE is newer than its files and this script is up to date and
+# not compiled again (--force compiles all).
 # Exit code: number of failed apps.
 
 # Paths are relative to the repository root
@@ -35,12 +39,19 @@ failed=0
 for dir in apps/*/; do
     [ -d "$dir" ] || continue
     name=$(basename "$dir")
-    exe="${APPS_DIR}/${name}.exe"
+    target_dir=$APPS_DIR
+    if [ -f "${dir}install_dir" ]; then
+        target_dir="drives/C/$(head -n 1 "${dir}install_dir")"
+        mkdir -p "$target_dir" || exit 1
+    fi
+    # The EXE that is there under another letter case (MSINFO32.EXE)
+    exe=$(find "$target_dir" -maxdepth 1 -type f -iname "${name}.exe" | head -n 1)
+    [ -n "$exe" ] || exe="${target_dir}/${name}.exe"
 
     # Up to date: the EXE exists and no file of the app (nor this script) is newer
     if [ "$force" -eq 0 ] && [ -f "$exe" ] && ! [ scripts/compile_apps.sh -nt "$exe" ] &&
             [ -z "$(find "$dir" -type f -newer "$exe" | head -n 1)" ]; then
-        echo "OK: ${name}.exe (up to date)"
+        echo "OK: $(basename "$exe") (up to date)"
         continue
     fi
 
@@ -59,9 +70,9 @@ for dir in apps/*/; do
     if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "$exe" \
         "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -lcomctl32 -lshell32 -lole32 \
         -mwindows; then
-        echo "OK: ${name}.exe"
+        echo "OK: $(basename "$exe")"
     else
-        echo "ERROR: ${name}.exe compilation failed!"
+        echo "ERROR: $(basename "$exe") compilation failed!"
         failed=$((failed + 1))
     fi
     # shellcheck disable=SC2086

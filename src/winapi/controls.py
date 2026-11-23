@@ -19,6 +19,7 @@ import struct
 from unicorn import UcError
 
 from .. import config
+from ..logger import log
 
 
 class ControlsMixin:
@@ -59,6 +60,61 @@ class ControlsMixin:
         or a dispatched message)"""
         return self._native_message(args[0], args[1], args[2], args[3])
 
+    # The window procedures GetClassInfo gives for the classes of the
+    # emulated child controls: a program that superclasses one (Word's
+    # OpusFedt of EDIT) passes its messages on to it with CallWindowProc,
+    # which tells which control the windows of its class are
+    CONTROL_CLASS_PROCS = {'EDIT': 'NativeEditProc', 'BUTTON': 'NativeButtonProc',
+                           'STATIC': 'NativeStaticProc', 'LISTBOX': 'NativeListBoxProc',
+                           'COMBOBOX': 'NativeComboBoxProc'}
+
+    def _class_proc_stub(self, class_name):
+        """Window procedure address GetClassInfo gives for a system class"""
+        name = self.CONTROL_CLASS_PROCS.get(class_name.upper())
+        if name is None:
+            return self._native_stub()
+        stubs = self.__dict__.setdefault('_class_proc_stubs', {})
+        if name not in stubs:
+            stubs[name] = self.emu.get_api_stub('user32.dll', name)
+        return stubs[name]
+
+    def _is_native_proc(self, proc):
+        """Is proc one of the emulated controls' window procedures?"""
+        return bool(proc) and (proc == self._native_stub() or
+                               proc in self.__dict__.get('_class_proc_stubs', {}).values())
+
+    def _class_proc(self, base, args):
+        """Window procedure of the system class base: a window of a program's
+        class passing its messages on to it is a superclass of base (see
+        _note_superclass); it becomes that control once created"""
+        hwnd, msg, wParam, lParam = args[:4]
+        if self.gui and hwnd in self.gui.windows and not self.gui.windows[hwnd].native:
+            win = self.gui.windows[hwnd]
+            wndclass = getattr(win, 'wndclass', None) or self.registered_classes.get(
+                getattr(win, 'class_name', None))
+            if wndclass is not None and not wndclass.get('base'):
+                wndclass['base'] = base
+                log.debug(f"Class '{win.class_name}' is a superclass of {base}")
+            if wndclass is not None and wndclass.get('base') == base:
+                self.superclass_windows.add(hwnd)
+            return self.DefWindowProcA([hwnd, msg, wParam, lParam])
+        return self._native_message(hwnd, msg, wParam, lParam)
+
+    def NativeEditProc(self, args):
+        return self._class_proc('EDIT', args)
+
+    def NativeButtonProc(self, args):
+        return self._class_proc('BUTTON', args)
+
+    def NativeStaticProc(self, args):
+        return self._class_proc('STATIC', args)
+
+    def NativeListBoxProc(self, args):
+        return self._class_proc('LISTBOX', args)
+
+    def NativeComboBoxProc(self, args):
+        return self._class_proc('COMBOBOX', args)
+
     def _native_window(self, hwnd, kind=None):
         win = self.gui.windows.get(hwnd) if self.gui else None
         if win is None or win.native is None or (kind and win.native != kind):
@@ -72,6 +128,12 @@ class ControlsMixin:
             return 0
         if proc == self._native_stub():
             return self._native_message(hwnd, msg, wParam, lParam, wide)
+        if self._is_native_proc(proc):
+            name = next(n for n, a in self._class_proc_stubs.items() if a == proc)
+            base = next(b for b, n in self.CONTROL_CLASS_PROCS.items() if n == name)
+            if self.gui and hwnd in self.gui.windows:
+                return self._class_proc(base, [hwnd, msg, wParam, lParam])
+            return self._native_message(hwnd, msg, wParam, lParam, wide)
         return self.emu.call_wndproc(proc, hwnd, msg, wParam, lParam)
 
     def _send(self, hwnd, msg, wParam=0, lParam=0):
@@ -81,7 +143,7 @@ class ControlsMixin:
     def _control_subclass(self, hwnd):
         """Program window procedure that subclasses a FakeControl, or 0"""
         proc = self.window_longs.get(hwnd, {}).get(-4, 0)
-        return proc if proc and proc != self._native_stub() else 0
+        return proc if proc and not self._is_native_proc(proc) else 0
 
     def CallWindowProcA(self, args, wide=False):
         """CallWindowProcA/W emulation"""
@@ -112,6 +174,19 @@ class ControlsMixin:
                                                code) + payload)
         result = self._send(parent, self.WM_NOTIFY, win.control_id, buf) if parent else 0
         return result, buf
+
+    WM_NOTIFYFORMAT, NF_QUERY, NFR_ANSI = 0x0055, 3, 1
+
+    def _notify_ansi(self, win):
+        """Does the control's parent take the ANSI notifications (LVN_GETDISPINFOA...)?
+        Like comctl32, it is asked once with WM_NOTIFYFORMAT; one that does
+        not answer gets the Unicode ones."""
+        st = win.nstate
+        if 'ansi' not in st:
+            parent = self._parent_of(win.hwnd)
+            st['ansi'] = bool(parent) and self._send(
+                parent, self.WM_NOTIFYFORMAT, win.hwnd, self.NF_QUERY) == self.NFR_ANSI
+        return st['ansi']
 
     def _notify_simple(self, win, code, payload=b''):
         result, buf = self._notify(win, code, payload)

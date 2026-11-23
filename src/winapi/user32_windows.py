@@ -48,12 +48,28 @@ class User32WindowsMixin:
             6: 1,      # SM_CYBORDER
             16: width,  # SM_CXFULLSCREEN
             17: height - 30 - 25,  # SM_CYFULLSCREEN: minus taskbar and caption
+            7: 3, 8: 3,    # SM_CXDLGFRAME, SM_CYDLGFRAME
+            # SM_CXICON, SM_CYICON: Word's message boxes put their text after the icon
+            11: 32, 12: 32,
+            13: 32, 14: 32,  # SM_CXCURSOR, SM_CYCURSOR
+            15: 20,    # SM_CYMENU
+            19: 1,     # SM_MOUSEPRESENT
+            # SM_RESERVED2: the cursor's display counter (ShowCursor). Word
+            # reads it to hide the pointer while typing and to show it again
+            # when the mouse moves; with 0 it hid the pointer for good
+            25: self.cursor_count,
+            32: 3, 33: 3,  # SM_CXFRAME, SM_CYFRAME
+            36: 4, 37: 4,  # SM_CXDOUBLECLK, SM_CYDOUBLECLK
+            43: 3,     # SM_CMOUSEBUTTONS
+            45: 2, 46: 2,  # SM_CXEDGE, SM_CYEDGE
+            49: 16, 50: 16,  # SM_CXSMICON, SM_CYSMICON
+            68: 4, 69: 4,  # SM_CXDRAG, SM_CYDRAG
             80: 1,     # SM_CMONITORS
         }
 
         result = metrics.get(nIndex, 0)
         log.debug(f"GetSystemMetrics({nIndex}) -> {result}")
-        return result
+        return result & 0xFFFFFFFF
 
     # MB_OK ... MB_CANCELTRYCONTINUE: (label, result id) of the buttons
     MESSAGEBOX_BUTTONS = {0: [('OK', 1)], 1: [('OK', 1), ('Cancel', 2)],
@@ -130,6 +146,7 @@ class User32WindowsMixin:
             self.module_classes[(class_name.lower(), hInstance)] = \
                 self.registered_classes[class_name]
 
+            self._note_superclass(class_name, lpWndClass)
             log.debug(f"RegisterClassA('{class_name}') -> 0x{atom:x}")
             return atom
         except UcError:
@@ -137,6 +154,17 @@ class User32WindowsMixin:
 
     def RegisterClassW(self, args):
         return self.RegisterClassA(args, wide=True)
+
+    def _note_superclass(self, class_name, wndclass_address):
+        """A class registered from the WNDCLASS GetClassInfo filled for a
+        system class is a superclass of it (Word's OpusFedt of EDIT, Office's
+        OpenListView of SysListView32): its windows are that emulated
+        control, run through the class's window procedure, which passes on
+        to the one GetClassInfo gave (CallWindowProc)"""
+        base = self.superclass_buffers.pop(wndclass_address, None)
+        if base is not None and base.upper() != class_name.upper():
+            self.registered_classes[class_name]['base'] = base
+            log.debug(f"Class '{class_name}' is a superclass of {base}")
 
     def RegisterClassExA(self, args, wide=False):
         """RegisterClassExA/W emulation"""
@@ -173,6 +201,7 @@ class User32WindowsMixin:
             self.module_classes[(class_name.lower(), hInstance)] = \
                 self.registered_classes[class_name]
 
+            self._note_superclass(class_name, lpwcx)
             log.debug(f"RegisterClassExA('{class_name}') -> 0x{atom:x}")
             return atom
         except UcError:
@@ -216,39 +245,56 @@ class User32WindowsMixin:
 
         # Create real window if GUI exists
         if self.gui and self.gui.running:
-            native = self.NATIVE_CLASSES.get(class_name.upper()) if isinstance(class_name, str) \
+            # A superclass of a system class is created as that control
+            superclass = self._superclass_of(class_name, hInstance)
+            base_class = superclass['base'] if superclass else class_name
+            native = self.NATIVE_CLASSES.get(base_class.upper()) if isinstance(base_class, str) \
                 else None
             if native and (hWndParent in self.gui.windows or not dwStyle & self.WS_CHILD):
                 hwnd = self._create_native(native, class_name, window_name, x, y, nWidth,
                                            nHeight, dwStyle, dwExStyle, hWndParent, hMenu)
                 win = self.gui.windows[hwnd]
+                if superclass:
+                    win.wndproc = superclass['wndproc']
+                    win.wndclass = superclass
                 if self._cbt_refuses(hwnd, lpParam, hInstance, hMenu, hWndParent, nHeight,
                                      nWidth, y, x, dwStyle, lpWindowName, lpClassName,
                                      dwExStyle):
                     return 0
+                if superclass:
+                    self._send_create(superclass['wndproc'], hwnd, lpParam, hInstance, hMenu,
+                                      hWndParent, nHeight, nWidth, y, x, dwStyle,
+                                      lpWindowName, lpClassName, dwExStyle)
                 if dwStyle & self.WS_VISIBLE and native != 'TOOLTIPS':
                     win.visible = True
                 if native == 'TOOLBAR' and not dwStyle & 0x4:  # CCS_NORESIZE
                     self._tb_autosize(win)
                 return hwnd
             # Create control for top-level controls
-            if class_name.upper() == "MSCTLS_STATUSBAR32" and hWndParent in self.gui.windows:
+            if base_class.upper() == "MSCTLS_STATUSBAR32" and hWndParent in self.gui.windows:
                 hwnd = self._create_status_bar(hWndParent, window_name, dwStyle, hMenu)
-            elif class_name.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
+            elif base_class.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
                                         "SCROLLBAR", "MSCTLS_PROGRESS32"]:
                 # BUTTON with a checkbox or radio button style is drawn and
                 # clicked as a checkbox
-                control_class = class_name
-                if (class_name.upper() == "BUTTON" and
+                control_class = base_class
+                if (base_class.upper() == "BUTTON" and
                         (dwStyle & 0xF) in self.CHECK_BUTTON_STYLES):
                     control_class = "CHECKBOX"
-                elif class_name.upper() == "MSCTLS_PROGRESS32":
+                elif base_class.upper() == "MSCTLS_PROGRESS32":
                     control_class = "PROGRESSBAR"
                 # For child controls hMenu carries the control ID (used by WM_COMMAND)
                 hwnd = self.gui.create_control(hWndParent, control_class, window_name,
                                                x, y, nWidth, nHeight, dwStyle,
                                                control_id=hMenu, ex_style=dwExStyle)
                 self.dirty_controls[hwnd] = True
+                if not dwStyle & self.WS_VISIBLE and hwnd in self.gui.controls:
+                    # Hidden until ShowWindow (Office's file dialogs keep spare edits)
+                    self.gui.controls[hwnd].visible = False
+                if superclass and hwnd in self.gui.controls:
+                    # GetClassName gives the superclass; its procedure gets the messages
+                    self.gui.controls[hwnd].superclass_name = class_name
+                    self.window_longs.setdefault(hwnd, {})[-4] = superclass['wndproc']
             else:
                 parent = hWndParent if dwStyle & self.WS_CHILD else 0
                 hwnd = self.gui.create_window(window_name, x, y, nWidth, nHeight, dwStyle,
@@ -299,15 +345,16 @@ class User32WindowsMixin:
             # CreateWindowEx returns. Apps often create their child controls here.
             # Controls have no app WndProc, so this only fires for app windows.
             wndproc = self._find_wndproc_for_hwnd(hwnd)
+            if not wndproc and superclass and self.gui and hwnd in self.gui.controls:
+                wndproc = superclass['wndproc']
             if wndproc:
-                cs_addr = self._build_createstruct(
-                    lpParam, hInstance, hMenu, hWndParent,
-                    nHeight, nWidth, y, x, dwStyle, lpWindowName, lpClassName, dwExStyle)
-                # WM_NCCREATE comes first (many frameworks attach their window
-                # object there), then WM_CREATE
-                self.emu.call_wndproc(wndproc, hwnd, self.WM_NCCREATE, 0, cs_addr)
-                self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
-                self.emu.heap_free(cs_addr)
+                self._send_create(wndproc, hwnd, lpParam, hInstance, hMenu, hWndParent,
+                                  nHeight, nWidth, y, x, dwStyle, lpWindowName, lpClassName,
+                                  dwExStyle)
+            if hwnd in self.superclass_windows:
+                # Its class turned out to superclass a control while creating it
+                self.superclass_windows.discard(hwnd)
+                self._make_superclass_control(hwnd, class_name, dwStyle, dwExStyle, hMenu)
                 if dwStyle & (self.WS_CHILD | self.WS_POPUP):
                     self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
             # WS_VISIBLE windows are shown without an explicit ShowWindow call
@@ -321,6 +368,60 @@ class User32WindowsMixin:
             hwnd = self.get_next_handle()
 
         return hwnd
+
+    def _send_create(self, wndproc, hwnd, *create_args):
+        """Send WM_NCCREATE (many frameworks attach their window object there),
+        then WM_CREATE, with a CREATESTRUCT of create_args"""
+        cs_addr = self._build_createstruct(*create_args)
+        try:
+            self.emu.call_wndproc(wndproc, hwnd, self.WM_NCCREATE, 0, cs_addr)
+            self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
+        finally:
+            self.emu.heap_free(cs_addr)
+
+    def _make_superclass_control(self, hwnd, class_name, style, ex_style, control_id):
+        """Turn the plain child window hwnd of a superclass of a control class
+        into that control, keeping its handle, text and window procedure"""
+        win = self.gui.windows.get(hwnd)
+        wndclass = getattr(win, 'wndclass', None) or self.registered_classes.get(class_name)
+        base = wndclass.get('base') if wndclass else None
+        if win is None or base not in self.CONTROL_CLASS_PROCS or win.parent not in \
+                self.gui.windows:
+            return
+        control_class = base
+        if base == 'BUTTON' and (style & 0xF) in self.CHECK_BUTTON_STYLES:
+            control_class = 'CHECKBOX'
+        with self.gui.lock:
+            parent = self.gui.windows[win.parent]
+            parent.children = [h for h in parent.children if h != hwnd]
+            del self.gui.windows[hwnd]
+            if hwnd in self.gui.z_order:
+                self.gui.z_order.remove(hwnd)
+            self.gui.create_control(parent.hwnd, control_class, win.title, win.x, win.y,
+                                    win.width, win.height, style, control_id=control_id,
+                                    ex_style=ex_style, hwnd=hwnd)
+            control = self.gui.controls[hwnd]
+            control.superclass_name = class_name
+            control.visible = win.visible or bool(style & self.WS_VISIBLE)
+        self.window_longs.setdefault(hwnd, {})[-4] = proc = (
+            win.wndproc or wndclass['wndproc'])
+        self.dirty_controls[hwnd] = True
+        log.debug(f"Window 0x{hwnd:x} of '{class_name}' is now a {base} control "
+                  f"(procedure 0x{proc:x})")
+
+    def _superclass_of(self, class_name, hinstance):
+        """Registered class of class_name (the module's own first) if it is a
+        superclass of a system class (see _note_superclass), else None"""
+        if not isinstance(class_name, str):
+            return None
+        wndclass = self.module_classes.get((class_name.lower(), hinstance))
+        if wndclass is None:
+            wndclass = self.registered_classes.get(class_name)
+        if wndclass is None:
+            match = next((n for n in self.registered_classes
+                          if n.lower() == class_name.lower()), None)
+            wndclass = self.registered_classes.get(match) if match else None
+        return wndclass if wndclass and wndclass.get('base') else None
 
     def _cbt_refuses(self, hwnd, *create_args):
         """Call the WH_CBT hooks for a new window (HCBT_CREATEWND with its
@@ -578,7 +679,11 @@ class User32WindowsMixin:
         # Default rectangle
         left, top, right, bottom = 0, 0, 400, 300
 
-        if self.gui and hWnd in self.gui.windows:
+        combo = self._combo_of_edit(hWnd)
+        if combo is not None:
+            left, top, right, bottom = self._combo_edit_rect(combo)
+            right, bottom, left, top = right - left, bottom - top, 0, 0
+        elif self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             right, bottom = self.gui.client_size(win)
         elif self.gui and hWnd in self.gui.controls:
@@ -601,6 +706,23 @@ class User32WindowsMixin:
 
         left, top, right, bottom = 100, 100, 500, 400
 
+        combo = self._combo_of_edit(hWnd)
+        if combo is not None:
+            # The edit field of a combo box: inside the combo box's window rect
+            parent = self.gui.windows.get(combo.parent_hwnd)
+            ox, oy = self.gui.client_origin(parent) if parent else (0, 0)
+            left, top, right, bottom = self._combo_edit_rect(combo)
+            left, top = ox + combo.x + left, oy + combo.y + top
+            right, bottom = ox + combo.x + right, oy + combo.y + bottom
+            if lpRect:
+                self._write_rect(lpRect, left, top, right, bottom)
+            return 1
+        if self.gui and hWnd not in self.gui.windows and hWnd not in self.gui.controls:
+            # No such window: fails and leaves the RECT alone (Word asks for
+            # the zoom box's edit child and filled the toolbar with gray)
+            log.debug(f"GetWindowRect(0x{hWnd:x}) -> invalid window")
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
         if self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             left, top = win.x, win.y

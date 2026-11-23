@@ -884,6 +884,11 @@ class WinmmMixin:
     def PlaySoundW(self, args):
         return self.PlaySoundA(args, wide=True)
 
+    def PlaySound(self, args):
+        """PlaySound: winmm's undecorated export, the ANSI one (Word 95 asks
+        GetProcAddress for it)"""
+        return self.PlaySoundA(args)
+
     def sndPlaySoundA(self, args, wide=False):
         """sndPlaySoundA/W emulation (winmm) - alias or file name"""
         flags = args[1] & (self.SND_ASYNC | self.SND_NODEFAULT | self.SND_MEMORY |

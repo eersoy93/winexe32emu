@@ -244,8 +244,11 @@ class WindowDrawingMixin:
         elif stype == 'text':
             x, y = shape['pos']
             font = self._get_render_font(shape.get('font'))
-            surface = font.render(shape['text'], True, shape.get('color') or self.COLOR_TEXT,
-                                  shape.get('bk'))
+            if shape.get('dx'):
+                surface = self._spaced_text_surface(shape, font)
+            else:
+                surface = font.render(shape['text'], True,
+                                      shape.get('color') or self.COLOR_TEXT, shape.get('bk'))
             prev_clip = None
             if shape.get('clip'):
                 # ExtTextOut's ETO_CLIPPED rectangle
@@ -282,6 +285,66 @@ class WindowDrawingMixin:
             if shape['size'][0] > 0 and shape['size'][1] > 0:
                 screen.blit(self._image_surface(shape), (ox + x, oy + y),
                             special_flags=self._rop_blend(shape.get('rop')))
+
+        elif stype == 'invert':
+            self._invert_area(screen, shape, ox, oy)
+
+    def _spaced_text_surface(self, shape, font):
+        """Surface of a text shape whose characters ExtTextOut placed with
+        lpDx (shape['dx']), cached in the shape"""
+        cached = shape.get('_surface')
+        if cached is not None and cached[0] is font:
+            return cached[1]
+        color = shape.get('color') or self.COLOR_TEXT
+        positions, x = [], 0
+        for advance in shape['dx']:
+            positions.append(x)
+            x += advance
+        glyphs = [font.render(ch, True, color) for ch in shape['text']]
+        width = max([x] + [p + g.get_width() for p, g in zip(positions, glyphs, strict=True)])
+        surface = pygame.Surface((max(1, width), font.get_height()), pygame.SRCALPHA)
+        if shape.get('bk') is not None:
+            surface.fill(tuple(shape['bk']) + (255,), pygame.Rect(0, 0, max(1, x),
+                                                                  font.get_height()))
+        for pos, glyph in zip(positions, glyphs, strict=True):
+            surface.blit(glyph, (pos, 0))
+        shape['_surface'] = (font, surface)
+        return surface
+
+    @staticmethod
+    def _invert_area(screen, shape, ox, oy):
+        """Invert the colors under an 'invert' display list entry (InvertRect,
+        PatBlt with DSTINVERT, a caret or selection blitted with an XOR
+        raster operation); a mask limits it to the pixels it sets"""
+        left, top, right, bottom = shape['rect']
+        full = pygame.Rect(ox + left, oy + top, right - left, bottom - top)
+        area = full.clip(screen.get_clip()).clip(screen.get_rect())
+        if area.width <= 0 or area.height <= 0:
+            return
+        inverted = pygame.Surface(area.size)
+        inverted.fill((255, 255, 255))
+        inverted.blit(screen.subsurface(area), (0, 0), special_flags=pygame.BLEND_RGB_SUB)
+        mask = shape.get('mask')
+        if mask is None:
+            screen.blit(inverted, area.topleft)
+            return
+        cached = shape.get('_mask')
+        if cached is None or cached[0] != full.size:
+            width, height, bits = mask
+            rgba = bytearray(len(bits) * 4)
+            rgba[0::4] = rgba[1::4] = rgba[2::4] = b'\xff' * len(bits)
+            rgba[3::4] = bits
+            from_bytes = getattr(pygame.image, 'frombytes', None) or pygame.image.fromstring
+            surface = from_bytes(bytes(rgba), (width, height), 'RGBA')
+            if surface.get_size() != full.size:
+                surface = pygame.transform.scale(surface, full.size)
+            cached = (full.size, surface)
+            shape['_mask'] = cached
+        masked = pygame.Surface(area.size, pygame.SRCALPHA)
+        masked.blit(inverted, (0, 0))
+        masked.blit(cached[1], (full.x - area.x, full.y - area.y),
+                    special_flags=pygame.BLEND_RGBA_MULT)
+        screen.blit(masked, area.topleft)
 
     @staticmethod
     def _rop_blend(rop):

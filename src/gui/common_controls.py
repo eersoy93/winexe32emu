@@ -569,11 +569,15 @@ class CommonControlsMixin:
             elif not win.style & 0x800:
                 self._draw_button_3d(rect, '')
             text = owner._tb_text(win, button)
-            ix = rect.x + (rect.width - bw) // 2
-            iy = rect.y + 3 + (1 if pressed else 0)
+            ix = rect.x + (rect.width - bw) // 2 + (1 if pressed else 0)
+            iy = rect.y + (3 if text and st['max_text_rows'] else (rect.height - bh) // 2) + \
+                (1 if pressed else 0)
             drawn = False
             if st['imagelist']:
                 drawn = self._draw_imagelist_image(owner, st['imagelist'], button['bitmap'],
+                                                   ix, iy, disabled=not enabled)
+            elif st.get('bitmap_list'):  # TB_ADDBITMAP bitmaps
+                drawn = self._draw_imagelist_image(owner, st['bitmap_list'], button['bitmap'],
                                                    ix, iy, disabled=not enabled)
             if not drawn:
                 glyph = self.VIEW_GLYPHS.get(button['bitmap'])

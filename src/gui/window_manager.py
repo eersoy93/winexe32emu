@@ -193,9 +193,9 @@ class WindowManagerMixin:
 
     @gui_locked
     def create_control(self, parent_hwnd, class_name, text, x, y, width, height, style=0,
-                       control_id=0, ex_style=0):
-        """Create new control"""
-        hwnd = self.get_next_hwnd()
+                       control_id=0, ex_style=0, hwnd=None):
+        """Create new control (hwnd: the handle of a window it replaces)"""
+        hwnd = hwnd or self.get_next_hwnd()
         control = FakeControl(hwnd, class_name, text, x, y, width, height, style, ex_style)
         control.parent_hwnd = parent_hwnd
         control.control_id = control_id
@@ -231,6 +231,12 @@ class WindowManagerMixin:
                 self.active_window = hwnd
                 if hwnd not in self.z_order:
                     self.z_order.append(hwnd)
+            elif not show and self.active_window == hwnd:
+                # Like Windows, hiding the active window activates the next
+                # one (Office's file dialogs hide a window that kept the keys)
+                self._activate_next_window()
+                if self.active_window == hwnd:
+                    self.active_window = None
         elif hwnd in self.controls:
             self.controls[hwnd].visible = show
 

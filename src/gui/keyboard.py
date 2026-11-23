@@ -103,15 +103,17 @@ class KeyboardMixin:
         vk = self._pygame_key_to_vk(event)
         sys_key = self._is_sys_key(vk)
         lparam = 0x20000001 if sys_key and self.alt_down else 1  # Context code: Alt is down
+        # The WM_CHAR / WM_SYSCHAR of the keystroke (GetMessageA gives the
+        # ANSI character): posted by TranslateMessage, like Windows
+        char = self._key_char(event, vk)
+        char_message = self.winapi.WM_SYSCHAR if sys_key else self.winapi.WM_CHAR
         if vk is not None:
             message = self.winapi.WM_SYSKEYDOWN if sys_key else self.winapi.WM_KEYDOWN
-            self.winapi.post_window_message(hwnd, message, vk, lparam)
-        # Synthesize WM_CHAR / WM_SYSCHAR like TranslateMessage (GetMessageA
-        # gives the ANSI character)
-        char = self._key_char(event, vk)
-        if char is not None:
-            message = self.winapi.WM_SYSCHAR if sys_key else self.winapi.WM_CHAR
-            self.winapi.post_window_message(hwnd, message, char, lparam)
+            self.winapi.post_window_message(hwnd, message, vk, lparam,
+                                            char=None if char is None else (char_message, char))
+        elif char is not None:
+            # A key without a virtual-key code here (punctuation): just its character
+            self.winapi.post_window_message(hwnd, char_message, char, lparam)
 
     # Keys whose character is a control code: Backspace, Tab, Enter, Esc
     CONTROL_KEY_CHARS = {0x08: 0x08, 0x09: 0x09, 0x0D: 0x0D, 0x1B: 0x1B}
@@ -213,6 +215,13 @@ class KeyboardMixin:
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE, pygame.K_TAB):
             if in_dialog:
                 return False  # The dialog handles them (default button, Cancel, next edit)
+            if win.owner is not None:
+                # The edit gets them, like Windows: the program's message loop
+                # makes them press its default button (Office's file dialogs)
+                vk = self._pygame_key_to_vk(event)
+                win.owner.post_window_message(control.hwnd, winapi.WinAPIHandler.WM_KEYDOWN,
+                                              vk, 1, char=(winapi.WinAPIHandler.WM_CHAR, vk))
+                return True
             self.focused_control = None
             return True
         self._edit_key(win, control, event)

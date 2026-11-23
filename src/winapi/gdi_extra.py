@@ -311,8 +311,13 @@ class GdiExtraMixin:
         return 1
 
     def InvertRgn(self, args):
-        """InvertRgn(hdc, hrgn) - like InvertRect, nothing is redrawn inverted"""
-        return 1 if args[0] in self.dc_state and self._region(args[1]) else 0
+        """InvertRgn(hdc, hrgn) - inverts the colors in the region"""
+        region = self._region(args[1])
+        if args[0] not in self.dc_state or region is None:
+            return 0
+        for rect in region['rects']:
+            self._add_shape(args[0], {'type': 'invert', 'rect': rect})
+        return 1
 
     # ---------- Bitmap bits and dimensions ----------
 
