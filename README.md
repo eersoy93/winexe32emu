@@ -44,7 +44,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
-| Microsoft Office 95 Professional | Installer only |
+| Microsoft Office 95 Professional | Installer and Word 95 |
 | Ski32 | Program |
 
 ## Getting Started
