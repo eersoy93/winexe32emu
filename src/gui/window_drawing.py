@@ -18,6 +18,7 @@ dropdowns"""
 
 from .. import winapi
 from ..config import PYGAME_AVAILABLE
+from .font_cache import CachedFont
 
 if PYGAME_AVAILABLE:
     import pygame
@@ -345,7 +346,7 @@ class WindowDrawingMixin:
             if cell and font.get_height() > height:
                 size = max(6, round(height * height / font.get_height()))
                 font = pygame.font.SysFont(names, size, bold=bold, italic=italic)
-            self._font_cache[key] = font
+            self._font_cache[key] = CachedFont(font)
         return self._font_cache[key]
 
     def _draw_menu_bar(self, window):

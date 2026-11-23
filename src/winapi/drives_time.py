@@ -30,7 +30,7 @@ from .. import winapi
 from ..config import (DRIVE_CDROM, DRIVE_FIXED, DRIVE_REMOVABLE, DRIVES, FLOPPY_BYTES,
                       READ_ONLY_DRIVES, drive_host_path)
 from ..logger import log
-from ..paths import strip_win32_path_prefix
+from ..paths import drive_letter_of_host, strip_win32_path_prefix
 from ..sound import SoundPlayer
 
 
@@ -276,19 +276,31 @@ class DrivesTimeMixin:
         return self.MoveFileExA([args[0], args[1], args[4]], wide=True)
 
     def CreateHardLinkA(self, args, wide=False):
-        """CreateHardLinkA/W emulation (sandboxed)"""
+        """CreateHardLinkA/W emulation (sandboxed). A link shares its file's
+        data, so neither name may be on the read-only CD-ROM D: (a link of a
+        D: file on C: would let a program change the host's D: file), and
+        like on Windows both are on the same drive (ERROR_NOT_SAME_DEVICE)."""
         new = self.resolve_drive_path(self._read_text(args[0], wide))
         existing = self.resolve_drive_path(self._read_text(args[1], wide))
         if new is None or existing is None:
             self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
+        if self._write_protected(new, existing):
+            return 0
+        if drive_letter_of_host(new) != drive_letter_of_host(existing):
+            self._last_error = 17  # ERROR_NOT_SAME_DEVICE
+            return 0
+        if os.path.isdir(existing):
+            self._last_error = 5  # Folders have no hard links
             return 0
         try:
             os.link(existing, new)
         except FileExistsError:
             self._last_error = 183  # ERROR_ALREADY_EXISTS
             return 0
-        except OSError:
-            self._last_error = 2
+        except OSError as e:
+            self._last_error = self._os_error_code(e, existing if not os.path.exists(existing)
+                                                   else new)
             return 0
         return 1
 

@@ -14,7 +14,9 @@
 
 """WinAPIHandler mixin: Memory DC / double buffering, bitmaps, device independent bitmaps"""
 
+import array
 import struct
+import sys
 
 from unicorn import UcError
 
@@ -28,6 +30,7 @@ if PYGAME_AVAILABLE:
 
 
 BITMAPCOREHEADER_SIZE = 12
+_DWORD_ARRAY = 'I' if array.array('I').itemsize == 4 else 'L'  # 32-bit array items
 
 
 def core_dib_to_info(data):
@@ -299,6 +302,58 @@ class MemoryDCMixin:
         return handle
 
     @staticmethod
+    def _bitfield_channel(value, mask):
+        """A color channel (0-255) of a 16 or 32 bpp pixel (BI_BITFIELDS mask)"""
+        if not mask:
+            return 0
+        shift = (mask & -mask).bit_length() - 1
+        top = mask >> shift
+        return ((value & mask) >> shift) * 255 // top
+
+    _BITFIELD_TABLES = {}  # 16 bpp masks -> RGB bytes of each of the 65536 pixels
+
+    @classmethod
+    def _bitfield_converter(cls, bpp, masks):
+        """converter(row, width) -> RGB bytes of a row of 16 or 32 bpp pixels.
+        A DIB section of a game is decoded again for every BitBlt, so no
+        Python code runs per pixel: 16 bpp pixels go through a table of all
+        65536 values, 32 bpp pixels whose masks are whole bytes are sliced."""
+        if bpp == 16:
+            table = cls._BITFIELD_TABLES.get(masks)
+            if table is None:
+                channel = cls._bitfield_channel
+                table = [bytes((channel(v, masks[0]), channel(v, masks[1]),
+                                channel(v, masks[2]))) for v in range(0x10000)]
+                cls._BITFIELD_TABLES[masks] = table
+
+            def convert16(line, width):
+                pixels = array.array('H', bytes(line[:2 * width]))
+                if sys.byteorder == 'big':
+                    pixels.byteswap()
+                return b''.join(map(table.__getitem__, pixels))
+            return convert16
+
+        byte_masks = (0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+        if all(m in byte_masks for m in masks):
+            offsets = [byte_masks.index(m) for m in masks]
+
+            def convert32_bytes(line, width):
+                out = bytearray(width * 3)
+                for c, offset in enumerate(offsets):
+                    out[c::3] = line[offset:width * 4:4]
+                return out
+            return convert32_bytes
+
+        channel = cls._bitfield_channel
+
+        def convert32(line, width):  # Masks of other widths (10-10-10...)
+            pixels = array.array(_DWORD_ARRAY, bytes(line[:4 * width]))
+            if sys.byteorder == 'big':
+                pixels.byteswap()
+            return bytes(channel(v, m) for v in pixels for m in masks)
+        return convert32
+
+    @staticmethod
     def _decode_dib(data):
         """(width, height, top-down RGB bytes) of a packed DIB (BITMAPINFOHEADER,
         color table, bits), or None for unsupported formats"""
@@ -332,12 +387,8 @@ class MemoryDCMixin:
         if len(data) < offset + stride * height:
             return None
 
-        def channel(value, mask):
-            if not mask:
-                return 0
-            shift = (mask & -mask).bit_length() - 1
-            top = mask >> shift
-            return ((value & mask) >> shift) * 255 // top
+        if masks is not None:
+            converter = MemoryDCMixin._bitfield_converter(bpp, masks)
 
         if bpp <= 8:
             # Indexed: unpack pixels to one index byte each, then map every
@@ -364,12 +415,7 @@ class MemoryDCMixin:
                 out[1::3] = line[1:width * 4:4]
                 out[2::3] = line[0:width * 4:4]
             elif bpp in (16, 32):
-                fmt = '<H' if bpp == 16 else '<I'
-                step = bpp // 8
-                out = bytearray()
-                for i in range(width):
-                    value = struct.unpack_from(fmt, line, i * step)[0]
-                    out += bytes(channel(value, m) for m in masks)
+                out = converter(line, width)
             else:
                 line = bytes(line)
                 if unpack is None:

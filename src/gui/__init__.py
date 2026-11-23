@@ -44,6 +44,7 @@ from .mouse import MouseMixin
 from .keyboard import KeyboardMixin
 from .messageboxes import MessageBoxesMixin
 from .console import ConsoleMixin
+from .font_cache import CachedFont
 
 
 class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, TaskbarMixin,
@@ -251,13 +252,14 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
 
         # Load fonts
         pygame.font.init()
-        self.font = pygame.font.SysFont('arial', 14)
-        self.font_small = pygame.font.SysFont('arial', 11)
-        self.font_small_bold = pygame.font.SysFont('arial', 11, bold=True)
-        self.font_bold = pygame.font.SysFont('arial', 14, bold=True)
-        self.font_console = pygame.font.SysFont('consolas,courier,monospace', 12)
+        # The fonts keep the texts they rendered (CachedFont)
+        self.font = CachedFont(pygame.font.SysFont('arial', 14))
+        self.font_small = CachedFont(pygame.font.SysFont('arial', 11))
+        self.font_small_bold = CachedFont(pygame.font.SysFont('arial', 11, bold=True))
+        self.font_bold = CachedFont(pygame.font.SysFont('arial', 14, bold=True))
+        self.font_console = CachedFont(pygame.font.SysFont('consolas,courier,monospace', 12))
         # List views use a font close to the 8 pt dialog font of Windows
-        self.font_list = pygame.font.SysFont('arial', 12)
+        self.font_list = CachedFont(pygame.font.SysFont('arial', 12))
 
         self._refresh_desktop_icons()
 
