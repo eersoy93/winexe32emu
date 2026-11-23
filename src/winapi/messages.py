@@ -682,8 +682,22 @@ class MessagesMixin:
                 return (hwnd, timer_id, timer['callback'])
         return None
 
-    def _write_msg(self, lpMsg, hwnd, message, wParam, lParam):
-        """Fill a MSG structure in emulated memory"""
+    CHAR_MESSAGES = (0x0102, 0x0103, 0x0106, 0x0107)  # WM_(SYS)CHAR, WM_(SYS)DEADCHAR
+
+    @staticmethod
+    def _ansi_char_code(code):
+        """wParam of a character message for GetMessageA/PeekMessageA: the
+        character in the ANSI code page ('?' if it has none)"""
+        if code < 0x80 or code > 0xFFFF:
+            return code
+        data = chr(code).encode(config.ANSI_CODEPAGE, errors='replace')
+        return data[0] if len(data) == 1 else 0x3F
+
+    def _write_msg(self, lpMsg, hwnd, message, wParam, lParam, wide=True):
+        """Fill a MSG structure in emulated memory (wide: GetMessageW/PeekMessageW;
+        the A functions get characters in the ANSI code page)"""
+        if not wide and message in self.CHAR_MESSAGES:
+            wParam = self._ansi_char_code(wParam)
         if lpMsg:
             # time and pt: when the message is retrieved (GetMessageTime/Pos)
             self.last_message_pos = x, y = self.gui.mouse_pos if self.gui else (0, 0)
@@ -695,7 +709,9 @@ class MessagesMixin:
         """Single non-blocking scan for a pending message.
 
         Returns (hwnd, message, wParam, lParam) or None. Priority mirrors
-        GetMessageA: synthesized WM_PAINT, then the input queue, then timers.
+        GetMessage: the posted and input messages, then the synthesized
+        WM_PAINT, then timers (a WM_PAINT handler that invalidates its window
+        again must not starve the input).
         hwnd_filter/msg_min/msg_max follow GetMessage's hWnd and filter range.
         """
         thread = self.emu.current_thread.tid
@@ -718,6 +734,14 @@ class MessagesMixin:
         self._deliver_set_cursor()
         if remove:
             self.refresh_native_views()
+
+        # Queued message (posted, and input forwarded from the GUI thread)
+        with self.message_lock:
+            for index, msg in enumerate(self.message_queue):
+                if matches(msg['hwnd'], msg['message']):
+                    if remove:
+                        del self.message_queue[index]
+                    return (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
 
         # Send WM_PAINT for visible windows not yet painted
         windows = []
@@ -755,14 +779,6 @@ class MessagesMixin:
                     del self.dirty_controls[hwnd]
                 return (hwnd, self.WM_PAINT, 0, 0)
 
-        # Queued message (input forwarded from the GUI thread)
-        with self.message_lock:
-            for index, msg in enumerate(self.message_queue):
-                if matches(msg['hwnd'], msg['message']):
-                    if remove:
-                        del self.message_queue[index]
-                    return (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
-
         # Fire due timers (lowest priority, like real WM_TIMER)
         if remove:
             due = self._pop_due_timer(matches)
@@ -772,8 +788,8 @@ class MessagesMixin:
 
         return None
 
-    def GetMessageA(self, args):
-        """GetMessageA emulation - For message loop"""
+    def GetMessageA(self, args, wide=False):
+        """GetMessageA/W emulation - For message loop"""
         lpMsg = args[0]
         hWnd = args[1]
         wMsgFilterMin = args[2]
@@ -791,7 +807,7 @@ class MessagesMixin:
             msg = self._next_message(True, hWnd, wMsgFilterMin, wMsgFilterMax)
             if msg is not None:
                 hwnd, message, wParam, lParam = msg
-                self._write_msg(lpMsg, hwnd, message, wParam, lParam)
+                self._write_msg(lpMsg, hwnd, message, wParam, lParam, wide)
                 if message == self.WM_QUIT:
                     return 0
                 return 1
@@ -811,9 +827,9 @@ class MessagesMixin:
             self.emu.idle_wait(0.01)
 
     def GetMessageW(self, args):
-        return self.GetMessageA(args)
+        return self.GetMessageA(args, wide=True)
 
-    def PeekMessageA(self, args):
+    def PeekMessageA(self, args, wide=False):
         """PeekMessageA emulation - non-blocking message check (game loops)"""
         lpMsg = args[0]
         hWnd = args[1]
@@ -834,13 +850,13 @@ class MessagesMixin:
             return 0
 
         hwnd, message, wParam, lParam = msg
-        self._write_msg(lpMsg, hwnd, message, wParam, lParam)
+        self._write_msg(lpMsg, hwnd, message, wParam, lParam, wide)
         log.debug(f"PeekMessageA() -> msg=0x{message:04x} hwnd=0x{hwnd:x}")
         return 1
 
     def PeekMessageW(self, args):
-        """PeekMessageW emulation (same as PeekMessageA in the emulator)"""
-        return self.PeekMessageA(args)
+        """PeekMessageW emulation"""
+        return self.PeekMessageA(args, wide=True)
 
     def TranslateMessage(self, args):
         """TranslateMessage emulation"""

@@ -106,10 +106,28 @@ class KeyboardMixin:
         if vk is not None:
             message = self.winapi.WM_SYSKEYDOWN if sys_key else self.winapi.WM_KEYDOWN
             self.winapi.post_window_message(hwnd, message, vk, lparam)
-        # Synthesize WM_CHAR / WM_SYSCHAR for printable input (TranslateMessage behavior)
-        if event.unicode and len(event.unicode) == 1 and event.unicode.isprintable():
+        # Synthesize WM_CHAR / WM_SYSCHAR like TranslateMessage (GetMessageA
+        # gives the ANSI character)
+        char = self._key_char(event, vk)
+        if char is not None:
             message = self.winapi.WM_SYSCHAR if sys_key else self.winapi.WM_CHAR
-            self.winapi.post_window_message(hwnd, message, ord(event.unicode), lparam)
+            self.winapi.post_window_message(hwnd, message, char, lparam)
+
+    # Keys whose character is a control code: Backspace, Tab, Enter, Esc
+    CONTROL_KEY_CHARS = {0x08: 0x08, 0x09: 0x09, 0x0D: 0x0D, 0x1B: 0x1B}
+
+    def _key_char(self, event, vk):
+        """Character code of a keystroke (WM_CHAR wParam), or None: printable
+        characters, the control codes of Backspace, Tab, Enter and Esc, and
+        Ctrl+letter (Ctrl+A = 1 ... Ctrl+Z = 26; ^Z accelerators)"""
+        ctrl = self.key_states.get(0x11) and not self.key_states.get(0x12)  # Ctrl+Alt: AltGr
+        if ctrl and vk is not None and 0x41 <= vk <= 0x5A:
+            return vk - 0x40
+        if vk in self.CONTROL_KEY_CHARS:
+            return self.CONTROL_KEY_CHARS[vk]
+        if event.unicode and len(event.unicode) == 1 and event.unicode.isprintable():
+            return ord(event.unicode)
+        return None
 
     def _handle_key_press(self, event):
         """Handle keyboard key press"""

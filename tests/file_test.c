@@ -183,6 +183,55 @@ int main(void)
         }
     }
 
+    /* ---- 6. CreateFile error codes and share modes, ReadFile of a bad handle ---- */
+    {
+        HANDLE first, second;
+        DWORD count = 99;
+        SetLastError(0);
+        first = CreateFileA("hello.txt", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+        if (first == INVALID_HANDLE_VALUE || GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            WriteString(hOut, "(Errors) OPEN_ALWAYS of an existing file: no ERROR_ALREADY_EXISTS!\n");
+            failed = 1;
+        }
+        /* Only reading is shared: writing is refused, reading is not */
+        second = CreateFileA("hello.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+        if (second != INVALID_HANDLE_VALUE || GetLastError() != ERROR_SHARING_VIOLATION)
+        {
+            WriteString(hOut, "(Errors) A write past FILE_SHARE_READ is not refused!\n");
+            failed = 1;
+            if (second != INVALID_HANDLE_VALUE)
+                CloseHandle(second);
+        }
+        second = CreateFileA("hello.txt", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+        if (second == INVALID_HANDLE_VALUE)
+        {
+            WriteString(hOut, "(Errors) A shared read is refused!\n");
+            failed = 1;
+        }
+        else
+            CloseHandle(second);
+        CloseHandle(first);
+        if (CreateFileA("no_such_folder\\x.txt", GENERIC_READ, 0, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL) != INVALID_HANDLE_VALUE ||
+            GetLastError() != ERROR_PATH_NOT_FOUND)
+        {
+            WriteString(hOut, "(Errors) A missing folder gives no ERROR_PATH_NOT_FOUND!\n");
+            failed = 1;
+        }
+        if (ReadFile((HANDLE)0x7777, buffer, 4, &count, NULL) || count != 0 ||
+            GetLastError() != ERROR_INVALID_HANDLE)
+        {
+            WriteString(hOut, "(Errors) ReadFile of a bad handle does not fail!\n");
+            failed = 1;
+        }
+        if (!failed)
+            WriteString(hOut, "(Errors) CreateFile and ReadFile error codes are right!\n");
+    }
+
     /* ---- 5. Sandbox escape must be refused ---- */
     hFile = CreateFileA("C:\\..\\escape.txt", GENERIC_WRITE, 0, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);

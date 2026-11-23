@@ -138,6 +138,7 @@ class GuestThread:
         self.tls_array = 0  # TEB->ThreadLocalStoragePointer (static TLS blocks)
         self.protection_index = 0  # Entries of CPUEmulator.protection_log applied
         self.retry_access = False  # Stale page protection: run the access again
+        self.preempted = False  # Stopped by the preemption watchdog (see emulate)
 
 
 class CPUEmulator(ProcessEnvironmentMixin):
@@ -185,6 +186,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
     SMALL_BLOCK_CACHED = 0x80
     # A thread that runs this long without blocking lets the others run
     THREAD_TIME_SLICE = 0.02
+    # A thread that runs this long without an API call (a busy-wait loop for
+    # another thread) is stopped by the preemption watchdog for a turn
+    PREEMPT_TIME_SLICE = 0.1
 
     # Process and thread ids: one pool for every emulated process, multiples
     # of 4 like on Windows
@@ -211,6 +215,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.threads = {self.main_thread.tid: self.main_thread}
         self.sched = threading.Condition(threading.RLock())
         self._slice_start = time.monotonic()
+        self._running_thread = None  # The guest thread holding the scheduler lock
+        self._watchdog = None  # Preemption thread, started with the second thread
         # Process memory shared by the threads' Unicorn instances:
         # base -> (size, perms, host buffer, host address)
         self.shared_regions = {}
@@ -319,7 +325,36 @@ class CPUEmulator(ProcessEnvironmentMixin):
             self.sched.wait(seconds)
         except RuntimeError:
             time.sleep(seconds)
+        self._start_slice()
+
+    def _start_slice(self):
+        """The calling guest thread got the scheduler lock: its time slice starts"""
+        self._running_thread = self.current_thread
         self._slice_start = time.monotonic()
+
+    def _start_watchdog(self):
+        """Preemption: threads only switch at API calls, so a thread that
+        spins without one (while (!flag);) would keep the others from ever
+        running. A host thread stops such a thread's emulation after
+        PREEMPT_TIME_SLICE; emulate() gives the others a turn and goes on."""
+        if self._watchdog is not None:
+            return
+
+        def watch():
+            while not self.stop_emulation:
+                time.sleep(self.PREEMPT_TIME_SLICE / 2)
+                thread = self._running_thread
+                if (len(self.threads) < 2 or thread is None or thread.uc is None or
+                        time.monotonic() - self._slice_start < self.PREEMPT_TIME_SLICE):
+                    continue
+                thread.preempted = True
+                try:
+                    thread.uc.emu_stop()
+                except UcError:
+                    pass
+
+        self._watchdog = threading.Thread(target=watch, name='preemption', daemon=True)
+        self._watchdog.start()
 
     def wait_until(self, condition, timeout_ms=0xFFFFFFFF):
         """Block until condition() is true (True), the timeout passes or the
@@ -624,8 +659,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
             self._tls.thread = thread
             with self.sched:
                 try:
+                    self._start_slice()
                     self.wait_until(lambda: thread.suspend_count == 0)
-                    self._slice_start = time.monotonic()
+                    self._start_slice()
                     if not (self.stop_emulation or thread.stop):
                         self.attach_thread()
                     if not (self.stop_emulation or thread.stop):
@@ -665,6 +701,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
         thread.python_thread = threading.Thread(target=body, daemon=True)
         thread.python_thread.start()
+        self._start_watchdog()
         return thread
 
     def exit_current_thread(self, code):
@@ -1749,7 +1786,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
         while True:
             try:
                 uc.emu_start(address, until, 0, 0)
-                return
+                address = self._resume_after_preemption(uc, until)
+                if address is None:
+                    return
+                continue
             except UcError as e:
                 thread = self.current_thread
                 if thread.retry_access and not (self.stop_emulation or thread.stop):
@@ -1784,6 +1824,25 @@ class CPUEmulator(ProcessEnvironmentMixin):
                 return
             self.apply_jump(uc, jump)
             address = jump.eip
+
+    def _resume_after_preemption(self, uc, until):
+        """After emu_start returned: if the preemption watchdog stopped the
+        thread (not an exit, a callback return or an unwind), let the other
+        threads run and return the address to go on at; else None"""
+        thread = self.current_thread
+        if not getattr(thread, 'preempted', False):
+            return None
+        thread.preempted = False
+        eip = uc.reg_read(UC_X86_REG_EIP)
+        if (eip == until or self.stop_emulation or thread.stop or
+                getattr(thread, 'pending_unwind', None) is not None):
+            return None
+        self.idle_wait(0.0005)
+        if self.stop_emulation or thread.stop:
+            return None
+        if thread.region_gen != self.region_gen:
+            self.sync_regions(thread)  # Another thread changed the memory map
+        return eip
 
     # CPU exceptions -> (Windows exception code, description, faulting
     # instruction length: 0 when EIP already points at it)
@@ -1967,7 +2026,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
         self.sched.acquire()
         self._tls.thread = self.main_thread
-        self._slice_start = time.monotonic()
+        self._start_slice()
         try:
             # Like the Windows loader: the DLLs the EXE imports (dependencies
             # first), then the EXE's TLS callbacks, then its entry point

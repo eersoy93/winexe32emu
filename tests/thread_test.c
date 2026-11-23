@@ -106,6 +106,27 @@ static DWORD WINAPI mapping_thread(LPVOID param)
     return ok;
 }
 
+static volatile LONG spin_flag = 0;
+
+static DWORD WINAPI set_flag_thread(LPVOID param)
+{
+    spin_flag = 1;
+    return 0;
+}
+
+/* A busy-wait without API calls: the other thread must still get a turn */
+static void test_preemption(void)
+{
+    volatile unsigned long spins = 0;
+    DWORD id;
+    HANDLE thread = CreateThread(NULL, 0, set_flag_thread, NULL, 0, &id);
+    while (!spin_flag && ++spins < 300000000UL)
+        ;
+    check(spin_flag == 1, "a thread spinning without API calls lets the others run");
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+}
+
 static void test_threads(void)
 {
     HANDLE threads[4];
@@ -283,6 +304,7 @@ int main(void)
 {
     printf("=== Thread test ===\n");
     test_threads();
+    test_preemption();
     test_named_objects();
     test_file_pointer();
     test_dll();

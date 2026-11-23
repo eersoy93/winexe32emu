@@ -222,6 +222,10 @@ class User32WindowsMixin:
                 hwnd = self._create_native(native, class_name, window_name, x, y, nWidth,
                                            nHeight, dwStyle, dwExStyle, hWndParent, hMenu)
                 win = self.gui.windows[hwnd]
+                if self._cbt_refuses(hwnd, lpParam, hInstance, hMenu, hWndParent, nHeight,
+                                     nWidth, y, x, dwStyle, lpWindowName, lpClassName,
+                                     dwExStyle):
+                    return 0
                 if dwStyle & self.WS_VISIBLE and native != 'TOOLTIPS':
                     win.visible = True
                 if native == 'TOOLBAR' and not dwStyle & 0x4:  # CCS_NORESIZE
@@ -287,6 +291,10 @@ class User32WindowsMixin:
                 elif dwStyle & self.WS_CHILD:
                     self.gui.windows[hwnd].control_id = hMenu
 
+            # The WH_CBT hooks see the window first (MFC subclasses it there)
+            if self._cbt_refuses(hwnd, lpParam, hInstance, hMenu, hWndParent, nHeight,
+                                 nWidth, y, x, dwStyle, lpWindowName, lpClassName, dwExStyle):
+                return 0
             # Real Windows sends WM_CREATE to the WndProc synchronously, before
             # CreateWindowEx returns. Apps often create their child controls here.
             # Controls have no app WndProc, so this only fires for app windows.
@@ -299,6 +307,7 @@ class User32WindowsMixin:
                 # object there), then WM_CREATE
                 self.emu.call_wndproc(wndproc, hwnd, self.WM_NCCREATE, 0, cs_addr)
                 self.emu.call_wndproc(wndproc, hwnd, self.WM_CREATE, 0, cs_addr)
+                self.emu.heap_free(cs_addr)
                 if dwStyle & (self.WS_CHILD | self.WS_POPUP):
                     self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
             # WS_VISIBLE windows are shown without an explicit ShowWindow call
@@ -312,6 +321,21 @@ class User32WindowsMixin:
             hwnd = self.get_next_handle()
 
         return hwnd
+
+    def _cbt_refuses(self, hwnd, *create_args):
+        """Call the WH_CBT hooks for a new window (HCBT_CREATEWND with its
+        CREATESTRUCT); True if one refused it (the window is destroyed)"""
+        if not self._hook_chain(self.WH_CBT):
+            return False
+        cs_addr = self._build_createstruct(*create_args)
+        try:
+            refused = self.cbt_create_window(hwnd, cs_addr)
+        finally:
+            self.emu.heap_free(cs_addr)
+        if refused:
+            log.debug(f"CreateWindowEx: a WH_CBT hook refused window 0x{hwnd:x}")
+            self.DestroyWindow([hwnd])
+        return refused
 
     def _top_level_window(self, hwnd):
         """The top-level window a window or control belongs to (the owner
@@ -378,33 +402,58 @@ class User32WindowsMixin:
         self.emu.uc.mem_write(addr, data)
         return addr
 
+    # ShowWindow commands that minimize, maximize, or show without activating
+    SW_MINIMIZING = (2, 6, 7, 11)  # SW_SHOWMINIMIZED, SW_MINIMIZE, SW_SHOWMINNOACTIVE,
+    #                                SW_FORCEMINIMIZE
+    SW_NOT_ACTIVATING = (4, 6, 7, 8, 11)  # SW_SHOWNOACTIVATE, ..., SW_SHOWNA
+
     def ShowWindow(self, args):
-        """ShowWindow emulation"""
+        """ShowWindow emulation - returns whether the window was visible"""
         hWnd = args[0]
         nCmdShow = args[1]
 
         show_names = {0: "SW_HIDE", 1: "SW_SHOWNORMAL", 2: "SW_SHOWMINIMIZED",
-                     3: "SW_SHOWMAXIMIZED", 4: "SW_SHOWNOACTIVATE", 5: "SW_SHOW"}
+                      3: "SW_SHOWMAXIMIZED", 4: "SW_SHOWNOACTIVATE", 5: "SW_SHOW",
+                      6: "SW_MINIMIZE", 7: "SW_SHOWMINNOACTIVE", 8: "SW_SHOWNA",
+                      9: "SW_RESTORE", 10: "SW_SHOWDEFAULT", 11: "SW_FORCEMINIMIZE"}
         show_name = show_names.get(nCmdShow, f"SW_{nCmdShow}")
 
         log.debug(f"ShowWindow(0x{hWnd:x}, {show_name})")
 
-        if self.gui and self.gui.running:
-            show = nCmdShow in [1, 3, 5, 6, 7, 8, 9, 10]
-            self.gui.show_window(hWnd, show)
-            win = self.gui.windows.get(hWnd)
-            if win is not None and win.parent is None and nCmdShow in (3, 9):
-                with self.gui.lock:
-                    if nCmdShow == 3 and not win.maximized:  # SW_SHOWMAXIMIZED
-                        win.minimized = False
-                        win.maximize(self.gui.width, self.gui.height, 30)
-                    elif nCmdShow == 9:  # SW_RESTORE
-                        win.restore()
+        if not (self.gui and self.gui.running):
+            return 0
+        win = self.gui.windows.get(hWnd)
+        target = win if win is not None else self.gui.controls.get(hWnd)
+        was_visible = 1 if target is not None and target.visible else 0
+        if nCmdShow == 0:  # SW_HIDE
+            self.gui.show_window(hWnd, False)
+            return was_visible
+        if win is None or win.parent is not None:  # A control or child window
+            self.gui.show_window(hWnd, True)
+            if win is not None and win.size_state is None:
                 self._send_size(hWnd)
-            elif show and win is not None and win.size_state is None:
-                self._send_size(hWnd)
+            return was_visible
 
-        return 1
+        with self.gui.lock:
+            if nCmdShow in self.SW_NOT_ACTIVATING:
+                win.visible = True  # Shown on top, but the active window stays active
+                if hWnd not in self.gui.z_order:
+                    self.gui.z_order.append(hWnd)
+            else:
+                self.gui.show_window(hWnd, True)
+            if nCmdShow in self.SW_MINIMIZING:
+                win.minimize()
+                if self.gui.active_window == hWnd:
+                    self.gui._activate_next_window()
+            elif nCmdShow == 3:  # SW_SHOWMAXIMIZED
+                if not win.maximized:
+                    win.minimized = False
+                    win.maximize(self.gui.width, self.gui.height, 30)
+            elif nCmdShow in (1, 9, 10):  # SW_SHOWNORMAL, SW_RESTORE, SW_SHOWDEFAULT
+                if win.minimized or nCmdShow == 9:
+                    win.restore()
+        self._send_size(hWnd)  # Only if the size or the state changed (SIZE_MINIMIZED...)
+        return was_visible
 
     def UpdateWindow(self, args):
         """UpdateWindow emulation"""
@@ -417,6 +466,9 @@ class User32WindowsMixin:
         hWnd = args[0]
         log.debug(f"DestroyWindow(0x{hWnd:x})")
 
+        if (self.gui and (hWnd in self.gui.controls or hWnd in self.gui.windows) and
+                self.cbt_destroy_window(hWnd)):
+            return 0  # A WH_CBT hook prevented it
         if self.gui and hWnd in self.gui.controls:
             self.gui.destroy_control(hWnd)
         elif self.gui and hWnd in self.dialogs:
