@@ -39,9 +39,30 @@ class ToolbarMixin:
                 w = button['bitmap']
             if wrap and x > 0 and x + w > width:
                 x, y = 0, y + bh
+            if button['state'] & 0x20:  # TBSTATE_WRAP (TB_SETROWS): the row ends here
+                if button['style'] & 0x1 and x == 0:
+                    # A separator alone in its row is a horizontal gap
+                    rects.append((0, y, bw, y + w))
+                    y += w
+                    continue
+                rects.append((x, y, x + w, y + bh))
+                x, y = 0, y + bh
+                continue
             rects.append((x, y, x + w, y + bh))
             x += w
         return rects
+
+    def _tb_set_rows(self, win, rows):
+        """TB_SETROWS: wrap the visible buttons into about rows rows (TBSTATE_WRAP)"""
+        st = win.nstate
+        visible = [i for i, b in enumerate(st['buttons']) if not b['state'] & 0x8]
+        rows = max(1, min(rows, len(visible)))
+        per_row = -(-len(visible) // rows) if visible else 1
+        new = [dict(b, state=b['state'] & ~0x20) for b in st['buttons']]
+        for position, index in enumerate(visible[:-1]):
+            if (position + 1) % per_row == 0:
+                new[index]['state'] |= 0x20
+        st['buttons'] = new
 
     def _tb_button_size(self, win):
         """(width, height) of the buttons: the set size, but never smaller than
@@ -105,6 +126,7 @@ class ToolbarMixin:
         width, height = st['bitmap_size']
         images = []
         layout = {'cx': width or 16, 'cy': height or 15}
+        st['bitmap_key'] = self._tb_bitmaps_key(sources)
         for count, hbm in sources:
             part = self._split_bitmap(layout, hbm, mask_color=self.TB_MASK_COLOR) if hbm else []
             images += (part + [None] * count)[:count]
@@ -113,6 +135,52 @@ class ToolbarMixin:
             handle = st['bitmap_list'] = self.get_next_handle()
         self.imagelists[handle] = {'cx': layout['cx'], 'cy': layout['cy'], 'flags': 0,
                                    'images': images}
+
+    @staticmethod
+    def _tb_click_check(win, index):
+        """A click on a check button: BTNS_CHECK toggles; BTNS_CHECKGROUP is
+        checked and the other buttons of its group (the adjacent CHECKGROUP
+        ones) are unchecked, like radio buttons"""
+        st = win.nstate
+        new = [dict(b) for b in st['buttons']]
+        if new[index]['style'] & 0x4:  # BTNS_GROUP
+            first = last = index
+            while first > 0 and new[first - 1]['style'] & 0x6 == 0x6:
+                first -= 1
+            while last + 1 < len(new) and new[last + 1]['style'] & 0x6 == 0x6:
+                last += 1
+            for i in range(first, last + 1):
+                new[i]['state'] &= ~0x1
+            new[index]['state'] |= 0x1  # TBSTATE_CHECKED
+        else:
+            new[index]['state'] ^= 0x1
+        st['buttons'] = new
+
+    def _tb_bitmaps_key(self, sources):
+        """What the TB_ADDBITMAP bitmaps hold now: their display lists (a
+        DIB section, whose bits are read in the emulation thread, counts as
+        unchanged)"""
+        key = []
+        for _, hbm in sources:
+            bmp = self.gdi_objects.get(hbm) if hbm else None
+            if bmp is None or bmp.get('type') != 'bitmap' or bmp.get('dib') is not None:
+                key.append(None)
+                continue
+            shapes = next((state['shapes'] for state in list(self.dc_state.values())
+                           if state.get('memory') and state.get('bitmap') == hbm),
+                          bmp['shapes'])
+            key.append((id(shapes), len(shapes), id(shapes[-1]) if shapes else 0))
+        return tuple(key)
+
+    def tb_refresh_bitmaps(self, win):
+        """Cut the bitmaps again if the program drew into one after adding it:
+        comctl32 paints the buttons from the bitmap itself (the Office Shortcut
+        Bar draws its button icons into the bitmap it gave the toolbar)"""
+        st = win.nstate
+        sources = st.get('bitmap_sources')
+        if sources and any(hbm for _, hbm in sources) and \
+                st.get('bitmap_key') != self._tb_bitmaps_key(sources):
+            self._tb_split_bitmaps(win)
 
     def _tb_index(self, win, command):
         for i, button in enumerate(win.nstate['buttons']):
@@ -155,6 +223,13 @@ class ToolbarMixin:
             st['buttons'] = new
             return 1
 
+        if msg in (self.WM_MOUSEMOVE, self.WM_LBUTTONDOWN, self.WM_LBUTTONUP, 0x204, 0x205):
+            # The mouse messages go on to the toolbar's tooltip control (TTM_RELAYEVENT)
+            tip = self.gui.windows.get(st.get('tooltips')) if self.gui else None
+            if tip is not None and tip.native == 'TOOLTIPS' and tip.owner is self:
+                self._tt_relay(tip, win.hwnd, msg, lParam)
+            if msg == self.WM_MOUSEMOVE:
+                return 0
         if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK):
             x, y = lParam & 0xFFFF, (lParam >> 16) & 0xFFFF
             for i, (left, top, right, bottom) in enumerate(self._tb_layout(win)):
@@ -172,7 +247,7 @@ class ToolbarMixin:
                 if left <= x < right and top <= y < bottom:
                     button = buttons[pressed]
                     if button['style'] & 0x2:  # BTNS_CHECK
-                        set_state(0x1, not button['state'] & 0x1)
+                        self._tb_click_check(win, pressed)
                     parent = self._parent_of(win.hwnd)
                     if parent:
                         self.post_window_message(parent, self.WM_COMMAND,
@@ -261,10 +336,25 @@ class ToolbarMixin:
             self._tb_autosize(win)
             return 0
         if msg == 0x423:  # TB_GETTOOLTIPS
+            return st.get('tooltips', 0)
+        if msg == 0x424:  # TB_SETTOOLTIPS
+            st['tooltips'] = wParam
             return 0
         if msg == 0x425:  # TB_SETPARENT
             previous, st['notify'] = st['notify'], wParam
             return previous
+        if msg == 0x427:  # TB_SETROWS(MAKEWPARAM(rows, larger), &bounding rect)
+            self._tb_set_rows(win, wParam & 0xFFFF)
+            rects = [r for r, b in zip(self._tb_layout(win), buttons, strict=False)
+                     if not b['state'] & 0x8]
+            right = max((r[2] for r in rects), default=0)
+            bottom = max((r[3] for r in rects), default=0)
+            if lParam:
+                self._mem_write(lParam, struct.pack('<4i', 0, 0, right, bottom))
+            # The toolbar takes the size of its buttons (the Office Shortcut
+            # Bar positions it with SWP_NOSIZE right after)
+            win.width, win.height = right, bottom
+            return 0
         if msg == 0x428:  # TB_GETROWS
             rects = self._tb_layout(win)
             return len({r[1] for r in rects}) or 1

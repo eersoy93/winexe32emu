@@ -36,14 +36,25 @@ class CommonControlsMixin:
         win = self.windows.get(hwnd)
         if win is None:
             return hwnd
-        for child in reversed(win.children):
+        for child in win.children:  # In Z order, the top one first
             c = self.windows.get(child)
             if c is None or not c.visible:
                 continue
             fx, fy = self.frame_origin(c)
             if fx <= x < fx + c.width and fy <= y < fy + c.height:
+                if c.native == 'TAB' and not self._on_tab(c, x, y):
+                    continue  # Its page is HTTRANSPARENT: the siblings under it get it
                 return self.child_at(child, x, y)
         return hwnd
+
+    def _on_tab(self, win, x, y):
+        """Is screen point (x, y) on one of a tab control's tabs?"""
+        owner = win.owner
+        if owner is None or 'tabs' not in win.nstate:
+            return False
+        cx, cy = self.client_origin(win)
+        return any(left <= x - cx < right and top <= y - cy < bottom
+                   for left, top, right, bottom in owner._tab_rects(win))
 
     def top_level_of(self, hwnd):
         """Top-level window that contains a window or control"""
@@ -148,6 +159,20 @@ class CommonControlsMixin:
         self.screen.blit(surface, (x, y))
         return True
 
+    def _draw_tooltip_windows(self):
+        """The tips the programs' tooltip controls show (over all windows)"""
+        font = self.font_list or self.font
+        for win in list(self.windows.values()):
+            tip = win.nstate.get('tip') if win.native == 'TOOLTIPS' else None
+            if not tip or win.owner is None:
+                continue
+            rect = pygame.Rect(tip['rect'])
+            pygame.draw.rect(self.screen, self.COLOR_TOOLTIP, rect)
+            pygame.draw.rect(self.screen, self.COLOR_TEXT, rect, 1)
+            for i, line in enumerate(tip['text']):
+                self.screen.blit(font.render(line, True, self.COLOR_TEXT),
+                                 (rect.x + 4, rect.y + 2 + 16 * i))
+
     def _draw_native(self, win, cx, cy, cw, ch):
         """Draw an emulated common control's client area"""
         if win.native == 'LISTVIEW':
@@ -181,6 +206,56 @@ class CommonControlsMixin:
             button = pygame.Rect(cx + cw - 18, cy + 2, 16, ch - 4)
             self._draw_button_3d(button, '', pressed=st.get('dropped', False))
             self._draw_arrow(button, 'down')
+        elif win.native == 'TAB':
+            self._draw_tab_control(win, cx, cy, cw, ch)
+
+    def _draw_tab_control(self, win, cx, cy, cw, ch):
+        """SysTabControl32: a row of tabs over a raised page frame"""
+        owner = win.owner
+        if owner is None or 'tabs' not in win.nstate:
+            return
+        st = win.nstate
+        rects = owner._tab_rects(win)
+        white, gray, dark = (255, 255, 255), (128, 128, 128), (64, 64, 64)
+        # The page is not filled: the controls on it are the tab control's siblings
+        top = cy + max((r[3] for r in rects), default=2 + owner.TAB_ROW_H)
+        page = pygame.Rect(cx, top, cw, max(0, cy + ch - top))
+        pygame.draw.line(self.screen, white, page.topleft, (page.right - 1, page.top))
+        pygame.draw.line(self.screen, white, page.topleft, (page.left, page.bottom - 1))
+        pygame.draw.line(self.screen, dark, (page.right - 1, page.top),
+                         (page.right - 1, page.bottom - 1))
+        pygame.draw.line(self.screen, dark, (page.left, page.bottom - 1),
+                         (page.right - 1, page.bottom - 1))
+        pygame.draw.line(self.screen, gray, (page.right - 2, page.top + 1),
+                         (page.right - 2, page.bottom - 2))
+        pygame.draw.line(self.screen, gray, (page.left + 1, page.bottom - 2),
+                         (page.right - 2, page.bottom - 2))
+        font = self.font_list or self.font
+        for i, (left, t, right, bottom) in enumerate(rects):
+            tab = st['tabs'][i]
+            selected = i == st['sel']
+            rect = pygame.Rect(cx + left, cy + t, right - left, bottom - t)
+            if selected:  # The selected tab is bigger and joins the page
+                rect.inflate_ip(4, 0)
+                rect.y -= 2
+                rect.height += 3
+            pygame.draw.rect(self.screen, self.COLOR_WINDOW_BG, rect)
+            pygame.draw.line(self.screen, white, (rect.left, rect.top + 2),
+                             (rect.left, rect.bottom - 1))
+            pygame.draw.line(self.screen, white, (rect.left + 2, rect.top),
+                             (rect.right - 3, rect.top))
+            self.screen.set_at((rect.left + 1, rect.top + 1), white)
+            pygame.draw.line(self.screen, dark, (rect.right - 1, rect.top + 2),
+                             (rect.right - 1, rect.bottom - 1))
+            pygame.draw.line(self.screen, gray, (rect.right - 2, rect.top + 1),
+                             (rect.right - 2, rect.bottom - 1))
+            x = rect.x + 6
+            image = tab['image']
+            if st['imagelist'] and image >= 0:
+                if self._draw_imagelist_image(owner, st['imagelist'], image, x, rect.y + 2):
+                    x += owner.imagelists[st['imagelist']]['cx'] + 4
+            label = font.render(owner.tab_label(tab['text']), True, self.COLOR_TEXT)
+            self.screen.blit(label, (x, rect.y + (rect.height - label.get_height()) // 2))
 
     def _draw_dotted(self, start, end, color=(128, 128, 128)):
         """Dotted horizontal or vertical line (tree view lines)"""
@@ -354,9 +429,14 @@ class CommonControlsMixin:
                     text = item['texts'].get(sub) or ''
                 tx = x + 4
                 if sub == 0:
+                    state_w = owner.lv_state_image_width(win) if owner else 0
+                    state_image = (item['state'] >> 12) & 0xF
+                    if state_w and state_image:  # 1-based: INDEXTOSTATEIMAGEMASK
+                        self._draw_imagelist_image(owner, st['imagelists'][2], state_image - 1,
+                                                   x + 2, y + 1)
                     image = item.get('cache_image', item['image'])
                     if image is not None and image >= 0 and himl:
-                        self._draw_imagelist_image(owner, himl, image, x + 2, y + 1)
+                        self._draw_imagelist_image(owner, himl, image, x + 2 + state_w, y + 1)
                     # No small image list: no icon space (like comctl32)
                     tx = x + 2 + (owner.lv_icon_space(win) if owner else 20)
                 width = column['width'] - (tx - x) - 4
@@ -488,6 +568,22 @@ class CommonControlsMixin:
                 self._draw_button_3d(pygame.Rect(bar.x, thumb_y, 16, thumb_h), '')
 
     VIEW_GLYPHS = {8: 'up', 10: 'new'}  # Standard VIEW_* bitmaps (IDB_VIEW_*_COLOR)
+    # VIEW_LARGEICONS, VIEW_SMALLICONS, VIEW_LIST, VIEW_DETAILS too when the
+    # toolbar's bitmap is known to be comctl32's IDB_VIEW_SMALL/LARGE_COLOR
+    VIEW_BITMAP_GLYPHS = {0: 'large', 1: 'small', 2: 'list', 3: 'details', 8: 'up', 10: 'new'}
+
+    @staticmethod
+    def _toolbar_view_index(st, index):
+        """Index of a button image in comctl32's VIEW bitmap it was added from
+        (TB_ADDBITMAP HINST_COMMCTRL IDB_VIEW_*), None if it is from another one"""
+        first = 0
+        bitmaps = st['bitmaps']
+        for number, (count, (hinst, nid)) in enumerate(bitmaps):
+            # The last one may be used past its count (the whole standard bitmap)
+            if first <= index and (index < first + count or number == len(bitmaps) - 1):
+                return index - first if hinst == 0xFFFFFFFF and nid in (4, 5) else None
+            first += count
+        return None
 
     def _view_glyph_surface(self, glyph, width, height):
         """16x16 picture of a standard VIEW_* toolbar bitmap (scaled to the
@@ -497,6 +593,12 @@ class CommonControlsMixin:
         if key in cache:
             return cache[key]
         surface = pygame.Surface((16, 16), pygame.SRCALPHA)
+        if glyph in ('large', 'small', 'list', 'details'):
+            self._draw_view_mode_glyph(surface, glyph)
+            if (width, height) != (16, 16):
+                surface = pygame.transform.scale(surface, (width, height))
+            cache[key] = surface
+            return surface
         fill, line = self.SYS_ICON_COLORS[1]
         # Folder in the lower left: tab and body
         pygame.draw.rect(surface, fill, (1, 4, 6, 3))
@@ -521,6 +623,27 @@ class CommonControlsMixin:
         return surface
 
     @staticmethod
+    def _draw_view_mode_glyph(surface, glyph):
+        """List view mode pictures: large icons, small icons, list, details"""
+        blue, black = (0, 0, 160), (0, 0, 0)
+        if glyph == 'large':
+            for x, y in ((1, 1), (9, 1), (1, 9), (9, 9)):
+                pygame.draw.rect(surface, blue, (x, y, 5, 4))
+                pygame.draw.line(surface, black, (x, y + 5), (x + 4, y + 5))
+        elif glyph == 'details':
+            for y in (2, 6, 10, 14):
+                pygame.draw.rect(surface, blue, (1, y - 1, 3, 3))
+                pygame.draw.line(surface, black, (5, y), (14, y))
+        else:  # Small icons in rows or in columns (list)
+            for i in range(4):
+                for j in range(2):
+                    x, y = 1 + 8 * j, 1 + 4 * i
+                    pygame.draw.rect(surface, blue, (x, y, 2, 2))
+                    pygame.draw.line(surface, black, (x + 3, y + 1), (x + 6, y + 1))
+            if glyph == 'list':
+                pygame.draw.line(surface, (128, 128, 128), (8, 0), (8, 15))
+
+    @staticmethod
     def _disabled_glyph(surface):
         """Disabled toolbar image like Windows draws it: a gray silhouette
         embossed with a white one offset by a pixel"""
@@ -542,6 +665,7 @@ class CommonControlsMixin:
             pygame.draw.line(self.screen, (255, 255, 255), (cx, cy + 1), (cx + cw, cy + 1))
         if owner is None:
             return
+        owner.tb_refresh_bitmaps(win)
         rects = owner._tb_layout(win)
         bw, bh = st['bitmap_size']
         mouse = self.mouse_pos
@@ -550,6 +674,12 @@ class CommonControlsMixin:
             if button['state'] & 0x8:
                 continue
             rect = pygame.Rect(cx + left, cy + top, right - left, bottom - top)
+            if button['style'] & 0x1 and rect.width > rect.height:  # Separator row (wrapped)
+                pygame.draw.line(self.screen, (128, 128, 128), (rect.x + 2, rect.centery - 1),
+                                 (rect.right - 3, rect.centery - 1))
+                pygame.draw.line(self.screen, (255, 255, 255), (rect.x + 2, rect.centery),
+                                 (rect.right - 3, rect.centery))
+                continue
             if button['style'] & 0x1:  # Separator
                 pygame.draw.line(self.screen, (128, 128, 128), (rect.centerx - 1, rect.y + 2),
                                  (rect.centerx - 1, rect.bottom - 3))
@@ -580,7 +710,9 @@ class CommonControlsMixin:
                 drawn = self._draw_imagelist_image(owner, st['bitmap_list'], button['bitmap'],
                                                    ix, iy, disabled=not enabled)
             if not drawn:
-                glyph = self.VIEW_GLYPHS.get(button['bitmap'])
+                view_index = self._toolbar_view_index(st, button['bitmap'])
+                glyph = self.VIEW_BITMAP_GLYPHS.get(view_index) if view_index is not None \
+                    else self.VIEW_GLYPHS.get(button['bitmap'])
                 if glyph:
                     surface = self._view_glyph_surface(glyph, bw or 16, bh or 16)
                     if not enabled:

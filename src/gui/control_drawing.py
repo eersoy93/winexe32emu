@@ -351,9 +351,9 @@ class ControlDrawingMixin:
                 if selected:
                     pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, item_rect)
                 color = self.COLOR_TITLE_TEXT if selected else self.COLOR_TEXT
-                text = self.font.render(control.items[i], True, color)
                 self.screen.set_clip(item_rect.clip(prev_clip))
-                self.screen.blit(text, (item_rect.x + 3, item_rect.y + 1))
+                self._draw_tabbed_text(control, control.items[i], color,
+                                       item_rect.x + 3, item_rect.y + 1)
                 self.screen.set_clip(prev_clip)
             self._draw_list_scrollbar(geo, control.hwnd)
 
@@ -432,6 +432,29 @@ class ControlDrawingMixin:
             dragging = (self.dragging_scrollbar is not None and
                         self.dragging_scrollbar[0] == control.hwnd)
             self._draw_button_3d(m['thumb'], "", pressed=dragging)
+
+    def _draw_tabbed_text(self, control, text, color, x, y):
+        """Draw a list item; an LBS_USETABSTOPS list expands its tabs to the
+        LB_SETTABSTOPS stops (default: every 32 dialog units), other lists
+        show a tab as a space"""
+        if not control.style & 0x0080:  # LBS_USETABSTOPS
+            text = text.replace('\t', ' ')
+        parts = text.split('\t')
+        stops = getattr(control, 'tab_stops', None) or [48]
+        left = pos = x
+        for n, part in enumerate(parts):
+            if n:
+                offset = pos - left
+                # The next given stop, then the last interval repeated
+                nxt = next((s for s in stops if s > offset), None)
+                if nxt is None:
+                    step = stops[-1] - (stops[-2] if len(stops) > 1 else 0) or 48
+                    nxt = stops[-1] + ((offset - stops[-1]) // step + 1) * step
+                pos = left + nxt
+            if part:
+                surface = self.font.render(part, True, color)
+                self.screen.blit(surface, (pos, y))
+                pos += surface.get_width()
 
     def _draw_window_edge(self, rect, style, ex_style):
         """Classic border of a child window by its styles: WS_EX_CLIENTEDGE

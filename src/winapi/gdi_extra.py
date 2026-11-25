@@ -186,6 +186,11 @@ class GdiExtraMixin:
         changes nothing drawn"""
         return self._set_dc_pair(args, 'brush_org', (0, 0), args[3])
 
+    def FixBrushOrgEx(self, args):
+        """FixBrushOrgEx(hdc, x, y, lppt) - not implemented by Win32 (kept for
+        Win32s programs): always FALSE"""
+        return 0
+
     def GetBrushOrgEx(self, args):
         return self._get_dc_pair(args[0], 'brush_org', (0, 0), args[1])
 
@@ -207,7 +212,25 @@ class GdiExtraMixin:
                         for x1, y1, x2, y2 in clip) else 0
 
     def GdiFlush(self, args):
+        """GdiFlush() - GDI's drawing reaches the memory of the DIB sections
+        (the program reads their bits next: Office 95's Shortcut Bar saves its
+        button bitmaps from one)"""
+        for state in list(self.dc_state.values()):
+            if state.get('memory') and state.get('bitmap'):
+                self._sync_dib_section_bits(state['bitmap'])
         return 1
+
+    # GDI calls are not batched here; the limit is only remembered
+    gdi_batch_limit = 20
+
+    def GdiSetBatchLimit(self, args):
+        """GdiSetBatchLimit(limit) - the previous limit (0 sets the default 20)"""
+        previous = self.gdi_batch_limit
+        self.gdi_batch_limit = args[0] or 20
+        return previous
+
+    def GdiGetBatchLimit(self, args):
+        return self.gdi_batch_limit
 
     def UnrealizeObject(self, args):
         """UnrealizeObject(h) - brushes and palettes need no realizing here"""
@@ -391,6 +414,14 @@ class GdiExtraMixin:
             return 0
         return 1 if self._mem_write(args[1], struct.pack('<2i', *bmp.get('dimension', (0, 0)))) \
             else 0
+
+    def GetRasterizerCaps(self, args):
+        """GetRasterizerCaps(lprs, cb) - RASTERIZER_STATUS {nSize, wFlags, nLanguageID}:
+        TrueType is available and enabled (TT_AVAILABLE | TT_ENABLED)"""
+        if not args[0]:
+            return 0
+        data = struct.pack('<3h', 6, 0x0001 | 0x0002, 0)
+        return 1 if self._mem_write(args[0], data[:min(args[1], 6)]) else 0
 
     def SetDIBitsToDevice(self, args):
         """SetDIBitsToDevice(hdc, xDest, yDest, w, h, xSrc, ySrc, uStartScan,
@@ -900,6 +931,99 @@ class GdiExtraMixin:
             if state.get('memory') and state.get('bitmap') == hbm:
                 state['shapes'] = [image]
 
+    def _sync_dib_sections_at(self, address, size):
+        """Bring the DIB sections whose bits overlap [address, address + size)
+        up to date with GDI's drawing (before the program's data there is used)"""
+        for hbm, bmp in list(self.gdi_objects.items()):
+            dib = bmp.get('dib') if isinstance(bmp, dict) else None
+            if dib is not None and dib['bits'] < address + size and \
+                    address < dib['bits'] + dib['size']:
+                self._sync_dib_section_bits(hbm)
+
+    def _sync_dib_section_bits(self, hbm):
+        """Write what GDI drew on a DIB section into its memory, in its own
+        format (1/4/8 bpp: the nearest color of its table; 16, 24, 32 bpp)"""
+        bmp = self.gdi_objects.get(hbm)
+        dib = bmp.get('dib') if bmp else None
+        if dib is None or dib['usage'] != 0:
+            return
+        self._refresh_dib_section(hbm)  # The program's own writes come first
+        shapes = self._bitmap_shapes(hbm, bmp)
+        key = (id(shapes), len(shapes), id(shapes[-1]) if shapes else 0)
+        if dib.get('synced') == key:
+            return
+        dib['synced'] = key
+        rgb = self._bitmap_rgb(hbm)
+        if rgb is None:
+            return
+        encoded = self._encode_dib_bits(dib['header'], bmp['width'], bmp['height'], rgb)
+        if encoded is None or len(encoded) != dib['size']:
+            return
+        self._mem_write(dib['bits'], encoded)
+        dib['snapshot'] = encoded
+
+    @staticmethod
+    def _encode_dib_bits(header, width, height, rgb):
+        """DIB bits (rows padded to 4 bytes) of top-down RGB pixels for a
+        BITMAPINFOHEADER / BITMAPCOREHEADER and its color table; None if the
+        format is not supported"""
+        size = struct.unpack_from('<I', header)[0]
+        if size == 12:
+            bpp, bottom_up, compression = struct.unpack_from('<H', header, 10)[0], True, 0
+            table_at, quad = 12, 3
+        else:
+            stored_height, _, bpp, compression = struct.unpack_from('<iHHI', header, 8)
+            bottom_up, table_at, quad = stored_height > 0, size, 4
+        stride = ((width * bpp + 31) // 32) * 4
+        pixels = [rgb[i:i + 3] for i in range(0, width * height * 3, 3)]
+        rows = []
+        if bpp <= 8:
+            count = (len(header) - table_at) // quad
+            table = [tuple(header[table_at + i * quad:table_at + i * quad + 3][::-1])
+                     for i in range(count)]
+            if not table:
+                return None
+            nearest = {}
+
+            def index(pixel):
+                found = nearest.get(pixel)
+                if found is None:
+                    r, g, b = pixel
+                    found = min(range(len(table)), key=lambda i: (table[i][0] - r) ** 2 +
+                                (table[i][1] - g) ** 2 + (table[i][2] - b) ** 2)
+                    nearest[pixel] = found
+                return found
+            per_byte = 8 // bpp
+            for y in range(height):
+                row = bytearray(stride)
+                for x in range(width):
+                    shift = 8 - bpp * (x % per_byte + 1)
+                    row[x // per_byte] |= index(pixels[y * width + x]) << shift
+                rows.append(bytes(row))
+        elif bpp in (16, 24, 32) and compression in (0, 3):
+            if bpp == 16:
+                masks = struct.unpack_from('<3I', header, size) if compression == 3 and \
+                    len(header) >= size + 12 else (0x7C00, 0x03E0, 0x001F)
+                fields = [(mask, mask.bit_length() - (mask & -mask).bit_length() + 1,
+                           (mask & -mask).bit_length() - 1) for mask in masks]
+            for y in range(height):
+                line = pixels[y * width:(y + 1) * width]
+                if bpp == 24:
+                    data = b''.join(bytes((b, g, r)) for r, g, b in line)
+                elif bpp == 32:
+                    data = b''.join(bytes((b, g, r, 0)) for r, g, b in line)
+                else:
+                    data = b''.join(struct.pack('<H', sum(
+                        ((value * ((1 << bits) - 1) // 255) << shift)
+                        for value, (_, bits, shift) in zip(pixel, fields, strict=True)))
+                        for pixel in line)
+                rows.append(data.ljust(stride, b'\x00'))
+        else:
+            return None
+        if bottom_up:
+            rows.reverse()
+        return b''.join(rows)
+
     def _refresh_dc_dib_section(self, hdc):
         state = self.dc_state.get(hdc)
         if state and state.get('memory') and state.get('bitmap'):
@@ -981,6 +1105,24 @@ class GdiExtraMixin:
         state = self.dc_state.get(args[0])
         return state.get('char_extra', 0) & 0xFFFFFFFF if state is not None else 0x80000000
 
+    def GetCurrentPositionEx(self, args):
+        """GetCurrentPositionEx(hdc, lpPoint) - MoveToEx's current position"""
+        state = self.dc_state.get(args[0])
+        if state is None or not args[1]:
+            return 0
+        return 1 if self._mem_write(args[1], struct.pack('<2i', *state.get('pos', (0, 0)))) \
+            else 0
+
+    def SetTextJustification(self, args):
+        """SetTextJustification(hdc, nBreakExtra, nBreakCount) - the extra
+        space of the break characters (kept, text is drawn without it)"""
+        state = self.dc_state.get(args[0])
+        if state is None:
+            return 0
+        extra, count = self._read_signed_args(args, 1, 2)
+        state['justification'] = (extra, count) if count else (0, 0)
+        return 1
+
     def GetTextExtentExPointA(self, args, wide=False):
         """GetTextExtentExPointA/W(hdc, lpszString, cchString, nMaxExtent,
         lpnFit, lpnDx, lpSize): the size of the text, how many characters fit
@@ -1042,6 +1184,14 @@ class GdiExtraMixin:
         handle = self.get_next_handle()
         self.gdi_objects[handle] = {'type': 'enhmetafile', 'wmf': data}
         return handle
+
+    def SetMapperFlags(self, args):
+        """SetMapperFlags(hdc, flags) - ASPECT_FILTERING for the font mapper
+        (the fonts are picked the same way); the previous flags"""
+        flags = self.__dict__.setdefault('_mapper_flags', {})
+        previous = flags.get(args[0], 0)
+        flags[args[0]] = args[1]
+        return previous
 
     def GetEnhMetaFileA(self, args, wide=False):
         """GetEnhMetaFileA/W(lpszMetaFile) - an .EMF file's handle (it is not

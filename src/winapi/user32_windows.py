@@ -231,6 +231,12 @@ class User32WindowsMixin:
         hMenu = args[9]
         hInstance = args[10]
         lpParam = args[11]
+        # An MDI child: its MDI styles and place, an MDICREATESTRUCT for WM_CREATE
+        mdi_client = self._mdi_client(hWndParent) if self.gui and \
+            dwExStyle & self.WS_EX_MDICHILD else None
+        if mdi_client is not None:
+            dwStyle, x, y, nWidth, nHeight, lpParam = self._mdi_create_params(
+                mdi_client, args, wide)
 
         # Class name can be atom or string
         if lpClassName < 0x10000:
@@ -254,6 +260,8 @@ class User32WindowsMixin:
                 hwnd = self._create_native(native, class_name, window_name, x, y, nWidth,
                                            nHeight, dwStyle, dwExStyle, hWndParent, hMenu)
                 win = self.gui.windows[hwnd]
+                if native == 'MDICLIENT':
+                    self._mdi_client_init(win, lpParam)
                 if superclass:
                     win.wndproc = superclass['wndproc']
                     win.wndclass = superclass
@@ -357,6 +365,13 @@ class User32WindowsMixin:
                 self._make_superclass_control(hwnd, class_name, dwStyle, dwExStyle, hMenu)
                 if dwStyle & (self.WS_CHILD | self.WS_POPUP):
                     self._send_size(hwnd)  # Overlapped windows get it from ShowWindow
+            elif (dwStyle & (self.WS_CHILD | self.WS_POPUP) and wndproc and
+                  hwnd in self.gui.windows and self.gui.windows[hwnd].size_state is None):
+                # Like Windows, child and pop-up windows get WM_SIZE right after
+                # WM_CREATE, not at their first ShowWindow (Schedule+ attaches the
+                # window's object after CreateWindowEx and shows it before the
+                # object is complete: its WM_SIZE handler must not run then)
+                self._send_size(hwnd)
             # WS_VISIBLE windows are shown without an explicit ShowWindow call
             win = self.gui.windows.get(hwnd)
             if (dwStyle & self.WS_VISIBLE and isinstance(win, windows.FakeWindow)
@@ -364,6 +379,8 @@ class User32WindowsMixin:
                 self.gui.show_window(hwnd, True)
                 if win.size_state is None:
                     self._send_size(hwnd)
+            if mdi_client is not None and hwnd in self.gui.windows:
+                self._mdi_child_created(hwnd)
         else:
             hwnd = self.get_next_handle()
 
@@ -526,8 +543,17 @@ class User32WindowsMixin:
         win = self.gui.windows.get(hWnd)
         target = win if win is not None else self.gui.controls.get(hWnd)
         was_visible = 1 if target is not None and target.visible else 0
+        if win is not None and was_visible != (nCmdShow != 0):
+            # Like Windows: WM_SHOWWINDOW before the window is shown or hidden
+            # (Access fills in its alert dialog there)
+            self._send(hWnd, self.WM_SHOWWINDOW, 1 if nCmdShow else 0, 0)
+            win = self.gui.windows.get(hWnd)
+            if win is None:
+                return was_visible
         if nCmdShow == 0:  # SW_HIDE
             self.gui.show_window(hWnd, False)
+            if win is not None and was_visible:
+                self._uncovered(win, (win.x, win.y, win.width, win.height), True)
             return was_visible
         if win is None or win.parent is not None:  # A control or child window
             self.gui.show_window(hWnd, True)
@@ -560,7 +586,37 @@ class User32WindowsMixin:
         """UpdateWindow emulation"""
         hWnd = args[0]
         log.debug(f"UpdateWindow(0x{hWnd:x})")
+        win = self.gui.windows.get(hWnd) if self.gui else None
+        if (win is None or win.owner is not self or hWnd in self.painted_windows or
+                hWnd in self.updating_windows or hWnd in self.dialogs or
+                hWnd in self.gui.consoles or not self._shown_with_parents(win)):
+            return 1
+        wndproc = self._find_wndproc_for_hwnd(hWnd)
+        if not wndproc or self._is_native_proc(wndproc):
+            return 1
+        # WM_PAINT is sent at once, not left for the message loop
+        self.painted_windows.add(hWnd)
+        self.paint_pending.add(hWnd)
+        self.updating_windows.add(hWnd)
+        try:
+            self._call_proc(wndproc, hWnd, self.WM_PAINT, 0, 0)
+        finally:
+            self.updating_windows.discard(hWnd)
+            if hWnd in self.paint_pending:
+                self.paint_pending.discard(hWnd)
+                self.update_rects.pop(hWnd, None)
         return 1
+
+    def _shown_with_parents(self, win):
+        """Is a window visible, with all its parents (and not minimized)?"""
+        for _ in range(64):
+            if not win.visible or getattr(win, 'minimized', False):
+                return False
+            parent = self.gui.windows.get(win.parent) if win.parent else None
+            if parent is None:
+                return True
+            win = parent
+        return False
 
     def DestroyWindow(self, args):
         """DestroyWindow emulation"""
@@ -585,10 +641,20 @@ class User32WindowsMixin:
             wndproc = self._find_wndproc_for_hwnd(hWnd)
             if wndproc:
                 self._call_proc(wndproc, hWnd, self.WM_DESTROY, 0, 0)
+            child = self.gui.windows.get(hWnd)
+            if child is None:  # Its WM_DESTROY destroyed it already
+                return 1
+            mdi_client = self._mdi_client(child.parent)
+            was_visible, child.visible = child.visible, False
+            self._uncovered(child, (child.x, child.y, child.width, child.height), was_visible)
             with self.gui.lock:
+                gone = self._window_and_children(hWnd)
                 self.gui._remove_window(hWnd)
-            self.painted_windows.discard(hWnd)
+            for handle in gone:
+                self._forget_window(handle)
             self.window_longs.pop(hWnd, None)
+            if mdi_client is not None:
+                self._mdi_child_destroyed(mdi_client, hWnd)
         elif self.gui and hWnd in self.gui.windows:
             # Like Windows: WM_DESTROY is sent at once, while the window still
             # exists, then the window and its children are gone (IsWindow is
@@ -603,7 +669,7 @@ class User32WindowsMixin:
             with self.message_lock:
                 self.message_queue[:] = [m for m in self.message_queue if m['hwnd'] not in gone]
             for handle in gone:
-                self.painted_windows.discard(handle)
+                self._forget_window(handle)
                 self.window_longs.pop(handle, None)
         elif self.gui:
             self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
@@ -686,6 +752,8 @@ class User32WindowsMixin:
         elif self.gui and hWnd in self.gui.windows:
             win = self.gui.windows[hWnd]
             right, bottom = self.gui.client_size(win)
+        elif hWnd == self.DESKTOP_HWND:
+            right, bottom = self._screen_size()
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
             if control.class_name == 'STATUSBAR':
@@ -716,6 +784,11 @@ class User32WindowsMixin:
             right, bottom = ox + combo.x + right, oy + combo.y + bottom
             if lpRect:
                 self._write_rect(lpRect, left, top, right, bottom)
+            return 1
+        if self.gui and hWnd == self.DESKTOP_HWND:
+            # The desktop window covers the screen (dialogs are kept inside it)
+            if lpRect:
+                self._write_rect(lpRect, 0, 0, *self._screen_size())
             return 1
         if self.gui and hWnd not in self.gui.windows and hWnd not in self.gui.controls:
             # No such window: fails and leaves the RECT alone (Word asks for

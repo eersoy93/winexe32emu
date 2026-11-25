@@ -18,7 +18,7 @@ closing and removing windows and controls"""
 
 from ..config import PYGAME_AVAILABLE
 from ..logger import log
-from ..windows import FakeControl, FakeWindow, gui_locked
+from ..windows import APPBARS, FakeControl, FakeWindow, gui_locked, work_area
 
 if PYGAME_AVAILABLE:
     pass
@@ -65,6 +65,22 @@ class WindowManagerMixin:
             win = self.windows.get(control.parent_hwnd) if control else None
         return win.owner if win else None
 
+    def work_area(self):
+        """(left, top, right, bottom) of the desktop without the taskbar and the appbars"""
+        return work_area(self.width, self.height, self.TASKBAR_H)
+
+    @gui_locked
+    def appbars_changed(self, changed=None):
+        """An appbar docked, moved or went away: the maximized windows fill the
+        new work area and the other appbars get ABN_POSCHANGED"""
+        left, top, right, bottom = self.work_area()
+        for hwnd, win in list(self.windows.items()):
+            if win.maximized and win.parent is None and hwnd not in APPBARS:
+                win.x, win.y, win.width, win.height = left, top, right - left, bottom - top
+        for hwnd, bar in list(APPBARS.items()):
+            if hwnd != changed and bar.callback_message and bar.owner is not None:
+                bar.owner.post_window_message(hwnd, bar.callback_message, 1, 0)  # ABN_POSCHANGED
+
     @gui_locked
     def _remove_window(self, hwnd):
         """Delete a window, its child windows and its controls, dropping every
@@ -72,6 +88,8 @@ class WindowManagerMixin:
         win = self.windows.pop(hwnd, None)
         if win is None:
             return
+        if APPBARS.pop(hwnd, None) is not None:
+            self.appbars_changed()  # Its edge of the desktop is free again
         for child in list(win.children):
             self._remove_window(child)
         parent = self.windows.get(win.parent)
@@ -92,7 +110,7 @@ class WindowManagerMixin:
         if hwnd in self.z_order:
             self.z_order.remove(hwnd)
         if self.active_window == hwnd:
-            self.active_window = self.z_order[-1] if self.z_order else None
+            self._activate_after(win)
         if self.open_menu and self.open_menu[0] == hwnd:
             self.open_menu = None
         if self.dragging_window == hwnd:
@@ -135,9 +153,21 @@ class WindowManagerMixin:
         if hwnd in self.z_order:
             self.z_order.remove(hwnd)
         if self.active_window == hwnd:
-            self.active_window = self.z_order[-1] if self.z_order else None
+            self._activate_after(self.windows[hwnd])
         if self.open_menu and self.open_menu[0] == hwnd:
             self.open_menu = None
+
+    def _activate_after(self, win):
+        """Like Windows, the active window went away: its owner gets the
+        activation, else the topmost visible window, never a hidden one
+        (Binder's hidden DDWindow after its Add Section dialog)"""
+        owner = self.windows.get(win.owner_hwnd) if win.owner_hwnd else None
+        if owner is not None and owner.visible and not owner.minimized and \
+                owner.hwnd in self.z_order:
+            self.active_window = owner.hwnd
+            return
+        self.active_window = None
+        self._activate_next_window()
 
     @gui_locked
     def raise_window(self, hwnd):
@@ -166,7 +196,13 @@ class WindowManagerMixin:
         """Get new HWND"""
         hwnd = self.next_hwnd
         self.next_hwnd += 4
+        if hwnd in self.RESERVED_HWNDS:
+            return self.get_next_hwnd.__wrapped__(self)
         return hwnd
+
+    # GetDesktopWindow's handle (WinAPIHandler.DESKTOP_HWND) is never a window's:
+    # PowerPoint 95 kept its dialogs inside the frame's 5th child window
+    RESERVED_HWNDS = (0x00010010,)
 
     @gui_locked
     def create_window(self, title, x, y, width, height, style=0, owner=None, parent=0):

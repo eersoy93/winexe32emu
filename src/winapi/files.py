@@ -210,13 +210,15 @@ class FilesMixin:
             base += '+'
         return base + 'b'
 
-    def post_window_message(self, hwnd, message, wParam, lParam, char=None):
+    def post_window_message(self, hwnd, message, wParam, lParam, char=None, thread=None):
         """Thread-safe: enqueue a window message (called from the GUI thread).
 
         The emulation thread consumes these in GetMessageA. Only plain Python
         data is touched here; Unicorn memory is written later on the emu thread.
         char ((WM_CHAR or WM_SYSCHAR, code)) is the character of a WM_KEYDOWN
         or WM_SYSKEYDOWN, posted when the program calls TranslateMessage.
+        thread: the guest thread a message without a window is for
+        (PostThreadMessage); only its message loop gets it.
         """
         msg = {
             'hwnd': hwnd & 0xFFFFFFFF,
@@ -226,6 +228,8 @@ class FilesMixin:
         }
         if char is not None:
             msg['char'] = char
+        if thread is not None:
+            msg['thread'] = thread
         with self.message_lock:
             # Coalesce mouse moves like Windows does: replace a still-pending
             # WM_MOUSEMOVE for the same window instead of flooding the queue

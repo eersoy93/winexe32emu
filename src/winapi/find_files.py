@@ -322,7 +322,15 @@ class FindFilesMixin:
         total = self.emu.HEAP_SIZE + self.BIG_REGION_BUDGET
         avail = max(0, self.emu.HEAP_BASE + self.emu.HEAP_SIZE - self.emu.heap_current)
         avail += max(0, self.BIG_REGION_BUDGET - self._big_region_usage())
-        return total, avail
+        # Microsoft Jet reserves as much address space as there is physical
+        # memory: more than the free room between the images (Access 95 at
+        # 0x50000000) makes it fail, so there is a 256 MB machine
+        # (the used part stays used: only what is free shrinks with the cap)
+        used = max(0, total - avail)
+        total = min(total, self.PHYSICAL_MEMORY_CAP)
+        return total, max(0, total - used)
+
+    PHYSICAL_MEMORY_CAP = 0x10000000
 
     def GlobalMemoryStatus(self, args):
         """GlobalMemoryStatus emulation - physical memory is the emulated heap
@@ -422,6 +430,31 @@ class FindFilesMixin:
         self._console_input_pending = pending[count:]
         return pending[:count]
 
+    def _overlapped_seek(self, info, overlapped):
+        """ReadFile/WriteFile with an OVERLAPPED on a file: the I/O starts at
+        its Offset/OffsetHigh (Microsoft Jet reads and writes its pages so,
+        without SetFilePointer); the handle's file pointer moves past it"""
+        if not overlapped or info.get('fp') is None:
+            return
+        try:
+            low, high = struct.unpack('<II', self.emu.uc.mem_read(overlapped + 8, 8))
+        except UcError:
+            return
+        info['fp'].seek((high << 32) | low)
+
+    def _overlapped_done(self, overlapped, count):
+        """Complete an OVERLAPPED at once: Internal (STATUS_SUCCESS),
+        InternalHigh (the bytes transferred), its event signaled"""
+        if not overlapped:
+            return
+        try:
+            event = struct.unpack('<I', self.emu.uc.mem_read(overlapped + 16, 4))[0]
+            self.emu.uc.mem_write(overlapped, struct.pack('<II', 0, count))
+        except UcError:
+            return
+        if event:
+            self.SetEvent([event])
+
     def ReadFile(self, args):
         """ReadFile emulation - reads from a real sandboxed file, or from
         the console input (statically linked C runtimes read stdin so)"""
@@ -444,11 +477,13 @@ class FindFilesMixin:
             return 0  # ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE
         else:
             try:
+                self._overlapped_seek(info, args[4] if len(args) > 4 else 0)
                 data = info['fp'].read(nNumberOfBytesToRead)
             except OSError as e:
                 log.error(f"ReadFile error: {e}")
                 self._last_error = 5  # ERROR_ACCESS_DENIED (a write-only handle)
                 return 0
+            self._overlapped_done(args[4] if len(args) > 4 else 0, len(data))
 
         if data:
             try:

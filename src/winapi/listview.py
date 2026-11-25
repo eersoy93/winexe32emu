@@ -55,7 +55,29 @@ class ListViewMixin:
     def lv_icon_space(self, win):
         """Pixels before an item's label in the report, list and small icon
         views: the small icon (none without a LVSIL_SMALL image list)"""
-        return 20 if win.nstate['imagelists'].get(1) else 0
+        return (20 if win.nstate['imagelists'].get(1) else 0) + self.lv_state_image_width(win)
+
+    def lv_state_image_width(self, win):
+        """Room of the state images (LVSIL_STATE, e.g. check boxes) before the
+        small icons"""
+        imagelist = self._imagelist(win.nstate['imagelists'].get(2))
+        return imagelist['cx'] if imagelist else 0
+
+    def _lv_hit_flags(self, win, index, x):
+        """LVHT_ONITEMSTATEICON, LVHT_ONITEMICON or LVHT_ONITEMLABEL for client
+        x on item index (LVHT_NOWHERE without an item); the report view's
+        first column only tells the parts apart"""
+        if index < 0:
+            return 0x1
+        if getattr(win, 'style', 0) & 0x3 != 1:  # Not LVS_REPORT
+            return 0x4
+        left = x + win.nstate.get('hscroll', 0)
+        state_w = self.lv_state_image_width(win)
+        if state_w and left < state_w + 2:
+            return 0x8
+        if win.nstate['imagelists'].get(1) and left < state_w + 20:
+            return 0x2
+        return 0x4
 
     def lv_cell_width(self, win):
         """Cell width of the small icon and list views: the widest label known"""
@@ -137,8 +159,9 @@ class ListViewMixin:
         if info['mask'] & self.LVIF_PARAM:
             item['param'] = info['param']
         if info['mask'] & self.LVIF_STATE:
-            # Like comctl32, inserting ignores stateMask
-            item['state'] = info['state'] & 0xFF & ~self.LVIS_FOCUSED
+            # Like comctl32, inserting ignores stateMask (the overlay and
+            # state image bits are kept)
+            item['state'] = info['state'] & 0xFFFF & ~self.LVIS_FOCUSED
         return item
 
     def _lv_send_changed(self, win, index, old_state, new_state):
@@ -824,14 +847,14 @@ class ListViewMixin:
             # saved EBP. comctl32 writes iSubItem only for LVM_SUBITEMHITTEST.
             x, y = self._read_struct(lParam, '<ii')
             index, _ = self._lv_hit(win, x, y)
-            self._mem_write(lParam + 8, struct.pack('<Ii', 0x4 if index >= 0 else 0x1,
+            self._mem_write(lParam + 8, struct.pack('<Ii', self._lv_hit_flags(win, index, x),
                                                     index))
             return index & 0xFFFFFFFF
         if msg == 0x1039:  # LVM_SUBITEMHITTEST
             x, y = self._read_struct(lParam, '<ii')
             index, sub = self._lv_hit(win, x, y)
-            self._mem_write(lParam + 8, struct.pack('<Iii', 0x4 if index >= 0 else 0x1,
-                                                    index, sub))
+            flags = self._lv_hit_flags(win, index, x) if sub == 0 else 0x4
+            self._mem_write(lParam + 8, struct.pack('<Iii', flags, index, sub))
             return index & 0xFFFFFFFF
         if msg == 0x1013:  # LVM_ENSUREVISIBLE
             if 0 <= wParam < len(items):

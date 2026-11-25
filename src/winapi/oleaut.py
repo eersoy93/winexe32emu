@@ -103,6 +103,49 @@ class OleAutMixin:
         method = struct.unpack('<I', self.emu.uc.mem_read(vtable + 4 * index, 4))[0]
         return self.emu.call_callback(method, [interface, *call_args])
 
+    # ---------- Active objects (the running object table of this process) ----------
+
+    ACTIVEOBJECT_WEAK = 1  # MK_E_UNAVAILABLE: OleMiscMixin
+
+    def RegisterActiveObject(self, args):
+        """RegisterActiveObject(punk, rclsid, dwFlags, pdwRegister) - an object
+        GetActiveObject finds by its CLSID; a strong registration holds a reference"""
+        punk, rclsid, flags, pdw_register = args[:4]
+        if not punk or not rclsid or not pdw_register:
+            return 0x80070057  # E_INVALIDARG
+        table = self.__dict__.setdefault('active_objects', {})
+        cookie = max(table, default=0) + 1
+        strong = not flags & self.ACTIVEOBJECT_WEAK
+        table[cookie] = (bytes(self.emu.uc.mem_read(rclsid, 16)), punk, strong)
+        if strong:
+            self._com_call(punk, 1)  # AddRef
+        self._mem_write(pdw_register, struct.pack('<I', cookie))
+        return 0
+
+    def RevokeActiveObject(self, args):
+        """RevokeActiveObject(dwRegister, pvReserved)"""
+        entry = self.__dict__.get('active_objects', {}).pop(args[0], None)
+        if entry is None:
+            return 0x80004005  # E_FAIL
+        if entry[2]:
+            self._com_call(entry[1], 2)  # Release
+        return 0
+
+    def GetActiveObject(self, args):
+        """GetActiveObject(rclsid, pvReserved, ppunk) - an AddRef'ed object
+        registered with the CLSID, else MK_E_UNAVAILABLE"""
+        rclsid, ppunk = args[0], args[2]
+        if not rclsid or not ppunk:
+            return 0x80070057  # E_INVALIDARG
+        clsid = bytes(self.emu.uc.mem_read(rclsid, 16))
+        for key, punk, _strong in self.__dict__.get('active_objects', {}).values():
+            if key == clsid:
+                self._com_call(punk, 1)  # AddRef
+                self._mem_write(ppunk, struct.pack('<I', punk))
+                return 0
+        self._mem_write(ppunk, b'\x00' * 4)
+        return self.MK_E_UNAVAILABLE
+
     def VariantInit(self, args):
         """VariantInit emulation - VT_EMPTY"""
         self._mem_write(args[0], b'\x00' * 16)
@@ -114,7 +157,9 @@ class OleAutMixin:
             return 0x80070057  # E_INVALIDARG
         vt, _, _, _, value = struct.unpack('<HHHHI', self.emu.uc.mem_read(args[0], 12))
         if not vt & self.VT_BYREF:
-            if vt == self.VT_BSTR:
+            if vt & 0x2000:  # VT_ARRAY
+                self.SafeArrayDestroy([value])
+            elif vt == self.VT_BSTR:
                 self.SysFreeString([value])
             elif vt in (self.VT_DISPATCH, self.VT_UNKNOWN) and value:
                 self._com_call(value, 2)  # Release
@@ -130,7 +175,15 @@ class OleAutMixin:
         self.VariantClear([dest])
         vt, value = struct.unpack_from('<H', data)[0], struct.unpack_from('<I', data, 8)[0]
         if not vt & self.VT_BYREF:
-            if vt == self.VT_BSTR and value:
+            if vt & 0x2000 and value:  # VT_ARRAY
+                cell = self.emu.heap_alloc(4)
+                result = self.SafeArrayCopy([value, cell])
+                copy = struct.unpack('<I', self.emu.uc.mem_read(cell, 4))[0]
+                self.emu.heap_free(cell)
+                if result:
+                    return result
+                data = data[:8] + struct.pack('<I', copy) + data[12:]
+            elif vt == self.VT_BSTR and value:
                 copy = self._alloc_bstr(bytes(self.emu.uc.mem_read(
                     value, self.SysStringByteLen([value]))))
                 if not copy:

@@ -54,7 +54,8 @@ class MenusMixin:
             return 0
 
         text = ""
-        if not (uFlags & self.MF_SEPARATOR) and lpNewItem:
+        # lpNewItem of MF_BITMAP is a bitmap handle, of MF_OWNERDRAW item data
+        if not uFlags & (self.MF_SEPARATOR | 0x4 | 0x100) and lpNewItem:
             text = self.read_string(lpNewItem)
 
         self.menus[hMenu].append({
@@ -62,6 +63,7 @@ class MenusMixin:
             'id': uIDNewItem,
             'text': text,
             'submenu': uIDNewItem if (uFlags & self.MF_POPUP) else 0,
+            'bitmap': lpNewItem if uFlags & 0x4 else 0,  # MF_BITMAP: its HBITMAP
         })
 
         log.debug(f"AppendMenuA(0x{hMenu:x}, flags=0x{uFlags:x}, id=0x{uIDNewItem:x}, '{text}')")
@@ -101,6 +103,10 @@ class MenusMixin:
                     'checked': bool(flags & self.MF_CHECKED),
                     'radio': bool(flags & self.MFT_RADIOCHECK), 'hmenu': 0,
                     'break': column_break}
+            if flags & 0x4:  # MF_BITMAP: the GDI bitmap (not an HBMMENU_* value)
+                bitmap = self.gdi_objects.get(item.get('bitmap', 0))
+                if bitmap is not None and bitmap.get('type') == 'bitmap':
+                    node['bitmap'] = bitmap
             if flags & self.MF_POPUP:
                 node['id'] = 0
                 node['hmenu'] = item['submenu']
@@ -398,7 +404,8 @@ class MenusMixin:
         items = list(items)
         items.insert(index, {'flags': uFlags & ~self.MF_BYPOSITION, 'id': uIDNewItem,
                              'text': text,
-                             'submenu': uIDNewItem if uFlags & self.MF_POPUP else 0})
+                             'submenu': uIDNewItem if uFlags & self.MF_POPUP else 0,
+                             'bitmap': lpNewItem if uFlags & 0x4 else 0})  # MF_BITMAP
         self.menus[hMenu] = items
         self._menus_changed()
         return 1
@@ -415,6 +422,7 @@ class MenusMixin:
         item = self.menus[hmenu][index]
         item['flags'], item['id'] = flags, args[3]
         item['submenu'] = args[3] if flags & self.MF_POPUP else 0
+        item['bitmap'] = args[4] if flags & 0x4 else 0  # MF_BITMAP: its HBITMAP
         if not flags & (self.MF_SEPARATOR | 0x4 | 0x100) and args[4]:
             item['text'] = self.read_wide_string(args[4])
         self._menus_changed()
@@ -435,6 +443,8 @@ class MenusMixin:
             flags = (flags & ~(self.MF_SEPARATOR | self.MFT_RADIOCHECK | 0x4 | 0x100 | 0x20 |
                                0x40)) | (info['type'] & (self.MF_SEPARATOR | self.MFT_RADIOCHECK |
                                                         0x4 | 0x100 | 0x20 | 0x40))
+        if mask & 0x10:  # MIIM_TYPE: dwTypeData of MFT_BITMAP is the HBITMAP
+            item['bitmap'] = info['type_data'] if info['type'] & 0x4 else 0
         if mask & 0x10 or mask & 0x40:  # MIIM_TYPE / MIIM_STRING
             if not info['type'] & (self.MF_SEPARATOR | 0x4 | 0x100) and info['type_data']:
                 item['text'] = self._read_text(info['type_data'], wide)

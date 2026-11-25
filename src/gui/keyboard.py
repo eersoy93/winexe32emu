@@ -22,6 +22,38 @@ if PYGAME_AVAILABLE:
     import pygame
 
 
+def _vk_scan_codes():
+    """Virtual key -> scan code of a US keyboard (bit 8: an extended key)"""
+    table = {0x1B: 0x01, 0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x11: 0x1D, 0x10: 0x2A,
+             0x12: 0x38, 0x20: 0x39, 0x14: 0x3A, 0x70: 0x3B, 0x71: 0x3C, 0x72: 0x3D,
+             0x73: 0x3E, 0x74: 0x3F, 0x75: 0x40, 0x76: 0x41, 0x77: 0x42, 0x78: 0x43,
+             0x79: 0x44, 0x7A: 0x57, 0x7B: 0x58, 0x6A: 0x37, 0x6D: 0x4A, 0x6B: 0x4E,
+             0xBD: 0x0C, 0xBB: 0x0D, 0xDB: 0x1A, 0xDD: 0x1B, 0xBA: 0x27, 0xDE: 0x28,
+             0xC0: 0x29, 0xDC: 0x2B, 0xBC: 0x33, 0xBE: 0x34, 0xBF: 0x35,
+             # The keys between the main block and the numeric keypad are extended
+             0x24: 0x147, 0x26: 0x148, 0x21: 0x149, 0x25: 0x14B, 0x27: 0x14D,
+             0x23: 0x14F, 0x28: 0x150, 0x22: 0x151, 0x2D: 0x152, 0x2E: 0x153,
+             0x6F: 0x135}
+    for i, ch in enumerate('1234567890'):
+        table[ord(ch)] = 0x02 + i
+    for scan, letters in ((0x10, 'QWERTYUIOP'), (0x1E, 'ASDFGHJKL'), (0x2C, 'ZXCVBNM')):
+        for i, ch in enumerate(letters):
+            table[ord(ch)] = scan + i
+    for i in range(10):  # Numeric keypad 0-9
+        table[0x60 + i] = (0x52, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49)[i]
+    return table
+
+
+VK_SCAN_CODES = _vk_scan_codes()
+
+
+def key_lparam(vk, flags=1):
+    """lParam of a key message: flags (repeat count, context and transition
+    bits) with the key's scan code in bits 16-23 and the extended key flag
+    in bit 24, like the messages of a real keyboard"""
+    return flags | (VK_SCAN_CODES.get(vk, 0) << 16)
+
+
 class KeyboardMixin:
     """Keyboard input: focus, virtual keys, edit controls"""
 
@@ -82,7 +114,7 @@ class KeyboardMixin:
         hwnd = self.key_target()
         if not hwnd or not self._is_app_window(hwnd):
             return
-        lparam = 0xC0000001  # Previous key state and transition state bits
+        lparam = key_lparam(vk, 0xC0000001)  # Previous key state and transition state bits
         if event is not None and event.key == pygame.K_LALT:
             # Alt alone is a system key; after Alt+key its release is a plain key-up
             sys_key = not self.alt_combo and not self.key_states.get(0x11)
@@ -102,7 +134,8 @@ class KeyboardMixin:
             return
         vk = self._pygame_key_to_vk(event)
         sys_key = self._is_sys_key(vk)
-        lparam = 0x20000001 if sys_key and self.alt_down else 1  # Context code: Alt is down
+        # Context code: Alt is down
+        lparam = key_lparam(vk, 0x20000001 if sys_key and self.alt_down else 1)
         # The WM_CHAR / WM_SYSCHAR of the keystroke (GetMessageA gives the
         # ANSI character): posted by TranslateMessage, like Windows
         char = self._key_char(event, vk)
@@ -208,6 +241,21 @@ class KeyboardMixin:
 
         multiline = control.class_name == "EDIT" and control.style & 0x4  # ES_MULTILINE
         in_dialog = win.owner is not None and control.parent_hwnd in win.owner.dialogs
+        owner = win.owner
+        if (owner is not None and not in_dialog and control.class_name == "EDIT" and
+                owner._control_subclass(control.hwnd)):
+            # A subclassed edit sees its keys first, like on Windows: WM_KEYDOWN,
+            # then the WM_CHAR of TranslateMessage. Schedule+'s in-place editors
+            # end on Enter there; what they pass on, the edit procedure types
+            # (edit_message)
+            vk = self._pygame_key_to_vk(event)
+            char = self._key_char(event, vk)
+            if vk is not None:
+                owner.post_window_message(control.hwnd, owner.WM_KEYDOWN, vk, key_lparam(vk),
+                                          char=None if char is None else (owner.WM_CHAR, char))
+            elif char is not None:
+                owner.post_window_message(control.hwnd, owner.WM_CHAR, char, 1)
+            return True
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and multiline and (
                 control.style & 0x1000 or not in_dialog):  # ES_WANTRETURN
             self._edit_insert(win, control, '\r\n')
@@ -265,6 +313,48 @@ class KeyboardMixin:
                 text = text.lower()
         if control.replace_selection(text):
             self._edit_notify_change(win, control)
+
+    # WM_CHAR control codes an edit control acts on -> (pygame key name, Ctrl)
+    EDIT_CHAR_KEYS = {0x08: ('backspace', False), 0x01: ('a', True), 0x03: ('c', True),
+                      0x16: ('v', True), 0x18: ('x', True)}
+    # Virtual keys an edit control acts on in WM_KEYDOWN -> pygame key names
+    EDIT_VK_KEYS = {0x25: 'left', 0x27: 'right', 0x26: 'up', 0x28: 'down', 0x24: 'home',
+                    0x23: 'end', 0x2E: 'delete', 0x2D: 'insert'}
+
+    def edit_message(self, control, message, code, wide=True):
+        """Default processing of a WM_KEYDOWN or WM_CHAR of an EDIT control:
+        the keys a subclassing procedure passes on to the edit procedure, and
+        the characters a program sends it. Called on the emulation thread."""
+        if not PYGAME_AVAILABLE:
+            return
+        win = self.windows.get(self.top_level_of(control.hwnd))
+        if win is None:
+            return
+        ctrl, shift = bool(self.key_states.get(0x11)), bool(self.key_states.get(0x10))
+        name = None
+        if message == winapi.WinAPIHandler.WM_KEYDOWN:
+            name = self.EDIT_VK_KEYS.get(code)
+        elif code in self.EDIT_CHAR_KEYS:
+            name, ctrl = self.EDIT_CHAR_KEYS[code]
+        elif code == 0x0D:
+            if control.style & 0x4:  # ES_MULTILINE
+                with self.lock:
+                    self._edit_insert(win, control, '\r\n')
+            return
+        elif code >= 0x20 and code != 0x7F:
+            from .. import config
+            char = (bytes([code]).decode(config.ANSI_CODEPAGE, errors='replace')
+                    if not wide and code < 0x100 else chr(code & 0xFFFF))
+            with self.lock:
+                self._edit_insert(win, control, char)
+            return
+        if name is None:
+            return
+        mod = (pygame.KMOD_CTRL if ctrl else 0) | (pygame.KMOD_SHIFT if shift else 0)
+        event = pygame.event.Event(pygame.KEYDOWN, key=pygame.key.key_code(name), mod=mod,
+                                   unicode='')
+        with self.lock:
+            self._edit_key(win, control, event)
 
     def _edit_key(self, win, control, event):
         """Caret movement, selection, deletion, clipboard and typing in an

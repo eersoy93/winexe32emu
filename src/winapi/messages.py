@@ -364,6 +364,17 @@ class MessagesMixin:
             return 1
         if Msg == self.LB_GETCOUNT:
             return len(items)
+        if Msg == 0x0192 and control.class_name == "LISTBOX":  # LB_SETTABSTOPS
+            # Tab stops in dialog units (wParam 0: every 32, 1: every *lParam)
+            # for an LBS_USETABSTOPS list; kept in pixels for drawing
+            try:
+                count = min(wParam, 256)
+                stops = struct.unpack(f'<{count}i', self.emu.uc.mem_read(lParam, 4 * count)) \
+                    if count else (32,)
+            except (UcError, struct.error):
+                return 0
+            control.tab_stops = [round(s * 1.5) for s in stops if s > 0] or [48]
+            return 1
         if Msg == self.LB_GETCURSEL:
             return control.sel_index if control.sel_index >= 0 else self.LB_ERR
         if Msg == self.LB_SETCURSEL:
@@ -467,6 +478,11 @@ class MessagesMixin:
                     self.emu.uc.mem_write(lParam, struct.pack("<i", control.scroll_max))
             except UcError:
                 pass
+            return 0
+        if Msg == self.WM_CLOSE:
+            # DefWindowProc: the control is destroyed (PowerPoint 95 closes its
+            # status bar so on exit until IsWindow says it is gone)
+            self.DestroyWindow([control.hwnd])
             return 0
 
         log.debug(f"Unhandled control message 0x{Msg:04x} for {control.class_name}")
@@ -621,7 +637,9 @@ class MessagesMixin:
             self.quit_code = wParam
             self.quit_requested = True
         else:
-            self.post_window_message(hWnd, Msg, wParam, lParam)
+            # Without a window it is a message for the calling thread
+            self.post_window_message(hWnd, Msg, wParam, lParam,
+                                     thread=None if hWnd else self.emu.current_thread.tid)
         return 1
 
     def PostMessageW(self, args):
@@ -701,8 +719,9 @@ class MessagesMixin:
         if lpMsg:
             # time and pt: when the message is retrieved (GetMessageTime/Pos)
             self.last_message_pos = x, y = self.gui.mouse_pos if self.gui else (0, 0)
+            self.last_message_time = int(time.time() * 1000) & 0xFFFFFFFF
             msg_data = struct.pack("<IIIIIii", hwnd, message, wParam, lParam,
-                                   int(time.time() * 1000) & 0xFFFFFFFF, x, y)
+                                   self.last_message_time, x, y)
             self.emu.uc.mem_write(lpMsg, msg_data)
 
     # Mouse messages -> (virtual key, held after it); WM_MOUSEMOVE tells all
@@ -776,7 +795,15 @@ class MessagesMixin:
 
         # Queued message (posted, and input forwarded from the GUI thread)
         with self.message_lock:
+            # Like Windows, the messages of a destroyed window are gone: no
+            # thread owns it, so it must not reach another thread's loop
+            if self.gui and any(m['hwnd'] and not self.IsWindow([m['hwnd']])
+                                for m in self.message_queue):
+                self.message_queue[:] = [m for m in self.message_queue
+                                         if not m['hwnd'] or self.IsWindow([m['hwnd']])]
             for index, msg in enumerate(self.message_queue):
+                if msg.get('thread', thread) != thread:
+                    continue  # PostThreadMessage to another thread
                 if matches(msg['hwnd'], msg['message']):
                     key = (msg['hwnd'], msg['message'], msg['wParam'], msg['lParam'])
                     if remove:
@@ -816,6 +843,11 @@ class MessagesMixin:
                 if ready and remove and matches(hwnd, self.WM_PAINT):
                     del self.dirty_controls[hwnd]
                     self._update_ctl_colors(control)
+                    # Its own WM_PAINT paints over what the program drew on
+                    # it through GetDC (a progress bar in a status bar); a
+                    # subclassed control would draw it again: it stays
+                    if control.drawn_shapes and not self._control_subclass(hwnd):
+                        self.gui.clear_drawings(hwnd)
                 elif parent is None:
                     self.dirty_controls.pop(hwnd, None)
                 continue
@@ -938,13 +970,16 @@ class MessagesMixin:
         try:
             return self._dispatch_message(args)
         finally:
-            if self.paint_pending:
-                try:
-                    hwnd, message = struct.unpack('<II', self.emu.uc.mem_read(args[0], 8))
-                except UcError:
-                    hwnd = message = 0
-                if message == self.WM_PAINT:
-                    self.paint_pending.discard(hwnd)
+            try:
+                hwnd, message, wParam, lParam = struct.unpack(
+                    '<4I', self.emu.uc.mem_read(args[0], 16))
+            except UcError:
+                hwnd = message = wParam = lParam = 0
+            if message == self.WM_PAINT and hwnd in self.paint_pending:
+                self.paint_pending.discard(hwnd)
+                self.update_rects.pop(hwnd, None)
+            elif message == 0x0006 and hwnd not in self.dialogs:  # WM_ACTIVATE
+                self._activation_focus(hwnd, wParam, lParam)
 
     def _dispatch_message(self, args):
         lpMsg = args[0]
@@ -1025,6 +1060,25 @@ class MessagesMixin:
 
         return 0
 
+    def _activation_focus(self, hwnd, wParam, lParam):
+        """The keyboard focus follows the activation: a top-level window that
+        was activated (WM_ACTIVATE) gets WM_SETFOCUS, unless it or one of its
+        children has the focus already, and WM_KILLFOCUS when it is
+        deactivated. Excel 95 handles WM_ACTIVATE itself and edits cells
+        properly only once its main window was given the focus."""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if win is None or win.parent:
+            return
+        if wParam & 0xFFFF and not wParam >> 16:  # Active, not minimized
+            inside = self.gui.focused_control or self.gui.focused_window
+            if self.top_focus != hwnd and not (
+                    inside and self.gui.top_level_of(inside) == hwnd):
+                self.top_focus = hwnd
+                self._send(hwnd, self.WM_SETFOCUS, 0, 0)
+        elif not wParam & 0xFFFF and self.top_focus == hwnd:
+            self.top_focus = 0
+            self._send(hwnd, self.WM_KILLFOCUS, lParam, 0)
+
     def DefWindowProcA(self, args, wide=False):
         """DefWindowProcA/W emulation"""
         hWnd = args[0]
@@ -1052,6 +1106,9 @@ class MessagesMixin:
             return 0
         if Msg == 0x0055 and lParam == 3:  # WM_NOTIFYFORMAT, NF_QUERY
             return 2 if wide else 1  # NFR_UNICODE for a Unicode window, else NFR_ANSI
+        if Msg == 0x0006:  # WM_ACTIVATE
+            self._activation_focus(hWnd, wParam, lParam)
+            return 0
         if Msg == self.WM_ERASEBKGND:
             # The class brush erases it (the desktop draws the window's
             # background color); a class without one leaves it to WM_PAINT

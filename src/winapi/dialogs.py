@@ -143,6 +143,9 @@ class DialogsMixin:
         win = self.gui.windows[hwnd]
         win.class_name = '#32770'
         win.is_dialog = True
+        # Like CreateWindowEx: the owner's top-level window owns the dialog, so
+        # it stays above it (PowerPoint 95 raises its frame over Tip of the Day)
+        win.owner_hwnd = self._top_level_window(owner) if owner else 0
         self.dialogs[hwnd] = {'proc': proc, 'handler': handler, 'owner': owner,
                               'result': 0, 'ended': False}
         self._set_dialog_instance(hwnd, template)
@@ -321,10 +324,12 @@ class DialogsMixin:
         else:
             result = self.emu.call_wndproc(dialog['proc'], dlg, message, wParam, lParam)
         if message == self.WM_CLOSE and not result and dlg in self.dialogs:
-            # DefDlgProc: closing a dialog clicks its Cancel button
+            # DefDlgProc: closing a dialog clicks its Cancel button. The
+            # WM_COMMAND goes to the dialog's window procedure: a subclass
+            # (MFC's AfxWndProc runs CDialog::OnCancel; AfxDlgProc ignores it)
             cancel = self._dialog_button(dlg, 2)
-            self.emu.call_wndproc(dialog['proc'], dlg, self.WM_COMMAND, 2,
-                                  cancel.hwnd if cancel else 0)
+            self.emu.call_wndproc(self._dialog_subclass(dlg) or dialog['proc'], dlg,
+                                  self.WM_COMMAND, 2, cancel.hwnd if cancel else 0)
         return result
 
     def _is_def_dlg_proc(self, proc):
@@ -543,6 +548,9 @@ class DialogsMixin:
                     self._audio_pump()
                     self.emu.idle_wait(0.01)
                     continue
+                # Like GetMessage: GetMessagePos/Time tell about this message
+                self.last_message_pos = self.gui.mouse_pos
+                self.last_message_time = int(time.time() * 1000) & 0xFFFFFFFF
                 if msg[1] == self.WM_QUIT:
                     self.quit_requested = True
                     break
@@ -865,6 +873,10 @@ class DialogsMixin:
     def PropertySheetA(self, args):
         return self.PropertySheetW(args, wide=False)
 
+    # The comctl32 of Windows 95 also exports PropertySheetA as PropertySheet
+    # (Office 95's MSOW.EXE looks it up so with GetProcAddress)
+    PropertySheet = PropertySheetA
+
     # ---------- Common dialogs (comdlg32) ----------
 
     @staticmethod
@@ -1053,6 +1065,44 @@ class DialogsMixin:
         """CommDlgExtendedError emulation - the last common dialog error"""
         error = self._last_error
         return error if 0x1000 <= error < 0x4000 else 0
+
+    PDERR_NODEFAULTPRN = 0x1008
+
+    def PrintDlgA(self, args):
+        """PrintDlgA/W, PageSetupDlgA/W - the computer has no printer (see
+        winspool): FALSE with CommDlgExtendedError PDERR_NODEFAULTPRN, like
+        Windows without an installed printer"""
+        self._last_error = self.PDERR_NODEFAULTPRN
+        return 0
+
+    PrintDlgW = PageSetupDlgA = PageSetupDlgW = PrintDlgA
+
+    def _get_file_title(self, args, wide):
+        """GetFileTitleA/W: the file name part of a path; 0 when copied, the
+        size the buffer needs (with the null) when too small, -1 bad name"""
+        lpszFile, lpszTitle, cchSize = args[0], args[1], args[2] & 0xFFFF
+        try:
+            path = (self.read_wide_string if wide else self.read_string)(lpszFile)
+        except UcError:
+            return 0xFFFFFFFF
+        title = ntpath.basename(path.rstrip('\\/')) if path else ''
+        if not title or any(c in title for c in '*?"<>|') or title.endswith(':'):
+            return 0xFFFFFFFF
+        data = (title.encode('utf-16-le') + b'\0\0' if wide else
+                title.encode(config.ANSI_CODEPAGE, errors='replace') + b'\0')
+        needed = len(data) // 2 if wide else len(data)
+        if not lpszTitle or cchSize < needed:
+            return needed
+        self.emu.uc.mem_write(lpszTitle, data)
+        return 0
+
+    def GetFileTitleA(self, args):
+        """GetFileTitleA emulation - the file name part of a path"""
+        return self._get_file_title(args, False)
+
+    def GetFileTitleW(self, args):
+        """GetFileTitleW emulation - the file name part of a path"""
+        return self._get_file_title(args, True)
 
     FR_DOWN, FR_MATCHCASE, FR_FINDNEXT, FR_DIALOGTERM = 0x1, 0x4, 0x8, 0x40
     FR_HIDEMATCHCASE = 0x8000

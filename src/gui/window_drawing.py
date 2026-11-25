@@ -69,6 +69,7 @@ class WindowDrawingMixin:
         # Render GDI shapes and texts (Rectangle, Ellipse, TextOut, ...)
         for shape in window.drawn_shapes:
             self._draw_shape(shape, client_x, client_y)
+        self._draw_caret(window.hwnd, client_x, client_y)
 
         if getattr(window, 'messagebox_icon', 0):
             self._draw_messagebox_icon(window.messagebox_icon, client_x + 20, client_y + 18)
@@ -186,17 +187,65 @@ class WindowDrawingMixin:
         self.screen.blit(icon, (bar.x + 2, bar.centery - self.CAPTION_ICON_SIZE // 2))
         return bar.x + 2 + self.CAPTION_ICON_SIZE + 4
 
-    def _draw_shape(self, shape, ox, oy, target=None):
+    caret = None  # The program-made caret (CreateCaret): hwnd, owner, pos, size, hidden
+
+    def _draw_caret(self, hwnd, ox, oy):
+        """Draw the caret of window hwnd (client origin ox, oy) while it is
+        shown, in the "on" half of its blink period: it inverts what is under it"""
+        caret = self.caret
+        if caret is None or caret['hwnd'] != hwnd or caret['hidden'] or \
+                pygame.time.get_ticks() % 1060 >= 530:
+            return
+        (x, y), (w, h) = caret['pos'], caret['size']
+        self._invert_area(self.screen, {'rect': (x, y, x + w, y + h)}, ox, oy)
+
+    @staticmethod
+    def _draw_dashed_line(screen, color, start, end, dash, phase=0):
+        """A one-pixel line from start to end (not drawn: like LineTo) in the
+        on/off runs of dash, starting phase pixels into the pattern; the
+        phase after it"""
+        (x1, y1), (x2, y2) = start, end
+        steps = max(abs(x2 - x1), abs(y2 - y1))
+        period = sum(dash)
+        for i in range(steps):
+            offset = (phase + i) % period
+            on = True
+            for run in dash:
+                if offset < run:
+                    break
+                offset -= run
+                on = not on
+            if on:
+                screen.set_at((x1 + (x2 - x1) * i // steps, y1 + (y2 - y1) * i // steps), color)
+        return (phase + steps) % period
+
+    def _draw_shape(self, shape, ox, oy, target=None, _in_region=False):
         """Render one GDI display list entry at client origin (ox, oy) on target
         (default: the screen)"""
         screen = self.screen if target is None else target
         stype = shape['type']
 
+        if shape.get('region') and not _in_region:
+            # Drawn with a clip region selected (SelectClipRgn, a partial
+            # WM_PAINT): once in each of its rectangles
+            previous = screen.get_clip()
+            for left, top, right, bottom in shape['region']:
+                area = pygame.Rect(ox + left, oy + top, right - left, bottom - top).clip(previous)
+                if area.width > 0 and area.height > 0:
+                    screen.set_clip(area)
+                    self._draw_shape(shape, ox, oy, target, _in_region=True)
+            screen.set_clip(previous)
+            return
+
         if stype == 'line':
             color, width = shape['pen']
             x1, y1 = shape['from']
             x2, y2 = shape['to']
-            pygame.draw.line(screen, color, (ox + x1, oy + y1), (ox + x2, oy + y2), width)
+            if shape.get('dash'):
+                self._draw_dashed_line(screen, color, (ox + x1, oy + y1), (ox + x2, oy + y2),
+                                       shape['dash'])
+            else:
+                pygame.draw.line(screen, color, (ox + x1, oy + y1), (ox + x2, oy + y2), width)
 
         elif stype in ('rect', 'ellipse'):
             left, top, right, bottom = shape['rect']
@@ -206,7 +255,16 @@ class WindowDrawingMixin:
                 draw_func(screen, shape['fill'], rect)
             if shape.get('pen') is not None:
                 color, width = shape['pen']
-                draw_func(screen, color, rect, width)
+                if shape.get('dash') and stype == 'rect' and rect.width > 1 and rect.height > 1:
+                    # A styled pen: the outline clockwise, its pattern continuing
+                    r, b = rect.right - 1, rect.bottom - 1
+                    phase = 0
+                    for start, end in (((rect.x, rect.y), (r, rect.y)), ((r, rect.y), (r, b)),
+                                       ((r, b), (rect.x, b)), ((rect.x, b), (rect.x, rect.y))):
+                        phase = self._draw_dashed_line(screen, color, start, end,
+                                                       shape['dash'], phase)
+                else:
+                    draw_func(screen, color, rect, width)
 
         elif stype == 'roundrect':
             left, top, right, bottom = shape['rect']
@@ -424,6 +482,15 @@ class WindowDrawingMixin:
             is_open = (self.open_menu == (window.hwnd, i))
             if is_open:
                 pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, rect)
+            bitmap = item.get('bitmap')
+            if bitmap:  # MF_BITMAP item: the bitmap, vertically centered
+                prev_clip = self.screen.get_clip()
+                self.screen.set_clip(rect.clip(prev_clip) if prev_clip else rect)
+                for shape in list(bitmap['shapes']):
+                    self._draw_shape(shape, rect.x + 4,
+                                     rect.y + (rect.height - bitmap['height']) // 2)
+                self.screen.set_clip(prev_clip)
+                continue
             color = self.COLOR_TITLE_TEXT if is_open else self.COLOR_TEXT
             text = self.font.render(item['text'], True, color)
             self.screen.blit(text, (rect.x + 8, rect.y + (rect.height - text.get_height()) // 2))

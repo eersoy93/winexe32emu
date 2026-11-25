@@ -84,13 +84,28 @@ class DeviceContextMixin:
                 return (pen['color'], max(1, pen['width']))
         return ((0, 0, 0), 1)  # Default: black pen, width 1
 
+    # On/off pixel runs of the styled cosmetic pens: PS_DASH, PS_DOT,
+    # PS_DASHDOT, PS_DASHDOTDOT
+    PEN_DASHES = {1: (18, 6), 2: (3, 3), 3: (9, 6, 3, 6), 4: (9, 3, 3, 3, 3, 3)}
+
+    def _with_pen_style(self, hdc, shape):
+        """shape with the 'dash' pattern of the DC's pen if it is a styled
+        one-pixel pen (PowerPoint 95's dotted placeholder outlines)"""
+        state = self.dc_state.get(hdc)
+        pen = self.gdi_objects.get(state['pen']) if state and state.get('pen') else None
+        if pen and pen['type'] == 'pen' and pen.get('width', 1) <= 1:
+            dash = self.PEN_DASHES.get(pen.get('style', 0) & 0xF)
+            if dash:
+                shape['dash'] = dash
+        return shape
+
     def _dc_brush(self, hdc):
         """Current brush color of a DC, or None for NULL_BRUSH"""
         state = self.dc_state.get(hdc)
         if state and state['brush']:
             brush = self.gdi_objects.get(state['brush'])
             if brush and brush['type'] == 'brush':
-                return brush['color']  # None for NULL_BRUSH
+                return self._brush_color(state['brush'], hdc)  # None for NULL_BRUSH
         return (255, 255, 255)  # Default: white brush
 
     def _dc_font(self, hdc):
@@ -111,7 +126,69 @@ class DeviceContextMixin:
                 return (bmp['width'], bmp['height'])
         return None
 
+    @staticmethod
+    def _rect_and(a, b):
+        """Intersection of two (left, top, right, bottom) rectangles, or None"""
+        left, top = max(a[0], b[0]), max(a[1], b[1])
+        right, bottom = min(a[2], b[2]), min(a[3], b[3])
+        return (left, top, right, bottom) if left < right and top < bottom else None
+
+    def _draw_clip(self, hdc):
+        """Device rectangles the drawing on a DC is clipped to: its clip region
+        (SelectClipRgn...) inside the update rectangle of a partial WM_PAINT
+        ('vis'); None if nothing clips it"""
+        state = self.dc_state.get(hdc)
+        if not state:
+            return None
+        clip, vis = state.get('clip'), state.get('vis')
+        if clip is None:
+            return None if vis is None else [vis]
+        if vis is None:
+            return list(clip)
+        return [part for part in (self._rect_and(rect, vis) for rect in clip) if part]
+
+    def _clip_shape(self, hdc, shape):
+        """The display list entries of a shape (in device coordinates) drawn on
+        a DC: the shape itself, parts of it, the shape with the 'region' it
+        is drawn in, or nothing if the DC's clipping hides it"""
+        rects = self._draw_clip(hdc)
+        if rects is None:
+            return [shape]
+        if shape.get('region'):
+            rects = [part for part in (self._rect_and(a, b) for a in rects
+                                       for b in shape['region']) if part]
+        if not rects:
+            return []
+        stype = shape['type']
+        if not shape.get('region') and (
+                (stype == 'invert' and shape.get('mask') is None) or
+                (stype == 'rect' and shape.get('pen') is None and
+                 shape.get('fill') is not None)):
+            # Plain rectangles are cut instead
+            left, top, right, bottom = shape['rect']
+            box = (min(left, right), min(top, bottom), max(left, right), max(top, bottom))
+            return [dict(shape, rect=part) for part in
+                    (self._rect_and(box, rect) for rect in rects) if part]
+        box = gui.PseudoWindowsGUI.shape_bbox(shape)
+        if box is not None:
+            rects = [rect for rect in rects if self._rect_and(box, rect)]
+            if not rects:
+                return []
+            if not shape.get('region') and any(
+                    rect[0] <= box[0] and rect[1] <= box[1] and rect[2] >= box[2] and
+                    rect[3] >= box[3] for rect in rects):
+                return [shape]  # Wholly inside
+        return [dict(shape, region=tuple(rects))]
+
     def _add_shape(self, hdc, shape, mapped=False):
+        """Append a GDI shape, clipped to the DC's clip region, to the display
+        list of the DC's window or memory bitmap (see _append_shape)"""
+        if not mapped:
+            shape = self._map_shape(hdc, shape)
+        for part in self._clip_shape(hdc, shape):
+            self._append_shape(hdc, part)
+
+    def _append_shape(self, hdc, shape, mapped=True):
         """Append a GDI shape to the display list of the DC's window.
 
         The shape is in the DC's logical coordinates (its window and viewport
@@ -167,12 +244,25 @@ class DeviceContextMixin:
 
         log.debug(f"BeginPaint(0x{hWnd:x})")
         self.paint_pending.discard(hWnd)  # BeginPaint validates the update region
+        update = self.update_rects.pop(hWnd, None)
 
-        hdc = self._create_dc(hWnd)
+        hdc = self._own_dc(hWnd) or self._create_dc(hWnd)
+        win = self.gui.windows.get(hWnd) if self.gui else None
+        if win is None:
+            update = None
+        self.dc_state[hdc].pop('vis', None)
 
-        # Painting starts fresh: clear the window's retained display lists
-        if self.gui:
-            self.gui.clear_drawings(hWnd)
+        if update is None:
+            # Painting starts fresh: clear the window's retained display lists
+            if self.gui:
+                self.gui.clear_drawings(hWnd)
+        else:
+            # Only a part is painted: the DC draws nothing outside it, and
+            # the class brush (the window's background) erases it
+            if not win.transparent:
+                self.gui.add_shape(hWnd, {'type': 'rect', 'rect': update, 'pen': None,
+                                          'fill': win.dialog_brush or win.bg_color})
+            self.dc_state[hdc]['vis'] = update
 
         # Like Windows, the window procedure erases the background first
         # (Word's dialogs paint their gray face there); fErase tells WM_PAINT
@@ -191,7 +281,7 @@ class DeviceContextMixin:
                 right, bottom = self.gui.client_size(win)
             # hdc, fErase, rcPaint(4 int), fRestore, fIncUpdate, rgbReserved[32]
             paint_data = struct.pack("<II", hdc, erase)  # First 8 bytes
-            paint_data += struct.pack("<iiii", 0, 0, right, bottom)  # rcPaint
+            paint_data += struct.pack("<iiii", *(update or (0, 0, right, bottom)))  # rcPaint
             paint_data += b'\x00' * (64 - len(paint_data))  # Rest
             self.emu.uc.mem_write(lpPaint, paint_data[:64])
 
@@ -206,22 +296,67 @@ class DeviceContextMixin:
         if lpPaint:
             try:
                 hdc = struct.unpack("<I", self.emu.uc.mem_read(lpPaint, 4))[0]
-                self._delete_dc(hdc)
+                if self.own_dcs.get(hWnd) == hdc:
+                    self.dc_state[hdc].pop('vis', None)  # The private DC lives on
+                else:
+                    self._delete_dc(hdc)
             except UcError:
                 pass
         return 1
 
     def InvalidateRect(self, args):
-        """InvalidateRect emulation - request a repaint via WM_PAINT"""
+        """InvalidateRect emulation - request a repaint via WM_PAINT: of the
+        rectangle, or of the whole client area (lpRect NULL)"""
         hWnd = args[0]
         lpRect = args[1]
-        bErase = args[2]
         log.debug(f"InvalidateRect(0x{hWnd:x})")
-        # GetMessageA re-synthesizes WM_PAINT for windows not in painted_windows
-        self.painted_windows.discard(hWnd)
-        if self.gui and hWnd in self.gui.controls:
-            self.dirty_controls[hWnd] = True
+        rect = None
+        if lpRect and self.gui and hWnd in self.gui.windows:
+            rect = self._read_rect(lpRect)
+        self._invalidate(hWnd, rect)
         return 1
+
+    def _invalidate(self, hwnd, rect=None):
+        """Add rect (client coordinates; None: the whole client area) to a
+        window's update region. GetMessage synthesizes WM_PAINT for windows
+        not in painted_windows."""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if rect is not None and win is not None:
+            rect = self._rect_and(rect, (0, 0) + tuple(self.gui.client_size(win)))
+            if rect is None:
+                return  # Nothing of it is in the window
+        valid = hwnd in self.painted_windows and hwnd not in self.paint_pending
+        if rect is None or win is None:
+            self.update_rects.pop(hwnd, None)
+        elif valid:
+            self.update_rects[hwnd] = rect
+        elif hwnd in self.update_rects:
+            old = self.update_rects[hwnd]
+            self.update_rects[hwnd] = (min(old[0], rect[0]), min(old[1], rect[1]),
+                                       max(old[2], rect[2]), max(old[3], rect[3]))
+        self.painted_windows.discard(hwnd)
+        if self.gui and hwnd in self.gui.controls:
+            self.dirty_controls[hwnd] = True
+
+    def _invalidate_area(self, hwnd, rect, skip=0):
+        """Invalidate rect (client coordinates of hwnd) in the visible window
+        hwnd and in its child windows (not in skip): what a hidden or moved
+        child window uncovered"""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if win is None or not win.visible:
+            return
+        rect = self._rect_and(rect, (0, 0) + tuple(self.gui.client_size(win)))
+        if rect is None:
+            return
+        if win.owner is self and hwnd not in self.dialogs:
+            self._invalidate(hwnd, rect)
+        for child in list(win.children):
+            child_win = self.gui.windows.get(child)
+            if child == skip or child_win is None:
+                continue
+            border, caption = self.gui.child_frame(child_win)
+            x, y = child_win.x + border, child_win.y + border + caption
+            self._invalidate_area(child, (rect[0] - x, rect[1] - y, rect[2] - x, rect[3] - y))
 
     def FillRect(self, args):
         """FillRect emulation"""
@@ -243,24 +378,51 @@ class DeviceContextMixin:
         log.debug(f"FillRect(0x{hdc:x}, rect=({left},{top},{right},{bottom}), brush=0x{hbr:x})")
 
         # Resolve the brush: GDI handle, or a system color index + 1 (e.g. COLOR_WINDOW+1)
-        color = self._brush_color(hbr)
+        color = self._brush_color(hbr, hdc)
 
         if color is not None:
             self._add_shape(hdc, {'type': 'rect', 'rect': (left, top, right, bottom),
                                   'fill': color, 'pen': None})
         return 1
 
+    CS_OWNDC = 0x0020
+
+    def _own_dc(self, hwnd):
+        """The private DC of a window whose class has CS_OWNDC (it is made on
+        first use and keeps its state: Excel 95 gets it once and selects its
+        fonts and clip regions into it for good), or 0"""
+        hdc = self.own_dcs.get(hwnd)
+        if hdc is not None and hdc in self.dc_state:
+            return hdc
+        if not self.gui or hwnd not in self.gui.windows:
+            return 0
+        info = self.registered_classes.get(self._window_class_name(hwnd))
+        if not info or not info['style'] & self.CS_OWNDC:
+            return 0
+        hdc = self.own_dcs[hwnd] = self._create_dc(hwnd)
+        return hdc
+
+    def _forget_window(self, hwnd):
+        """Paint state of a destroyed window"""
+        self.painted_windows.discard(hwnd)
+        self.update_rects.pop(hwnd, None)
+        hdc = self.own_dcs.pop(hwnd, None)
+        if hdc is not None:
+            self._delete_dc(hdc)
+
     def GetDC(self, args):
         """GetDC emulation"""
         hWnd = args[0]
         log.debug(f"GetDC(0x{hWnd:x})")
-        return self._create_dc(hWnd)
+        return self._own_dc(hWnd) or self._create_dc(hWnd)
 
     def ReleaseDC(self, args):
         """ReleaseDC emulation"""
         hWnd = args[0]
         hDC = args[1]
         log.debug(f"ReleaseDC(0x{hWnd:x}, 0x{hDC:x})")
+        if self.own_dcs.get(self.dc_map.get(hDC)) == hDC:
+            return 1  # A private DC is never released
         self._delete_dc(hDC)
         return 1
 
@@ -272,6 +434,7 @@ class DeviceContextMixin:
         width, height = self._screen_size()
 
         caps = {
+            2: 1,       # TECHNOLOGY: DT_RASDISPLAY
             4: 320,     # HORZSIZE (mm)
             6: 240,     # VERTSIZE (mm)
             8: width,   # HORZRES
@@ -279,6 +442,14 @@ class DeviceContextMixin:
             12: 32,     # BITSPIXEL
             14: 1,      # PLANES
             24: -1,     # NUMCOLORS (more than 256 colors)
+            36: 1,      # CLIPCAPS: CP_RECTANGLE
+            40: 36,     # ASPECTX (square pixels, like a VGA display)
+            42: 36,     # ASPECTY
+            44: 51,     # ASPECTXY (hypotenuse)
+            # RASTERCAPS: RC_BITBLT, RC_BITMAP64, RC_GDI20_OUTPUT, RC_DI_BITMAP,
+            # RC_DIBTODEV, RC_BIGFONT, RC_STRETCHBLT, RC_FLOODFILL, RC_STRETCHDIB,
+            # RC_OP_DX_OUTPUT (a true color display: no RC_PALETTE)
+            38: 0x7E99,
             88: 96,     # LOGPIXELSX
             90: 96,     # LOGPIXELSY
             117: height, # DESKTOPVERTRES
@@ -326,6 +497,75 @@ class DeviceContextMixin:
             self._add_text(hdc, text, *self._aligned_text_pos(hdc, text, x, y))
 
         return 1
+
+    def _tabbed_text(self, hdc, text, n_tabs, lp_tabs, origin, x, y=None):
+        """Lay out (and with y, draw) text with its tabs expanded: tab stops at
+        the n_tabs pixel positions of lp_tabs from origin (right or centered
+        stops, negative values, are taken as left ones), every lp_tabs[0]
+        pixels for one value, else every 8 average character widths.
+        Returns MAKELONG(width, height) like TabbedTextOut."""
+        stops = []
+        if n_tabs > 0 and lp_tabs:
+            count = min(n_tabs, 1024)
+            try:
+                stops = [abs(v) for v in struct.unpack(
+                    f'<{count}i', bytes(self.emu.uc.mem_read(lp_tabs, 4 * count)))]
+            except UcError:
+                stops = []
+        interval = 0
+        if len(stops) == 1:
+            interval, stops = stops[0], []
+        elif not stops:
+            interval = 8 * max(1, self._text_extent(hdc, 'x')[0])
+        height = self._text_extent(hdc, text.replace('\t', '') or ' ')[1]
+        pos = x
+        for index, piece in enumerate(text.split('\t')):
+            if index:
+                column = pos - origin
+                stop = next((s for s in stops if s > column), None)
+                if stop is None:
+                    stop = ((column // interval + 1) * interval if interval > 0
+                            else column + self._text_extent(hdc, ' ')[0])
+                pos = origin + stop
+            if piece:
+                if y is not None and self.gui:
+                    self._add_text(hdc, piece, pos, y)
+                pos += self._text_extent(hdc, piece)[0]
+        return ((height & 0xFFFF) << 16) | ((pos - x) & 0xFFFF)
+
+    @staticmethod
+    def _int32(value):
+        value &= 0xFFFFFFFF
+        return value - 0x100000000 if value & 0x80000000 else value
+
+    def TabbedTextOutA(self, args, wide=False):
+        """TabbedTextOutA/W(hdc, x, y, string, count, tab count, &tab stops,
+        tab origin) - TextOut that expands the tabs"""
+        hdc, x, y, lp_string, count = args[0], self._int32(args[1]), \
+            self._int32(args[2]), args[3], self._int32(args[4])
+        text = (self.read_wide_string(lp_string) if wide else
+                self.read_string(lp_string)) if lp_string else ""
+        if count >= 0:
+            text = text[:count]
+        log.debug(f"TabbedTextOut(0x{hdc:x}, {x}, {y}, \"{text}\")")
+        return self._tabbed_text(hdc, text, self._int32(args[5]), args[6],
+                                 self._int32(args[7]), x, y)
+
+    def TabbedTextOutW(self, args):
+        return self.TabbedTextOutA(args, wide=True)
+
+    def GetTabbedTextExtentA(self, args, wide=False):
+        """GetTabbedTextExtentA/W(hdc, string, count, tab count, &tab stops):
+        MAKELONG(width, height) of the text with its tabs expanded"""
+        hdc, lp_string, count = args[0], args[1], self._int32(args[2])
+        text = (self.read_wide_string(lp_string) if wide else
+                self.read_string(lp_string)) if lp_string else ""
+        if count >= 0:
+            text = text[:count]
+        return self._tabbed_text(hdc, text, self._int32(args[3]), args[4], 0, 0)
+
+    def GetTabbedTextExtentW(self, args):
+        return self.GetTabbedTextExtentA(args, wide=True)
 
     ETO_OPAQUE = 0x2
     ETO_CLIPPED = 0x4
@@ -575,7 +815,7 @@ class DeviceContextMixin:
     TA_BASELINE = 0x18
 
     def SetTextAlign(self, args):
-        """SetTextAlign emulation - honoured by TextOut (TA_UPDATECP is ignored)"""
+        """SetTextAlign emulation - honoured by TextOut and ExtTextOut"""
         hdc, align = args[0], args[1]
         log.debug(f"SetTextAlign(0x{hdc:x}, 0x{align:x})")
         state = self.dc_state.get(hdc)
@@ -587,13 +827,20 @@ class DeviceContextMixin:
 
     def _aligned_text_pos(self, hdc, text, x, y, dx=None):
         """Top-left position of TextOut text for the DC's text alignment (dx:
-        the advances of its characters, if given)"""
-        align = self.dc_state.get(hdc, {}).get('text_align', 0)
-        if not align & ~self.TA_UPDATECP:
+        the advances of its characters, if given). With TA_UPDATECP the text
+        goes at the current position (MoveToEx), not at x, y, and moves it
+        past the text (PowerPoint 95 draws its outline view this way)."""
+        state = self.dc_state.get(hdc, {})
+        align = state.get('text_align', 0)
+        if not align:  # TA_LEFT | TA_TOP | TA_NOUPDATECP
             return x, y
         width, height = self._text_extent(hdc, text)
         if dx:
             width = sum(dx)
+        if align & self.TA_UPDATECP and 'pos' in state:
+            x, y = state['pos']
+            if align & self.TA_CENTER != self.TA_CENTER:
+                state['pos'] = (x - width if align & self.TA_RIGHT else x + width, y)
         if align & self.TA_CENTER == self.TA_CENTER:
             x -= width // 2
         elif align & self.TA_RIGHT:

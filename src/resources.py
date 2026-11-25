@@ -256,9 +256,11 @@ def standard_cursor_image(cursor_id):
     return image
 
 
-def read_exe_icon(host_path, size=32):
-    """(width, height, RGBA bytes) of the EXE's main icon (its first icon group),
-    the image closest to size x size with the most colors; None if it has none"""
+def read_exe_icon(host_path, size=32, index=0):
+    """(width, height, RGBA bytes) of an icon of an EXE or DLL, the image closest
+    to size x size with the most colors; None if it has none. index (like
+    ExtractIcon's): the index-th icon group (0: the main icon), or the negated
+    resource ID of one"""
     try:
         pe = pefile.PE(host_path, fast_load=True)
     except (pefile.PEFormatError, OSError):
@@ -278,7 +280,13 @@ def read_exe_icon(host_path, size=32):
             struct_ = languages.entries[0].data.struct
             return pe.get_data(struct_.OffsetToData, struct_.Size)
 
-        group = first_language_data(entries[14].directory.entries[0])
+        groups = entries[14].directory.entries
+        if index < 0:
+            groups = [entry for entry in groups if entry.id == -index]
+            index = 0
+        if index >= len(groups):
+            return None
+        group = first_language_data(groups[index])
         if not group or len(group) < 6:
             return None
         count = struct.unpack_from('<H', group, 4)[0]

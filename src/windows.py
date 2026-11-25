@@ -27,6 +27,41 @@ def gui_locked(method):
     return wrapper
 
 
+# Application desktop toolbars (SHAppBarMessage) of all the programs:
+# hwnd -> AppBar. Their docked rectangles are taken out of the work area.
+APPBARS = {}
+
+
+class AppBar:
+    """A registered appbar: its callback message, edge and reserved rectangle"""
+
+    def __init__(self, owner, callback_message):
+        self.owner = owner  # WinAPIHandler of the process that registered it
+        self.callback_message = callback_message
+        self.edge = None   # ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM once ABM_SETPOS
+        self.rect = None   # (left, top, right, bottom) it reserved
+        self.autohide = set()  # Edges it is the autohide appbar of
+
+
+def work_area(screen_width, screen_height, taskbar_height=30, exclude=None):
+    """(left, top, right, bottom) of the desktop not covered by the taskbar at
+    the bottom or by the docked appbars (all except hwnd exclude)"""
+    left, top, right, bottom = 0, 0, screen_width, screen_height - taskbar_height
+    for hwnd, bar in list(APPBARS.items()):
+        if hwnd == exclude or bar.rect is None:
+            continue
+        bar_left, bar_top, bar_right, bar_bottom = bar.rect
+        if bar.edge == 0:
+            left = max(left, min(bar_right, right))
+        elif bar.edge == 1:
+            top = max(top, min(bar_bottom, bottom))
+        elif bar.edge == 2:
+            right = min(right, max(bar_left, left))
+        elif bar.edge == 3:
+            bottom = min(bottom, max(bar_top, top))
+    return left, top, right, bottom
+
+
 class FakeWindow:
     """Fake Windows window"""
 
@@ -122,11 +157,12 @@ class FakeWindow:
             self.restore_width = self.width
             self.restore_height = self.height
 
-            # Go fullscreen (except taskbar)
-            self.x = 0
-            self.y = 0
-            self.width = screen_width
-            self.height = screen_height - taskbar_height
+            # Fill the work area (the desktop without the taskbar and the appbars)
+            left, top, right, bottom = work_area(screen_width, screen_height, taskbar_height)
+            self.x = left
+            self.y = top
+            self.width = right - left
+            self.height = bottom - top
             self.maximized = True
         else:
             # Restore

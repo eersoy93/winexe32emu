@@ -48,6 +48,53 @@ def core_dib_to_info(data):
     return header + table + data[BITMAPCOREHEADER_SIZE + 3 * count:]
 
 
+def decompress_rle(bits, width, height, bpp):
+    """BI_RLE8 (bpp 8) / BI_RLE4 (bpp 4) bitmap bits as uncompressed bottom-up
+    rows (DWORD-aligned stride); skipped pixels stay color index 0"""
+    stride = ((width * bpp + 31) // 32) * 4
+    out = bytearray(stride * height)
+    x = y = i = 0
+
+    def put(px, index):
+        if px >= width or y >= height:
+            return
+        if bpp == 8:
+            out[y * stride + px] = index
+        else:
+            pos = y * stride + px // 2
+            out[pos] |= (index & 0x0F) << (0 if px & 1 else 4)
+
+    while i + 1 < len(bits) and y < height:
+        count, value = bits[i], bits[i + 1]
+        i += 2
+        if count:  # Encoded run: count pixels of value (RLE4: two alternating)
+            for k in range(count):
+                put(x, value if bpp == 8 else (value >> 4 if k % 2 == 0 else value & 0x0F))
+                x += 1
+        elif value == 0:  # End of line
+            x, y = 0, y + 1
+        elif value == 1:  # End of bitmap
+            break
+        elif value == 2:  # Delta
+            if i + 1 >= len(bits):
+                break
+            x, y = x + bits[i], y + bits[i + 1]
+            i += 2
+        else:  # Absolute run of value pixels, padded to a WORD
+            nbytes = value if bpp == 8 else (value + 1) // 2
+            literal = bits[i:i + nbytes]
+            for k in range(value):
+                if bpp == 8:
+                    index = literal[k] if k < len(literal) else 0
+                else:
+                    b = literal[k // 2] if k // 2 < len(literal) else 0
+                    index = b >> 4 if k % 2 == 0 else b & 0x0F
+                put(x, index)
+                x += 1
+            i += nbytes + (nbytes & 1)
+    return bytes(out)
+
+
 class MemoryDCMixin:
     """Memory DC / double buffering, bitmaps, device independent bitmaps"""
 
@@ -112,6 +159,9 @@ class MemoryDCMixin:
             if key in moved:
                 left, top, right, bottom = moved[key]
                 moved[key] = (left + dx, top + dy, right + dx, bottom + dy)
+        if moved.get('region'):
+            moved['region'] = tuple((left + dx, top + dy, right + dx, bottom + dy)
+                                    for left, top, right, bottom in moved['region'])
         if 'pos' in moved:
             x, y = moved['pos']
             moved['pos'] = (x + dx, y + dy)
@@ -151,6 +201,8 @@ class MemoryDCMixin:
         # origin (Word draws a line at its document y in a one-line bitmap
         # whose viewport origin is moved up by that y)
         sx, sy = self._lp_to_dp(hdcSrc, sx, sy)
+        if rop != self.SRCCOPY and self._blit_pixels(hdcDest, x, y, cx, cy, hdcSrc, sx, sy, rop):
+            return 1
         dx, dy = x - sx, y - sy
         shapes = []
         for shape in src_state['shapes']:
@@ -203,6 +255,9 @@ class MemoryDCMixin:
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
+        clipped = self._draw_clip(hdcDest) is not None
+        if clipped:
+            shapes = [part for shape in shapes for part in self._clip_shape(hdcDest, shape)]
         if self.gui and hwnd in self.gui.controls:
             # An owner-draw control's DC (WM_DRAWITEM)
             for shape in shapes:
@@ -213,7 +268,7 @@ class MemoryDCMixin:
 
         window = self.gui.windows[hwnd]
         client_w, client_h = self.gui.client_size(window)
-        if x <= 0 and y <= 0 and x + cx >= client_w and y + cy >= client_h:
+        if not clipped and x <= 0 and y <= 0 and x + cx >= client_w and y + cy >= client_h:
             # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
             window.drawn_shapes = shapes
         else:
@@ -306,6 +361,116 @@ class MemoryDCMixin:
         return [{'type': 'image', 'pos': rect[:2], 'dim': (w, h), 'size': (w, h),
                  'data': bytes(rgb), 'rop': MemoryDCMixin.SRCCOPY, 'colorkey': key}]
 
+    # Largest memory bitmap (pixels) whose raster operations are done on pixels
+    PIXEL_ROP_MAX_AREA = 1024 * 1024
+
+    @staticmethod
+    def rop3_bytes(rop, pattern, source, dest):
+        """Bytes of a ternary raster operation applied to equally long pattern,
+        source and destination bytes (None: not used by the operation, taken
+        as 0). Bit P*4 + S*2 + D of the ROP index is the result bit."""
+        index = (rop >> 16) & 0xFF
+        size = len(dest)
+        full = (1 << (8 * size)) - 1
+        planes = [int.from_bytes(plane, 'little') if plane is not None else 0
+                  for plane in (dest, source, pattern)]
+        result = 0
+        for term in range(8):
+            if not (index >> term) & 1:
+                continue
+            bits = full
+            for bit, plane in enumerate(planes):
+                bits &= plane if (term >> bit) & 1 else ~plane & full
+            result |= bits
+        return result.to_bytes(size, 'little')
+
+    @staticmethod
+    def _crop_rgb(rgb, width, left, top, w, h):
+        """The w x h pixels at (left, top) of top-down RGB bytes width wide"""
+        row = width * 3
+        return b''.join(rgb[(top + r) * row + left * 3:(top + r) * row + (left + w) * 3]
+                        for r in range(h))
+
+    def _blit_pixels(self, hdcDest, x, y, cx, cy, hdcSrc, sx, sy, rop):
+        """Do a raster operation that depends on the destination on the pixels
+        of a memory DC's bitmap: masks and pictures built with SRCAND, SRCPAINT,
+        DSTINVERT... (Excel 95's toolbar buttons) need the real result, not a
+        display list of layers. x, y are logical, sx, sy device coordinates;
+        hdcSrc is 0 for PatBlt. Returns False if it cannot be done here (the
+        destination is a window, or the pictures cannot be rendered)."""
+        state = self.dc_state.get(hdcDest)
+        if not state or not state.get('memory'):
+            return False
+        hbm = state.get('bitmap', 0)
+        bmp = self.gdi_objects.get(hbm)
+        if not bmp or bmp['type'] != 'bitmap' or bmp.get('dib'):
+            return False
+        width, height = bmp['width'], bmp['height']
+        if not 0 < width * height <= self.PIXEL_ROP_MAX_AREA:
+            return False
+        x, y = self._lp_to_dp(hdcDest, x, y)
+        src_bmp = src_rgb = None
+        src_size = (0, 0)
+        if hdcSrc:
+            src_state = self.dc_state.get(hdcSrc) or {}
+            src_hbm = src_state.get('bitmap', 0)
+            src_bmp = self.gdi_objects.get(src_hbm)
+            if not src_bmp or src_bmp['type'] != 'bitmap':
+                return False
+            src_size = (src_bmp['width'], src_bmp['height'])
+            if not 0 < src_size[0] * src_size[1] <= self.PIXEL_ROP_MAX_AREA:
+                return False
+        # Clip to both bitmaps
+        left, top = max(x, 0), max(y, 0)
+        right, bottom = min(x + cx, width), min(y + cy, height)
+        if hdcSrc:
+            left, top = max(left, x - sx), max(top, y - sy)
+            right = min(right, x - sx + src_size[0])
+            bottom = min(bottom, y - sy + src_size[1])
+        if right <= left or bottom <= top:
+            return True  # Nothing inside
+        w, h = right - left, bottom - top
+        try:
+            dest_rgb = self._bitmap_rgb(hbm)
+            if hdcSrc:
+                src_rgb = self._bitmap_rgb(src_hbm)
+        except (UcError, ValueError, TypeError):
+            return False
+        if dest_rgb is None or (hdcSrc and src_rgb is None):
+            return False
+        dest_mono = bmp.get('bpp') == 1
+        source = None
+        if hdcSrc:
+            source = self._crop_rgb(src_rgb, src_size[0], left - x + sx, top - y + sy, w, h)
+            src_mono = src_bmp.get('bpp') == 1
+            if src_mono and not dest_mono:
+                # 0 bits are the destination's text color, 1 bits its background
+                text = bytes(state.get('text_color') or (0, 0, 0))
+                back = bytes(state.get('bk_color') or (255, 255, 255))
+                if (text, back) != (b'\x00\x00\x00', b'\xff\xff\xff'):
+                    source = b''.join(back if source[i] else text
+                                      for i in range(0, len(source), 3))
+            elif dest_mono and not src_mono:
+                # The source's background color is 1 (white), the others 0
+                back = bytes(src_state.get('bk_color') or (255, 255, 255))
+                source = b''.join(b'\xff\xff\xff' if source[i:i + 3] == back
+                                  else b'\x00\x00\x00' for i in range(0, len(source), 3))
+        brush = self._dc_brush_color(hdcDest)
+        if dest_mono:
+            brush = (255, 255, 255) if sum(brush) >= 384 else (0, 0, 0)
+        pattern = bytes(brush) * (w * h)
+        dest = self._crop_rgb(dest_rgb, width, left, top, w, h)
+        result = self.rop3_bytes(rop, pattern, source, dest)
+        row = width * 3
+        pixels = bytearray(dest_rgb)
+        for r in range(h):
+            start = (top + r) * row + left * 3
+            pixels[start:start + w * 3] = result[r * w * 3:(r + 1) * w * 3]
+        state['shapes'] = [{'type': 'image', 'pos': (0, 0), 'dim': (width, height),
+                            'size': (width, height), 'data': bytes(pixels),
+                            'rop': self.SRCCOPY}]
+        return True
+
     def _crop_image(self, shape, sx, sy, cx, cy, rop):
         """Part of an image shape inside the source rect (sx, sy, cx, cy), or None.
 
@@ -338,7 +503,7 @@ class MemoryDCMixin:
     def _dc_brush_color(self, hdc):
         """(r, g, b) of the brush selected into a DC (the default is white)"""
         state = self.dc_state.get(hdc) or {}
-        color = self._brush_color(state.get('brush')) if state.get('brush') else None
+        color = self._brush_color(state.get('brush'), hdc) if state.get('brush') else None
         return color if color is not None else (255, 255, 255)
 
     @staticmethod
@@ -445,8 +610,11 @@ class MemoryDCMixin:
             return None
         (hdr_size, width, height, _, bpp, compression, _, _, _,
          clr_used, _) = struct.unpack_from('<IiiHHIIiiII', data)
-        if hdr_size < 40 or width <= 0 or height == 0 or compression not in (0, 3) or \
+        if hdr_size < 40 or width <= 0 or height == 0 or compression not in (0, 1, 2, 3) or \
                 bpp not in (1, 4, 8, 16, 24, 32):
+            return None
+        # BI_RLE8 / BI_RLE4: 8 / 4 bits per pixel, always bottom-up
+        if compression in (1, 2) and (bpp != (8 if compression == 1 else 4) or height < 0):
             return None
         bottom_up = height > 0
         height = abs(height)
@@ -466,6 +634,8 @@ class MemoryDCMixin:
                 b, g, r = data[offset + 4 * i:offset + 4 * i + 3]
                 palette.append(bytes((r, g, b)))
             offset += 4 * count
+        if compression in (1, 2):
+            data = bytes(data[:offset]) + decompress_rle(data[offset:], width, height, bpp)
         stride = ((width * bpp + 31) // 32) * 4
         if len(data) < offset + stride * height:
             return None
@@ -775,6 +945,11 @@ class MemoryDCMixin:
             scaled['to'] = (tx(x), ty(y))
         if 'points' in scaled:
             scaled['points'] = [(tx(x), ty(y)) for x, y in scaled['points']]
+        if scaled.get('region'):
+            scaled['region'] = tuple(
+                (min(tx(left), tx(right)), min(ty(top), ty(bottom)),
+                 max(tx(left), tx(right)), max(ty(top), ty(bottom)))
+                for left, top, right, bottom in scaled['region'])
         if 'dx' in scaled:
             scaled['dx'] = [int(round(d * scale_x)) for d in scaled['dx']]
             scaled.pop('_surface', None)
@@ -1247,4 +1422,5 @@ class MemoryDCMixin:
         hWnd = args[0]
         self.painted_windows.add(hWnd)
         self.paint_pending.discard(hWnd)
+        self.update_rects.pop(hWnd, None)
         return 1

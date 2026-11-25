@@ -407,6 +407,7 @@ class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, Taskbar
         self._draw_open_combo()
         self._draw_open_native_combo()
         self._draw_popup_menu()
+        self._draw_tooltip_windows()
 
         # Desktop right-click menu, the Start menu and the clock tooltip are the topmost layers
         self._draw_desktop_menu()

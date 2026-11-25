@@ -102,6 +102,12 @@ class OleStorageMixin:
 
     def _save_docfile(self, info):
         """Write a docfile's tree to its file; False if it cannot be written"""
+        if info.get('lockbytes'):  # A docfile on an ILockBytes (OleLockBytesMixin)
+            if self._lockbytes_write_all(info['lockbytes'],
+                                         compound_file.save(info['root'])) & 0x80000000:
+                return False
+            info['dirty'] = False
+            return True
         if info['host'] is None or info['delete']:
             return True
         try:
@@ -428,6 +434,8 @@ class OleStorageMixin:
                 pass
         elif not info['transacted'] and info['dirty']:
             self._save_docfile(info)
+        if info.get('lockbytes'):  # The docfile's reference to its ILockBytes
+            self._release_lockbytes(info.pop('lockbytes'))
 
     # ---------- IEnumSTATSTG ----------
 

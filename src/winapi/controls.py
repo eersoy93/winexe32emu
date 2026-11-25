@@ -37,7 +37,8 @@ class ControlsMixin:
                       'REBARWINDOW32': 'REBAR', 'COMBOBOXEX32': 'COMBOBOXEX',
                       'SYSHEADER32': 'HEADER', 'TOOLTIPS_CLASS32': 'TOOLTIPS',
                       'MSCTLS_TRACKBAR32': 'TRACKBAR', 'MSCTLS_UPDOWN32': 'UPDOWN',
-                      'SYSTREEVIEW32': 'TREEVIEW', 'SYSTABCONTROL32': 'TAB'}
+                      'SYSTREEVIEW32': 'TREEVIEW', 'SYSTABCONTROL32': 'TAB',
+                      'MDICLIENT': 'MDICLIENT'}
     WM_NOTIFY = 0x004E
     WM_SETFONT = 0x0030
     WM_GETFONT = 0x0031
@@ -227,6 +228,11 @@ class ControlsMixin:
             state.update(self._tv_new_state())
         elif kind == 'REBAR':
             state.update(bands=[], notify=parent)
+        elif kind == 'TAB':
+            # Only the tabs and the page frame are painted: the page's controls
+            # are its siblings, often above it in the Z order without
+            # WS_CLIPSIBLINGS (Office 95's File New dialog)
+            win.transparent = True
         elif kind == 'COMBOBOXEX':
             state.update(items=[], sel=-1, imagelist=0, drop_height=max(height, 100),
                          dropped=False, edit=0, notify=parent)
@@ -264,10 +270,17 @@ class ControlsMixin:
             return 6
         if msg == 0x2008:  # CCM_SETVERSION
             return 6
+        if win.native == 'MDICLIENT':
+            result = self._mdiclient_message(win, msg, wParam, lParam, wide)
+            if result is not None:
+                return result & 0xFFFFFFFF
+            return self.DefWindowProcA([hwnd, msg, wParam, lParam])
         handler = {'LISTVIEW': self._listview_message, 'TREEVIEW': self._treeview_message,
                    'TOOLBAR': self._toolbar_message,
                    'REBAR': self._rebar_message, 'COMBOBOXEX': self._comboboxex_message,
-                   'HEADER': self._header_message}.get(win.native)
+                   'HEADER': self._header_message,
+                   'TOOLTIPS': self._tooltip_message,
+                   'TAB': self._tab_message}.get(win.native)
         result = handler(win, msg, wParam, lParam) if handler else None
         if result is not None:
             return result & 0xFFFFFFFF
@@ -305,6 +318,12 @@ class ControlsMixin:
                 return 0
             if msg in (self.WM_KEYDOWN, self.WM_CHAR, self.WM_KEYUP):
                 return 0
+        if msg in (self.WM_KEYDOWN, self.WM_CHAR) and control.class_name == 'EDIT':
+            # Keys a subclassing procedure passes on and characters a program
+            # sends (Schedule+ passes the key that opened its in-place edit on
+            # to it): the edit types them, moves the caret, deletes...
+            self.gui.edit_message(control, msg, wParam, wide)
+            return 0
         if msg in (self.WM_KEYDOWN, self.WM_CHAR, self.WM_KEYUP, self.WM_LBUTTONDOWN,
                    self.WM_LBUTTONUP, self.WM_MOUSEMOVE, self.WM_SETFOCUS, self.WM_KILLFOCUS):
             return 0
@@ -339,6 +358,31 @@ class ControlsMixin:
         handle = self.get_next_handle()
         self.imagelists[handle] = {'cx': cx, 'cy': cy, 'flags': flags, 'images': []}
         return handle
+
+    def ImageList_LoadImageA(self, args, wide=False):
+        """ImageList_LoadImageA/W(hi, name, cx, cGrow, crMask, uType, uFlags) -
+        a list of the cx wide images of a bitmap (crMask: transparent color)"""
+        hi, name, cx, _grow, mask, kind, flags = args[:7]
+        if kind != 0:  # Only IMAGE_BITMAP
+            return 0
+        hbm = self.LoadImageA([hi, name, kind, 0, 0, flags], wide)
+        bitmap = self.gdi_objects.get(hbm) if hbm else None
+        if bitmap is None:
+            return 0
+        handle = self.get_next_handle()
+        imagelist = {'cx': cx or bitmap['height'], 'cy': bitmap['height'], 'flags': 0,
+                     'images': []}
+        self.imagelists[handle] = imagelist
+        mask_color = None if mask == 0xFFFFFFFF else self._colorref_to_rgb(mask)
+        imagelist['images'] = self._split_bitmap(imagelist, hbm, mask_color=mask_color)
+        self.DeleteObject([hbm])
+        return handle
+
+    def ImageList_LoadImageW(self, args):
+        return self.ImageList_LoadImageA(args, wide=True)
+
+    def ImageList_LoadImage(self, args):
+        return self.ImageList_LoadImageA(args)
 
     def ImageList_Destroy(self, args):
         return 1 if self.imagelists.pop(args[0], None) is not None else 0
@@ -452,8 +496,10 @@ class ControlsMixin:
         image = imagelist['images'][index]
         if (isinstance(image, tuple) and len(image) == 3 and isinstance(image[2], bytes)
                 and image[0] > 0 and image[1] > 0):
+            # Icons are stretched to the image list's size
             self._add_shape(hdc, {'type': 'icon', 'pos': (x, y), 'image': image,
-                                  'size': (cx or image[0], cy or image[1])})
+                                  'size': (cx or imagelist.get('cx') or image[0],
+                                           cy or imagelist.get('cy') or image[1])})
         return 1
 
     def ImageList_Draw(self, args):

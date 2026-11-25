@@ -556,8 +556,8 @@ class ShellFoldersMixin:
             data = struct.pack('<I', dword_values[action])
         elif action == 0x03:  # SPI_GETMOUSE: threshold1, threshold2, acceleration
             data = struct.pack('<3i', 6, 10, 1)
-        elif action == 0x30:  # SPI_GETWORKAREA: the desktop above the taskbar
-            data = struct.pack('<4i', 0, 0, width, height - 30)
+        elif action == 0x30:  # SPI_GETWORKAREA: the desktop without the taskbar and appbars
+            data = struct.pack('<4i', *self._work_area())
         elif action == 0x1F:  # SPI_GETICONTITLELOGFONT
             data = self._logfont()
         elif action == 0x29:  # SPI_GETNONCLIENTMETRICS

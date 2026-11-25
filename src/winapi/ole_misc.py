@@ -422,20 +422,46 @@ class OleMiscMixin:
 
     # ---------- OLE servers: there are none ----------
 
-    def _no_ole_server(self, name, out):
+    CO_E_SERVER_EXEC_FAILURE = 0x80080005
+
+    def _no_ole_server(self, name, out, clsid_ptr=0):
+        """Fail an object creation: no OLE server runs in the emulator. A
+        class registered with a server (LocalServer32/InprocServer32) fails
+        like a server that could not be started, any other one as unknown"""
         if out:
             self._mem_write(out, b'\x00' * 4)
         log.debug(f"{name}: no OLE server can create the object")
+        if clsid_ptr and self._class_has_server(clsid_ptr):
+            return self.CO_E_SERVER_EXEC_FAILURE
         return self.REGDB_E_CLASSNOTREG
+
+    @registry_locked
+    def _class_has_server(self, clsid_ptr):
+        """Whether HKEY_CLASSES_ROOT\\CLSID\\{clsid} names a server"""
+        try:
+            key = self._class_key(clsid_ptr)
+        except UcError:
+            return False
+        if key is None:
+            return False
+        return any(self._registry_walk(self.HKEY_CLASSES_ROOT, f'{key}\\{server}')[0]
+                   is not None for server in ('LocalServer32', 'InprocServer32',
+                                              'LocalServer', 'InprocServer'))
 
     def OleCreate(self, args):
         """OleCreate(rclsid, riid, renderopt, pFormatEtc, pClientSite, pStg, ppvObj)"""
-        return self._no_ole_server('OleCreate', args[6])
+        return self._no_ole_server('OleCreate', args[6], args[0])
 
     def OleCreateFromFile(self, args):
         """OleCreateFromFile(rclsid, lpszFileName, riid, renderopt, lpFormatEtc,
-        pClientSite, pStg, ppvObj)"""
-        return self._no_ole_server('OleCreateFromFile', args[7])
+        pClientSite, pStg, ppvObj) - the file's class (GetClassFile) has no
+        OLE server"""
+        clsid = self.emu.heap_alloc(16)
+        try:
+            known = args[1] and self.GetClassFile([args[1], clsid]) == self.S_OK
+            return self._no_ole_server('OleCreateFromFile', args[7], clsid if known else 0)
+        finally:
+            self.emu.heap_free(clsid)
 
     def OleCreateLink(self, args):
         return self._no_ole_server('OleCreateLink', args[6])
@@ -458,7 +484,15 @@ class OleMiscMixin:
     def OleLoad(self, args):
         """OleLoad(pStg, riid, pClientSite, ppvObj) - the storage's class has
         no OLE server"""
-        return self._no_ole_server('OleLoad', args[3])
+        entry, _ = self._storage_entry(args[0]) if args[0] else (None, None)
+        if entry is None or not any(entry.clsid):
+            return self._no_ole_server('OleLoad', args[3])
+        clsid = self.emu.heap_alloc(16)
+        try:
+            self._mem_write(clsid, bytes(entry.clsid))
+            return self._no_ole_server('OleLoad', args[3], clsid)
+        finally:
+            self.emu.heap_free(clsid)
 
     def OleCreateDefaultHandler(self, args):
         """OleCreateDefaultHandler(clsid, pUnkOuter, riid, lplpObj)"""
@@ -971,6 +1005,44 @@ class OleMiscMixin:
             return self.E_INVALIDARG
         return self._return_object(self._new_moniker([('file', self.read_wide_string(args[0]))]),
                                    args[1])
+
+    def BindMoniker(self, args):
+        """BindMoniker(pmk, grfOpt, iidResult, ppvResult) - IMoniker::BindToObject
+        with a new bind context. A file no OLE server runs for fails like
+        OleCreateFromFile (Binder's Add from File)."""
+        pmk, _, riid, out = args[:4]
+        if not out:
+            return self.E_POINTER
+        self._mem_write(out, b'\x00' * 4)
+        if not pmk or not riid:
+            return self.E_INVALIDARG
+        state = self.com_objects.get(pmk)
+        if state is not None and 'parts' in state:
+            parts = state['parts']
+            result = self._bind_moniker(parts, riid, out, 0)
+            if result == self.MK_E_NOOBJECT and len(parts) == 1 and parts[0][0] == 'file':
+                name = self._alloc_units(self._text_units(parts[0][1], True), True)
+                clsid = self.emu.heap_alloc(16)
+                try:
+                    if self.GetClassFile([name, clsid]) == self.S_OK and \
+                            self._class_has_server(clsid):
+                        result = self.CO_E_SERVER_EXEC_FAILURE
+                finally:
+                    self.emu.heap_free(clsid)
+                    self.emu.heap_free(name)
+            return result
+        holder = self.emu.heap_alloc(4)
+        try:
+            result = self.CreateBindCtx([0, holder])
+            if result:
+                return result
+            bind_ctx = self._read_u32(holder)
+            try:
+                return self._guest_method(pmk, 8, [bind_ctx, 0, riid, out])  # BindToObject
+            finally:
+                self._release(bind_ctx)
+        finally:
+            self.emu.heap_free(holder)
 
     def CreateItemMoniker(self, args):
         """CreateItemMoniker(lpszDelim, lpszItem, ppmk)"""

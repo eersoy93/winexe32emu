@@ -244,6 +244,48 @@ class WindowsExtraMixin:
     def GetClipboardFormatNameW(self, args):
         return self.GetClipboardFormatNameA(args, wide=True)
 
+    # The first window of the clipboard viewer chain (shared by the processes)
+    clipboard_viewer = 0
+    WM_DRAWCLIPBOARD, WM_CHANGECBCHAIN = 0x0308, 0x030D
+
+    def _send_to_window(self, hwnd, msg, wParam, lParam):
+        """Send a message to a window of this process; post it to another's"""
+        win = self.gui.windows.get(hwnd) if self.gui else None
+        if win is None:
+            return 0
+        if win.owner is self:
+            return self._send(hwnd, msg, wParam, lParam)
+        if win.owner is not None:
+            win.owner.post_window_message(hwnd, msg, wParam, lParam)
+        return 0
+
+    def SetClipboardViewer(self, args):
+        """SetClipboardViewer(hwnd) - hwnd heads the clipboard viewer chain and
+        gets WM_DRAWCLIPBOARD; the next window of the chain (0 if none)"""
+        hwnd = args[0]
+        previous = type(self).clipboard_viewer
+        if previous and not self.IsWindow([previous]):
+            previous = 0
+        type(self).clipboard_viewer = hwnd
+        self._send_to_window(hwnd, self.WM_DRAWCLIPBOARD, 0, 0)
+        return previous
+
+    def GetClipboardViewer(self, args):
+        viewer = type(self).clipboard_viewer
+        return viewer if viewer and self.IsWindow([viewer]) else 0
+
+    def ChangeClipboardChain(self, args):
+        """ChangeClipboardChain(hwndRemove, hwndNext) - take a window out of the
+        viewer chain: the head is replaced, else the chain is told with
+        WM_CHANGECBCHAIN"""
+        remove, following = args[0], args[1]
+        viewer = type(self).clipboard_viewer
+        if viewer == remove:
+            type(self).clipboard_viewer = following
+        elif viewer and self.IsWindow([viewer]):
+            self._send_to_window(viewer, self.WM_CHANGECBCHAIN, remove, following)
+        return 1
+
     # ---------- winspool: the computer has no printer ----------
 
     ERROR_INVALID_PRINTER_NAME = 1801
@@ -279,6 +321,16 @@ class WindowsExtraMixin:
         return 0
 
     GetPrinterDriverW = GetPrinterDriverA
+
+    def EnumPrintersA(self, args):
+        """EnumPrintersA/W(Flags, Name, Level, pPrinterEnum, cbBuf, pcbNeeded,
+        pcReturned) - succeeds with no printers"""
+        for pointer in (args[5], args[6]):
+            if pointer:
+                self._mem_write(pointer, b'\x00\x00\x00\x00')
+        return 1
+
+    EnumPrintersW = EnumPrintersA
 
     def DocumentPropertiesA(self, args):
         """DocumentPropertiesA/W(hWnd, hPrinter, pDeviceName, pDevModeOutput,
@@ -394,11 +446,13 @@ class WindowsExtraMixin:
         if args[0] not in self.emu.threads:
             self._last_error = 1444  # ERROR_INVALID_THREAD_ID
             return 0
-        if args[1] == self.WM_QUIT:
+        if args[1] == self.WM_QUIT and args[0] == self.emu.current_thread.tid:
             self.quit_code = args[2]
             self.quit_requested = True
         else:
-            self.post_window_message(0, args[1], args[2], args[3])
+            # Only that thread's message loop gets it (PowerPoint 95's file
+            # search thread took the dialog's messages and crashed on them)
+            self.post_window_message(0, args[1], args[2], args[3], thread=args[0])
         return 1
 
     PostThreadMessageW = PostThreadMessageA

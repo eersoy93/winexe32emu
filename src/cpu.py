@@ -32,8 +32,8 @@ from unicorn import (UC_ARCH_X86, UC_CTL_IO_WRITE, UC_CTL_TLB_FLUSH, UC_ERR_INSN
 from unicorn.x86_const import (UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX, UC_X86_REG_EBP,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
                                UC_X86_REG_EFLAGS, UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_ESI,
-                               UC_X86_REG_ESP, UC_X86_REG_FS, UC_X86_REG_GDTR, UC_X86_REG_GS,
-                               UC_X86_REG_SS)
+                               UC_X86_REG_ESP, UC_X86_REG_FPCW, UC_X86_REG_FS, UC_X86_REG_GDTR,
+                               UC_X86_REG_GS, UC_X86_REG_MXCSR, UC_X86_REG_SS)
 from capstone import CS_ARCH_X86, CS_MODE_32, Cs
 
 from . import config
@@ -616,6 +616,13 @@ class CPUEmulator(ProcessEnvironmentMixin):
         uc.reg_write(UC_X86_REG_SS, 0x10)
         uc.reg_write(UC_X86_REG_FS, 0x18)
         uc.reg_write(UC_X86_REG_GS, 0x00)
+        # The FPU and SSE state a Win32 thread starts with: all floating point
+        # exceptions masked, 53-bit precision. Unicorn starts with control word
+        # 0 (every exception unmasked, 24-bit precision): the C runtime's math
+        # functions then raised STATUS_FLOAT_INEXACT_RESULT (Find Fast's
+        # indexing thread) and x87 results were rounded to floats.
+        uc.reg_write(UC_X86_REG_FPCW, 0x027F)
+        uc.reg_write(UC_X86_REG_MXCSR, 0x1F80)
         return gdt_addr
 
     def _new_teb(self, tid, stack_base, stack_limit):

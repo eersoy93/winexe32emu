@@ -259,9 +259,10 @@ class LayoutMixin:
         self.start_menu_open = False
         self.start_open_path = []
         self.desktop_menu = None
+        left, top, right, bottom = self.work_area()
         for win in self.windows.values():
             if win.maximized and win.parent is None:
-                win.x, win.y, win.width, win.height = 0, 0, width, height - 30
+                win.x, win.y, win.width, win.height = left, top, right - left, bottom - top
         log.info(f"Display mode changed to {width}x{height}")
 
     WS_EX_DLGMODALFRAME = 0x1
@@ -319,12 +320,38 @@ class LayoutMixin:
         if active == previous:
             return
         self.notified_active = active
-        if previous is not None and self._is_app_window(previous):
-            owner = self.windows[previous].owner
-            owner.post_window_message(previous, owner.WM_ACTIVATE, 0, active or 0)  # WA_INACTIVE
-        if active is not None and self._is_app_window(active):
-            owner = self.windows[active].owner
-            owner.post_window_message(active, owner.WM_ACTIVATE, 1, previous or 0)  # WA_ACTIVE
+        old_owner = self.windows[previous].owner if previous is not None and \
+            self._is_app_window(previous) else None
+        new_owner = self.windows[active].owner if active is not None and \
+            self._is_app_window(active) else None
+        # WM_ACTIVATEAPP (0x001C) first when the activation moves to another
+        # program: Excel 95 learns from it that it is the active application
+        if old_owner is not None:
+            if new_owner is not old_owner:
+                old_owner.post_window_message(previous, 0x001C, 0, 0)
+            old_owner.post_window_message(previous, old_owner.WM_ACTIVATE, 0,
+                                          active or 0)  # WA_INACTIVE
+        if new_owner is not None:
+            if new_owner is not old_owner:
+                new_owner.post_window_message(active, 0x001C, 1, 0)
+            new_owner.post_window_message(active, new_owner.WM_ACTIVATE, 1,
+                                          previous or 0)  # WA_ACTIVE
+
+    WS_CLIPSIBLINGS = 0x04000000
+
+    def _child_paint_order(self, window):
+        """The order the child windows of window are drawn in, the one that
+        shows on top last. window.children is in Z order, the top one first
+        (GetWindow's order). A WS_CLIPSIBLINGS child is clipped by the
+        siblings above it, so these are drawn from the bottom up. A child
+        without it paints over its siblings, and Windows paints them from
+        the top down: the lowest one shows (PowerPoint 95's Tip of the Day
+        puts the tip's text below the white box it is drawn on)."""
+        clipped = [h for h in reversed(window.children)
+                   if h in self.windows and self.windows[h].style & self.WS_CLIPSIBLINGS]
+        return clipped + [h for h in window.children
+                          if h in self.windows and
+                          not self.windows[h].style & self.WS_CLIPSIBLINGS]
 
     def _draw_child_windows(self, window):
         """Draw the visible child windows of window (inside its client area)"""
@@ -333,9 +360,9 @@ class LayoutMixin:
         captioned = [hwnd for hwnd in window.children
                      if hwnd in self.windows and self.windows[hwnd].visible
                      and self.child_frame(self.windows[hwnd])[1]]
-        active_child = captioned[-1] if captioned and \
+        active_child = captioned[0] if captioned and \
             self.top_level_of(window.hwnd) == self.active_window else None
-        for hwnd in window.children:
+        for hwnd in self._child_paint_order(window):
             child = self.windows.get(hwnd)
             if child is None or not child.visible:
                 continue
@@ -359,6 +386,7 @@ class LayoutMixin:
                 self._draw_native(child, cx, cy, cw, ch)
             for shape in child.drawn_shapes:
                 self._draw_shape(shape, cx, cy)
+            self._draw_caret(hwnd, cx, cy)
             for control in child.controls:
                 self._draw_control(control, cx, cy)
             self._draw_child_windows(child)

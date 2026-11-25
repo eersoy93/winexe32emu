@@ -399,7 +399,10 @@ class User32ExtraMixin:
         return 0
 
     def GetMessageTime(self, args):
-        return int(time.time() * 1000) & 0x7FFFFFFF
+        """GetMessageTime() - when the last message was retrieved, on the clock
+        of GetTickCount"""
+        stamp = getattr(self, 'last_message_time', None)
+        return stamp if stamp is not None else int(time.time() * 1000) & 0xFFFFFFFF
 
     def GetMessageExtraInfo(self, args):
         return 0
@@ -1060,21 +1063,40 @@ class User32ExtraMixin:
     def ValidateRgn(self, args):
         return self.ValidateRect([args[0], 0])
 
+    def _update_rect(self, hwnd):
+        """The client rectangle of a window waiting to be painted, or None"""
+        if not self.IsWindow([hwnd]) or (hwnd in self.painted_windows and
+                                         hwnd not in self.paint_pending):
+            return None
+        rect = self.update_rects.get(hwnd)
+        if rect is not None:
+            return rect
+        width = height = 0
+        if self.gui and hwnd in self.gui.windows:
+            width, height = self.gui.client_size(self.gui.windows[hwnd])
+        elif self.gui and hwnd in self.gui.controls:
+            width, height = self.gui.controls[hwnd].width, self.gui.controls[hwnd].height
+        return (0, 0, width, height) if width > 0 and height > 0 else None
+
     def GetUpdateRect(self, args):
-        """GetUpdateRect(hwnd, rect, erase) - the client area until it is painted"""
-        pending = self.IsWindow([args[0]]) and (args[0] not in self.painted_windows or
-                                                 args[0] in self.paint_pending)
+        """GetUpdateRect(hwnd, rect, erase) - what is to be painted: the client
+        area, or the invalidated part of it"""
+        rect = self._update_rect(args[0])
         if args[1]:
-            if pending:
-                self.GetClientRect([args[0], args[1]])
-            else:
-                self._write_rect(args[1], 0, 0, 0, 0)
-        return 1 if pending else 0
+            self._write_rect(args[1], *(rect or (0, 0, 0, 0)))
+        return 1 if rect else 0
 
     def GetUpdateRgn(self, args):
-        """GetUpdateRgn(hwnd, region, erase) - NULLREGION or SIMPLEREGION"""
-        return 2 if self.IsWindow([args[0]]) and (args[0] not in self.painted_windows or
-                                                  args[0] in self.paint_pending) else 1
+        """GetUpdateRgn(hwnd, region, erase) - the region becomes what is to be
+        painted (Excel 95 clips its WM_PAINT to it), empty if nothing is;
+        NULLREGION or SIMPLEREGION"""
+        hwnd = args[0]
+        region = self._region(args[1])
+        if not self.IsWindow([hwnd]) or region is None:
+            return 0  # ERROR
+        rect = self._update_rect(hwnd)
+        region['rects'] = [rect] if rect else []
+        return 2 if rect else 1
 
     def GetWindowDC(self, args):
         return self.GetDC(args)
@@ -1817,12 +1839,70 @@ class User32ExtraMixin:
             self.BringWindowToTop(args)
         return previous
 
+    # ---------- The caret: one per desktop, owned by a window; the fake
+    # desktop draws it blinking over that window (gui.caret) ----------
+
+    def CreateCaret(self, args):
+        """CreateCaret(hWnd, hBitmap, nWidth, nHeight) - a new, hidden caret at
+        (0, 0); the previous one is destroyed. A bitmap caret has the
+        bitmap's size and is drawn solid; width or height 0 is the system's
+        border size."""
+        hwnd, hbm = args[0], args[1]
+        width, height = self._read_signed_args(args, 2, 2)
+        if not self.IsWindow([hwnd]):
+            self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
+            return 0
+        bmp = self.gdi_objects.get(hbm) if hbm > 1 else None
+        if bmp and bmp['type'] == 'bitmap':
+            width, height = bmp['width'], bmp['height']
+        if self.gui:
+            self.gui.caret = {'hwnd': hwnd, 'owner': self, 'pos': (0, 0),
+                              'size': (max(width, 1), max(height, 1)), 'hidden': 1}
+        return 1
+
+    def _own_caret(self, hwnd=0):
+        """The caret if this program owns it (and hwnd, if given, is its window)"""
+        caret = self.gui.caret if self.gui else None
+        if caret is None or caret['owner'] is not self or (hwnd and caret['hwnd'] != hwnd):
+            return None
+        return caret
+
+    def DestroyCaret(self, args):
+        if self._own_caret() is None:
+            return 0
+        self.gui.caret = None
+        return 1
+
+    def SetCaretPos(self, args):
+        """SetCaretPos(X, Y) - client coordinates of the caret's window"""
+        caret = self._own_caret()
+        if caret is None:
+            return 0
+        self.gui.caret = dict(caret, pos=tuple(self._read_signed_args(args, 0, 2)))
+        return 1
+
+    def GetCaretPos(self, args):
+        caret = self._own_caret()
+        pos = caret['pos'] if caret else (0, 0)
+        return 1 if args[0] and self._mem_write(args[0], struct.pack('<ii', *pos)) else 0
+
     def HideCaret(self, args):
-        """HideCaret/ShowCaret(hWnd) - the caret of edit controls is drawn by
-        the fake desktop; programs' own carets are not drawn"""
+        """HideCaret(hWnd) - hiding is counted: as many ShowCaret calls show
+        the caret again"""
+        caret = self._own_caret(args[0])
+        if caret is None:
+            return 0
+        self.gui.caret = dict(caret, hidden=caret['hidden'] + 1)
         return 1
 
     def ShowCaret(self, args):
+        caret = self._own_caret(args[0])
+        if caret is None:
+            return 0
+        self.gui.caret = dict(caret, hidden=max(caret['hidden'] - 1, 0))
+        return 1
+
+    def SetCaretBlinkTime(self, args):
         return 1
 
     def ExcludeUpdateRgn(self, args):

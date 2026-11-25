@@ -537,8 +537,30 @@ class CrtStdioMixin:
         return buf
 
     def _getdrive(self, args):
-        """_getdrive emulation - drive C: is 3"""
-        return 3
+        """_getdrive emulation - the current directory's drive (C: is 3)"""
+        letter = self.current_directory[:1].upper()
+        return ord(letter) - ord('A') + 1 if 'A' <= letter <= 'Z' else 3
+
+    def _chdir(self, args):
+        """_chdir(path) - 0, or -1 with errno ENOENT"""
+        if self.SetCurrentDirectoryA([args[0]]):
+            return 0
+        self._store_errno(2)  # ENOENT
+        return 0xFFFFFFFF
+
+    def _chdrive(self, args):
+        """_chdrive(drive) - 1 = A: ...; the current directory of that drive"""
+        letter = chr(ord('A') + args[0] - 1) if 1 <= args[0] <= 26 else ''
+        if not letter or self.resolve_drive_path(f"{letter}:\\") is None:
+            return 0xFFFFFFFF
+        if self.current_directory[:1].upper() != letter:
+            address = self.emu.heap_alloc(4)
+            self._mem_write(address, f"{letter}:\\".encode('ascii') + b'\x00')
+            ok = self.SetCurrentDirectoryA([address])
+            self.emu.heap_free(address)
+            if not ok:
+                return 0xFFFFFFFF
+        return 0
 
     # ---- Console I/O (conio) ----
 

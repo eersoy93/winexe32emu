@@ -44,7 +44,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
-| Microsoft Office 95 Professional | Installer and Word 95 |
+| Microsoft Office 95 Professional | Installer, Word, Excel, PowerPoint, Schedule+, Binder (without editing sections in place), the Office Shortcut Bar and Find Fast; Access starts and creates databases |
 | Ski32 | Program |
 
 ## Getting Started
@@ -120,6 +120,7 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - .NET programs
 - DirectX, OpenGL and other hardware graphics
 - A real network
+- OLE and DDE between two running programs (embedding a Word document in Binder, opening a template from the Office Shortcut Bar)
 - Drivers, services and other system components
 - APIs the emulator does not emulate yet (see `--missing-apis`)
 

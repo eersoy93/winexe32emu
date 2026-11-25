@@ -170,6 +170,8 @@ class User32Mixin:
             win.x, win.y = X, Y
             win.width, win.height = max(nWidth, 0), max(nHeight, 0)
             self._native_moved(win)
+            if bRepaint:
+                self._uncovered(win, before, win.visible)
             self._send_window_pos_changed(win, before, 0 if bRepaint else self.SWP_NOREDRAW)
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
@@ -178,6 +180,18 @@ class User32Mixin:
              control.height) = self._read_signed_args(args, 1, 4)
 
         return 1
+
+    def _uncovered(self, win, before, was_visible):
+        """A child window that was hidden or moved from before (x, y, width,
+        height): what was under it (its parent, its siblings) is painted
+        again. Excel 95 hides its in-cell editor and calls UpdateWindow to
+        have the sheet draw the cell."""
+        if not win.parent or not was_visible or \
+                (win.visible and (win.x, win.y, win.width, win.height) == before):
+            return
+        x, y, width, height = before
+        self._invalidate_area(win.parent, (x, y, x + width, y + height),
+                              skip=win.hwnd if win.visible else 0)
 
     WM_WINDOWPOSCHANGED = 0x0047
     SWP_NOSIZE, SWP_NOMOVE, SWP_NOREDRAW = 0x0001, 0x0002, 0x0008
@@ -241,11 +255,24 @@ class User32Mixin:
             win = self.gui.windows[hWnd]
             X, Y, cx, cy = self._read_signed_args(args, 2, 4)
             before = (win.x, win.y, win.width, win.height)
+            was_visible = win.visible
             with self.gui.lock:
                 if not (uFlags & 0x0002):  # SWP_NOMOVE
                     win.x, win.y = X, Y
                 if not (uFlags & 0x0001):  # SWP_NOSIZE
                     win.width, win.height = cx, cy
+                parent = self.gui.windows.get(win.parent) if win.parent else None
+                if not uFlags & 0x0004 and parent is not None and hWnd in parent.children:
+                    # The Z order of child windows: parent.children, top first
+                    siblings = [h for h in parent.children if h != hWnd]
+                    after = hWndInsertAfter
+                    if after in (0, 0xFFFFFFFF):  # HWND_TOP, HWND_TOPMOST
+                        siblings.insert(0, hWnd)
+                    elif after in siblings:
+                        siblings.insert(siblings.index(after) + 1, hWnd)
+                    else:  # HWND_BOTTOM, HWND_NOTOPMOST, a control
+                        siblings.append(hWnd)
+                    parent.children[:] = siblings
                 if (not uFlags & 0x0004 and win.parent is None  # SWP_NOZORDER
                         and hWnd in self.gui.z_order):
                     after = (hWndInsertAfter if hWndInsertAfter < 0x80000000 else
@@ -264,6 +291,8 @@ class User32Mixin:
                         and win.visible and not win.minimized):
                     self.gui.active_window = hWnd
             self._native_moved(win)
+            if not uFlags & self.SWP_NOREDRAW:
+                self._uncovered(win, before, was_visible)
             self._send_window_pos_changed(win, before, uFlags, hWndInsertAfter)
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
@@ -286,12 +315,15 @@ class User32Mixin:
         bEnable = args[1]
         log.debug(f"EnableWindow(0x{hWnd:x}, {bEnable})")
 
-        if self.gui and hWnd in self.gui.windows:
-            self.gui.windows[hWnd].enabled = bool(bEnable)
-        elif self.gui and hWnd in self.gui.controls:
-            self.gui.controls[hWnd].enabled = bool(bEnable)
-
-        return 1
+        # Returns whether the window was disabled before
+        target = None
+        if self.gui:
+            target = self.gui.windows.get(hWnd) or self.gui.controls.get(hWnd)
+        if target is None:
+            return 0
+        was_disabled = 0 if target.enabled else 1
+        target.enabled = bool(bEnable)
+        return was_disabled
 
     def GetDlgItem(self, args):
         """GetDlgItem emulation"""
@@ -477,20 +509,28 @@ class User32Mixin:
             return (store.get(nIndex) or self.emu.pe_loader.image_base) & 0xFFFFFFFF
         if nIndex == GWL_STYLE:
             control = self.gui.controls.get(hWnd) if self.gui and win is None else None
+            WS_VISIBLE = 0x10000000
             if control is not None:
-                old = control.style
+                # WS_VISIBLE is whether it is shown (ShowWindow changes it)
+                old = (control.style & ~WS_VISIBLE) | (WS_VISIBLE if control.visible else 0)
                 if set_value:
                     control.style = new_value
+                    control.visible = bool(new_value & WS_VISIBLE)
                 return old & 0xFFFFFFFF
             if win is None:
                 old = store.get(nIndex, 0)
             else:
-                # WS_MINIMIZE / WS_MAXIMIZE reflect the window state
-                old = (win.style | (0x20000000 if win.minimized else 0)
+                # WS_VISIBLE, WS_MINIMIZE and WS_MAXIMIZE reflect the window
+                # state (Access 95 hid its database window again when the
+                # style said it was hidden)
+                old = ((win.style & ~WS_VISIBLE) | (WS_VISIBLE if win.visible else 0)
+                       | (0x20000000 if win.minimized else 0)
                        | (0x01000000 if win.maximized else 0))
             if set_value:
                 if win:
                     win.style = new_value
+                    if win.visible != bool(new_value & WS_VISIBLE):
+                        self.gui.show_window(hWnd, bool(new_value & WS_VISIBLE))
                     # Dropping WS_MINIMIZE / WS_MAXIMIZE leaves that state
                     if not new_value & 0x20000000:
                         win.minimized = False
@@ -982,9 +1022,8 @@ class User32Mixin:
             if hWnd not in self.gui.windows:
                 self._last_error = 1400  # ERROR_INVALID_WINDOW_HANDLE
                 return 0
-            if hWnd in self.gui.z_order:
-                self.gui.z_order.remove(hWnd)
-                self.gui.z_order.append(hWnd)
+            # The windows it owns stay above it
+            self.gui.raise_window(hWnd)
             win = self.gui.windows[hWnd]
             # Only a top-level window is active: Word's status bar prompt
             # (a child) took the keystrokes after saving and crashed on them

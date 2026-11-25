@@ -186,7 +186,7 @@ class User32MiscMixin:
             return 0
         size = struct.unpack('<I', self.emu.uc.mem_read(args[1], 4))[0]
         width, height = self._screen_size()
-        data = struct.pack('<4i4iI', 0, 0, width, height, 0, 0, width, height - 30, 1)
+        data = struct.pack('<4i4iI', 0, 0, width, height, *self._work_area(), 1)
         self._mem_write(args[1] + 4, data)
         if size >= 72:
             name = '\\\\.\\DISPLAY1'

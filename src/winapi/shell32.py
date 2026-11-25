@@ -21,7 +21,7 @@ import struct
 import ntpath
 
 from .. import config, winapi
-from ..resources import parse_shell_link
+from ..resources import _icon_image_rgba, parse_shell_link, read_exe_icon
 from ..logger import log
 
 
@@ -140,15 +140,30 @@ class Shell32Mixin:
         else:
             ext = name.rsplit('.', 1)[-1].upper() if '.' in name else ''
             type_name = f"{ext} File" if ext else 'File'
+        if not attributes & 0x10 and name.lower().endswith(self.NEVER_SHOW_EXTENSIONS):
+            name = name.rsplit('.', 1)[0]  # The shell never shows a shortcut's extension
+        icon = None
+        # SHGFI_ICON: the file's own; with SHGFI_USEFILEATTRIBUTES (no file)
+        # its type's DefaultIcon (Binder's section icons: "x.doc")
+        typed = flags & SHGFI_USEFILEATTRIBUTES and '.' in name and \
+            not name.lower().endswith(('.lnk', '.exe', '.dll', '.ico'))
+        if flags & 0x100 and (host or typed) and not attributes & 0x10:
+            icon = self._extract_icon(*self._icon_location(path), 16 if flags & 0x1 else 32)
         return self._write_file_info(psfi, cbFileInfo, flags, wide, index,
-                                     0x40000000 if attributes & 0x10 else 0, name, type_name)
+                                     0x40000000 if attributes & 0x10 else 0, name, type_name,
+                                     icon)
 
-    def _write_file_info(self, psfi, cbFileInfo, flags, wide, index, sfgao, name, type_name):
+    # File types with NeverShowExt in the registry: shortcuts
+    NEVER_SHOW_EXTENSIONS = ('.lnk', '.pif', '.url')
+
+    def _write_file_info(self, psfi, cbFileInfo, flags, wide, index, sfgao, name, type_name,
+                         icon=None):
         """Fill SHFILEINFO; SHGetFileInfo's result"""
         SHGFI_SYSICONINDEX, SHGFI_SMALLICON, SHGFI_ICON = 0x4000, 0x1, 0x100
         if psfi:
-            data = struct.pack('<IiI', self.get_next_handle() if flags & SHGFI_ICON else 0,
-                               index, sfgao)
+            if flags & SHGFI_ICON and not icon:
+                icon = self.get_next_handle()
+            data = struct.pack('<IiI', icon if flags & SHGFI_ICON else 0, index, sfgao)
             if wide:
                 data += name.encode('utf-16-le')[:518].ljust(520, b'\x00')
                 data += type_name.encode('utf-16-le')[:158].ljust(160, b'\x00')
@@ -218,11 +233,144 @@ class Shell32Mixin:
     SHGetFileInfo = SHGetFileInfoA
 
     def DllGetClassObject(self, args):
-        """shell32 DllGetClassObject(rclsid, riid, ppv) - its COM classes
-        are made with CoCreateInstance only"""
-        if args[2]:
-            self._mem_write(args[2], struct.pack('<I', 0))
-        return 0x80040111  # CLASS_E_CLASSNOTAVAILABLE
+        """shell32 DllGetClassObject(rclsid, riid, ppv) - an IClassFactory of the
+        classes CoCreateInstance makes (Office 95 calls shell32 directly for
+        CLSID_ShellLink); its CreateInstance is CoCreateInstance"""
+        rclsid, riid, ppv = args[:3]
+        if not ppv:
+            return self.E_POINTER
+        self._mem_write(ppv, struct.pack('<I', 0))
+        clsid = self._read_guid(rclsid)
+        if clsid not in (self.CLSID_SHELLLINK, self.CLSID_TASKBARLIST):
+            return 0x80040111  # CLASS_E_CLASSNOTAVAILABLE
+        # CoCreateInstance reads the CLSID from memory: keep a copy of it
+        guid = self.emu.heap_alloc(16)
+        self._mem_write(guid, self._guid_bytes(clsid))
+        pointers = self._com_new_object(
+            [((self.IID_ICLASSFACTORY, self.IID_IUNKNOWN),
+              self._com_vtable('IClassFactory', 'class_factory'))],
+            {'clsid': guid})
+        return self._com_query_new(pointers[self.IID_IUNKNOWN], riid, ppv)
+
+    IID_IEXTRACTICONA = '000214eb-0000-0000-c000-000000000046'
+    IID_IEXTRACTICONW = '000214fa-0000-0000-c000-000000000046'
+
+    def _icon_location(self, path):
+        """(file, index) of a file's icon: a shortcut's icon location or its
+        target, a program its own icon, other files themselves (no icon of theirs)"""
+        if path.lower().endswith('.lnk'):
+            host = self.resolve_drive_path(path)
+            try:
+                with open(host, 'rb') as f:
+                    link = parse_shell_link(f.read(65536))
+            except (OSError, TypeError):
+                link = None
+            if link is not None:
+                if link['icon']:
+                    return link['icon'], link['icon_index']
+                if link['path']:
+                    return link['path'], 0
+        extension = ntpath.splitext(path)[1]
+        if extension and not path.lower().endswith(('.exe', '.dll', '.ico')):
+            # A document: the DefaultIcon of its type ("file,index")
+            prog_id = self._registry_default_text(extension)
+            location = self._registry_default_text(prog_id + '\\DefaultIcon') if prog_id else ''
+            if not location and prog_id:
+                # Else the DefaultIcon of the type's class (PowerPoint.Show.7)
+                clsid = self._registry_default_text(prog_id + '\\CLSID')
+                if clsid:
+                    location = self._registry_default_text(f'CLSID\\{clsid}\\DefaultIcon')
+            if location:
+                file, _, index = location.rpartition(',')
+                if not file:
+                    file, index = location, '0'
+                try:
+                    return file.strip('"'), int(index)
+                except ValueError:
+                    return file.strip('"'), 0
+        return path, 0
+
+    def _extract_icon(self, path, index, size):
+        """New icon handle of the index-th icon (ExtractIcon's index) of an
+        EXE, DLL or .ico file at size x size; its image is kept for image lists
+        and DrawIcon. Other files get an icon without an image."""
+        host = self.resolve_drive_path(path) if path else None
+        if host is None or not os.path.isfile(host):
+            return 0
+        handle = self.get_next_handle()
+        image = None
+        if path.lower().endswith('.ico'):
+            try:
+                with open(host, 'rb') as f:
+                    image = self._ico_file_image(f.read(), size)
+            except OSError:
+                pass
+        else:
+            image = read_exe_icon(host, size, index)
+        if image is not None:
+            self.icons[handle] = image
+        return handle
+
+    @staticmethod
+    def _ico_file_image(data, size):
+        """(width, height, RGBA) of the image of an .ico file closest to size"""
+        try:
+            count = struct.unpack_from('<H', data, 4)[0]
+            best = None
+            for i in range(count):
+                w, _, _, _, _, bits, length, offset = struct.unpack_from('<BBBBHHII', data,
+                                                                         6 + 16 * i)
+                key = (abs((w or 256) - size), -bits)
+                if best is None or key < best[0]:
+                    best = (key, data[offset:offset + length])
+        except struct.error:
+            return None
+        return _icon_image_rgba(best[1]) if best else None
+
+    def _extract_icon_object(self, path):
+        """New IExtractIconA/W of a file (IShellFolder::GetUIObjectOf); returns its pointer"""
+        pointers = self._com_new_object(
+            [((self.IID_IEXTRACTICONW, self.IID_IUNKNOWN),
+              self._com_vtable('IExtractIconW', 'extract_icon', wide=True)),
+             ((self.IID_IEXTRACTICONA,), self._com_vtable('IExtractIconA', 'extract_icon'))],
+            {'path': path})
+        return pointers[self.IID_IUNKNOWN]
+
+    def _com_extract_icon(self, method, wide, args):
+        """IExtractIcon: GetIconLocation(flags, file, cch, &index, &flags),
+        Extract(file, index, &large, &small, MAKELONG(large size, small size))"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        state = self.com_objects[args[0]]
+        if method == 'GetIconLocation':
+            _, _, buffer, cch, pindex, pflags = args[:6]
+            file, index = self._icon_location(state['path'])
+            if buffer and cch:
+                self._write_text(buffer, file[:cch - 1], wide)
+            if pindex:
+                self._mem_write(pindex, struct.pack('<i', index))
+            if pflags:
+                self._mem_write(pflags, struct.pack('<I', 0))
+            return self.S_OK
+        _, pfile, index, plarge, psmall, sizes = args[:6]
+        file = self._read_text(pfile, wide) if pfile else ''
+        index = index - (1 << 32) if index & 0x80000000 else index
+        for pointer, size in ((plarge, sizes & 0xFFFF), (psmall, sizes >> 16)):
+            if pointer:
+                self._mem_write(pointer, struct.pack('<I', self._extract_icon(file, index,
+                                                                              size or 32)))
+        return self.S_OK
+
+    def _com_class_factory(self, method, wide, args):
+        """IClassFactory of DllGetClassObject: CreateInstance(outer, riid, ppv), LockServer"""
+        result = self._com_unknown(method, args)
+        if result is not None:
+            return result
+        if method == 'CreateInstance':
+            state = self.com_objects[args[0]]
+            return self.CoCreateInstance([state['clsid'], args[1], 0, args[2], args[3]])
+        return self.S_OK  # LockServer
 
     def DllCanUnloadNow(self, args):
         return 1  # S_FALSE: the emulated DLLs stay loaded
@@ -237,6 +385,18 @@ class Shell32Mixin:
             return 2, None  # SE_ERR_FNF
         if os.path.isdir(host):
             return 31, None  # SE_ERR_NOASSOC: no Explorer
+        if full.lower().endswith('.lnk') and verb.lower() in ('', 'open'):
+            # A shortcut opens its target with its arguments in its working folder
+            try:
+                with open(host, 'rb') as f:
+                    link = parse_shell_link(f.read(65536))
+            except OSError:
+                link = None
+            if not link or not link['path'] or link['path'].lower().endswith('.lnk'):
+                return 31, None
+            arguments = ' '.join(part for part in (link['arguments'], params) if part)
+            return self._shell_execute(verb, link['path'], arguments,
+                                       link['workdir'] or directory, hwnd)
         if not full.lower().endswith(('.exe', '.com')) or verb.lower() not in ('', 'open'):
             return 31, None
         starter = winapi.WinAPIHandler.process_starter

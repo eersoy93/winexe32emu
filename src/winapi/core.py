@@ -60,14 +60,17 @@ class CoreMixin:
         'CreateStatusWindowA': 4, 'CreateStatusWindowW': 4, 'CreateToolbarEx': 13,
         'DllGetVersion': 1, 'ImageList_Add': 3, 'ImageList_AddMasked': 3,
         'ImageList_Create': 5, 'ImageList_Destroy': 1, 'ImageList_Draw': 6,
+        'ImageList_LoadImageA': 7, 'ImageList_LoadImageW': 7, 'ImageList_LoadImage': 7,
         'ImageList_DrawEx': 10,
         'ImageList_GetIcon': 3, 'ImageList_GetIconSize': 3, 'ImageList_GetImageCount': 1,
         'ImageList_Remove': 2, 'ImageList_ReplaceIcon': 3, 'ImageList_SetBkColor': 2,
         'ImageList_SetImageCount': 2, 'InitCommonControls': 0, 'InitCommonControlsEx': 1,
-        'PropertySheetA': 1, 'PropertySheetW': 1,
+        'PropertySheetA': 1, 'PropertySheetW': 1, 'PropertySheet': 1,
         # comdlg32
-        'CommDlgExtendedError': 0, 'FindTextA': 1, 'GetOpenFileNameA': 1,
+        'CommDlgExtendedError': 0, 'FindTextA': 1, 'GetFileTitleA': 3, 'GetFileTitleW': 3,
+        'GetOpenFileNameA': 1,
         'GetOpenFileNameW': 1, 'GetSaveFileNameA': 1, 'GetSaveFileNameW': 1,
+        'PrintDlgA': 1, 'PrintDlgW': 1, 'PageSetupDlgA': 1, 'PageSetupDlgW': 1,
         # gdi32
         'CombineRgn': 4, 'CreateRectRgn': 4, 'CreateRectRgnIndirect': 1, 'GetRgnBox': 2,
         'ExcludeClipRect': 5, 'GetClipBox': 2, 'IntersectClipRect': 5, 'SelectClipRgn': 2,
@@ -78,6 +81,7 @@ class CoreMixin:
         'CreateCompatibleBitmap': 3, 'CreateCompatibleDC': 1, 'CreateDCA': 4,
         'CreateFontA': 14, 'CreateFontIndirectA': 1, 'CreateHatchBrush': 2,
         'CreatePalette': 1, 'CreatePen': 3, 'CreatePenIndirect': 1, 'CreatePatternBrush': 1,
+        'CreateDIBPatternBrush': 2, 'CreateDIBPatternBrushPt': 2,
         'CreateSolidBrush': 1,
         'DeleteDC': 1, 'DeleteObject': 1, 'Ellipse': 5, 'EnumFontFamiliesA': 4, 'EnumFontsA': 4,
         'GetBkColor': 1, 'GetCharABCWidthsA': 4, 'GetCharABCWidthsW': 4,
@@ -92,6 +96,8 @@ class CoreMixin:
         'SetStretchBltMode': 2, 'SetTextAlign': 2, 'SetTextColor': 2, 'StretchBlt': 11,
         'StretchDIBits': 13, 'TextOutA': 5, 'TextOutW': 5,
         'ExtTextOutA': 8, 'ExtTextOutW': 8,
+        'TabbedTextOutA': 8, 'TabbedTextOutW': 8,
+        'GetTabbedTextExtentA': 5, 'GetTabbedTextExtentW': 5,
         # kernel32
         'AllocConsole': 0, 'Beep': 2, 'CloseHandle': 1, 'CompareStringA': 6, 'CopyFileA': 3,
         'CopyFileW': 3, 'CreateDirectoryA': 2, 'CreateDirectoryW': 2, 'CreateFileA': 7,
@@ -100,7 +106,8 @@ class CoreMixin:
         'ExpandEnvironmentStringsA': 3, 'FileTimeToLocalFileTime': 2,
         'FileTimeToSystemTime': 2, 'FindClose': 1, 'FindFirstFileA': 2, 'FindFirstFileW': 2,
         'FindNextFileA': 2, 'FindNextFileW': 2,
-        'FindFirstStreamW': 4, 'FindNextStreamW': 2, 'FindResourceA': 3, 'FlushFileBuffers': 1,
+        'FindFirstStreamW': 4, 'FindNextStreamW': 2, 'FindResourceA': 3, 'FindResourceW': 3,
+        'FindResourceExA': 4, 'FindResourceExW': 4, 'FlushFileBuffers': 1,
         'FormatMessageA': 7, 'FormatMessageW': 7, 'FreeConsole': 0,
         'FreeEnvironmentStringsA': 1, 'FreeEnvironmentStringsW': 1, 'FreeLibrary': 1,
         'FreeLibraryAndExitThread': 2, 'DisableThreadLibraryCalls': 1,
@@ -164,7 +171,9 @@ class CoreMixin:
         'MapViewOfFileEx': 6, 'MoveFileWithProgressW': 5, 'OpenEventA': 3, 'OpenEventW': 3,
         'OpenFileMappingA': 3, 'OpenFileMappingW': 3, 'OpenMutexA': 3, 'OpenMutexW': 3,
         'OpenProcess': 3, 'OpenSemaphoreA': 3, 'OpenSemaphoreW': 3, 'Process32FirstW': 2,
-        'Process32NextW': 2, 'SetConsoleCtrlHandler': 2, 'SetConsoleMode': 2,
+        'Process32NextW': 2, 'Process32First': 2, 'Process32Next': 2, 'Module32First': 2,
+        'Module32Next': 2, 'Module32FirstW': 2, 'Module32NextW': 2,
+        'SetConsoleCtrlHandler': 2, 'SetConsoleMode': 2,
         'SetFileApisToANSI': 0, 'SetFileApisToOEM': 0, 'SetFilePointerEx': 5,
         'SetProcessAffinityMask': 2, 'UnmapViewOfFile': 1,
         # kernel32: threads and synchronization
@@ -221,6 +230,27 @@ class CoreMixin:
         'SysFreeString': 1, 'SysReAllocString': 2, 'SysReAllocStringLen': 3,
         'SysStringByteLen': 1, 'SysStringLen': 1, 'VariantClear': 1, 'VariantCopy': 2,
         'VariantInit': 1,
+        'SafeArrayCreate': 3, 'SafeArrayCreateEx': 4, 'SafeArrayCreateVector': 3,
+        'SafeArrayCreateVectorEx': 4, 'SafeArrayAllocDescriptor': 2,
+        'SafeArrayAllocDescriptorEx': 3, 'SafeArrayAllocData': 1, 'SafeArrayDestroy': 1,
+        'SafeArrayDestroyData': 1, 'SafeArrayDestroyDescriptor': 1, 'SafeArrayGetDim': 1,
+        'SafeArrayGetElemsize': 1, 'SafeArrayGetUBound': 3, 'SafeArrayGetLBound': 3,
+        'SafeArrayLock': 1, 'SafeArrayUnlock': 1, 'SafeArrayAccessData': 2,
+        'SafeArrayUnaccessData': 1, 'SafeArrayPtrOfIndex': 3, 'SafeArrayGetElement': 3,
+        'SafeArrayPutElement': 3, 'SafeArrayGetVartype': 2, 'SafeArrayCopyData': 2,
+        'SafeArrayCopy': 2, 'SafeArrayRedim': 2,
+        'VariantChangeTypeEx': 5, 'VariantChangeType': 4, 'VariantCopyInd': 2,
+        'VarBstrFromI2': 4, 'VarBstrFromI4': 4, 'VarBstrFromR4': 4, 'VarBstrFromR8': 5,
+        'VarBstrFromCy': 5, 'VarBstrFromDate': 5, 'VarBstrFromBool': 4, 'VarI2FromStr': 4,
+        'VarI4FromStr': 4, 'VarR4FromStr': 4, 'VarR8FromStr': 4, 'VarCyFromStr': 4,
+        'VarDateFromStr': 4, 'VarBoolFromStr': 4, 'VarUI1FromI2': 2, 'VarR4FromR8': 3,
+        'VarI2FromI4': 2, 'VarI4FromR8': 3, 'VarCyFromI4': 2, 'VarCyFromR8': 3,
+        'VarR8FromCy': 3, 'VariantTimeToDosDateTime': 4, 'DosDateTimeToVariantTime': 3,
+        'LHashValOfNameSysA': 3, 'LHashValOfNameSys': 3, 'CreateErrorInfo': 1,
+        'SetErrorInfo': 2, 'GetErrorInfo': 2, 'DispGetIDsOfNames': 4, 'DispInvoke': 8,
+        'CreateILockBytesOnHGlobal': 3, 'GetHGlobalFromILockBytes': 2,
+        'StgCreateDocfileOnILockBytes': 4, 'StgOpenStorageOnILockBytes': 6,
+        'StgIsStorageILockBytes': 1,
         # shell32
         'ExtractIconA': 3, 'ExtractIconExA': 5, 'ExtractIconExW': 5, 'SHBrowseForFolderA': 1,
         # (the shell32 names without A/W are the ANSI functions)
@@ -241,6 +271,8 @@ class CoreMixin:
         'CreateDialogParamA': 5, 'CreateDialogParamW': 5, 'CreateMenu': 0,
         'CreatePopupMenu': 0, 'CreateWindowExA': 12, 'CreateWindowExW': 12,
         'DefWindowProcA': 4, 'DefWindowProcW': 4, 'DestroyCursor': 1, 'DestroyIcon': 1,
+        'DefFrameProcA': 5, 'DefFrameProcW': 5, 'DefMDIChildProcA': 4, 'DefMDIChildProcW': 4,
+        'CreateMDIWindowA': 10, 'CreateMDIWindowW': 10, 'TranslateMDISysAccel': 2,
         'DestroyMenu': 1, 'DestroyWindow': 1, 'DialogBoxParamA': 5, 'DialogBoxParamW': 5,
         'DispatchMessageA': 1, 'DispatchMessageW': 1, 'DrawMenuBar': 1, 'DrawTextA': 5,
         'DrawTextW': 5, 'EnableWindow': 2, 'EndDialog': 2, 'EndPaint': 2,
@@ -320,14 +352,17 @@ class CoreMixin:
         'VerFindFileA': 8, 'VerInstallFileA': 8,
         'CreateDIBitmap': 6, 'CreateDiscardableBitmap': 3, 'CreateScalableFontResourceA': 4,
         'CreateScalableFontResourceW': 4, 'DPtoLP': 3, 'GetMapMode': 1, 'LPtoDP': 3,
-        'SetMapMode': 2,
+        'SetMapMode': 2, 'SetMapperFlags': 2,
         'CreatePipe': 4, 'FlushViewOfFile': 2, 'PeekConsoleInputA': 4,
         'PeekConsoleInputW': 4, 'ReadConsoleInputA': 4, 'ReadConsoleInputW': 4, 'WinExec': 2,
         'DefDlgProcA': 4, 'DefDlgProcW': 4, 'ExcludeUpdateRgn': 2, 'FreeDDElParam': 2,
         'HideCaret': 1, 'PackDDElParam': 3, 'ReuseDDElParam': 5, 'SetActiveWindow': 1,
         'ShowCaret': 1, 'UnpackDDElParam': 4,
+        'CreateCaret': 4, 'DestroyCaret': 0, 'SetCaretPos': 2, 'GetCaretPos': 1,
+        'SetCaretBlinkTime': 1,
         'GetClassFile': 2, 'OleGetAutoConvert': 2, 'OleSetAutoConvert': 2,
         'LoadTypeLib': 2, 'LoadTypeLibEx': 3, 'RegisterTypeLib': 3, 'UnRegisterTypeLib': 5,
+        'QueryPathOfRegTypeLib': 5, 'LoadRegTypeLib': 5,
         # user32: DDEML
         'DdeAbandonTransaction': 3, 'DdeAccessData': 2, 'DdeAddData': 4,
         'DdeClientTransaction': 8, 'DdeCmpStringHandles': 2, 'DdeConnect': 4,
@@ -349,9 +384,14 @@ class CoreMixin:
         'GetFileVersionInfoSizeW': 2, 'GetFileVersionInfoW': 4, 'VerQueryValueA': 4,
         'VerQueryValueW': 4,
         # winmm
-        'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciSendCommandA': 4, 'PlaySoundA': 3, 'PlaySound': 3,
+        'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciGetDeviceIDA': 1, 'mciGetErrorStringA': 3,
+        'mciSendCommandA': 4, 'mciSendStringA': 4, 'mmioClose': 2, 'mmioInstallIOProcA': 3,
+        'mmioInstallIOProcW': 3,
+        'mmioOpenA': 3, 'mmioRead': 3, 'mmioSeek': 3, 'mmioStringToFOURCCA': 2, 'mmioWrite': 3,
+        'waveOutGetNumDevs': 0, 'PlaySoundA': 3, 'PlaySound': 3,
         'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2, 'timeBeginPeriod': 1,
-        'timeEndPeriod': 1, 'timeGetTime': 0, 'waveOutClose': 1, 'waveOutGetPosition': 3,
+        'timeEndPeriod': 1, 'timeGetTime': 0, 'timeSetEvent': 5, 'timeKillEvent': 1,
+        'MmTimerThreadProc': 1, 'waveOutClose': 1, 'waveOutGetPosition': 3,
         'waveOutOpen': 6, 'waveOutPause': 1, 'waveOutPrepareHeader': 3, 'waveOutReset': 1,
         'waveOutRestart': 1, 'waveOutUnprepareHeader': 3, 'waveOutWrite': 3,
         # advapi32: security, CryptoAPI, services, event log, ETW, more registry
@@ -498,8 +538,10 @@ class CoreMixin:
         'SetWindowOrgEx': 4, 'SetViewportOrgEx': 4, 'SetWindowExtEx': 4, 'SetViewportExtEx': 4,
         'GetWindowOrgEx': 2, 'GetViewportOrgEx': 2, 'GetWindowExtEx': 2, 'GetViewportExtEx': 2,
         'OffsetViewportOrgEx': 4, 'OffsetWindowOrgEx': 4, 'ScaleViewportExtEx': 6,
-        'SetBrushOrgEx': 4, 'GetBrushOrgEx': 2, 'GetBkMode': 1, 'RectVisible': 2,
-        'GdiFlush': 0, 'UnrealizeObject': 1, 'GetObjectType': 1, 'SetRectRgn': 5,
+        'SetBrushOrgEx': 4, 'FixBrushOrgEx': 4, 'GetBrushOrgEx': 2, 'GetBkMode': 1,
+        'RectVisible': 2,
+        'GdiFlush': 0, 'GdiSetBatchLimit': 1, 'GdiGetBatchLimit': 0, 'UnrealizeObject': 1,
+        'GetObjectType': 1, 'SetRectRgn': 5,
         'OffsetRgn': 3, 'CreatePolygonRgn': 3, 'FillRgn': 3, 'InvertRgn': 2,
         'CreateBitmapIndirect': 1, 'GetBitmapBits': 3, 'SetBitmapBits': 3,
         'SetBitmapDimensionEx': 4, 'GetBitmapDimensionEx': 2, 'SetDIBitsToDevice': 12,
@@ -524,7 +566,7 @@ class CoreMixin:
         'CoTreatAsClass': 2, 'OleRegGetMiscStatus': 3, 'OleRegEnumVerbs': 2,
         'OleRegEnumFormatEtc': 3, 'OleRun': 1, 'OleIsRunning': 1, 'OleCreate': 7,
         'OleCreateFromFile': 8, 'OleCreateLink': 7, 'OleCreateLinkToFile': 7,
-        'OleCreateFromData': 7, 'OleCreateLinkFromData': 7, 'OleLoad': 4,
+        'OleCreateFromData': 7, 'OleCreateLinkFromData': 7, 'OleLoad': 4, 'BindMoniker': 4,
         'OleCreateDefaultHandler': 4, 'CreateDataCache': 4, 'OleConvertOLESTREAMToIStorage': 3,
         'OleConvertIStorageToOLESTREAM': 2, 'OleCreateMenuDescriptor': 2,
         'OleDestroyMenuDescriptor': 1, 'OleSetMenuDescriptor': 5, 'OleTranslateAccelerator': 3,
@@ -557,6 +599,7 @@ class CoreMixin:
         'CoFreeAllLibraries': 0, 'CoFreeUnusedLibraries': 0, 'CoFreeUnusedLibrariesEx': 2,
         'CoGetCurrentProcess': 0, 'CoGetMalloc': 2, 'CoInitializeEx': 2,
         'CoInitializeSecurity': 9, 'CoLockObjectExternal': 3, 'CoRegisterClassObject': 5,
+        'CoGetClassObject': 5,
         'CoRegisterMessageFilter': 2, 'CoReleaseServerProcess': 0, 'CoRevokeClassObject': 1,
         'CoSetProxyBlanket': 8, 'CoWaitForMultipleHandles': 5, 'IIDFromString': 2,
         'ProgIDFromCLSID': 2, 'StringFromCLSID': 2, 'StringFromGUID2': 3, 'StringFromIID': 2,
@@ -722,6 +765,11 @@ class CoreMixin:
         'inet_ntop': 4, 'inet_pton': 3, 'ioctlsocket': 3, 'listen': 2, 'ntohl': 1, 'ntohs': 1,
         'recv': 4, 'recvfrom': 6, 'select': 5, 'send': 4, 'sendto': 6, 'setsockopt': 5,
         'shutdown': 2, 'socket': 3,
+        # PowerPoint 95
+        'GetRasterizerCaps': 2, 'SetClipboardViewer': 1, 'GetClipboardViewer': 0,
+        'ChangeClipboardChain': 2, 'RegisterActiveObject': 4, 'RevokeActiveObject': 2,
+        'GetActiveObject': 3, 'EnumPrintersA': 7, 'EnumPrintersW': 7,
+        'SetTextJustification': 3, 'GetCurrentPositionEx': 2,
     }
 
     # Windows message constants
@@ -878,6 +926,13 @@ class CoreMixin:
         # Windows whose WM_PAINT is being handled before BeginPaint or
         # ValidateRect: their update region is still the client area
         self.paint_pending = set()
+        # Window -> the client rectangle to repaint (InvalidateRect with a
+        # rectangle, an area a hidden sibling uncovered); a window to paint
+        # that is not here is painted whole
+        self.update_rects = {}
+        self.top_focus = 0  # Top-level window DefWindowProc gave the focus (WM_SETFOCUS)
+        self.own_dcs = {}  # Window of a CS_OWNDC class -> its private DC
+        self.updating_windows = set()  # Windows inside UpdateWindow's WM_PAINT
         self.dirty_controls = {}  # Owner-draw controls waiting for WM_DRAWITEM (ordered)
         self._drawitem_buf = 0
         self.quit_requested = False
@@ -1041,6 +1096,9 @@ class CoreMixin:
             '__acrt_iob_func': self.api__acrt_iob_func,
             '?terminate@@YAXXZ': self.abort,
             '??1type_info@@UAE@XZ': lambda args: 0,  # thiscall, nothing to free
+            # operator new / delete (and the [] forms) of the C runtime DLLs
+            '??2@YAPAXI@Z': self.malloc, '??_U@YAPAXI@Z': self.malloc,
+            '??3@YAXPAX@Z': self.free, '??_V@YAXPAX@Z': self.free,
         }
         self._api_map.update(self._crt_extra_api_map())
         self._api_map.update(self._crt_variable_api_map())

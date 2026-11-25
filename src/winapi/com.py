@@ -87,6 +87,12 @@ class ComMixin:
             ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetClassID', 2),
             ('IsDirty', 1), ('Load', 3), ('Save', 3), ('SaveCompleted', 2),
             ('GetCurFile', 2)],
+        'extract_icon': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('GetIconLocation', 6),
+            ('Extract', 6)],
+        'class_factory': [
+            ('QueryInterface', 3), ('AddRef', 1), ('Release', 1), ('CreateInstance', 4),
+            ('LockServer', 2)],
         # ITaskbarList4 (and the ITaskbarList..3 prefixes of its vtable);
         # SetProgressValue takes two ULONGLONGs
         'taskbar_list': [
@@ -193,8 +199,10 @@ class ComMixin:
             self._com_unknown('Release', [unknown])
             return result
         if clsid != self.CLSID_SHELLLINK:
-            log.warning(f"CoCreateInstance: COM class {{{clsid}}} is not emulated")
-            return self.REGDB_E_CLASSNOTREG
+            result = self._create_from_class_object(rclsid, riid, ppv)
+            if result == self.REGDB_E_CLASSNOTREG:
+                log.warning(f"CoCreateInstance: COM class {{{clsid}}} is not emulated")
+            return result
         pointers = self._com_new_object(
             [((self.IID_ISHELLLINKW, self.IID_IUNKNOWN),
               self._com_vtable('IShellLinkW', 'shell_link', wide=True)),
@@ -208,6 +216,26 @@ class ComMixin:
         result = self._com_unknown('QueryInterface', [unknown, riid, ppv])
         self._com_unknown('Release', [unknown])
         return result
+
+    IID_ICLASSFACTORY = '00000001-0000-0000-c000-000000000046'
+
+    def _create_from_class_object(self, rclsid, riid, ppv):
+        """CoCreateInstance of a class the process registered or an
+        in-process server DLL serves: its IClassFactory::CreateInstance"""
+        cell = self.emu.heap_alloc(20)
+        try:
+            self._mem_write(cell, self._guid_bytes(self.IID_ICLASSFACTORY))
+            result = self.CoGetClassObject([rclsid, 1, 0, cell, cell + 16])
+            factory = struct.unpack('<I', self.emu.uc.mem_read(cell + 16, 4))[0]
+            if result & 0x80000000 or not factory:
+                return result or self.REGDB_E_CLASSNOTREG
+            vtable = struct.unpack('<I', self.emu.uc.mem_read(factory, 4))[0]
+            release, create = struct.unpack('<II', self.emu.uc.mem_read(vtable + 8, 8))
+            result = self.emu.call_callback(create, [factory, 0, riid, ppv])
+            self.emu.call_callback(release, [factory])
+            return result
+        finally:
+            self.emu.heap_free(cell)
 
     def _com_taskbar_list(self, method, wide, args):
         """ITaskbarList..4 methods: the fake taskbar has no tab thumbnails,
@@ -449,8 +477,11 @@ class ComMixin:
                      (self._read_struct(apidl, f'<{count}I') if count and apidl else ())]
             if not paths or None in paths:
                 return self.E_INVALIDARG
-            if self._read_guid(riid) not in (self.IID_ICONTEXTMENU, self.IID_ICONTEXTMENU2,
-                                             self.IID_ICONTEXTMENU3):
+            iid = self._read_guid(riid)
+            if iid in (self.IID_IEXTRACTICONA, self.IID_IEXTRACTICONW) and count == 1:
+                return self._com_query_new(self._extract_icon_object(paths[0]), riid, ppv)
+            if iid not in (self.IID_ICONTEXTMENU, self.IID_ICONTEXTMENU2,
+                           self.IID_ICONTEXTMENU3):
                 return self.E_NOINTERFACE
             pointers = self._com_new_object(
                 [((self.IID_ICONTEXTMENU3, self.IID_ICONTEXTMENU2, self.IID_ICONTEXTMENU,
@@ -473,6 +504,8 @@ class ComMixin:
                 name = self._drive_display_name(path)
             else:
                 name = ntpath.basename(path.rstrip('\\')) or path
+                if name.lower().endswith(self.NEVER_SHOW_EXTENSIONS):
+                    name = name.rsplit('.', 1)[0]  # Shortcuts never show their extension
             text = self.emu.heap_alloc((len(name) + 1) * 2)
             self._write_text(text, name, True)
             self._mem_write(strret, struct.pack('<II', 0, text))  # STRRET_WSTR
@@ -489,7 +522,7 @@ class ComMixin:
 
     def _shell_menu_verbs(self, paths):
         """Offsets of the shell verbs that apply to the items (None: separator)"""
-        runnable = all(path.lower().endswith(('.exe', '.com')) and
+        runnable = all(path.lower().endswith(('.exe', '.com', '.lnk')) and
                        os.path.isfile(self.resolve_drive_path(path) or '') for path in paths)
         return ([0, None] if runnable else []) + [1, None, 2, None, 3]
 
@@ -1170,6 +1203,10 @@ class ComMixin:
             self._mem_write(args[1], struct.pack('<I', 0))
         attributes = self._type_library_attributes(name) if name else None
         if attributes is None:
+            builtin = self._builtin_typelib(name)
+            if builtin is not None:  # OLE Automation (stdole32.tlb) comes with oleaut32
+                return self.S_OK if self._mem_write(args[1], struct.pack(
+                    '<I', self._new_typelib_object(builtin, name))) else self.E_POINTER
             log.debug(f"LoadTypeLib(\"{name}\"): not found")
             return self.TYPE_E_CANTLOADLIBRARY
         pointers = self._com_new_object(
@@ -1212,12 +1249,74 @@ class ComMixin:
     def UnRegisterTypeLib(self, args):
         return self.S_OK
 
+    def QueryPathOfRegTypeLib(self, args):
+        """QueryPathOfRegTypeLib(guid, major, minor, lcid, lpbstrPath) - the
+        file HKEY_CLASSES_ROOT\\TypeLib\\{LIBID}\\major.minor\\lcid\\win32
+        names, as a BSTR. Like oleaut32, a higher minor version of the same
+        major one will do, and the language falls back to its primary
+        language, then to the neutral one (0)."""
+        guid = self._read_guid(args[0])
+        major, minor, lcid, out = args[1] & 0xFFFF, args[2] & 0xFFFF, args[3], args[4]
+        if out:
+            self._mem_write(out, struct.pack('<I', 0))
+        library, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, f"TypeLib\\{{{guid}}}")
+        if not out:
+            return 0x8002801D  # TYPE_E_LIBNOTREGISTERED
+        versions = []
+        for key in (library['keys'].values() if library is not None else ()):
+            text_major, _, text_minor = key['name'].partition('.')
+            try:
+                version = (int(text_major, 16), int(text_minor or '0', 16))
+            except ValueError:
+                continue
+            if version[0] == major and version[1] >= minor:
+                versions.append((version, key))
+        for _version, key in sorted(versions, key=lambda item: item[0][1]):
+            for language in (lcid, lcid & 0x3FF, 0):
+                node = key['keys'].get(f"{language:x}")
+                win32 = node['keys'].get('win32') if node else None
+                value = win32['values'].get('') if win32 else None
+                if value is not None:
+                    path = str(value['data']).rstrip('\x00')
+                    log.debug(f"QueryPathOfRegTypeLib({{{guid}}} {major}.{minor}) -> \"{path}\"")
+                    bstr = self._alloc_bstr(path.encode('utf-16-le'))
+                    return self.S_OK if self._mem_write(out, struct.pack('<I', bstr)) \
+                        else self.E_POINTER
+        builtin = self._builtin_typelib_path(guid, major)
+        if builtin:
+            bstr = self._alloc_bstr(builtin.encode('utf-16-le'))
+            return self.S_OK if self._mem_write(out, struct.pack('<I', bstr)) else self.E_POINTER
+        log.debug(f"QueryPathOfRegTypeLib({{{guid}}} {major}.{minor}): not registered")
+        return 0x8002801D  # TYPE_E_LIBNOTREGISTERED
+
+    def LoadRegTypeLib(self, args):
+        """LoadRegTypeLib(guid, major, minor, lcid, pptlib) - LoadTypeLib of
+        the file the registry names for the library (QueryPathOfRegTypeLib)"""
+        if args[4]:
+            self._mem_write(args[4], struct.pack('<I', 0))
+        cell = self.emu.heap_alloc(4)
+        try:
+            result = self.QueryPathOfRegTypeLib(list(args[:4]) + [cell])
+            if result != self.S_OK:
+                return result
+            bstr = struct.unpack('<I', self.emu.uc.mem_read(cell, 4))[0]
+            try:
+                return self.LoadTypeLib([bstr, args[4]])
+            finally:
+                self.emu.heap_free(bstr - 4)
+        finally:
+            self.emu.heap_free(cell)
+
     def _com_type_lib(self, method, wide, args):
-        """ITypeLib methods: a library without type information"""
+        """ITypeLib methods: the types of a library typelib_reader reads (see
+        TypeInfoMixin), else a library without type information"""
         result = self._com_unknown(method, args)
         if result is not None:
             return result
         state = self.com_objects[args[0]]
+        result = self._typelib_model_method(method, state, args)
+        if result is not None:
+            return result
         if method == 'GetTypeInfoCount':
             return 0
         if method == 'GetLibAttr':  # TLIBATTR: GUID, lcid, syskind (SYS_WIN32), version, flags

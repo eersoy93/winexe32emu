@@ -8,6 +8,32 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 - Microsoft Office 95 Setup runs to the end: dialog frames, owner-drawn controls, the progress bar, Jet, the Change Folder dialog
 - Word 95 starts, opens and edits documents: font APIs, compound files (OLE storage), its dialogs and menus
+- Excel 95 starts, takes cell entries and formulas, selects cells, saves and opens workbooks:
+  - Drawing is clipped to the DC's clip region (`SelectClipRgn`, `IntersectClipRect`...), which is kept in device coordinates
+  - Update rectangles: `InvalidateRect` with a rectangle repaints only that part (`GetUpdateRgn`, `GetUpdateRect`, `rcPaint`); a hidden, moved or destroyed child window invalidates what it covered; `UpdateWindow` sends `WM_PAINT` at once
+  - Private DCs of `CS_OWNDC` window classes
+  - Raster operations into memory bitmaps (`SRCAND`, `SRCPAINT`, `DSTINVERT`...) are done on the pixels
+  - `WM_ACTIVATEAPP`, and `WM_SETFOCUS` / `WM_KILLFOCUS` for the activated top-level window
+  - The caret: `CreateCaret`, `SetCaretPos`, `ShowCaret`, `HideCaret`, `DestroyCaret`, drawn blinking
+  - Child windows are drawn in their Z order (the first one on top), which `SetWindowPos` changes
+  - Scan codes in the key messages; `FixBrushOrgEx`, `CreateDIBPatternBrush(Pt)`, `GetDeviceCaps(RASTERCAPS)`
+- PowerPoint 95 starts, makes slides with text, switches between its views, saves and opens presentations
+- Schedule+ 7.0 starts without a network, keeps appointments, tasks and contacts in its schedule file
+- Office Binder 95 starts, makes binders from templates, adds sections from files, saves and opens binders (sections cannot be edited in place: no OLE between processes)
+- The Office Shortcut Bar docks on the desktop, shows its buttons and tooltips and starts programs; Find Fast and the Fast Start preloader run
+- Access 95 starts, creates a blank database and shows the database window (a workgroup file written by an older Setup run has to be made again with `WRKGADM.EXE`)
+- Bookshelf 95 starts and asks for its own CD (the Office 95 CD does not hold its content)
+- For these programs:
+  - MDI windows (`MDICLIENT`, `DefFrameProc`, `DefMDIChildProc`), tab controls and tooltip controls
+  - Application desktop toolbars (`SHAppBarMessage`): docked bars shrink the work area of maximized windows
+  - Shortcut (`.lnk`) files: icons through shell32's class factory, `ShellExecute` follows them to their target
+  - Byte-range file locks (`LockFile`, `UnlockFile` and the `Ex` versions) that really exclude each other
+  - Thread messages have a target thread (`PostThreadMessage`, `PostMessage(NULL)`); messages of destroyed windows are dropped
+  - RLE4 and RLE8 bitmaps, pattern brushes, pen styles (dashed and dotted lines), `TA_UPDATECP`, `GetPixel` sees drawn text
+  - DIB sections get what GDI drew into them (`GdiFlush`), bitmap menu items (`MF_BITMAP`), list box tab stops
+  - winmm: multimedia file I/O (`mmioOpen`, `mmioInstallIOProc`...), `mciSendString`
+  - `ILockBytes` and compound files on them, more oleaut32 (variants, safe arrays, type libraries, the running object table)
+  - `FindResourceW`, `FindResourceEx`, `GetFileTitle`, `PrintDlg` and `PageSetupDlg` (no printer), `TabbedTextOut`, `PropertySheet`, the ToolHelp process and module lists
 - The network and stream APIs 7-Zip File Manager needs; `\\server` paths are network paths
 - More API groups: shlwapi, security, crypto, psapi, sockets (offline), themes
 - Scroll bars for list boxes and the lists of combo boxes
@@ -29,6 +55,16 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 ### Fixed
 
+- `AppendMenuA` with `MF_BITMAP` or `MF_OWNERDRAW` no longer reads the item data as a string (Excel 95 stopped at startup)
+- `EnableWindow` returns whether the window was disabled before
+- The desktop window's handle is no longer given to a program's window (the fifth window a program made got it)
+- Child and pop-up windows get their first `WM_SIZE` right after `WM_CREATE`, not from `ShowWindow`
+- Threads start with the Win32 floating-point control word instead of every exception unmasked
+- Subclassed edit controls get their keys through the message queue; `WM_CLOSE` destroys a control
+- A dialog's owner is activated when the dialog closes, and owned windows stay above their owner
+- Overlapping child windows without `WS_CLIPSIBLINGS` paint in the Windows order
+- The caption's close button works in MFC dialogs; `GetMessagePos` and `GetMessageTime` are right in modal dialogs
+- `GetDeviceCaps` gives the aspect values (a division by zero in Binder)
 - Windows file name rules, path buffer sizes, the PEB, system DLL images and static TLS
 - `GetDlgItem`, `GCL_WNDPROC`, `CharUpperA` on cp1252, the `=C:` environment variables
 - The `lpIDList` read of `ShellExecuteEx`

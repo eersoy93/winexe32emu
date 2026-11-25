@@ -467,18 +467,66 @@ class Kernel32ExtraMixin:
     def CreateDirectoryExW(self, args):
         return self.CreateDirectoryExA(args, wide=True)
 
-    def _file_lock(self, handle):
+    def _file_lock(self, handle, start, length, exclusive=True, unlock=False):
+        """Byte-range lock of a file handle. Locks belong to the handle (they go
+        away with it); a range overlapping a lock of any handle of the same
+        file fails with ERROR_LOCK_VIOLATION, also one of the same handle
+        (programs such as Schedule+ probe this by locking a byte twice), unless
+        both locks are shared. Unlocking needs the exact range of a lock."""
         info = self.handles.get(handle)
         if not info or info.get('type') != 'file':
             self._last_error = 6  # ERROR_INVALID_HANDLE
             return 0
+        locks = info.setdefault('locks', [])
+        if unlock:
+            for lock in locks:
+                if lock[0] == start and lock[1] == length:
+                    locks.remove(lock)
+                    return 1
+            self._last_error = 158  # ERROR_NOT_LOCKED
+            return 0
+        if length:
+            key = os.path.normcase(os.path.abspath(info['path'])) if info.get('path') else None
+            for other in list(self.handles.values()):
+                if other is not info and (
+                        key is None or other.get('type') != 'file' or not other.get('path') or
+                        os.path.normcase(os.path.abspath(other['path'])) != key):
+                    continue
+                for lstart, llength, lexclusive in other.get('locks', ()):
+                    if (llength and start < lstart + llength and lstart < start + length and
+                            (exclusive or lexclusive)):
+                        self._last_error = 33  # ERROR_LOCK_VIOLATION
+                        return 0
+        locks.append((start, length, exclusive))
         return 1
 
     def LockFile(self, args):
-        """LockFile/UnlockFile(Ex) - one process uses a file at a time: success"""
-        return self._file_lock(args[0])
+        """LockFile(file, offset low, offset high, bytes low, bytes high)"""
+        return self._file_lock(args[0], args[1] | args[2] << 32, args[3] | args[4] << 32)
 
-    UnlockFile = LockFileEx = UnlockFileEx = LockFile
+    def UnlockFile(self, args):
+        """UnlockFile(file, offset low, offset high, bytes low, bytes high)"""
+        return self._file_lock(args[0], args[1] | args[2] << 32, args[3] | args[4] << 32,
+                               unlock=True)
+
+    def _overlapped_offset(self, address):
+        """File offset of an OVERLAPPED (Offset at +8, OffsetHigh at +12)"""
+        try:
+            low, high = struct.unpack('<II', self.emu.uc.mem_read(address + 8, 8))
+        except UcError:
+            return 0
+        return low | high << 32
+
+    def LockFileEx(self, args):
+        """LockFileEx(file, flags, reserved, bytes low, bytes high, &overlapped);
+        a lock that would have to wait fails at once (LOCKFILE_EXCLUSIVE_LOCK 2)"""
+        return self._file_lock(args[0], self._overlapped_offset(args[5]),
+                               args[3] | args[4] << 32, exclusive=bool(args[1] & 2))
+
+    def UnlockFileEx(self, args):
+        """UnlockFileEx(file, reserved, bytes low, bytes high, &overlapped)"""
+        return self._file_lock(args[0], self._overlapped_offset(args[4]),
+                               args[2] | args[3] << 32, unlock=True)
 
     # ---------- Handles ----------
 

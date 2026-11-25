@@ -25,7 +25,7 @@ import wave
 
 from unicorn import UcError
 
-from .. import winapi
+from .. import config, winapi
 from ..config import PYGAME_AVAILABLE
 from ..logger import log
 from ..sound import SoundPlayer
@@ -50,6 +50,53 @@ class WinmmMixin:
 
     def timeEndPeriod(self, args):
         """timeEndPeriod emulation - TIMERR_NOERROR"""
+        return 0
+
+    TIME_PERIODIC, TIME_CALLBACK_EVENT_SET, TIME_CALLBACK_EVENT_PULSE = 0x1, 0x10, 0x20
+
+    def timeSetEvent(self, args):
+        """timeSetEvent(delay, resolution, proc, user, flags) - a multimedia
+        timer: like Windows, its own thread calls proc(id, 0, user, 0, 0) (or
+        sets / pulses the event proc) after delay ms, once or periodically.
+        Returns the timer id, 0 on failure."""
+        delay, _resolution, proc, user, flags = args[:5]
+        timers = self.__dict__.setdefault('_mm_timers', {})
+        timer_id = self.__dict__.get('_mm_next_timer', 1)
+        self._mm_next_timer = timer_id + 1
+        timers[timer_id] = {'delay': max(delay, 1), 'proc': proc, 'user': user,
+                            'flags': flags}
+        stub = self.emu.get_api_stub('winmm.dll', 'MmTimerThreadProc')
+        if not stub or self.emu.create_thread(stub, timer_id) is None:
+            timers.pop(timer_id, None)
+            return 0
+        log.debug(f"timeSetEvent({delay} ms, 0x{proc:x}, flags 0x{flags:x}) -> {timer_id}")
+        return timer_id
+
+    def timeKillEvent(self, args):
+        """timeKillEvent(id) - TIMERR_NOERROR, or MMSYSERR_INVALPARAM"""
+        return 0 if self.__dict__.get('_mm_timers', {}).pop(args[0], None) else 11
+
+    def MmTimerThreadProc(self, args):
+        """Start routine of a multimedia timer's thread (see timeSetEvent)"""
+        timer_id = args[0]
+        timers = self.__dict__.get('_mm_timers', {})
+        thread = self.emu.current_thread
+        while not self.emu.stop_emulation and not getattr(thread, 'stop', False):
+            timer = timers.get(timer_id)
+            if timer is None:
+                break
+            self._wait_ms(timer['delay'], until=lambda: timer_id in timers)
+            if timers.get(timer_id) is not timer or self.emu.stop_emulation:
+                break
+            kind = timer['flags'] & 0x30
+            if kind == self.TIME_CALLBACK_EVENT_SET:
+                self.SetEvent([timer['proc']])
+            elif kind == self.TIME_CALLBACK_EVENT_PULSE:
+                self.PulseEvent([timer['proc']])
+            elif timer['proc']:
+                self.emu.call_callback(timer['proc'], [timer_id, 0, timer['user'], 0, 0])
+            if not timer['flags'] & self.TIME_PERIODIC:
+                timers.pop(timer_id, None)
         return 0
 
     # ---------- PCM / ADPCM sample conversion ----------
@@ -597,6 +644,284 @@ class WinmmMixin:
         """joyGetDevCapsA emulation - no joystick driver"""
         return 165  # JOYERR_PARMS
 
+    # ---------- Multimedia file I/O (mmio) ----------
+    # An HMMIO is the address of its MMIOINFO block in guest memory, which an
+    # installed I/O procedure (mmioInstallIOProc) reads and updates itself;
+    # the standard DOS procedure reads and writes the host file. No buffering.
+
+    MMIOINFO_SIZE = 72
+    MMIOM_READ, MMIOM_WRITE, MMIOM_SEEK, MMIOM_OPEN, MMIOM_CLOSE = 0, 1, 2, 3, 4
+    MMIO_RWMODE = 0x3
+    MMIO_CREATE, MMIO_PARSE, MMIO_DELETE, MMIO_EXIST = 0x1000, 0x100, 0x200, 0x4000
+    MMIOERR_FILENOTFOUND, MMIOERR_CANNOTOPEN, MMIOERR_INVALIDFILE = 257, 259, 288
+    FOURCC_DOS = 0x20534F44  # 'DOS '
+
+    def _mmio_state(self):
+        """(installed I/O procedures {FOURCC: proc}, open DOS files {HMMIO: file})"""
+        if not hasattr(self, 'mmio_procs'):
+            self.mmio_procs = {}
+            self.mmio_files = {}
+        return self.mmio_procs, self.mmio_files
+
+    @staticmethod
+    def _fourcc_of(text):
+        """FOURCC of up to 4 characters (upper case, padded with blanks)"""
+        data = text.upper().encode('ascii', errors='replace')[:4].ljust(4, b' ')
+        return struct.unpack('<I', data)[0]
+
+    @staticmethod
+    def _fourcc_upper(fcc):
+        return struct.unpack('<I', struct.pack('<I', fcc).upper())[0]
+
+    def mmioInstallIOProcA(self, args):
+        """mmioInstallIOProcA emulation - install, remove or find the I/O
+        procedure of a FOURCC (the file extension it handles)"""
+        fcc, proc, flags = args[0], args[1], args[2]
+        procs, _ = self._mmio_state()
+        fcc = self._fourcc_upper(fcc)
+        if flags & 0x10000:  # MMIO_INSTALLPROC
+            if not proc:
+                return 0
+            procs[fcc] = proc
+            return proc
+        if flags & 0x20000:  # MMIO_REMOVEPROC
+            return procs.pop(fcc) if procs.get(fcc) == proc else 0
+        return procs.get(fcc, 0)  # MMIO_FINDPROC
+
+    mmioInstallIOProcW = mmioInstallIOProcA
+
+    def mmioStringToFOURCCA(self, args):
+        """mmioStringToFOURCCA emulation (MMIO_TOUPPER: 0x10)"""
+        text = self.read_string(args[0])[:4] if args[0] else ''
+        data = (text.upper() if args[1] & 0x10 else text).encode('ascii', errors='replace')
+        return struct.unpack('<I', data.ljust(4, b' ')[:4])[0]
+
+    def _mmio_proc_for(self, filename, fcc, proc):
+        """The I/O procedure for mmioOpen: the one given, the one of the FOURCC
+        given, or the one of the extension before the first "+" of the name
+        (C:\\BOOK.M14+TOPIC: the M14 procedure); 0 means the DOS one"""
+        procs, _ = self._mmio_state()
+        if proc:
+            return proc
+        if fcc:
+            fcc = self._fourcc_upper(fcc)
+            return 0 if fcc == self.FOURCC_DOS else procs.get(fcc, -1)
+        if '+' in filename:
+            ext = os.path.splitext(filename.split('+', 1)[0])[1][1:]
+            if ext:
+                return procs.get(self._fourcc_of(ext), -1)
+        return 0
+
+    def _mmio_call(self, info, message, param1=0, param2=0):
+        proc = struct.unpack('<I', self.emu.uc.mem_read(info + 8, 4))[0]
+        result = self.emu.call_callback(proc, [info, message, param1, param2])
+        return result - (1 << 32) if result & 0x80000000 else result
+
+    def _mmio_dos_open(self, filename, flags):
+        """Open the host file of the DOS I/O procedure: (file, 0) or (None, error)"""
+        path = self.resolve_drive_path(filename)
+        if path is None:
+            return None, self.MMIOERR_CANNOTOPEN
+        mode = flags & self.MMIO_RWMODE
+        if flags & self.MMIO_CREATE:
+            if self._write_protected(path):
+                return None, self.MMIOERR_CANNOTOPEN
+            py_mode = 'w+b'
+        elif mode == 0:
+            py_mode = 'rb'
+        else:
+            if self._write_protected(path):
+                return None, self.MMIOERR_CANNOTOPEN
+            py_mode = 'r+b'
+        if not os.path.isfile(path) and not flags & self.MMIO_CREATE:
+            return None, self.MMIOERR_FILENOTFOUND
+        try:
+            return open(path, py_mode), 0
+        except OSError:
+            return None, self.MMIOERR_CANNOTOPEN
+
+    def mmioOpenA(self, args):
+        """mmioOpenA emulation - open a file through the DOS I/O procedure or
+        an installed one; also MMIO_PARSE, MMIO_EXIST and MMIO_DELETE"""
+        lpszFile, lpmmioinfo, flags = args[0], args[1], args[2]
+        _, files = self._mmio_state()
+        filename = self.read_string(lpszFile) if lpszFile else ''
+        user = bytes(self.emu.uc.mem_read(lpmmioinfo, self.MMIOINFO_SIZE)) \
+            if lpmmioinfo else bytes(self.MMIOINFO_SIZE)
+        fcc, proc = struct.unpack_from('<II', user, 4)
+
+        def fail(error):
+            if lpmmioinfo:
+                self._mem_write(lpmmioinfo + 12, struct.pack('<I', error))
+            return 0
+
+        proc = self._mmio_proc_for(filename, fcc, proc)
+        log.debug(f"mmioOpenA({filename!r}, flags=0x{flags:x}) -> proc 0x{proc & 0xFFFFFFFF:x}")
+        if proc == -1:
+            return fail(self.MMIOERR_INVALIDFILE)
+        if not proc and flags & (self.MMIO_PARSE | self.MMIO_EXIST | self.MMIO_DELETE):
+            full = self.full_windows_path(filename) if filename else None
+            path = self.resolve_drive_path(filename) if filename else None
+            if flags & self.MMIO_DELETE:
+                if path is None or not os.path.isfile(path) or self._write_protected(path):
+                    return fail(self.MMIOERR_FILENOTFOUND)
+                try:
+                    os.remove(path)
+                except OSError:
+                    return fail(self.MMIOERR_CANNOTOPEN)
+                return 1
+            if full is None or (flags & self.MMIO_EXIST and
+                                (path is None or not os.path.exists(path))):
+                return fail(self.MMIOERR_FILENOTFOUND)
+            if flags & self.MMIO_PARSE and lpszFile:
+                self._mem_write(lpszFile, full.encode(config.ANSI_CODEPAGE,
+                                                      errors='replace')[:127] + b'\0')
+            return 1
+        info = self.emu.heap_alloc(self.MMIOINFO_SIZE)
+        if not info:
+            return fail(self.MMIOERR_CANNOTOPEN)
+        block = bytearray(self.MMIOINFO_SIZE)
+        struct.pack_into('<III', block, 0, flags, fcc or self.FOURCC_DOS, proc)
+        block[48:60] = user[48:60]  # adwInfo
+        struct.pack_into('<I', block, 68, info)
+        self.emu.uc.mem_write(info, bytes(block))
+        if proc:
+            error = self._mmio_call(info, self.MMIOM_OPEN, lpszFile, 0) & 0xFFFF
+        else:
+            fp, error = self._mmio_dos_open(filename, flags)
+            if fp is not None:
+                files[info] = fp
+        if error:
+            self.emu.heap_free(info)
+            return fail(error)
+        if flags & self.MMIO_EXIST:
+            self.mmioClose([info, 0])
+            return 1
+        if lpmmioinfo:
+            self._mem_write(lpmmioinfo + 12, struct.pack('<I', 0))
+            self._mem_write(lpmmioinfo + 68, struct.pack('<I', info))
+        return info
+
+    def _mmio_dos_seek(self, info, fp, offset, origin):
+        if origin not in (0, 1, 2):
+            return -1
+        try:
+            position = fp.seek(offset if origin else max(offset, 0), origin)
+        except (OSError, ValueError):
+            return -1
+        self._mem_write(info + 44, struct.pack('<i', position))
+        return position
+
+    def _mmio_check(self, hmmio):
+        """True if hmmio is an open HMMIO of this process"""
+        if not hmmio:
+            return False
+        try:
+            return struct.unpack('<I', self.emu.uc.mem_read(hmmio + 68, 4))[0] == hmmio
+        except UcError:
+            return False
+
+    def mmioRead(self, args):
+        """mmioRead emulation - bytes read, 0 at the end, -1 on error"""
+        hmmio, pch, cch = args[0], args[1], args[2]
+        if not self._mmio_check(hmmio):
+            return 0xFFFFFFFF
+        cch = cch - (1 << 32) if cch & 0x80000000 else cch
+        if cch <= 0:
+            return 0
+        fp = self._mmio_state()[1].get(hmmio)
+        if fp is None:
+            return self._mmio_call(hmmio, self.MMIOM_READ, pch, cch) & 0xFFFFFFFF
+        data = fp.read(cch)
+        if data and not self._mem_write(pch, data):
+            return 0xFFFFFFFF
+        self._mem_write(hmmio + 44, struct.pack('<i', fp.tell()))
+        return len(data)
+
+    def mmioWrite(self, args):
+        """mmioWrite emulation - bytes written, -1 on error"""
+        hmmio, pch, cch = args[0], args[1], args[2]
+        if not self._mmio_check(hmmio):
+            return 0xFFFFFFFF
+        cch = cch - (1 << 32) if cch & 0x80000000 else cch
+        if cch <= 0:
+            return 0
+        fp = self._mmio_state()[1].get(hmmio)
+        if fp is None:
+            return self._mmio_call(hmmio, self.MMIOM_WRITE, pch, cch) & 0xFFFFFFFF
+        try:
+            fp.write(bytes(self.emu.uc.mem_read(pch, cch)))
+        except (UcError, OSError, ValueError):
+            return 0xFFFFFFFF
+        self._mem_write(hmmio + 44, struct.pack('<i', fp.tell()))
+        return cch
+
+    def mmioSeek(self, args):
+        """mmioSeek emulation - the new position, -1 on error"""
+        hmmio, offset, origin = args[0], args[1], args[2]
+        if not self._mmio_check(hmmio):
+            return 0xFFFFFFFF
+        offset = offset - (1 << 32) if offset & 0x80000000 else offset
+        fp = self._mmio_state()[1].get(hmmio)
+        if fp is None:
+            return self._mmio_call(hmmio, self.MMIOM_SEEK, offset, origin) & 0xFFFFFFFF
+        return self._mmio_dos_seek(hmmio, fp, offset, origin) & 0xFFFFFFFF
+
+    def mmioClose(self, args):
+        """mmioClose emulation - close the file and free the HMMIO"""
+        hmmio, flags = args[0], args[1]
+        if not self._mmio_check(hmmio):
+            return 5  # MMSYSERR_INVALHANDLE
+        fp = self._mmio_state()[1].pop(hmmio, None)
+        result = 0
+        if fp is not None:
+            fp.close()
+        else:
+            result = self._mmio_call(hmmio, self.MMIOM_CLOSE, flags, 0) & 0xFFFF
+        self._mem_write(hmmio + 68, b'\0\0\0\0')
+        self.emu.heap_free(hmmio)
+        return result
+
+    def waveOutGetNumDevs(self, args):
+        """waveOutGetNumDevs emulation - one wave output device (sound may
+        still be silent when the host has no audio)"""
+        return 1
+
+    MCI_ERRORS = {
+        257: 'The specified device is not open or is not recognized by MCI.',
+        261: 'The specified command was not recognized.',
+        263: 'The specified device is not open or is not recognized by MCI.',
+        274: 'The MCI device you are using does not support the specified command.',
+        275: 'Cannot find the specified file. Make sure the path and filename are correct.',
+    }
+
+    def mciGetErrorStringA(self, args):
+        """mciGetErrorStringA emulation - the text of an MCI error code"""
+        error, buffer, size = args[0], args[1], args[2]
+        if not buffer or not size:
+            return 0
+        default = ('Unknown problem while loading the specified device driver.' if error
+                   else 'The specified command was carried out.')
+        text = self.MCI_ERRORS.get(error, default)
+        data = text.encode('ascii')[:size - 1] + b'\0'
+        return 1 if self._mem_write(buffer, data) else 0
+
+    def mciGetDeviceIDA(self, args):
+        """mciGetDeviceIDA emulation - the ID of an open device by its alias,
+        element or type; 0 when not open"""
+        return self._mci_device_by_name(self.read_string(args[0]) if args[0] else '')
+
+    def _mci_device_by_name(self, name):
+        """The ID of an open MCI device by its alias, element or type; 0 if none"""
+        name = name.lower()
+        if name == 'all':
+            return 0xFFFF
+        for device_id, device in self.mci_devices.items():
+            path = device['path'] or ''
+            if name in (device['alias'].lower(), device['type'], os.path.basename(path).lower()):
+                return device_id
+        return 0
+
     # ---------- Media control interface (mciSendCommandA) ----------
 
     MM_MCINOTIFY = 0x3B9
@@ -803,6 +1128,107 @@ class WinmmMixin:
         if notify_hwnd:
             self.post_window_message(notify_hwnd, self.MM_MCINOTIFY, 1, device_id)
         return result
+
+    MCI_MODE_NAMES = {524: 'not ready', 525: 'stopped', 526: 'playing', 527: 'recording',
+                      528: 'seeking', 529: 'paused', 530: 'open'}
+    MCI_STRING_COMMANDS = {'close': 0x804, 'play': 0x806, 'seek': 0x807, 'stop': 0x808,
+                           'pause': 0x809, 'set': 0x80D, 'status': 0x814, 'resume': 0x855}
+
+    def mciSendStringA(self, args):
+        """mciSendStringA emulation - the command strings of the devices
+        mciSendCommandA has (open, play, stop, pause, resume, seek, set time
+        format, status, close), carried out through mciSendCommandA"""
+        lpstrCommand, lpstrReturn, uReturnLength, hwndCallback = args[:4]
+        command = self.read_string(lpstrCommand) if lpstrCommand else ''
+        log.info(f"mciSendStringA({command!r})")
+        tokens = []
+        for i, part in enumerate(command.split('"')):
+            tokens += [part] if i % 2 else part.lower().split()
+        if len(tokens) < 2:
+            return 261 if tokens else 263  # MCIERR_UNRECOGNIZED_COMMAND
+        verb, name, rest = tokens[0].lower(), tokens[1], tokens[2:]
+        flags = (0x1 if 'notify' in rest else 0) | (0x2 if 'wait' in rest else 0)
+        block = self.emu.heap_alloc(64)
+        strings = []
+
+        def guest_string(text):
+            address = self.emu.heap_alloc(len(text) + 1)
+            self.emu.uc.mem_write(address, text.encode('ascii', errors='replace') + b'\0')
+            strings.append(address)
+            return address
+
+        def word_after(word):
+            return rest[rest.index(word) + 1] if word in rest[:-1] else None
+
+        try:
+            self.emu.uc.mem_write(block, struct.pack('<I', hwndCallback))
+            result_text = ''
+            if verb == 'open':
+                dev_type, element = word_after('type'), name
+                if '!' in name:
+                    dev_type, element = name.split('!', 1)
+                elif not any(c in name for c in '.\\:') and dev_type is None:
+                    dev_type, element = name, None
+                alias = word_after('alias')
+                if dev_type:
+                    flags |= 0x2000
+                    self.emu.uc.mem_write(block + 8, struct.pack('<I', guest_string(dev_type)))
+                if element:
+                    flags |= 0x200
+                    self.emu.uc.mem_write(block + 12, struct.pack('<I', guest_string(element)))
+                if alias:
+                    flags |= 0x400
+                    self.emu.uc.mem_write(block + 16, struct.pack('<I', guest_string(alias)))
+                result = self.mciSendCommandA([0, 0x803, flags, block])
+                if result == 0:
+                    result_text = str(struct.unpack('<I', self.emu.uc.mem_read(block + 4, 4))[0])
+            elif verb in self.MCI_STRING_COMMANDS:
+                device_id = 0xFFFF if verb == 'close' and name.lower() == 'all' else \
+                    self._mci_device_by_name(name)
+                if not device_id:
+                    return 263  # MCIERR_INVALID_DEVICE_NAME
+                message = self.MCI_STRING_COMMANDS[verb]
+                if verb == 'play':
+                    for word, flag, offset in (('from', 0x4, 4), ('to', 0x8, 8)):
+                        value = word_after(word)
+                        if value is not None and value.isdigit():
+                            flags |= flag
+                            self.emu.uc.mem_write(block + offset, struct.pack('<I', int(value)))
+                elif verb == 'seek':
+                    target = word_after('to')
+                    if target == 'start':
+                        flags |= 0x100
+                    elif target == 'end':
+                        flags |= 0x200
+                    elif target is not None and target.isdigit():
+                        flags |= 0x8
+                        self.emu.uc.mem_write(block + 4, struct.pack('<I', int(target)))
+                elif verb == 'set':
+                    if word_after('format') is None:
+                        return 274  # MCIERR_UNSUPPORTED_FUNCTION
+                    flags |= 0x400  # MCI_SET_TIME_FORMAT (ms, the only one kept)
+                    self.emu.uc.mem_write(block + 4, struct.pack('<I', 0))
+                elif verb == 'status':
+                    items = {'length': 1, 'position': 2, 'mode': 4, 'ready': 7}
+                    item = next((items[w] for w in rest if w in items), None)
+                    if item is None:
+                        return 274
+                    flags |= 0x100  # MCI_STATUS_ITEM
+                    self.emu.uc.mem_write(block + 8, struct.pack('<I', item))
+                result = self.mciSendCommandA([device_id, message, flags, block])
+                if result == 0 and verb == 'status':
+                    value = struct.unpack('<I', self.emu.uc.mem_read(block + 4, 4))[0]
+                    result_text = (self.MCI_MODE_NAMES.get(value, 'stopped') if item == 4 else
+                                   ('true' if value else 'false') if item == 7 else str(value))
+            else:
+                return 261  # MCIERR_UNRECOGNIZED_COMMAND
+            if lpstrReturn and uReturnLength:
+                data = result_text.encode('ascii')[:uReturnLength - 1] + b'\0'
+                self._mem_write(lpstrReturn, data)
+            return result
+        finally:
+            for address in strings + [block]:
+                self.emu.heap_free(address)
 
     SND_ASYNC = 0x0001
     SND_NODEFAULT = 0x0002

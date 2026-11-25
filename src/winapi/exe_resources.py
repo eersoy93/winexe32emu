@@ -31,11 +31,11 @@ class ExeResourcesMixin:
 
     # ---------- Resources of the loaded EXE ----------
 
-    def _resource_key(self, value):
+    def _resource_key(self, value, wide=False):
         """Resource name/type: integer ID (MAKEINTRESOURCE or "#123") or upper-case name"""
         if value < 0x10000:
             return value
-        name = self.read_string(value)
+        name = self.read_wide_string(value) if wide else self.read_string(value)
         if name.startswith('#') and name[1:].isdigit():
             return int(name[1:])
         return name.upper()
@@ -81,18 +81,31 @@ class ExeResourcesMixin:
         resources are emulated)?"""
         return self._resource_module(hModule) is not None
 
-    def FindResourceA(self, args):
+    def FindResourceA(self, args, wide=False):
         """FindResourceA emulation (resources of the EXE and its loaded DLLs)"""
         hModule, lpName, lpType = args[0], args[1], args[2]
-        name, res_type = self._resource_key(lpName), self._resource_key(lpType)
+        name = self._resource_key(lpName, wide)
+        res_type = self._resource_key(lpType, wide)
         resource = self._find_resource(res_type, name, hModule)
-        log.debug(f"FindResourceA({name!r}, type {res_type!r}) -> {resource}")
+        log.debug(f"FindResource({name!r}, type {res_type!r}) -> {resource}")
         if resource is None:
             self._last_error = 1814  # ERROR_RESOURCE_NAME_NOT_FOUND
             return 0
         handle = self.get_next_handle()
         self.handles[handle] = {'type': 'resource', 'addr': resource[0], 'size': resource[1]}
         return handle
+
+    def FindResourceW(self, args):
+        """FindResourceW emulation: FindResourceA with UTF-16 names"""
+        return self.FindResourceA(args, wide=True)
+
+    def FindResourceExA(self, args):
+        """FindResourceExA(hModule, lpType, lpName, wLanguage): the first language"""
+        return self.FindResourceA([args[0], args[2], args[1]])
+
+    def FindResourceExW(self, args):
+        """FindResourceExW(hModule, lpType, lpName, wLanguage): the first language"""
+        return self.FindResourceA([args[0], args[2], args[1]], wide=True)
 
     def LoadResource(self, args):
         """LoadResource emulation - resources are already mapped with the image"""
@@ -209,6 +222,8 @@ class ExeResourcesMixin:
         lpBuffer = args[1]
         nNumberOfBytesToWrite = args[2]
         lpNumberOfBytesWritten = args[3]
+        # Saving a DIB section's bits: they show what GDI drew on it
+        self._sync_dib_sections_at(lpBuffer, nNumberOfBytesToWrite)
 
         try:
             data = self.emu.uc.mem_read(lpBuffer, nNumberOfBytesToWrite)
@@ -228,8 +243,11 @@ class ExeResourcesMixin:
                 # Real file handle (opened via CreateFile, inside drives/)
                 info = self.handles.get(hFile)
                 if info and info.get('fp'):
+                    overlapped = args[4] if len(args) > 4 else 0
+                    self._overlapped_seek(info, overlapped)
                     written = info['fp'].write(bytes(data))
                     bytes_written = written if written is not None else nNumberOfBytesToWrite
+                    self._overlapped_done(overlapped, bytes_written)
                 else:
                     # Unknown handle: report failure so callers notice.
                     if lpNumberOfBytesWritten != 0:

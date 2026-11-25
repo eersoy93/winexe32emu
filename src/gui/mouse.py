@@ -44,8 +44,10 @@ class MouseMixin:
         rects = []
         x = bar.x + 4
         for item in win.menu:
-            text_w = self.font.size(item['text'])[0]
-            width = text_w + 16
+            if item.get('bitmap'):  # MF_BITMAP item: as wide as its bitmap
+                width = item['bitmap']['width'] + 8
+            else:
+                width = self.font.size(item['text'])[0] + 16
             rects.append(pygame.Rect(x, bar.y, width, bar.height))
             x += width
         return rects
@@ -374,8 +376,12 @@ class MouseMixin:
                 cursor_hwnd, self.winapi.WM_SETCURSOR, cursor_hwnd,
                 (self.winapi.WM_MOUSEMOVE << 16) | self.winapi.HTCLIENT)
             if child is not None:
-                if child.native:
-                    return  # Emulated controls don't track the mouse without capture
+                if child.native and (child.owner is None or
+                                     child.wndproc == child.owner._native_stub()):
+                    # Emulated controls don't track the mouse without capture; a
+                    # subclassed one gets the moves (the Office Shortcut Bar's
+                    # toolbar relays them to its tooltips)
+                    return
                 target = child.hwnd
                 cx, cy = self._client_point(child, x, y)
         self.winapi.post_window_message(target, self.winapi.WM_MOUSEMOVE,

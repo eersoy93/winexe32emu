@@ -26,6 +26,7 @@ from unicorn import UcError
 from ..config import USER_PROFILE_FOLDER
 from ..logger import log
 from ..paths import resolve_drive_path
+from ..windows import APPBARS, AppBar, work_area
 
 
 class ShellExtraMixin:
@@ -401,15 +402,77 @@ class ShellExtraMixin:
         return self.Shell_NotifyIconA(args, wide=True)
 
     def SHAppBarMessage(self, args):
-        """SHAppBarMessage(message, APPBARDATA) - the taskbar at the bottom"""
+        """SHAppBarMessage(message, APPBARDATA) - application desktop toolbars
+        docked at an edge of the desktop next to the taskbar at the bottom.
+        APPBARDATA: cbSize, hWnd, uCallbackMessage, uEdge, rc, lParam."""
         message, data = args[0], args[1]
+        width, height = self._screen_size()
         if message == 5:  # ABM_GETTASKBARPOS
-            width, height = self._screen_size()
             self._mem_write(data + 12, struct.pack('<I4i', 3, 0, height - 30, width, height))
             return 1
         if message == 4:  # ABM_GETSTATE: ABS_ALWAYSONTOP
             return 2
-        return 0
+        if message == 10:  # ABM_SETSTATE (the taskbar's own state)
+            return 1
+        try:
+            hwnd, callback, edge, *rect = struct.unpack('<3I4i', self.emu.uc.mem_read(data + 4, 28))
+        except UcError:
+            return 0
+        if message == 0:  # ABM_NEW
+            if hwnd in APPBARS:
+                return 0
+            APPBARS[hwnd] = AppBar(self, callback)
+            return 1
+        if message == 7:  # ABM_GETAUTOHIDEBAR
+            return next((h for h, bar in APPBARS.items() if edge in bar.autohide), 0)
+        bar = APPBARS.get(hwnd)
+        if bar is None:
+            return 0
+        if message == 1:  # ABM_REMOVE
+            del APPBARS[hwnd]
+            if bar.rect is not None:
+                self._appbars_changed(hwnd)
+            return 1
+        if message in (2, 3):  # ABM_QUERYPOS, ABM_SETPOS
+            if edge > 3:
+                return 0
+            left, top, right, bottom = work_area(width, height, exclude=hwnd)
+            x1, y1, x2, y2 = rect
+            if edge in (0, 2):  # ABE_LEFT, ABE_RIGHT: keep the width
+                size = x2 - x1
+                x1, x2 = (left, left + size) if edge == 0 else (right - size, right)
+                y1, y2 = max(y1, top), min(y2, bottom)
+            else:  # ABE_TOP, ABE_BOTTOM: keep the height
+                size = y2 - y1
+                y1, y2 = (top, top + size) if edge == 1 else (bottom - size, bottom)
+                x1, x2 = max(x1, left), min(x2, right)
+            self._mem_write(data + 16, struct.pack('<4i', x1, y1, x2, y2))
+            if message == 3 and (bar.edge, bar.rect) != (edge, (x1, y1, x2, y2)):
+                bar.edge, bar.rect = edge, (x1, y1, x2, y2)
+                self._appbars_changed(hwnd)
+            return 1
+        if message == 8:  # ABM_SETAUTOHIDEBAR (lParam: register or unregister)
+            if edge > 3:
+                return 0
+            lparam = struct.unpack('<i', self.emu.uc.mem_read(data + 32, 4))[0]
+            owner = next((h for h, other in APPBARS.items() if edge in other.autohide), None)
+            if not lparam:
+                bar.autohide.discard(edge)
+                return 1
+            if owner not in (None, hwnd):
+                return 0  # Only one autohide appbar per edge
+            bar.autohide.add(edge)
+            return 1
+        return 1  # ABM_ACTIVATE, ABM_WINDOWPOSCHANGED
+
+    def _work_area(self):
+        """(left, top, right, bottom) of the desktop without the taskbar and the appbars"""
+        return work_area(*self._screen_size())
+
+    def _appbars_changed(self, hwnd):
+        """The work area changed: refit the maximized windows, tell the other appbars"""
+        if self.gui:
+            self.gui.appbars_changed(hwnd)
 
     def ShellAboutA(self, args, wide=False):
         """ShellAboutA/W(hwnd, title, other text, icon) - a message box"""
@@ -576,14 +639,51 @@ class ShellExtraMixin:
             else 0x80070057
 
     def CoRegisterClassObject(self, args):
-        """CoRegisterClassObject(CLSID, factory, context, flags, &cookie)"""
+        """CoRegisterClassObject(CLSID, factory, context, flags, &cookie) -
+        CoGetClassObject of the process finds the factory"""
         cookie = self.get_next_handle()
         if args[4]:
             self._mem_write(args[4], struct.pack('<I', cookie))
+        if args[1]:
+            classes = self.__dict__.setdefault('_class_objects', {})
+            classes[cookie] = (self._read_guid(args[0]), args[1])
         return 0
 
     def CoRevokeClassObject(self, args):
+        self.__dict__.get('_class_objects', {}).pop(args[0], None)
         return 0
+
+    def _inproc_server(self, clsid):
+        """The DLL HKEY_CLASSES_ROOT\\CLSID\\{clsid}\\InprocServer32 names ('' if none)"""
+        node, _ = self._registry_walk(self.HKEY_CLASSES_ROOT, f"CLSID\\{{{clsid}}}\\InprocServer32")
+        value = node['values'].get('') if node else None
+        return str(value['data']).rstrip('\x00') if value else ''
+
+    def CoGetClassObject(self, args):
+        """CoGetClassObject(rclsid, context, server info, riid, ppv) - a
+        factory the process registered (CoRegisterClassObject), else the
+        DllGetClassObject of the class's in-process server DLL"""
+        rclsid, _context, _info, riid, ppv = args[:5]
+        clsid = self._read_guid(rclsid)
+        if not ppv:
+            return 0x80004003  # E_POINTER
+        self._mem_write(ppv, struct.pack('<I', 0))
+        for registered, factory in self.__dict__.get('_class_objects', {}).values():
+            if registered == clsid:
+                vtable = struct.unpack('<I', self.emu.uc.mem_read(factory, 4))[0]
+                query = struct.unpack('<I', self.emu.uc.mem_read(vtable, 4))[0]
+                return self.emu.call_callback(query, [factory, riid, ppv])
+        path = self._inproc_server(clsid)
+        if not path:
+            log.debug(f"CoGetClassObject({{{clsid}}}): not registered")
+            return 0x80040154  # REGDB_E_CLASSNOTREG
+        handle = self._module_handle(path, load=True)
+        module = self.emu.find_dll(handle) if handle else None
+        entry = module['exports'].get('DllGetClassObject', 0) if module else 0
+        log.debug(f"CoGetClassObject({{{clsid}}}) -> \"{path}\" (DllGetClassObject 0x{entry:x})")
+        if not entry:
+            return 0x8007007E if not handle else 0x80040154  # ERROR_MOD_NOT_FOUND
+        return self.emu.call_callback(entry, [rclsid, riid, ppv])
 
     def CoLockObjectExternal(self, args):
         return 0

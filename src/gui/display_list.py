@@ -38,6 +38,8 @@ class DisplayListMixin:
     @staticmethod
     def covers_rect(shape, area):
         """True if shape opaquely hides everything in area (left, top, right, bottom)"""
+        if shape.get('region'):
+            return False  # Clipped: only a part of it is drawn
         if shape['type'] == 'image':
             if shape.get('rop') not in (0x00CC0020, 0x00330008) or \
                     shape.get('colorkey') is not None:  # Only opaque SRCCOPY, NOTSRCCOPY
@@ -130,6 +132,9 @@ class DisplayListMixin:
                 shapes[-1]['rect'] == shape['rect'] and shapes[-1].get('mask') == shape.get('mask'):
             # Inverting the same area twice (a blinking caret) changes nothing
             return shapes[:-1]
+        if shape.get('region'):
+            shapes.append(shape)  # Clipped to a region: what it hides is not known
+            return shapes
         cover = None
         if shape['type'] == 'rect' and shape.get('fill') is not None:
             cover = cls.shape_bbox(shape)

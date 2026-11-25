@@ -110,7 +110,21 @@ class GdiMixin:
             return self.GetStockObject([5])  # NULL_BRUSH
         if style == 2:  # BS_HATCHED
             return self.CreateHatchBrush([hatch, color])
+        if style == 3:  # BS_PATTERN: lbHatch is the bitmap
+            return self.CreatePatternBrush([hatch])
+        if style == 6:  # BS_DIBPATTERNPT: lbHatch points to a packed DIB
+            return self.CreateDIBPatternBrushPt([hatch, color & 0xFFFF])
         return self.CreateSolidBrush([color])
+
+    def _mono_brush_color(self, brush, hdc):
+        """Color of a monochrome pattern brush in a DC: its text color (0 bits)
+        and background color (1 bits), mixed like the pattern"""
+        state = self.dc_state.get(hdc)
+        if not state:
+            return brush['color']
+        ones = brush['mono']
+        return tuple(int(round(t * (1 - ones) + b * ones))
+                     for t, b in zip(state['text_color'], state['bk_color'], strict=True))
 
     # Stock fonts: index -> (face, pixel height)
     STOCK_FONTS = {
@@ -252,8 +266,8 @@ class GdiMixin:
         if state:
             pen = self._dc_pen(hdc)
             if pen:
-                self._add_shape(hdc, {'type': 'line', 'from': state['pos'],
-                                      'to': (x, y), 'pen': pen})
+                self._add_shape(hdc, self._with_pen_style(hdc, {
+                    'type': 'line', 'from': state['pos'], 'to': (x, y), 'pen': pen}))
             state['pos'] = (x, y)
 
         log.debug(f"LineTo(0x{hdc:x}, {x}, {y})")
@@ -265,8 +279,9 @@ class GdiMixin:
         left, top, right, bottom = (v if v < 0x80000000 else v - 0x100000000
                                     for v in args[1:5])
 
-        self._add_shape(hdc, {'type': 'rect', 'rect': (left, top, right, bottom),
-                              'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
+        self._add_shape(hdc, self._with_pen_style(hdc, {
+            'type': 'rect', 'rect': (left, top, right, bottom),
+            'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)}))
 
         log.debug(f"Rectangle(0x{hdc:x}, {left}, {top}, {right}, {bottom})")
         return 1
@@ -384,6 +399,24 @@ class GdiMixin:
             # arc/text: no reliable hit test, skip
         return None
 
+    def _rendered_pixel(self, hbm, shapes, bmp, x, y):
+        """(r, g, b) at (x, y) of the bitmap hbm drawn from its display list,
+        cached while the list does not change; None if it cannot be rendered"""
+        key = (hbm, id(shapes), len(shapes), id(shapes[-1]) if shapes else None)
+        cache = getattr(self, '_pixel_render_cache', None)
+        if cache is None or cache[0] != key:
+            try:
+                pixels = self._bitmap_rgb(hbm)
+            except (UcError, ValueError, TypeError):
+                pixels = None
+            # The last shape is kept alive with the key, so its id is not reused
+            cache = self._pixel_render_cache = (key, pixels, shapes[-1] if shapes else None)
+        pixels = cache[1]
+        i = (y * bmp['width'] + x) * 3
+        if not pixels or i + 3 > len(pixels):
+            return None
+        return tuple(pixels[i:i + 3])
+
     def GetPixel(self, args):
         """GetPixel emulation - resolved from the DC's display list"""
         hdc = args[0]
@@ -393,6 +426,17 @@ class GdiMixin:
         if state and state.get('memory'):
             shapes = state['shapes']
             background = (255, 255, 255)
+            bmp = self.gdi_objects.get(state.get('bitmap')) or {}
+            if bmp.get('type') == 'bitmap' and 'width' in bmp and 'height' in bmp:
+                if not (0 <= x < bmp['width'] and 0 <= y < bmp['height']):
+                    return 0xFFFFFFFF  # CLR_INVALID: outside the bitmap
+                if any(shape['type'] == 'text' for shape in shapes):
+                    # Text has no hit test: render the bitmap (programs such as
+                    # Schedule+ read text drawn in a memory DC pixel by pixel to
+                    # turn it sideways), once per change of its drawing
+                    color = self._rendered_pixel(state['bitmap'], shapes, bmp, x, y)
+                    if color is not None:
+                        return self._rgb_to_colorref(color)
         else:
             hwnd = self._dc_hwnd(hdc)
             if not self.gui or hwnd not in self.gui.windows:
@@ -525,10 +569,13 @@ class GdiMixin:
                               'fill': self._dc_brush(hdc), 'pen': self._dc_pen(hdc)})
         return 1
 
-    def _brush_color(self, hbr):
-        """Resolve a brush handle (or COLOR_* + 1 index) to an RGB color"""
+    def _brush_color(self, hbr, hdc=None):
+        """Resolve a brush handle (or COLOR_* + 1 index) to an RGB color; a
+        monochrome pattern brush painted in the DC hdc takes its colors from it"""
         brush = self.gdi_objects.get(hbr)
         if brush and brush['type'] == 'brush':
+            if brush.get('mono') is not None and hdc is not None:
+                return self._mono_brush_color(brush, hdc)
             return brush['color']
         if hbr < 32:
             # COLOR_* + 1 stands for that system color
@@ -652,8 +699,8 @@ class GdiMixin:
             self._mem_write(args[1], struct.pack('<4i', *box))
         return self._region_kind(rects)
 
-    # ---------- Clipping regions of DCs (kept for their queries; drawing is
-    # not clipped to them) ----------
+    # ---------- Clipping regions of DCs: device rectangles in the DC's
+    # 'clip'; _add_shape clips the drawing to them ----------
 
     def _dc_bounds(self, hdc):
         """The whole drawing surface of a DC: a memory DC's bitmap, a window's
@@ -679,7 +726,12 @@ class GdiMixin:
         hdc = args[0]
         if hdc not in self.dc_state:
             return 0  # ERROR
+        # Logical coordinates; the clip region is in device ones
         left, top, right, bottom = self._read_signed_args(args, 1, 4)
+        (left, top), (right, bottom) = self._lp_to_dp(hdc, left, top), \
+            self._lp_to_dp(hdc, right, bottom)
+        left, right = min(left, right), max(left, right)
+        top, bottom = min(top, bottom), max(top, bottom)
         rect = [(left, top, right, bottom)] if left < right and top < bottom else []
         clip = self._combine_rects(self._dc_clip(hdc), rect, test)
         self.dc_state[hdc]['clip'] = clip
@@ -712,9 +764,15 @@ class GdiMixin:
         hdc = args[0]
         if hdc not in self.dc_state:
             return 0
-        rects = self._dc_clip(hdc)
-        box = (min(r[0] for r in rects), min(r[1] for r in rects),
-               max(r[2] for r in rects), max(r[3] for r in rects)) if rects else (0, 0, 0, 0)
+        rects = self._draw_clip(hdc)
+        if rects is None:
+            rects = [self._dc_bounds(hdc)]
+        box = (0, 0, 0, 0)
+        if rects:
+            # In logical coordinates
+            x1, y1 = self._dp_to_lp(hdc, min(r[0] for r in rects), min(r[1] for r in rects))
+            x2, y2 = self._dp_to_lp(hdc, max(r[2] for r in rects), max(r[3] for r in rects))
+            box = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
         if args[1]:
             self._mem_write(args[1], struct.pack('<4i', *box))
         return self._region_kind(rects)
@@ -744,6 +802,9 @@ class GdiMixin:
         elif rop == 0x00FF0062:      # WHITENESS
             color = (255, 255, 255)
         else:
+            if rop != 0x00F00021 and w > 0 and h > 0 and \
+                    self._blit_pixels(hdc, x, y, w, h, 0, 0, 0, rop):
+                return 1  # A memory bitmap: done on its pixels
             color = self._dc_brush(hdc)
             # DSTINVERT, PATINVERT with a white brush etc.: what they do to
             # the destination (a text selection, a dragged splitter bar)
@@ -945,7 +1006,48 @@ class GdiMixin:
                 color = tuple(sum(pixels[i::3]) // count for i in range(3))
         handle = self.get_next_handle()
         self.gdi_objects[handle] = {'type': 'brush', 'color': color, 'width': 0}
+        if bmp.get('bpp') == 1:
+            # A monochrome pattern paints its 0 bits in the DC's text color and
+            # its 1 bits in its background color: keep the share of 1 bits
+            self.gdi_objects[handle]['mono'] = sum(color) / (3 * 255)
         log.debug(f"CreatePatternBrush(0x{hbm:x}) -> 0x{handle:x}, color {color}")
+        return handle
+
+    def CreateDIBPatternBrushPt(self, args):
+        """CreateDIBPatternBrushPt(lpPackedDIB, iUsage) emulation - like
+        CreatePatternBrush, the average color of the packed DIB (gray if it
+        cannot be read, or if its colors are palette indices)"""
+        color = (128, 128, 128)
+        try:
+            header = bytes(self.emu.uc.mem_read(args[0], 40))
+            size, width, height, _, bpp = struct.unpack_from('<IiiHH', header)
+            clr_used = struct.unpack_from('<I', header, 32)[0]
+            colors = (clr_used or (1 << bpp)) if bpp <= 8 else 0
+            if size != 40 or not 0 < width <= 64 or not 0 < abs(height) <= 64:
+                raise ValueError
+            total = size + 4 * colors + ((width * bpp + 31) // 32) * 4 * abs(height)
+            decoded = None
+            if args[1] == 0:  # DIB_RGB_COLORS
+                decoded = self._decode_dib(bytes(self.emu.uc.mem_read(args[0], total)))
+        except (UcError, ValueError, struct.error):
+            return 0
+        if decoded:
+            pixels = decoded[2]
+            count = len(pixels) // 3
+            color = tuple(sum(pixels[i::3]) // count for i in range(3))
+        handle = self.get_next_handle()
+        self.gdi_objects[handle] = {'type': 'brush', 'color': color, 'width': 0}
+        log.debug(f"CreateDIBPatternBrushPt() -> 0x{handle:x}, color {color}")
+        return handle
+
+    def CreateDIBPatternBrush(self, args):
+        """CreateDIBPatternBrush(hPackedDIB, fuColorSpec) emulation - the packed
+        DIB is in a global memory block"""
+        address = self.GlobalLock([args[0]])
+        if not address:
+            return 0
+        handle = self.CreateDIBPatternBrushPt([address, args[1]])
+        self.GlobalUnlock([args[0]])
         return handle
 
     def CreateFontA(self, args):

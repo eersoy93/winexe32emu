@@ -70,6 +70,13 @@ from .windows_extra import WindowsExtraMixin
 from .gdi_extra import GdiExtraMixin
 from .ole_storage import OleStorageMixin
 from .ole_misc import OleMiscMixin
+from .mdi import MdiMixin
+from .typeinfo import TypeInfoMixin
+from .safearray import SafeArrayMixin
+from .oleaut_variant import OleAutVariantMixin
+from .ole_lockbytes import OleLockBytesMixin
+from .tooltips import TooltipsMixin
+from .tabcontrol import TabControlMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -88,5 +95,7 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     ShlwapiMixin, SecurityMixin, Kernel32ExtraMixin, User32ExtraMixin,
                     ShellExtraMixin, SystemExtraMixin, NetworkMixin, DdeMixin,
                     Lz32Mixin, WindowsExtraMixin, GdiExtraMixin,
-                    OleStorageMixin, OleMiscMixin):
+                    OleStorageMixin, OleMiscMixin, MdiMixin, TooltipsMixin, TabControlMixin,
+                    TypeInfoMixin, SafeArrayMixin, OleAutVariantMixin,
+                    OleLockBytesMixin):
     """Windows API emulation"""

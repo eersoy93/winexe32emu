@@ -26,7 +26,7 @@ import unicodedata
 
 from unicorn import UcError
 
-from .. import winapi
+from .. import config, winapi
 from ..config import (DRIVE_CDROM, DRIVE_FIXED, DRIVE_REMOVABLE, DRIVES, FLOPPY_BYTES,
                       READ_ONLY_DRIVES, drive_host_path)
 from ..logger import log
@@ -366,19 +366,97 @@ class DrivesTimeMixin:
         return 0
 
     def CreateToolhelp32Snapshot(self, args):
-        """CreateToolhelp32Snapshot emulation - an empty snapshot"""
+        """CreateToolhelp32Snapshot(flags, pid) - the emulated processes
+        (TH32CS_SNAPPROCESS) and the modules of one of them (TH32CS_SNAPMODULE:
+        its EXE and loaded DLLs; pid 0 is this process)"""
+        flags, pid = args[0], args[1]
+        processes = list(self.gui.processes) if self.gui else []
+        if self not in processes:
+            processes.insert(0, self)
+        entries = []
+        for process in processes:
+            emu = getattr(process, 'emu', None)
+            if emu is None or getattr(emu, 'pe_loader', None) is None:
+                continue
+            entries.append((emu.process_id, len(getattr(emu, 'threads', {}) or {}) or 1,
+                            process.windows_exe_path()))
+        modules = []
+        target = self if pid in (0, self.emu.process_id) else next(
+            (p for p in processes if getattr(getattr(p, 'emu', None), 'process_id', None) == pid),
+            None)
+        if flags & 0x8 and target is not None:  # TH32CS_SNAPMODULE
+            emu = target.emu
+            loader = emu.pe_loader
+            size = loader.pe.OPTIONAL_HEADER.SizeOfImage if loader.pe else 0
+            modules.append((loader.image_base, size, target.windows_exe_path()))
+            for module in list(emu.dlls.values()):
+                modules.append((module['base'], module['size'], module['path']))
         handle = self.get_next_handle()
-        self.handles[handle] = {'type': 'snapshot'}
+        self.handles[handle] = {'type': 'snapshot', 'pid': pid or self.emu.process_id,
+                                'processes': entries if flags & 0x2 else [],  # SNAPPROCESS
+                                'modules': modules, 'next_process': 0, 'next_module': 0}
         return handle
 
+    def _toolhelp_next(self, args, kind, first, wide):
+        """Process32First/Next, Module32First/Next (A and W): the next entry of
+        the snapshot into PROCESSENTRY32 / MODULEENTRY32"""
+        snapshot = self.handles.get(args[0])
+        if not isinstance(snapshot, dict) or snapshot.get('type') != 'snapshot' or not args[1]:
+            self._last_error = 6  # ERROR_INVALID_HANDLE
+            return 0
+        key = 'next_process' if kind == 'process' else 'next_module'
+        if first:
+            snapshot[key] = 0
+        entries = snapshot['processes'] if kind == 'process' else snapshot['modules']
+        if snapshot[key] >= len(entries):
+            self._last_error = 18  # ERROR_NO_MORE_FILES
+            return 0
+        entry = entries[snapshot[key]]
+        snapshot[key] += 1
+        unit = 2 if wide else 1
+
+        def text(value, chars):
+            data = value.encode('utf-16-le') if wide else \
+                value.encode(config.ANSI_CODEPAGE, 'replace')
+            return data[:(chars - 1) * unit].ljust(chars * unit, b'\x00')
+        if kind == 'process':
+            pid, threads, path = entry
+            # dwSize, cntUsage, th32ProcessID, th32DefaultHeapID, th32ModuleID,
+            # cntThreads, th32ParentProcessID, pcPriClassBase, dwFlags, szExeFile
+            data = struct.pack('<9I', 0, 0, pid, 0, 0, threads, 0, 8, 0) + text(path, 260)
+        else:
+            base, size, path = entry
+            # dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage,
+            # modBaseAddr, modBaseSize, hModule, szModule, szExePath
+            data = struct.pack('<8I', 0, 1, snapshot['pid'], 1, 1, base, size, base) + \
+                text(path.rsplit('\\', 1)[-1], 256) + text(path, 260)
+        size = struct.unpack('<I', self.emu.uc.mem_read(args[1], 4))[0]
+        self._mem_write(args[1] + 4, data[4:max(4, min(len(data), size))])
+        return 1
+
+    def Process32First(self, args):
+        return self._toolhelp_next(args, 'process', True, False)
+
+    def Process32Next(self, args):
+        return self._toolhelp_next(args, 'process', False, False)
+
     def Process32FirstW(self, args):
-        """Process32FirstW emulation - no processes are listed"""
-        self._last_error = 18  # ERROR_NO_MORE_FILES
-        return 0
+        return self._toolhelp_next(args, 'process', True, True)
 
     def Process32NextW(self, args):
-        self._last_error = 18  # ERROR_NO_MORE_FILES
-        return 0
+        return self._toolhelp_next(args, 'process', False, True)
+
+    def Module32First(self, args):
+        return self._toolhelp_next(args, 'module', True, False)
+
+    def Module32Next(self, args):
+        return self._toolhelp_next(args, 'module', False, False)
+
+    def Module32FirstW(self, args):
+        return self._toolhelp_next(args, 'module', True, True)
+
+    def Module32NextW(self, args):
+        return self._toolhelp_next(args, 'module', False, True)
 
     def CreateFileMappingA(self, args, wide=False):
         """CreateFileMappingA/W emulation - host memory that every process (and
