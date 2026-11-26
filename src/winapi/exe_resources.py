@@ -17,12 +17,12 @@ errors, virtual memory and heaps"""
 
 import re
 import struct
-import codecs
 
 from unicorn import UC_PROT_ALL, UcError
 
 from .. import config
 from ..logger import log
+from .codepages import codec_for_codepage, decode_codepage, encode_codepage
 
 
 class ExeResourcesMixin:
@@ -295,17 +295,12 @@ class ExeResourcesMixin:
     def WriteConsoleW(self, args):
         return self.WriteConsoleA(args, wide=True)
 
-    @staticmethod
-    def _codepage_name(code_page):
-        """Python codec for a Windows code page number, or None if unsupported"""
-        if code_page in (0, 1, 3):  # CP_ACP, CP_OEMCP, CP_THREAD_ACP
+    def _codepage_name(self, code_page):
+        """Python codec for a Windows code page number (CP_ACP, CP_OEMCP,
+        CP_MACCP, CP_THREAD_ACP too), or None if unsupported"""
+        if code_page in (0, 3):  # CP_ACP, CP_THREAD_ACP
             return config.ANSI_CODEPAGE
-        if code_page == 65001:
-            return 'utf-8'
-        try:
-            return codecs.lookup(f'cp{code_page}').name
-        except LookupError:
-            return None
+        return codec_for_codepage(self._resolve_codepage(code_page))
 
     def MultiByteToWideChar(self, args):
         """MultiByteToWideChar emulation"""
@@ -315,10 +310,15 @@ class ExeResourcesMixin:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         if cbMultiByte == 0xFFFFFFFF:
-            data = self.read_cstring(lpMultiByteStr) + b'\x00'
+            data = self.read_cstring(lpMultiByteStr, max_len=0x8000000) + b'\x00'
         else:
             data = bytes(self.emu.uc.mem_read(lpMultiByteStr, cbMultiByte))
-        out = data.decode(codec, errors='replace').encode('utf-16-le')
+        # MB_ERR_INVALID_CHARS: an invalid sequence fails instead of U+FFFD
+        text = decode_codepage(data, codec, strict=bool(dwFlags & 0x8))
+        if text is None:
+            self._last_error = 1113  # ERROR_NO_UNICODE_TRANSLATION
+            return 0
+        out = text.encode('utf-16-le', errors='surrogatepass')
         count = len(out) // 2
         if cchWideChar == 0:
             return count
@@ -337,16 +337,14 @@ class ExeResourcesMixin:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
         if cchWideChar == 0xFFFFFFFF:
-            text = self.read_wide_string(lpWideCharStr) + '\x00'
+            text = self.read_wide_string(lpWideCharStr, max_len=0x4000000) + '\x00'
         else:
             text = bytes(self.emu.uc.mem_read(lpWideCharStr, cchWideChar * 2)).decode(
                 'utf-16-le', errors='replace')
-        try:
-            out = text.encode(codec)
-            used_default = 0
-        except UnicodeEncodeError:
-            out = text.encode(codec, errors='replace')
-            used_default = 1
+        # lpDefaultChar: the program's replacement for what the code page lacks
+        default = (self.read_cstring(lpDefaultChar, max_len=2)[:2] or b'?') \
+            if lpDefaultChar and codec not in ('utf-8', 'utf-7') else b'?'
+        out, used_default = encode_codepage(text, codec, default)
         if lpUsedDefaultChar:
             self.emu.uc.mem_write(lpUsedDefaultChar, struct.pack('<I', used_default))
         if cbMultiByte == 0:
@@ -749,16 +747,14 @@ class ExeResourcesMixin:
         return self.FreeEnvironmentStringsA(args)
 
     def GetCPInfo(self, args):
-        """GetCPInfo emulation - single-byte code pages, UTF-8 up to 4 bytes"""
+        """GetCPInfo emulation - MaxCharSize, DefaultChar and the lead bytes of
+        a double-byte code page (CodePagesMixin._cp_info)"""
         codepage, lpCPInfo = args[0], args[1]
-        ansi = self._ansi_codepage_number()
-        if codepage in (0, 3):  # CP_ACP, CP_THREAD_ACP
-            codepage = ansi
-        elif codepage == 1:  # CP_OEMCP
-            codepage = self.GetOEMCP([])
-        max_size = 4 if codepage == 65001 else 1
-        data = struct.pack('<I2s12s', max_size, b'?\x00', b'')
-        return 1 if self._mem_write(lpCPInfo, data) else 0
+        info = self._cp_info(codepage)
+        if info is None:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return 0
+        return 1 if self._mem_write(lpCPInfo, info[2]) else 0
 
     @staticmethod
     def _ctype1(ch):

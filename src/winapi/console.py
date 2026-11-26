@@ -25,23 +25,51 @@ class ConsoleMixin:
 
     # ==================== CONSOLE ====================
 
+    # Set by CreateProcess before the process starts (_child_inheritance)
+    console_title = None     # STARTUPINFO.lpTitle: the title of a new console
+    console_parent = None    # The parent process whose console a console program shares
+    console_detached = False  # DETACHED_PROCESS: no console at all
+    console_shared = False   # The console belongs to the parent (it stays when we end)
+
+    def start_console(self):
+        """The console a console program starts with: its parent's (a program
+        that cmd runs writes into cmd's window), or a new one"""
+        parent = self.console_parent
+        if self.console_detached:
+            return
+        if parent is not None and parent.has_console and not self.has_console:
+            self.has_console = True
+            self.console_shared = True
+            self.console = parent.console
+            if self.console is not None:
+                self.console.attached.append(self)
+            return
+        self.alloc_console()
+
     def alloc_console(self):
         """Give the process its own console (window). False if it already has one."""
         if self.has_console:
             return False
         self.has_console = True
+        self.console_shared = False
         if self.gui and self.gui.running:
-            self.console = self.gui.create_console(self.windows_exe_path(), self)
+            self.console = self.gui.create_console(self.console_title or
+                                                   self.windows_exe_path(), self)
         return True
 
     def free_console(self):
-        """Detach from the console; its window closes. False if there was none."""
+        """Detach from the console; its window closes unless another process
+        owns it. False if there was none."""
         if not self.has_console:
             return False
         self.flush_std_streams()
         self.has_console = False
         console, self.console = self.console, None
-        if console is not None and self.gui:
+        if self.console_shared:
+            self.console_shared = False
+            if console is not None and self in console.attached:
+                console.attached.remove(self)
+        elif console is not None and self.gui:
             self.gui.close_console(console)
         return True
 
@@ -65,7 +93,11 @@ class ConsoleMixin:
         self.quit_requested = True
         console = self.console
         if console is not None and self.gui:
-            self.gui.cancel_console_input(console)
+            if self.console_shared:
+                # The console goes on for its owner: only our read ends
+                self.gui.wake_console_input(console)
+            else:
+                self.gui.cancel_console_input(console)
 
     def _set_exit_code(self, code):
         if self.exit_code is None:

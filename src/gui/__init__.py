@@ -32,6 +32,7 @@ if PYGAME_AVAILABLE:
 
 from .desktop import DesktopMixin
 from .start_menu import StartMenuMixin
+from .run_dialog import RunDialogMixin
 from .window_manager import WindowManagerMixin
 from .taskbar import TaskbarMixin
 from .window_drawing import WindowDrawingMixin
@@ -45,12 +46,15 @@ from .keyboard import KeyboardMixin
 from .messageboxes import MessageBoxesMixin
 from .console import ConsoleMixin
 from .font_cache import CachedFont
+from .edit_control import EditControlMixin
+from .menu_keys import MenuKeysMixin
 
 
-class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, WindowManagerMixin, TaskbarMixin,
+class PseudoWindowsGUI(DesktopMixin, StartMenuMixin, RunDialogMixin, WindowManagerMixin,
+                       TaskbarMixin,
                        WindowDrawingMixin, CommonControlsMixin, MenusMixin, ControlDrawingMixin,
                        LayoutMixin, DisplayListMixin, MouseMixin, KeyboardMixin, MessageBoxesMixin,
-                       ConsoleMixin):
+                       ConsoleMixin, EditControlMixin, MenuKeysMixin):
     """Pygame-based fake Windows GUI environment"""
 
     # Windows colors

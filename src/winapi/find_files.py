@@ -23,7 +23,7 @@ import time
 
 from unicorn import UcError
 
-from .. import config
+from .. import config, recycle_bin
 from ..config import USER_NAME
 from ..guest import QWordResult
 from ..logger import log
@@ -56,7 +56,9 @@ class FindFilesMixin:
             return None
         read_only = 0x01 if self._host_read_only(path) else 0  # FILE_ATTRIBUTE_READONLY
         if os.path.isdir(path):
-            return (name, 0x10 | read_only, 0, st.st_mtime)  # FILE_ATTRIBUTE_DIRECTORY
+            # (the Recycle Bin's store is hidden and system)
+            return (name, 0x10 | read_only | recycle_bin.store_attributes(path), 0,
+                    st.st_mtime)  # FILE_ATTRIBUTE_DIRECTORY
         return (name, read_only or 0x80, st.st_size, st.st_mtime)  # FILE_ATTRIBUTE_NORMAL
 
     def _write_find_data(self, address, entry, wide):

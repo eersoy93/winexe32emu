@@ -100,6 +100,16 @@ class RegistryMixin:
                 if csidl in folders:
                     node['values'][name.lower()] = {'name': name, 'type': 1,
                                                     'data': folders[csidl] + '\x00'}
+        # Text files open in Notepad (apps/notepad), like on Windows
+        software = roots[0x80000002]['keys']['software']
+        classes = software['keys'].setdefault('classes', cls._new_registry_key('Classes'))
+        for path, value in (('.txt', 'txtfile'), ('.log', 'txtfile'),
+                            ('txtfile', 'Text Document'),
+                            ('txtfile\\shell\\open\\command', 'C:\\Windows\\notepad.exe %1')):
+            node = classes
+            for part in path.split('\\'):
+                node = node['keys'].setdefault(part.lower(), cls._new_registry_key(part))
+            node['values'][''] = {'name': '', 'type': 1, 'data': value + '\x00'}
         return roots
 
     # Explorer\Shell Folders value -> CSIDL: the user's (HKEY_CURRENT_USER) and

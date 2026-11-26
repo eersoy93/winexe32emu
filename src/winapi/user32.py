@@ -256,6 +256,9 @@ class User32Mixin:
             X, Y, cx, cy = self._read_signed_args(args, 2, 4)
             before = (win.x, win.y, win.width, win.height)
             was_visible = win.visible
+            # Hidden or moved without redrawing, a child leaves its image
+            self._window_pos_bits(win, uFlags, (not uFlags & 0x0002 and (X, Y) != before[:2]) or
+                                  (not uFlags & 0x0001 and (cx, cy) != before[2:]))
             with self.gui.lock:
                 if not (uFlags & 0x0002):  # SWP_NOMOVE
                     win.x, win.y = X, Y

@@ -102,7 +102,8 @@ class MenusMixin:
                     'grayed': bool(flags & (self.MF_GRAYED | self.MF_DISABLED)),
                     'checked': bool(flags & self.MF_CHECKED),
                     'radio': bool(flags & self.MFT_RADIOCHECK), 'hmenu': 0,
-                    'break': column_break}
+                    'break': column_break,
+                    'raw_text': item['text'] or ''}  # With its "&" mnemonic (menu keys)
             if flags & 0x4:  # MF_BITMAP: the GDI bitmap (not an HBMMENU_* value)
                 bitmap = self.gdi_objects.get(item.get('bitmap', 0))
                 if bitmap is not None and bitmap.get('type') == 'bitmap':

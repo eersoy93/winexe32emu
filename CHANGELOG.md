@@ -21,7 +21,26 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 - Schedule+ 7.0 starts without a network, keeps appointments, tasks and contacts in its schedule file
 - Office Binder 95 starts, makes binders from templates, adds sections from files, saves and opens binders (sections cannot be edited in place: no OLE between processes)
 - The Office Shortcut Bar docks on the desktop, shows its buttons and tooltips and starts programs; Find Fast and the Fast Start preloader run
-- Access 95 starts, creates a blank database and shows the database window (a workgroup file written by an older Setup run has to be made again with `WRKGADM.EXE`)
+- Access 95 starts, creates databases, designs and saves tables, takes rows in datasheet view and shows them again after reopening the database; queries can be designed and run (form design and the wizards do not work yet; a workgroup file written by an older Setup run has to be made again with `WRKGADM.EXE`):
+  - `GetClassInfo(Ex)` and `GetClassLong` return a class's extra class and window bytes; `WM_GETTEXT` reaches a program's own window class
+  - A child hidden or moved with `SWP_NOREDRAW` leaves its image on screen
+  - List boxes with multiple selection (`LB_SETSEL`, `LB_GETSELITEMS`...), owner-draw list boxes (`WM_MEASUREITEM`, `WM_DRAWITEM`), clicks on subclassed list boxes
+  - `ITypeComp` (`Bind`, `BindType`); `LoadTypeLib` finds a loaded DLL given without a path
+- Desktop: User (the user's folder), Network and Recycle Bin icons, drawn by the emulator, that open in Explorer; the Recycle Bin icon shows whether it is empty and its right-click menu can empty it
+- Recycle Bin: files deleted with `FOF_ALLOWUNDO` go to a hidden store on their own drive (`X:\$Recycle` with an `INDEX.TXT`); the floppy A: deletes for good, the CD-ROM D: stays read-only; `SHQueryRecycleBin`, `SHEmptyRecycleBin`, `CSIDL_BITBUCKET` and `CSIDL_NETWORK`
+- Explorer: Delete sends files to the Recycle Bin, Shift+Delete deletes them for good; a Recycle Bin view with original location and deletion date, Restore, Delete and Empty Recycle Bin; an empty Network view (the emulated PC stays offline); hidden files are not listed; a double-click opens a document with its associated program
+- Command Prompt (`C:\Windows\System32\cmd.exe`, built from `apps/cmd`) with a Start menu entry: an interactive prompt, `cmd /c` and `cmd /k`; DIR, CD, MD, RD, COPY, MOVE, DEL, REN, TYPE, ECHO, SET, PATH, PROMPT, TITLE, VER, VOL, DATE, TIME, CLS, START, PAUSE, HELP, EXIT and more; programs run from the current folder and the PATH; `>` `>>` `<` `2>&1` `|` `&&` `||`; batch files with GOTO, CALL, IF, FOR and SHIFT
+  - `system()` runs the command with cmd.exe; a console program started by another one shares its console window; `CreateProcess` passes on the environment, `STARTUPINFO`'s title and the standard handles (`STARTF_USESTDHANDLES`)
+  - Console windows: Left/Right/Home/End/Delete line editing, Up/Down history, CLS clears them, 300 lines of scrollback
+  - An app folder with a `console` file is compiled as a console program
+- Start menu: a Run... dialog (also Win+R) that starts a program by name or path with arguments, a document with its associated program, or a folder in Explorer; it keeps the typed commands in `Explorer\RunMRU` and has a Browse... list
+- Start menu: a Documents submenu with the 15 most recently opened documents (shortcuts in the Recent folder); `SHAddToRecentDocs`; documents chosen in the common Open/Save dialogs and opened with `ShellExecute` join them
+- `ShellExecute(Ex)` opens documents with their file association (`HKEY_CLASSES_ROOT` ProgID `shell\verb\command`, or WIN.INI `[Extensions]`), folders in Explorer, and finds bare program names in the Windows folders, PATH and App Paths
+- Notepad (`notepad.exe` in C:\Windows, built from `apps/notepad`): opens and saves ANSI, UTF-8 (with or without BOM), UTF-16 LE/BE and about 45 other code pages; Windows, Unix and Mac line breaks; Find/Replace, Go To, Word Wrap, a status bar; it is 7-Zip's editor and opens .txt files
+  - More Windows code pages (ISO-8859, KOI8, Mac, GB18030, EUC...); `CP_OEMCP` is the OEM code page; `MB_ERR_INVALID_CHARS`, `lpDefaultChar`; `GetCPInfoEx`, `EnumSystemCodePages`; lead bytes in `GetCPInfo`
+  - The Find and Replace common dialogs (`FindTextW`, `ReplaceTextA/W`), `RegisterWindowMessageW`
+  - Edit controls: undo, word wrap, a vertical scroll bar, the mouse wheel, Page Up/Down, `EM_SCROLL` / `EM_LINESCROLL`, texts of several megabytes (no 32K cut)
+  - Accelerators work while an edit control has the focus; Alt+letter opens menus and letters pick menu items
 - Bookshelf 95 starts and asks for its own CD (the Office 95 CD does not hold its content)
 - For these programs:
   - MDI windows (`MDICLIENT`, `DefFrameProc`, `DefMDIChildProc`), tab controls and tooltip controls
@@ -45,6 +64,7 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 ### Changed
 
+- The reader of SLTG type libraries (Office 95's `.TLB` / `.OLB` files) was written anew from the bytes of those libraries and their documentation; it now also reads help strings, help contexts, the DLL entries of module functions, functions with more than 31 parameters, libraries' locale, and marks the optional parameters before `[lcid]` and `[retval]`
 - The fake desktop keeps the texts it rendered instead of rendering them again every frame
 - 16 and 32 bpp DIBs with color masks (`BI_BITFIELDS`, 16 bpp DIB sections) decode about 10 times faster
 - More unit tests: wildcards, time conversions, INI files, the printf engine, `VerQueryValue`, share modes, the DIB decoder
@@ -55,6 +75,9 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 ### Fixed
 
+- `Var*From*` conversions wrote their result to the wrong argument (Access showed 2.785E-314 as a Number field's default value)
+- Dialogs without `DS_SETFONT` use the system font's dialog units; list view small icons wider than 16 pixels no longer overlap their labels
+- `lstrlenW`, `wcslen` and `GetWindowTextLengthW` count UTF-16 units, `lstrlenA` counts bytes
 - `AppendMenuA` with `MF_BITMAP` or `MF_OWNERDRAW` no longer reads the item data as a string (Excel 95 stopped at startup)
 - `EnableWindow` returns whether the window was disabled before
 - The desktop window's handle is no longer given to a program's window (the fifth window a program made got it)

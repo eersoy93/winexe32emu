@@ -214,8 +214,9 @@ class User32MiscMixin:
         return self.gui.get_window_text(hwnd)
 
     def GetWindowTextLengthW(self, args):
+        """GetWindowTextLengthW emulation - UTF-16 code units (an emoji is 2)"""
         self._last_error = 0
-        return len(self._window_text(args[0]))
+        return len(self._window_text(args[0]).encode('utf-16-le', errors='surrogatepass')) // 2
 
     def MapVirtualKeyA(self, args):
         """MapVirtualKeyA/W emulation: VK <-> scan code for the common keys"""
@@ -278,7 +279,8 @@ class User32MiscMixin:
                          None)
             wndclass = self.registered_classes.get(match) if match else None
         if wndclass is not None:
-            fields = (wndclass['style'], wndclass['wndproc'], 0, 0, wndclass['hInstance'], 0,
+            fields = (wndclass['style'], wndclass['wndproc'], wndclass.get('cls_extra', 0),
+                      wndclass.get('wnd_extra', 0), wndclass['hInstance'], 0,
                       wndclass['cursor'], wndclass['background'], 0, lpClassName)
             atom = wndclass['atom']
         elif name and name.upper() in self.SYSTEM_CLASSES:
@@ -346,7 +348,8 @@ class User32MiscMixin:
 
     # GCL_* index -> class field (registered_classes entry key)
     CLASS_LONG_FIELDS = {-8: 'menu', -10: 'background', -12: 'cursor', -14: 'icon',
-                         -16: 'hInstance', -24: 'wndproc', -26: 'style', -34: 'icon_small'}
+                         -16: 'hInstance', -18: 'wnd_extra', -20: 'cls_extra',
+                         -24: 'wndproc', -26: 'style', -34: 'icon_small'}
 
     def _class_entry(self, hwnd):
         """Class data of a window (a dict changed by SetClassLong), or None"""

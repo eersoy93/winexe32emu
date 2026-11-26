@@ -544,14 +544,14 @@ class WindowDrawingMixin:
         geo['drop'] = drop
         return geo
 
-    def _list_geometry(self, frame, count, rows, top):
+    def _list_geometry(self, frame, count, rows, top, item_h=None):
         """Rows and vertical scroll bar inside a list's 1-pixel frame (screen coords).
 
         A dict with 'items' as (index, rect) pairs of the visible rows, 'rows',
         and the scroll bar's 'bar', 'up', 'down', 'track' and 'thumb' rects
         ('bar' is None when every item fits).
         """
-        item_h = self.LISTBOX_ITEM_H
+        item_h = item_h or self.LISTBOX_ITEM_H
         scroll = count > rows
         body_w = frame.width - 2 - (self.SCROLL_BTN if scroll else 0)
         items = [(i, pygame.Rect(frame.x + 1, frame.y + 1 + (i - top) * item_h, body_w, item_h))
@@ -577,10 +577,12 @@ class WindowDrawingMixin:
         if abs_pos is None:
             return None
         frame = pygame.Rect(abs_pos[0], abs_pos[1], control.width, control.height)
-        rows = max(1, (control.height - 2) // self.LISTBOX_ITEM_H)
+        # An owner-draw list's items are as high as its parent said
+        item_h = getattr(control, 'item_height', None) or self.LISTBOX_ITEM_H
+        rows = max(1, (control.height - 2) // item_h)
         count = len(control.items)
         control.top_index = max(0, min(control.top_index, count - rows))
-        geo = self._list_geometry(frame, count, rows, control.top_index)
+        geo = self._list_geometry(frame, count, rows, control.top_index, item_h)
         geo['drop'] = frame
         return geo
 

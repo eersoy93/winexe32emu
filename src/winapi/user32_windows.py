@@ -121,6 +121,7 @@ class User32WindowsMixin:
             wndclass_data = self.emu.uc.mem_read(lpWndClass, 40)
             style = struct.unpack("<I", wndclass_data[0:4])[0]
             lpfnWndProc = struct.unpack("<I", wndclass_data[4:8])[0]
+            cls_extra, wnd_extra = struct.unpack("<ii", wndclass_data[8:16])
             hInstance = struct.unpack("<I", wndclass_data[16:20])[0]
             hCursor = struct.unpack("<I", wndclass_data[24:28])[0]
             hbrBackground = struct.unpack("<I", wndclass_data[28:32])[0]
@@ -141,6 +142,10 @@ class User32WindowsMixin:
                 'cursor': hCursor,
                 'menu': (lpszMenuName if lpszMenuName < 0x10000 else
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
+                # GetClassInfo gives them back: a program superclassing its
+                # own class keeps its window bytes after the base class's
+                'cls_extra': max(cls_extra, 0),
+                'wnd_extra': max(wnd_extra, 0),
             }
             self.atoms[atom] = class_name
             self.module_classes[(class_name.lower(), hInstance)] = \
@@ -176,6 +181,7 @@ class User32WindowsMixin:
             cbSize = struct.unpack("<I", wcex_data[0:4])[0]
             style = struct.unpack("<I", wcex_data[4:8])[0]
             lpfnWndProc = struct.unpack("<I", wcex_data[8:12])[0]
+            cls_extra, wnd_extra = struct.unpack("<ii", wcex_data[12:20])
             hInstance = struct.unpack("<I", wcex_data[20:24])[0]
             hCursor = struct.unpack("<I", wcex_data[28:32])[0]
             hbrBackground = struct.unpack("<I", wcex_data[32:36])[0]
@@ -196,6 +202,8 @@ class User32WindowsMixin:
                 'cursor': hCursor,
                 'menu': (lpszMenuName if lpszMenuName < 0x10000 else
                          self._read_text(lpszMenuName, wide)) if lpszMenuName else 0,
+                'cls_extra': max(cls_extra, 0),
+                'wnd_extra': max(wnd_extra, 0),
             }
             self.atoms[atom] = class_name
             self.module_classes[(class_name.lower(), hInstance)] = \
@@ -691,8 +699,8 @@ class User32WindowsMixin:
         hWnd = args[0]
         lpString = args[1]
 
-        text = self._read_text(lpString, wide)
-        log.debug(f"SetWindowTextA(0x{hWnd:x}, '{text}')")
+        text = self._read_long_text(lpString, wide)
+        log.debug(f"SetWindowTextA(0x{hWnd:x}, '{text[:200]}')")
 
         if self._text_wndproc(hWnd):
             # Like Windows: WM_SETTEXT to the window's procedure
@@ -731,7 +739,7 @@ class User32WindowsMixin:
         else:
             copied = 0
 
-        log.debug(f"GetWindowTextA(0x{hWnd:x}) -> '{text}'")
+        log.debug(f"GetWindowTextA(0x{hWnd:x}) -> '{text[:200]}'")
         return copied
 
     def GetWindowTextW(self, args):

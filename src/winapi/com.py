@@ -1198,7 +1198,7 @@ class ComMixin:
         """LoadTypeLib(szFile, pptlib) - an ITypeLib object with the library's
         attributes but no type information: enough for setup programs and
         DllRegisterServer functions that register libraries"""
-        name = self.read_wide_string(args[0]) if args[0] else ''
+        name = self._search_typelib_file(self.read_wide_string(args[0]) if args[0] else '')
         if args[1]:
             self._mem_write(args[1], struct.pack('<I', 0))
         attributes = self._type_library_attributes(name) if name else None

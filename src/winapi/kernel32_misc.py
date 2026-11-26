@@ -23,7 +23,7 @@ import time
 
 from unicorn import UcError
 
-from .. import config, winapi
+from .. import config, recycle_bin, winapi
 from ..config import DRIVES
 from ..logger import log
 from ..paths import drive_path_error
@@ -170,20 +170,20 @@ class Kernel32MiscMixin:
         if lpString == 0:
             return 0
 
-        s = self.read_string(lpString)
-        log.debug(f"lstrlenA(\"{s[:32]}...\") -> {len(s)}")
-        return len(s)
+        # Bytes, not characters (a double-byte or UTF-8 code page has more),
+        # of a string of any length; a bad pointer gives 0 like on Windows
+        data = self._read_until_null(lpString, 0x8000000, 1)
+        return len(data) if data else 0
 
     def lstrlenW(self, args):
-        """lstrlenW emulation"""
+        """lstrlenW emulation - UTF-16 code units (a surrogate pair is 2)"""
         lpString = args[0]
 
         if lpString == 0:
             return 0
 
-        s = self.read_wide_string(lpString)
-        log.debug(f"lstrlenW() -> {len(s)}")
-        return len(s)
+        data = self._read_until_null(lpString, 0x8000000, 2)
+        return len(data) // 2 if data else 0
 
     def IsDBCSLeadByteEx(self, args):
         """IsDBCSLeadByteEx emulation - supported code pages have no DBCS lead bytes"""
@@ -525,7 +525,8 @@ class Kernel32MiscMixin:
             return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
         read_only = 0x01 if self._host_read_only(path) else 0  # FILE_ATTRIBUTE_READONLY
         if os.path.isdir(path):
-            return 0x10 | read_only  # FILE_ATTRIBUTE_DIRECTORY
+            # (the Recycle Bin's store is hidden and system)
+            return 0x10 | read_only | recycle_bin.store_attributes(path)  # DIRECTORY
         return read_only or 0x80  # FILE_ATTRIBUTE_NORMAL
 
     def CreateFileA(self, args):

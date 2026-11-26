@@ -25,13 +25,14 @@ Written with GitHub Copilot and Claude AI.
 
 ## Features
 
-- 🖥️ **Fake Windows desktop** with a taskbar, a Start menu, windows, dialogs and sound
+- 🖥️ **Fake Windows desktop** with a taskbar, a Start menu (Programs, Documents, Run...), windows, dialogs and sound
+- 🗑️ **Desktop folders**: the user's folder, an (always offline) Network folder and a Recycle Bin that deleted files can be restored from
 - 📦 **Runs real programs**: setups and applications, several of them side by side
 - 💾 **Virtual drives**: A: (floppy disk), C: (hard disk) and D: (CD-ROM) are plain folders in `drives/`
 - 🔒 **Sandboxed**: programs can only reach the files inside their virtual drives
 - 🗂️ **A shared registry** that the emulated programs keep between runs
 - 🌐 **Offline by design**: programs see a PC without a network
-- 🧩 **Built-in apps**: Explorer (`explorer.exe`) and a Windows Help stub (`winhlp32.exe`)
+- 🧩 **Built-in apps**: Explorer (`explorer.exe`), Notepad (`notepad.exe`, with UTF-8, UTF-16, ANSI and other code pages, and Windows, Unix and Mac line endings), a Command Prompt (`cmd.exe`, with the basic commands and simple batch files) and a Windows Help stub (`winhlp32.exe`)
 - 🔍 **Missing API report**: see what a program needs that is not emulated yet
 
 ## Supported Programs

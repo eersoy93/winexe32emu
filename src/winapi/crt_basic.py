@@ -37,10 +37,12 @@ class CrtBasicMixin:
 
     def wcslen(self, args):
         """wcslen emulation"""
-        s = args[0]
-        string = self.read_wide_string(s)
-        log.debug(f"wcslen() -> {len(string)}")
-        return len(string)
+        # UTF-16 code units (a surrogate pair is 2) of a string of any length
+        data = self._read_until_null(args[0], 0x8000000, 2) if args[0] else b''
+        if data is None:
+            self._string_access_violation(args[0])
+            return 0
+        return len(data) // 2
 
     def memset(self, args):
         """memset emulation"""

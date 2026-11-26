@@ -104,6 +104,9 @@ run_test thread_test "== 0 failure(s) =="
 run_test vista_api_test "== 0 failure(s) =="
 run_test ext_api_test "== 0 failure(s) =="
 run_test exception_test "== 0 failure(s) =="
+# Notepad's encodings (apps/notepad/textcodec.c) with a Western and a Turkish ANSI
+run_test notepad_codec_test "== 0 failure(s) =="
+run_test notepad_codec_test "== 0 failure(s) ==" "" cp1254
 run_args_test argv_test "== 0 failure(s) ==" plain "two words" 'a\b' 'q"uote' '' end
 # Two processes: the second one finds what the first one saved
 run_args_test registry_test "== 0 failure(s) ==" write

@@ -20,7 +20,7 @@ import shutil
 import struct
 import ntpath
 
-from .. import config, winapi
+from .. import config, recent_documents, shell_open, winapi
 from ..resources import _icon_image_rgba, parse_shell_link, read_exe_icon
 from ..logger import log
 
@@ -121,6 +121,8 @@ class Shell32Mixin:
             path = self._read_text(pszPath, wide) if pszPath else ''
         if self._is_my_computer(path):
             return self._my_computer_file_info(psfi, cbFileInfo, flags, wide)
+        if self._is_virtual_folder(path):  # The Recycle Bin, the network
+            return self._virtual_folder_file_info(path, psfi, cbFileInfo, flags, wide)
         name = ntpath.basename(path.rstrip('\\')) or path
         host = None
         if not flags & SHGFI_USEFILEATTRIBUTES and path:
@@ -202,6 +204,8 @@ class Shell32Mixin:
             return 0 if pidl else 0x8007000E  # E_OUTOFMEMORY
         if csidl & 0xFF == self.CSIDL_DRIVES:
             folder = self.MY_COMPUTER_PATH
+        elif csidl & 0xFF in self.VIRTUAL_FOLDERS:  # CSIDL_BITBUCKET, CSIDL_NETWORK
+            folder = self.VIRTUAL_FOLDERS[csidl & 0xFF]
         else:
             folder = self._shell_folder(csidl & 0xFF)
         if folder is None:
@@ -381,10 +385,15 @@ class Shell32Mixin:
         full = self.full_windows_path(file) if file else None
         host = self.resolve_drive_path(full) if full else None
         log.info(f"ShellExecute(\"{verb}\", \"{file}\", \"{params}\")")
+        if (host is None or not os.path.exists(host)) and file and \
+                not any(sep in file for sep in '\\/:'):
+            # A bare program name is searched like Windows does (the Windows
+            # folders, PATH, App Paths)
+            found = shell_open.find_file(file, self.current_directory)
+            if found:
+                full, host = found, self.resolve_drive_path(found)
         if host is None or not os.path.exists(host):
             return 2, None  # SE_ERR_FNF
-        if os.path.isdir(host):
-            return 31, None  # SE_ERR_NOASSOC: no Explorer
         if full.lower().endswith('.lnk') and verb.lower() in ('', 'open'):
             # A shortcut opens its target with its arguments in its working folder
             try:
@@ -397,17 +406,23 @@ class Shell32Mixin:
             arguments = ' '.join(part for part in (link['arguments'], params) if part)
             return self._shell_execute(verb, link['path'], arguments,
                                        link['workdir'] or directory, hwnd)
-        if not full.lower().endswith(('.exe', '.com')) or verb.lower() not in ('', 'open'):
-            return 31, None
+        # A program runs, a folder opens in Explorer, a document with the
+        # program of its type (HKEY_CLASSES_ROOT file associations)
+        current = self.full_windows_path(directory, clamp=True) if directory else None
+        program, cmdline, current = shell_open.open_command(full, verb, params, current)
+        if program is None:
+            return cmdline, None  # SE_ERR_FNF or SE_ERR_NOASSOC
         starter = winapi.WinAPIHandler.process_starter
         if starter is None:
             return 31, None
-        quoted = f'"{full}"' if ' ' in full else full
-        cmdline = quoted + (' ' + params if params else '')
-        current = self.full_windows_path(directory, clamp=True) if directory else \
-            ntpath.dirname(full)
-        child = starter(full, cmdline, current)
-        return (42, child) if child is not None else (31, None)
+        child = starter(program, cmdline, current)
+        if child is None:
+            return 31, None
+        if not os.path.isdir(host) and not shell_open.is_program(full) and \
+                verb.lower() in ('', 'open'):
+            # Like Explorer, the opened document joins the Start menu's Documents
+            recent_documents.add_recent_document(shell_open.canonical_path(full) or full)
+        return 42, child
 
     def ShellExecuteA(self, args, wide=False):
         """ShellExecuteA/W emulation"""
@@ -462,8 +477,8 @@ class Shell32Mixin:
     ERROR_CANCELLED = 1223
 
     def _confirm_delete(self, sources, hosts):
-        """The shell's delete confirmation (there is no Recycle Bin: the
-        files are deleted for good); True if confirmed"""
+        """The shell's confirmation before deleting files for good (without
+        FOF_ALLOWUNDO, on the floppy A:, in the Recycle Bin); True if confirmed"""
         if len(sources) == 1:
             name = ntpath.basename(sources[0].rstrip('\\'))
             if os.path.isdir(hosts[0]):
@@ -480,7 +495,7 @@ class Shell32Mixin:
 
     def SHFileOperationA(self, args, wide=False):
         """SHFileOperationA/W emulation - delete/copy/move/rename in the sandbox
-        (deleted files don't go to a Recycle Bin). Asks like the shell unless
+        (FOF_ALLOWUNDO deletes into the Recycle Bin). Asks like the shell unless
         FOF_NOCONFIRMATION: before deleting and before replacing a file."""
         hwnd, func, p_from, p_to, flags = self._read_struct(args[0], '<IIIIH')
         sources = self._read_multi_string(p_from, wide)
@@ -500,6 +515,11 @@ class Shell32Mixin:
         # Deleting, moving or renaming on the CD-ROM D: fails (DE_ACCESSDENIEDSRC)
         if func != 2 and self._write_protected(*hosts):
             return finish(0x78)
+        if func == 3 and flags & self.FOF_ALLOWUNDO and self._recyclable(hosts):
+            # To the Recycle Bin (shell_namespace.py); A: and bin items: for good
+            code = self._recycle_files(sources, hosts, confirm)
+            aborted = code == self.ERROR_CANCELLED
+            return finish(code)
         if func == 3 and confirm and sources and not self._confirm_delete(sources, hosts):
             aborted = True
             return finish(self.ERROR_CANCELLED)
@@ -510,11 +530,19 @@ class Shell32Mixin:
                         shutil.rmtree(src)
                     else:
                         os.remove(src)
+                    self._recycle_forget(src)
                     continue
                 target = targets[i] if i < len(targets) else (targets[0] if targets else '')
                 dst = self.resolve_drive_path(target)
                 if dst is None or self._write_protected(dst):
                     return finish(5)
+                if func != 2 and self._in_recycle_store(src):
+                    # Out of the Recycle Bin (Restore): its index line goes
+                    code = self._recycle_move_out(src, dst, flags, confirm)
+                    aborted = aborted or code != 0
+                    if code:
+                        return finish(code)
+                    continue
                 if os.path.isdir(dst) and func in (1, 2):
                     dst = os.path.join(dst, os.path.basename(src))
                 if os.path.isfile(dst) and os.path.isfile(src) and \

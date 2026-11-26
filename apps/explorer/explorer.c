@@ -28,8 +28,15 @@ runs EXE files and copies, moves, renames and deletes files.
     (Ctrl+X / C / V), Select All (Ctrl+A), Properties (Alt+Enter), Refresh (F5)
   - Right-click an item, the empty space or a tree folder for its menu
   - The CD-ROM D: is read-only: nothing on it can be changed
+  - Delete sends files to the Recycle Bin (SHFileOperation with
+    FOF_ALLOWUNDO; on the floppy A: they are deleted for good), Shift+Delete
+    deletes them for good
+  - The Recycle Bin lists the deleted items with their original location and
+    deletion date: Restore, Delete (for good), Empty Recycle Bin
+  - The network folder is empty: the emulated PC has no network
 
-Usage: explorer.exe [folder]  (default: My Computer)
+Usage: explorer.exe [folder]  (default: My Computer; also the Recycle Bin's
+and the network's parsing names, BIN_PATH and NETWORK_PATH)
 */
 
 #include <windows.h>
@@ -61,14 +68,35 @@ Usage: explorer.exe [folder]  (default: My Computer)
 #define COL_TYPE     2
 #define COL_MODIFIED 3
 
+/* The virtual folders besides My Computer (""): their shell parsing names */
+#define BIN_PATH     "::{645FF040-5081-101B-9F08-00AA002F954E}"
+#define NETWORK_PATH "::{208D2C60-3AEA-1069-A2D7-08002B30309D}"
+#define BIN_NAME     "Recycle Bin"
+#define NETWORK_NAME "Network"
+
+/* The Recycle Bin store of a drive (written by the emulator's shell32,
+   src/recycle_bin.py): X:\$Recycle holds the deleted items and INDEX.TXT,
+   UTF-8 lines "stored name TAB FILETIME TAB size TAB F|D TAB original path"
+   after a header line */
+#define BIN_STORE        "$Recycle"
+#define BIN_INDEX        "INDEX.TXT"
+#define BIN_INDEX_HEADER "winexe32emu recycle bin 1"
+
+/* The Recycle Bin's columns */
+#define COL_ORIGIN  1
+#define COL_DELETED 2
+#define COL_BINSIZE 3
+
 typedef struct {
     char name[MAX_PATH];  /* A drive's root ("C:\") in My Computer */
     char type[80];
     DWORD attributes;
     ULONGLONG size;       /* Drives: total bytes */
     ULONGLONG free;       /* Drives: free bytes */
-    FILETIME modified;
+    FILETIME modified;    /* Recycle Bin: the deletion time */
     int image;
+    char origin[MAX_PATH];  /* Recycle Bin: the path it was deleted from */
+    char store[MAX_PATH];   /* Recycle Bin: the stored item (X:\$Recycle\R000001.txt) */
 } Entry;
 
 static HINSTANCE hInst;
@@ -82,6 +110,9 @@ static int sort_column = COL_NAME, sort_ascending = 1;
 static char back_stack[HISTORY][MAX_PATH], forward_stack[HISTORY][MAX_PATH];
 static int back_count, forward_count;
 static int syncing_tree;  /* The tree selection follows the list: no navigation */
+static int bin_items_shown = -1;  /* Items in the Recycle Bin when its icon was set */
+
+#define BIN_TIMER 1
 
 /* Cut / Copy: the paths (double-NUL list) and whether Paste moves them */
 static char *clip_paths;
@@ -89,12 +120,30 @@ static int clip_cut;
 
 static void navigate(const char *path, int add_history);
 static void refresh(void);
+static Entry *add_entry(const char *name, DWORD attributes);
+static void properties_of_selection(void);
 
 /* ---------- Helpers ---------- */
 
 static int is_computer(const char *path)
 {
     return path[0] == '\0';
+}
+
+static int is_bin(const char *path)
+{
+    return lstrcmpiA(path, BIN_PATH) == 0;
+}
+
+static int is_network(const char *path)
+{
+    return lstrcmpiA(path, NETWORK_PATH) == 0;
+}
+
+/* My Computer, the Recycle Bin, the network: no folder of a drive */
+static int is_virtual(const char *path)
+{
+    return is_computer(path) || is_bin(path) || is_network(path);
 }
 
 static int is_root(const char *path)
@@ -150,7 +199,7 @@ static const char *base_name(const char *path)
 static int is_read_only(const char *path)
 {
     char root[4];
-    if (is_computer(path))
+    if (is_virtual(path))
         return 1;
     lstrcpynA(root, path, 4);
     return GetDriveTypeA(root) == DRIVE_CDROM;
@@ -158,14 +207,18 @@ static int is_read_only(const char *path)
 
 static void read_only_message(void)
 {
-    MessageBoxA(hMain, "This drive is a CD-ROM: its files cannot be changed.", "My Computer",
-                MB_OK | MB_ICONINFORMATION);
+    if (is_virtual(current))
+        MessageBoxA(hMain, "Files cannot be created or changed here.", "My Computer",
+                    MB_OK | MB_ICONINFORMATION);
+    else
+        MessageBoxA(hMain, "This drive is a CD-ROM: its files cannot be changed.",
+                    "My Computer", MB_OK | MB_ICONINFORMATION);
 }
 
 static int folder_exists(const char *path)
 {
     DWORD attributes;
-    if (is_computer(path))
+    if (is_virtual(path))
         return 1;
     attributes = GetFileAttributesA(path);
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
@@ -234,6 +287,10 @@ static void display_name(char *out, const char *path)
 {
     if (is_computer(path))
         lstrcpyA(out, "My Computer");
+    else if (is_bin(path))
+        lstrcpyA(out, BIN_NAME);
+    else if (is_network(path))
+        lstrcpyA(out, NETWORK_NAME);
     else
         lstrcpyA(out, path);
 }
@@ -254,17 +311,136 @@ static int shell_icon(const char *path, DWORD attributes, char *type, int type_s
     return info.iIcon;
 }
 
-static int computer_icon(void)
+/* Icon of a virtual folder (CSIDL_DRIVES, CSIDL_BITBUCKET: empty or full, CSIDL_NETWORK) */
+static int special_icon(int csidl)
 {
     LPITEMIDLIST pidl = NULL;
     SHFILEINFOA info;
     memset(&info, 0, sizeof(info));
-    if (SHGetSpecialFolderLocation(NULL, CSIDL_DRIVES, &pidl) == S_OK) {
+    if (SHGetSpecialFolderLocation(NULL, csidl, &pidl) == S_OK) {
         SHGetFileInfoA((LPCSTR)pidl, 0, &info, sizeof(info),
                        SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
         CoTaskMemFree(pidl);
     }
     return info.iIcon;
+}
+
+static int computer_icon(void)
+{
+    return special_icon(CSIDL_DRIVES);
+}
+
+/* ---------- The Recycle Bin ---------- */
+
+/* UTF-8 (the index) -> the ANSI code page of the A functions */
+static void utf8_to_ansi(char *out, int size, const char *text)
+{
+    WCHAR wide[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, MAX_PATH) ||
+            !WideCharToMultiByte(CP_ACP, 0, wide, -1, out, size, NULL, NULL))
+        lstrcpynA(out, text, size);
+}
+
+/* A decimal number of the index */
+static ULONGLONG parse_number(const char *text)
+{
+    ULONGLONG value = 0;
+    while (*text >= '0' && *text <= '9')
+        value = value * 10 + (ULONGLONG)(*text++ - '0');
+    return value;
+}
+
+/* The whole index file of a drive's bin ("C:\"), NUL-terminated (free it), or NULL */
+static char *read_bin_index(const char *root)
+{
+    char path[MAX_PATH], *data;
+    DWORD size, got = 0;
+    HANDLE file;
+    wsprintfA(path, "%s%s\\%s", root, BIN_STORE, BIN_INDEX);
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return NULL;
+    size = GetFileSize(file, NULL);
+    data = size != INVALID_FILE_SIZE && size < 16 * 1024 * 1024 ? malloc(size + 1) : NULL;
+    if (data && (!ReadFile(file, data, size, &got, NULL) || got != size)) {
+        free(data);
+        data = NULL;
+    }
+    CloseHandle(file);
+    if (data)
+        data[size] = '\0';
+    return data;
+}
+
+/* One index line: "name TAB time TAB size TAB kind TAB original" (cut in place) */
+static void add_bin_line(const char *root, char *line)
+{
+    char *fields[5], ansi[MAX_PATH], store[MAX_PATH];
+    ULONGLONG deleted;
+    DWORD attributes;
+    Entry *e;
+    int i;
+    fields[0] = line;
+    for (i = 1; i < 5; i++) {
+        fields[i] = strchr(fields[i - 1], '\t');
+        if (!fields[i])
+            return;
+        *fields[i]++ = '\0';
+    }
+    wsprintfA(store, "%s%s\\%s", root, BIN_STORE, fields[0]);
+    attributes = GetFileAttributesA(store);
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return;  /* Gone meanwhile */
+    utf8_to_ansi(ansi, sizeof(ansi), fields[4]);
+    e = add_entry(base_name(ansi), attributes);
+    if (!e)
+        return;
+    lstrcpynA(e->origin, ansi, MAX_PATH);
+    lstrcpynA(e->store, store, MAX_PATH);
+    deleted = parse_number(fields[1]);
+    e->modified.dwLowDateTime = (DWORD)deleted;
+    e->modified.dwHighDateTime = (DWORD)(deleted >> 32);
+    e->size = parse_number(fields[2]);
+    e->image = shell_icon(store, attributes, e->type, sizeof(e->type));
+}
+
+/* The items of the bins of all hard disks */
+static void load_bin(void)
+{
+    char roots[256], *root;
+    DWORD length = GetLogicalDriveStringsA(sizeof(roots), roots);
+    if (length == 0 || length >= sizeof(roots))
+        return;
+    for (root = roots; *root; root += lstrlenA(root) + 1) {
+        char *data, *line, *next;
+        if (GetDriveTypeA(root) != DRIVE_FIXED || !(data = read_bin_index(root)))
+            continue;
+        for (line = data, next = NULL; line && *line; line = next) {
+            char *end = strchr(line, '\n');
+            next = end ? end + 1 : NULL;
+            if (end)
+                *end = '\0';
+            if (end && end > line && end[-1] == '\r')
+                end[-1] = '\0';
+            if (line == data) {
+                if (lstrcmpA(line, BIN_INDEX_HEADER) != 0)
+                    break;  /* Not an index this Explorer knows */
+                continue;
+            }
+            add_bin_line(root, line);
+        }
+        free(data);
+    }
+}
+
+/* Is there anything in the Recycle Bin? */
+static int bin_has_items(void)
+{
+    SHQUERYRBINFO info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    return SHQueryRecycleBinA(NULL, &info) == S_OK && info.i64NumItems > 0;
 }
 
 /* ---------- The list (right pane) ---------- */
@@ -319,6 +495,8 @@ static void load_files(void)
         Entry *e;
         if (lstrcmpA(fd.cFileName, ".") == 0 || lstrcmpA(fd.cFileName, "..") == 0)
             continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)
+            continue;  /* Like Explorer by default (the Recycle Bin's store) */
         e = add_entry(fd.cFileName, fd.dwFileAttributes);
         if (!e)
             break;
@@ -335,6 +513,23 @@ static int CALLBACK compare_items(LPARAM a, LPARAM b, LPARAM unused)
 {
     const Entry *x = &entries[a], *y = &entries[b];
     int result = 0;
+    if (is_bin(current)) {
+        /* Name, Original Location, Date Deleted, Size */
+        switch (sort_column) {
+        case COL_ORIGIN:
+            result = lstrcmpiA(x->origin, y->origin);
+            break;
+        case COL_DELETED:
+            result = CompareFileTime(&x->modified, &y->modified);
+            break;
+        case COL_BINSIZE:
+            result = x->size < y->size ? -1 : x->size > y->size;
+            break;
+        }
+        if (!result)
+            result = lstrcmpiA(x->name, y->name);
+        return sort_ascending ? result : -result;
+    }
     if (is_computer(current))
         result = lstrcmpiA(x->name, y->name);  /* Drives: by letter */
     else if (is_dir(x) != is_dir(y))
@@ -378,6 +573,16 @@ static void set_columns(void)
         set_column(COL_SIZE, "Type", 110, 0);
         set_column(COL_TYPE, "Total Size", 90, 1);
         set_column(COL_MODIFIED, "Free Space", 90, 1);
+    } else if (is_bin(current)) {
+        set_column(COL_NAME, "Name", 160, 0);
+        set_column(COL_ORIGIN, "Original Location", 170, 0);
+        set_column(COL_DELETED, "Date Deleted", 120, 0);
+        set_column(COL_BINSIZE, "Size", 70, 1);
+    } else if (is_network(current)) {
+        set_column(COL_NAME, "Name", 190, 0);
+        set_column(COL_SIZE, "Comment", 260, 0);
+        set_column(COL_TYPE, "", 0, 0);
+        set_column(COL_MODIFIED, "", 0, 0);
     } else {
         set_column(COL_NAME, "Name", 190, 0);
         set_column(COL_SIZE, "Size", 80, 1);
@@ -399,7 +604,7 @@ static void show_sort_arrow(void)
         item.mask = HDI_FORMAT;
         SendMessageA(header, HDM_GETITEMA, i, (LPARAM)&item);
         item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-        if (i == sort_column && !is_computer(current))
+        if (i == sort_column && !is_computer(current) && !is_network(current))
             item.fmt |= sort_ascending ? HDF_SORTUP : HDF_SORTDOWN;
         SendMessageA(header, HDM_SETITEMA, i, (LPARAM)&item);
     }
@@ -470,6 +675,8 @@ static void entry_path(char *out, const Entry *e)
 {
     if (is_computer(current))
         lstrcpyA(out, e->name);
+    else if (is_bin(current))
+        lstrcpyA(out, e->store);  /* The file operations work on the stored item */
     else
         join_path(out, current, e->name);
 }
@@ -503,10 +710,19 @@ static char *selected_paths(void)
 /* The status line: the selection or the folder's summary */
 static void update_status(void)
 {
-    char text[MAX_PATH + 128], number[32], second[32];
+    char text[3 * MAX_PATH], number[32], second[32];
     int count = selected_count();
     int index = entry_of_row(first_selected());
-    if (count == 1 && index >= 0) {
+    if (is_network(current)) {
+        lstrcpyA(text, "The network is not available: this computer is not connected to a "
+                 "network.");
+    } else if (count == 1 && index >= 0 && is_bin(current)) {
+        const Entry *e = &entries[index];
+        format_time(second, &e->modified);
+        format_size(number, e->size);
+        wsprintfA(text, "%s - %s, deleted from %s on %s", e->name, number, e->origin,
+                  second);
+    } else if (count == 1 && index >= 0) {
         const Entry *e = &entries[index];
         if (is_computer(current)) {
             format_size(number, e->free);
@@ -526,14 +742,14 @@ static void update_status(void)
         ULONGLONG total = 0;
         int i;
         for (i = 0; i < entry_count; i++)
-            if (!is_dir(&entries[i]))
+            if (!is_dir(&entries[i]) || is_bin(current))  /* (the bin knows folder sizes) */
                 total += entries[i].size;
         if (is_computer(current)) {
             wsprintfA(text, "%d drive(s)", entry_count);
         } else {
             format_size(number, total);
             wsprintfA(text, "%d object(s) - %s%s", entry_count, number,
-                      is_read_only(current) ? " (read-only)" : "");
+                      !is_virtual(current) && is_read_only(current) ? " (read-only)" : "");
         }
     }
     SetWindowTextA(hStatus, text);
@@ -549,7 +765,9 @@ static void load_list(const char *select)
     entry_count = 0;
     if (is_computer(current))
         load_drives();
-    else
+    else if (is_bin(current))
+        load_bin();
+    else if (!is_network(current))  /* (no network: nothing to list) */
         load_files();
 
     SendMessageA(hList, WM_SETREDRAW, FALSE, 0);
@@ -574,6 +792,14 @@ static void load_list(const char *select)
             set_item_text(row, COL_TYPE, e->size ? number : "");
             format_size(number, e->free);
             set_item_text(row, COL_MODIFIED, e->size ? number : "");
+        } else if (is_bin(current)) {
+            char folder[MAX_PATH];
+            parent_path(folder, e->origin);
+            set_item_text(row, COL_ORIGIN, folder);
+            format_time(number, &e->modified);
+            set_item_text(row, COL_DELETED, number);
+            format_size(number, e->size);
+            set_item_text(row, COL_BINSIZE, number);
         } else {
             if (!is_dir(e)) {
                 format_size(number, e->size);
@@ -597,8 +823,8 @@ static void load_list(const char *select)
 
     display_name(text, current);
     SetWindowTextA(hAddress, text);
-    if (is_computer(current)) {
-        SetWindowTextA(hMain, "My Computer");
+    if (is_virtual(current)) {
+        SetWindowTextA(hMain, text);  /* "My Computer", "Recycle Bin", "Network" */
     } else {
         wsprintfA(text, "My Computer - %s", current);
         SetWindowTextA(hMain, text);
@@ -632,6 +858,7 @@ static int has_subfolders(const char *path)
         return 0;
     do {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                !(fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) &&
                 lstrcmpA(fd.cFileName, ".") && lstrcmpA(fd.cFileName, "..")) {
             found = 1;
             break;
@@ -669,7 +896,8 @@ static void fill_tree_item(HTREEITEM item)
     WIN32_FIND_DATAA fd;
     HANDLE find;
     TVITEMA tv;
-    if (!path || SendMessageA(hTree, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item))
+    if (!path || SendMessageA(hTree, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item) ||
+            is_bin(path) || is_network(path))
         return;
     if (is_computer(path)) {
         char roots[256], *root;
@@ -688,6 +916,7 @@ static void fill_tree_item(HTREEITEM item)
     if (find != INVALID_HANDLE_VALUE) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                    (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) ||
                     !lstrcmpA(fd.cFileName, ".") || !lstrcmpA(fd.cFileName, ".."))
                 continue;
             join_path(child, path, fd.cFileName);
@@ -727,6 +956,16 @@ static HTREEITEM tree_item_of(const char *path, int expand)
     HTREEITEM item = (HTREEITEM)SendMessageA(hTree, TVM_GETNEXTITEM, TVGN_ROOT, 0);
     char step[MAX_PATH];
     int position;
+    if (item && (is_bin(path) || is_network(path))) {
+        /* The Recycle Bin and the network are roots of their own after My Computer */
+        for (; item; item = (HTREEITEM)SendMessageA(hTree, TVM_GETNEXTITEM, TVGN_NEXT,
+                                                    (LPARAM)item)) {
+            const char *root = tree_path(item);
+            if (root && lstrcmpiA(root, path) == 0)
+                return item;
+        }
+        return NULL;
+    }
     if (!item || is_computer(path))
         return item;
     lstrcpynA(step, path, 4);  /* "C:\" */
@@ -788,6 +1027,42 @@ static void build_tree(void)
     HTREEITEM root = add_tree_item(TVI_ROOT, "My Computer", "", computer_icon(), 1, TVI_LAST);
     fill_tree_item(root);
     SendMessageA(hTree, TVM_EXPAND, TVE_EXPAND, (LPARAM)root);
+    add_tree_item(TVI_ROOT, NETWORK_NAME, NETWORK_PATH, special_icon(CSIDL_NETWORK), 0,
+                  TVI_LAST);
+    add_tree_item(TVI_ROOT, BIN_NAME, BIN_PATH, special_icon(CSIDL_BITBUCKET), 0, TVI_LAST);
+}
+
+/* The Recycle Bin's tree icon shows whether it is empty: after every deletion */
+static void update_bin_icon(void)
+{
+    SHQUERYRBINFO info;
+    HTREEITEM item = tree_item_of(BIN_PATH, 0);
+    TVITEMA tv;
+    if (!item)
+        return;
+    memset(&tv, 0, sizeof(tv));
+    tv.mask = TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+    tv.hItem = item;
+    tv.iImage = tv.iSelectedImage = special_icon(CSIDL_BITBUCKET);
+    SendMessageA(hTree, TVM_SETITEMA, 0, (LPARAM)&tv);
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    if (SHQueryRecycleBinA(NULL, &info) == S_OK)
+        bin_items_shown = (int)info.i64NumItems;
+}
+
+/* Every second: the Recycle Bin may have changed elsewhere (emptied from the
+   desktop, files deleted by a program): its icon and its open view follow */
+static void check_bin(void)
+{
+    SHQUERYRBINFO info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    if (SHQueryRecycleBinA(NULL, &info) != S_OK || (int)info.i64NumItems == bin_items_shown)
+        return;
+    update_bin_icon();
+    if (is_bin(current) && !SendMessageA(hList, LVM_GETEDITCONTROL, 0, 0))
+        refresh();
 }
 
 /* ---------- Navigation ---------- */
@@ -796,7 +1071,7 @@ static void update_buttons(void)
 {
     EnableWindow(GetDlgItem(hMain, ID_BACK), back_count > 0);
     EnableWindow(GetDlgItem(hMain, ID_FORWARD), forward_count > 0);
-    EnableWindow(GetDlgItem(hMain, ID_UP), !is_computer(current));
+    EnableWindow(GetDlgItem(hMain, ID_UP), !is_virtual(current));
 }
 
 static void push(char stack[][MAX_PATH], int *count, const char *path)
@@ -869,11 +1144,22 @@ static void go_forward(void)
 static void go_up(void)
 {
     char parent[MAX_PATH], child[MAX_PATH];
-    if (is_computer(current))
-        return;
+    if (is_virtual(current))
+        return;  /* (the top of the tree) */
     lstrcpyA(child, is_root(current) ? current : base_name(current));
     parent_path(parent, current);
     navigate_select(parent, 1, child);  /* The folder we came from stays selected */
+}
+
+/* The virtual folder a typed name or parsing name stands for, or NULL */
+static const char *virtual_folder_of(const char *text)
+{
+    if (lstrcmpiA(text, BIN_NAME) == 0 || is_bin(text))
+        return BIN_PATH;
+    if (lstrcmpiA(text, NETWORK_NAME) == 0 || is_network(text) ||
+            lstrcmpiA(text, "Network Neighborhood") == 0)
+        return NETWORK_PATH;
+    return NULL;
 }
 
 /* The address bar: a folder path, "My Computer", or an EXE to run */
@@ -888,6 +1174,11 @@ static void go_address(void)
         text[--len] = '\0';
     if (len == 0 || lstrcmpiA(text, "My Computer") == 0) {
         navigate("", 1);
+        return;
+    }
+    if (virtual_folder_of(text)) {
+        navigate(virtual_folder_of(text), 1);
+        SetFocus(hList);
         return;
     }
     if (len == 2 && text[1] == ':')
@@ -950,13 +1241,18 @@ static void open_entry(int index)
         return;
     e = &entries[index];
     entry_path(path, e);
-    if (is_dir(e)) {
+    if (is_bin(current)) {
+        properties_of_selection();  /* Deleted items open only after Restore */
+    } else if (is_dir(e)) {
         navigate(path, 1);
     } else if (is_exe(e->name)) {
         run_program(path);
+    } else if ((INT_PTR)ShellExecuteA(hMain, "open", path, NULL, current,
+                                      SW_SHOWNORMAL) > 32) {
+        /* A document: its associated program opened it */
     } else {
-        wsprintfA(message, "%s\n\nThere is no program to open %s files with.\n"
-                  "Only EXE files can be run.", e->name, e->type);
+        wsprintfA(message, "%s\n\nThere is no program to open %s files with.",
+                  e->name, e->type);
         MessageBoxA(hMain, message, "My Computer", MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -1033,7 +1329,7 @@ static void paste_into(const char *folder)
 
 static void copy_selection(int cut)
 {
-    if (is_computer(current) || !selected_count())
+    if (is_virtual(current) || !selected_count())
         return;
     if (cut && is_read_only(current)) {
         read_only_message();
@@ -1044,13 +1340,15 @@ static void copy_selection(int cut)
     clip_cut = cut;
 }
 
-static void delete_selection(void)
+/* Delete: to the Recycle Bin (the shell decides: the floppy A: has none),
+   for good with permanent or Shift held, and always in the Recycle Bin itself */
+static void delete_selection(int permanent)
 {
     SHFILEOPSTRUCTA op;
     char *paths;
-    if (is_computer(current) || !selected_count())
+    if (is_computer(current) || is_network(current) || !selected_count())
         return;
-    if (is_read_only(current)) {
+    if (!is_bin(current) && is_read_only(current)) {
         read_only_message();
         return;
     }
@@ -1061,10 +1359,81 @@ static void delete_selection(void)
     op.hwnd = hMain;
     op.wFunc = FO_DELETE;
     op.pFrom = paths;
+    if (!permanent && !is_bin(current) && GetKeyState(VK_SHIFT) >= 0)
+        op.fFlags = FOF_ALLOWUNDO;
     SHFileOperationA(&op);  /* It asks before deleting */
     free(paths);
-    refresh_tree_folder(current);
+    if (!is_bin(current))
+        refresh_tree_folder(current);
+    update_bin_icon();
     refresh();
+}
+
+/* Restore: the selected Recycle Bin items go back where they were deleted
+   from (the shell makes their folders again and asks before replacing) */
+static void restore_selection(void)
+{
+    SHFILEOPSTRUCTA op;
+    char *sources, *targets, folder[MAX_PATH];
+    int row = -1, size = 1;
+    if (!is_bin(current) || !selected_count() || !(sources = selected_paths()))
+        return;
+    targets = malloc(1);
+    if (!targets) {
+        free(sources);
+        return;
+    }
+    targets[0] = '\0';
+    /* The targets in the order of selected_paths(): the selected rows */
+    while ((row = (int)SendMessageA(hList, LVM_GETNEXTITEM, row, LVNI_SELECTED)) >= 0) {
+        int index = entry_of_row(row), length;
+        char *grown;
+        if (index < 0)
+            continue;
+        length = lstrlenA(entries[index].origin) + 1;
+        grown = realloc(targets, size + length);
+        if (!grown)
+            break;
+        targets = grown;
+        memcpy(targets + size - 1, entries[index].origin, length);
+        size += length;
+        targets[size - 1] = '\0';
+    }
+    memset(&op, 0, sizeof(op));
+    op.hwnd = hMain;
+    op.wFunc = FO_MOVE;
+    op.pFrom = sources;
+    op.pTo = targets;
+    op.fFlags = FOF_MULTIDESTFILES;
+    SHFileOperationA(&op);
+    /* The folders that got their items back (or were made again) show them in the tree */
+    for (row = -1; (row = (int)SendMessageA(hList, LVM_GETNEXTITEM, row, LVNI_SELECTED)) >= 0;) {
+        int index = entry_of_row(row);
+        char grandparent[MAX_PATH];
+        if (index < 0)
+            continue;
+        parent_path(folder, entries[index].origin);
+        parent_path(grandparent, folder);
+        refresh_tree_folder(grandparent);
+        refresh_tree_folder(folder);
+    }
+    free(sources);
+    free(targets);
+    update_bin_icon();
+    refresh();
+}
+
+static void empty_bin(void)
+{
+    if (!bin_has_items()) {
+        MessageBoxA(hMain, "The Recycle Bin is already empty.", BIN_NAME,
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    SHEmptyRecycleBinA(hMain, NULL, 0);  /* It asks first */
+    update_bin_icon();
+    if (is_bin(current))
+        refresh();
 }
 
 static void new_folder(void)
@@ -1208,6 +1577,23 @@ static void fill_properties(Properties *p, const char *path)
                 drives++;
         wsprintfA(text, "%d", drives);
         add_row(p, "Drives:", text);
+    } else if (is_bin(path)) {
+        SHQUERYRBINFO info;
+        lstrcpyA(p->name, BIN_NAME);
+        add_row(p, "Type:", "System Folder");
+        memset(&info, 0, sizeof(info));
+        info.cbSize = sizeof(info);
+        if (SHQueryRecycleBinA(NULL, &info) == S_OK) {
+            wsprintfA(text, "%u", (unsigned)info.i64NumItems);
+            add_row(p, "Items:", text);
+            size_text(text, (ULONGLONG)info.i64Size);
+            add_row(p, "Size:", text);
+        }
+        add_row(p, "", "Deleted files of the hard disks. The floppy A: has none.");
+    } else if (is_network(path)) {
+        lstrcpyA(p->name, NETWORK_NAME);
+        add_row(p, "Type:", "System Folder");
+        add_row(p, "", "This computer is not connected to a network.");
     } else if (is_root(path)) {
         char file_system[32] = "";
         ULARGE_INTEGER free_bytes, total_bytes;
@@ -1309,11 +1695,38 @@ static void show_properties(const char *path)
     free(p);
 }
 
+/* A deleted item: where it came from and when it was deleted */
+static void show_bin_properties(const Entry *e)
+{
+    char text[MAX_PATH];
+    Properties *p = malloc(sizeof(Properties));
+    if (!p)
+        return;
+    memset(p, 0, sizeof(*p));
+    p->attributes = -1;
+    lstrcpynA(p->name, e->name, MAX_PATH);
+    add_row(p, "Type:", e->type);
+    parent_path(text, e->origin);
+    add_row(p, "Origin:", text);
+    format_time(text, &e->modified);
+    add_row(p, "Deleted:", text);
+    size_text(text, e->size);
+    add_row(p, "Size:", text);
+    add_row(p, "", "Restore it to open it.");
+    wsprintfA(p->title, "%s Properties", p->name);
+    DialogBoxParamA(hInst, MAKEINTRESOURCEA(IDD_PROPERTIES), hMain, PropertiesProc, (LPARAM)p);
+    free(p);
+}
+
 /* Properties of the selection, or of the current folder */
 static void properties_of_selection(void)
 {
     char path[MAX_PATH];
     int index = entry_of_row(first_selected());
+    if (selected_count() == 1 && index >= 0 && is_bin(current)) {
+        show_bin_properties(&entries[index]);
+        return;
+    }
     if (selected_count() == 1 && index >= 0)
         entry_path(path, &entries[index]);
     else
@@ -1332,8 +1745,12 @@ static HMENU create_menu(void)
     AppendMenuA(file, MF_STRING, IDM_NEWFOLDER, "New &Folder\tCtrl+Shift+N");
     AppendMenuA(file, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file, MF_STRING, IDM_DELETE, "&Delete\tDel");
+    AppendMenuA(file, MF_STRING, IDM_PURGE, "Delete Per&manently\tShift+Del");
     AppendMenuA(file, MF_STRING, IDM_RENAME, "Rena&me\tF2");
     AppendMenuA(file, MF_STRING, IDM_PROPERTIES, "P&roperties\tAlt+Enter");
+    AppendMenuA(file, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(file, MF_STRING, IDM_RESTORE, "R&estore");
+    AppendMenuA(file, MF_STRING, IDM_EMPTYBIN, "Empty Recycle &Bin");
     AppendMenuA(file, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file, MF_STRING, IDM_EXIT, "&Close");
     AppendMenuA(edit, MF_STRING, IDM_CUT, "Cu&t\tCtrl+X");
@@ -1347,6 +1764,9 @@ static HMENU create_menu(void)
     AppendMenuA(go, MF_STRING, IDM_UP, "&Up One Level\tBackspace");
     AppendMenuA(go, MF_SEPARATOR, 0, NULL);
     AppendMenuA(go, MF_STRING, IDM_COMPUTER, "&My Computer");
+    AppendMenuA(go, MF_STRING, IDM_GO_USER, "U&ser Folder");
+    AppendMenuA(go, MF_STRING, IDM_GO_NETWORK, "&Network");
+    AppendMenuA(go, MF_STRING, IDM_GO_BIN, "&Recycle Bin");
     AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About My Computer");
     AppendMenuA(menu, MF_POPUP, (UINT_PTR)file, "&File");
     AppendMenuA(menu, MF_POPUP, (UINT_PTR)edit, "&Edit");
@@ -1361,9 +1781,13 @@ static void update_menu(HMENU menu)
 {
     int selection = selected_count() > 0 && !is_computer(current);
     int writable = !is_read_only(current);
+    int deletable = selection && (writable || is_bin(current));
     EnableMenuItem(menu, IDM_OPEN, selected_count() == 1 ? MF_ENABLED : MF_GRAYED);
     EnableMenuItem(menu, IDM_NEWFOLDER, writable ? MF_ENABLED : MF_GRAYED);
-    EnableMenuItem(menu, IDM_DELETE, selection && writable ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, IDM_DELETE, deletable ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, IDM_PURGE, deletable ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, IDM_RESTORE, selection && is_bin(current) ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, IDM_EMPTYBIN, bin_has_items() ? MF_ENABLED : MF_GRAYED);
     EnableMenuItem(menu, IDM_RENAME, selected_count() == 1 && selection && writable ?
                    MF_ENABLED : MF_GRAYED);
     EnableMenuItem(menu, IDM_CUT, selection && writable ? MF_ENABLED : MF_GRAYED);
@@ -1371,7 +1795,7 @@ static void update_menu(HMENU menu)
     EnableMenuItem(menu, IDM_PASTE, clip_paths && writable ? MF_ENABLED : MF_GRAYED);
     EnableMenuItem(menu, IDM_BACK, back_count ? MF_ENABLED : MF_GRAYED);
     EnableMenuItem(menu, IDM_FORWARD, forward_count ? MF_ENABLED : MF_GRAYED);
-    EnableMenuItem(menu, IDM_UP, !is_computer(current) ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, IDM_UP, !is_virtual(current) ? MF_ENABLED : MF_GRAYED);
 }
 
 static void popup_at(HMENU menu, int x, int y)
@@ -1388,7 +1812,20 @@ static void popup_at(HMENU menu, int x, int y)
 static void list_context_menu(int x, int y)
 {
     HMENU menu = CreatePopupMenu();
-    if (selected_count() > 0) {
+    if (is_bin(current)) {
+        /* Deleted items: back where they were, or gone for good */
+        if (selected_count() > 0) {
+            AppendMenuA(menu, MF_STRING, IDM_RESTORE, "R&estore");
+            AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(menu, MF_STRING, IDM_DELETE, "&Delete");
+        } else {
+            AppendMenuA(menu, MF_STRING, IDM_REFRESH, "R&efresh");
+            AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(menu, MF_STRING, IDM_EMPTYBIN, "Empty Recycle &Bin");
+        }
+    } else if (is_network(current)) {
+        AppendMenuA(menu, MF_STRING, IDM_REFRESH, "R&efresh");
+    } else if (selected_count() > 0) {
         AppendMenuA(menu, MF_STRING, IDM_OPEN, "&Open");
         if (!is_computer(current)) {
             AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
@@ -1442,10 +1879,14 @@ static void tree_context_menu(int x, int y)
     menu = CreatePopupMenu();
     AppendMenuA(menu, MF_STRING, IDM_EXPAND, tv.state & TVIS_EXPANDED ? "Collapse" : "&Expand");
     AppendMenuA(menu, MF_STRING, IDM_OPEN, "&Open");
-    if (!is_computer(folder)) {
+    if (!is_virtual(folder)) {
         AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuA(menu, MF_STRING | (clip_paths && !is_read_only(folder) ? 0 : MF_GRAYED),
                     IDM_PASTE, "&Paste");
+    } else if (is_bin(folder)) {
+        AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(menu, MF_STRING | (bin_has_items() ? 0 : MF_GRAYED), IDM_EMPTYBIN,
+                    "Empty Recycle &Bin");
     }
     AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(menu, MF_STRING, IDM_PROPERTIES, "P&roperties");
@@ -1460,6 +1901,9 @@ static void tree_context_menu(int x, int y)
         break;
     case IDM_PASTE:
         paste_into(folder);
+        break;
+    case IDM_EMPTYBIN:
+        empty_bin();
         break;
     case IDM_PROPERTIES:
         show_properties(folder);
@@ -1556,7 +2000,7 @@ static LRESULT on_notify(NMHDR *nm)
             return 0;
         case LVN_COLUMNCLICK: {
             int column = ((NMLISTVIEW *)nm)->iSubItem;
-            if (is_computer(current))
+            if (is_computer(current) || is_network(current))
                 return 0;
             if (column == sort_column)
                 sort_ascending = !sort_ascending;
@@ -1648,7 +2092,28 @@ static void on_command(int id)
         new_folder();
         break;
     case IDM_DELETE:
-        delete_selection();
+        delete_selection(0);
+        break;
+    case IDM_PURGE:
+        delete_selection(1);
+        break;
+    case IDM_RESTORE:
+        restore_selection();
+        break;
+    case IDM_EMPTYBIN:
+        empty_bin();
+        break;
+    case IDM_GO_USER: {
+        char profile[MAX_PATH];
+        if (SHGetSpecialFolderPathA(hMain, profile, CSIDL_PROFILE, TRUE))
+            navigate(profile, 1);
+        break;
+    }
+    case IDM_GO_NETWORK:
+        navigate(NETWORK_PATH, 1);
+        break;
+    case IDM_GO_BIN:
+        navigate(BIN_PATH, 1);
         break;
     case IDM_RENAME:
         rename_selection();
@@ -1679,7 +2144,8 @@ static void on_command(int id)
     case IDM_ABOUT:
         MessageBoxA(hMain, "My Computer for winexe32emu\n\n"
                     "Browse the drives A: (floppy disk), C: and D: (CD-ROM, read-only), "
-                    "run programs and copy, move, rename or delete files.\n\n"
+                    "run programs and copy, move, rename or delete files. Deleted files "
+                    "go to the Recycle Bin, where they can be restored.\n\n"
                     "This project is not endorsed by, affiliated with, or sponsored by "
                     "Microsoft Corporation in any way. Windows, Win32, and related "
                     "trademarks are the property of Microsoft Corporation.",
@@ -1717,6 +2183,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         layout(rc.right, rc.bottom);
         navigate(current, 0);
         SetFocus(hList);
+        update_bin_icon();
+        SetTimer(hwnd, BIN_TIMER, 1000, NULL);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == BIN_TIMER)
+            check_bin();
         return 0;
 
     case WM_SIZE:
@@ -1756,6 +2229,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, BIN_TIMER);
         free(entries);
         entries = NULL;
         entry_count = entry_capacity = 0;
@@ -1778,6 +2252,10 @@ static void read_start_folder(const char *cmdline)
     len = lstrlenA(folder);
     while (len > 0 && (folder[len - 1] == '"' || folder[len - 1] == ' '))
         folder[--len] = '\0';
+    if (virtual_folder_of(folder)) {  /* The desktop's Recycle Bin and network icons */
+        lstrcpyA(current, virtual_folder_of(folder));
+        return;
+    }
     if (len == 0 || !GetFullPathNameA(folder, MAX_PATH, full, NULL))
         return;
     len = lstrlenA(full);

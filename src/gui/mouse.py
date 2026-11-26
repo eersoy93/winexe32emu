@@ -16,6 +16,7 @@
 
 
 from ..config import PYGAME_AVAILABLE
+from ..winapi.listbox_multisel import click_item, is_multi_select
 
 if PYGAME_AVAILABLE:
     import pygame
@@ -312,6 +313,9 @@ class MouseMixin:
         hwnd, grab = self.dragging_list_thumb
         control = self.controls.get(hwnd)
         geo = None
+        if control is not None and control.class_name == "EDIT":
+            self._drag_edit_thumb_to(control, pos, grab)
+            return
         if control is not None and control.class_name == "LISTBOX":
             geo = self._listbox_rects(control)
         elif control is not None and self.open_combo == hwnd:
@@ -326,6 +330,38 @@ class MouseMixin:
             return
         offset = max(0, min(pos[1] - grab - track.y, free))
         control.top_index = (offset * span + free // 2) // free
+
+    def _subclassed_list_click(self, parent, control, index, cx, cy):
+        """A left click on a list box a program subclassed: its procedure gets
+        WM_LBUTTONDOWN (WM_LBUTTONDBLCLK the second time, the class has
+        CS_DBLCLKS) and passes it on to the list box procedure, which selects
+        the item. The release goes to the list too (it tracks the mouse while
+        the button is down). True if the click was handed over."""
+        owner = getattr(parent, 'owner', None)
+        if owner is None or not owner._control_subclass(control.hwnd) or \
+                control.parent_hwnd in owner.dialogs:
+            return False
+        double = self._double_click(('listbox', control.hwnd, index))
+        message = owner.WM_LBUTTONDBLCLK if double else owner.WM_LBUTTONDOWN
+        mods = pygame.key.get_mods()
+        keys = owner.MK_LBUTTON | (0x4 if mods & pygame.KMOD_SHIFT else 0) | \
+            (0x8 if mods & pygame.KMOD_CTRL else 0)
+        owner.post_window_message(control.hwnd, message, keys, self._make_lparam(cx, cy))
+        self.list_mouse_down = (owner, control.hwnd)
+        return True
+
+    def _subclassed_list_release(self, pos):
+        """WM_LBUTTONUP to the subclassed list box the button went down on;
+        True if there was one"""
+        owner, hwnd = getattr(self, 'list_mouse_down', None) or (None, 0)
+        self.list_mouse_down = None
+        control = self.controls.get(hwnd)
+        abs_pos = self._scrollbar_abs_pos(control) if control is not None else None
+        if owner is None or abs_pos is None:
+            return False
+        owner.post_window_message(hwnd, owner.WM_LBUTTONUP, 0, self._make_lparam(
+            pos[0] - abs_pos[0] - 1, pos[1] - abs_pos[1] - 1))
+        return True
 
     def _capture_target(self):
         """Window that currently captures the mouse (SetCapture), or None."""
@@ -395,6 +431,8 @@ class MouseMixin:
 
         # Mouse capture: the release always goes to the capturing window
         win = self._capture_target()
+        if button == 1 and win is None and self._subclassed_list_release(pos):
+            return
         if win is not None:
             cx, cy = self._client_point(win, x, y)
             lparam = self._make_lparam(cx, cy)
@@ -624,6 +662,9 @@ class MouseMixin:
                             if hwnd in self.messageboxes:
                                 self._messagebox_done(hwnd, getattr(control, 'mb_result', 1))
                                 return
+                            # The desktop's own dialogs (Run) handle their buttons
+                            if button == 1 and self._host_dialog_button(hwnd, control):
+                                return
                             if win.is_dialog and not self._is_app_window(hwnd):
                                 self._close_window(hwnd)
                                 return
@@ -634,7 +675,12 @@ class MouseMixin:
                         elif control.class_name == "EDIT":
                             # Give keyboard focus to the edit control, the caret
                             # goes where it was clicked
-                            if button == 1:
+                            if button in (4, 5) and control.style & 0x4:  # Wheel
+                                self._edit_scroll(control, 3 if button == 5 else -3)
+                            elif button == 1 and self._edit_scrollbar_click(control, pos,
+                                                                            ctrl_x, ctrl_y):
+                                self.focused_control = control.hwnd
+                            elif button == 1:
                                 self.focused_control = control.hwnd
                                 offset = self._edit_caret_from_x(control, x - ctrl_x,
                                                                  y - ctrl_y)
@@ -666,8 +712,19 @@ class MouseMixin:
                                     return
                                 index = next((i for i, r in geo['items']
                                               if r.collidepoint(pos)), -1)
+                                if self._subclassed_list_click(target, control, index,
+                                                               x - ctrl_x - 1, y - ctrl_y - 1):
+                                    return
                                 if 0 <= index < len(control.items):
-                                    control.sel_index = index
+                                    if is_multi_select(control):
+                                        mods = pygame.key.get_mods()
+                                        click_item(control, index,
+                                                   bool(mods & pygame.KMOD_CTRL),
+                                                   bool(mods & pygame.KMOD_SHIFT))
+                                    else:
+                                        control.sel_index = index
+                                    if self._host_dialog_list_click(hwnd, control, index):
+                                        return
                                     if self.winapi:
                                         self._post_control_command(
                                             win, control, self.winapi.LBN_SELCHANGE)

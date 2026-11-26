@@ -263,9 +263,8 @@ class TypeInfoMixin:
         if method in ('IsName', 'FindName'):
             return self._typelib_find_name(model, method, args)
         if method == 'GetTypeComp':
-            log.warning("ITypeLib::GetTypeComp is not emulated")
-            self._write_pointer(args[1], 0)
-            return E_NOTIMPL
+            return self.S_OK if self._write_pointer(
+                args[1], self._new_typecomp_object(model)) else self.E_POINTER
         return None
 
     def _typelib_find_name(self, model, method, args):
@@ -491,7 +490,11 @@ class TypeInfoMixin:
             member = self._ti_member(state, memid)
             texts = []
             if member is not None:
-                texts = [member.name] + [p[0] for p in getattr(member, 'params', [])]
+                texts = [member.name]
+                for param in getattr(member, 'params', []):
+                    if not param[0]:
+                        break  # The value of a property put has no name
+                    texts.append(param[0])
             texts = texts[:room]
             for number, text in enumerate(texts):
                 self._write_bstr(names + 4 * number, text)
@@ -550,6 +553,10 @@ class TypeInfoMixin:
             return self.S_OK
         if method == 'Invoke':
             return self._ti_invoke(state, args)
+        if method == 'GetTypeComp':
+            return self.S_OK if self._write_pointer(
+                args[1], self._new_typecomp_object(model, info, state['view'])) \
+                else self.E_POINTER
         if method == 'GetMops':
             self._write_pointer(args[2], 0)
             return self.S_OK
@@ -583,6 +590,12 @@ class TypeInfoMixin:
             lower = texts[0].lower()
             member = next((m for m in state['type'].funcs + state['type'].vars
                            if m.name.lower() == lower), None)
+            if member is None:
+                # Like Windows, the interfaces it derives from have names too
+                member = self._inherited_member(state['lib'], state['type'], state['view'],
+                                                texts[0])
+        log.debug(f"ITypeInfo::GetIDsOfNames({state['type'].name}, {texts}) -> "
+                  f"{member.memid if member is not None else 'unknown'}")
         if member is None:
             result = DISP_E_UNKNOWNNAME
         else:

@@ -52,9 +52,11 @@ class MessagesMixin:
         if Msg in (WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH) and self.gui and \
                 hWnd in self.gui.controls and self._control_subclass(hWnd):
             return self.emu.call_wndproc(self._control_subclass(hWnd), hWnd, Msg, wParam, lParam)
-        if Msg == WM_SETTEXT and self._text_wndproc(hWnd):
+        if Msg in (WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH) and self._text_wndproc(hWnd):
             # A program's window class (a custom static text, say) sees its new
-            # text and repaints; DefWindowProc stores it
+            # text and repaints; DefWindowProc stores it. One that keeps its
+            # own text answers WM_GETTEXT itself (Access 95's grid reads the
+            # field name typed into its cell editor that way).
             return self._call_proc(self._text_wndproc(hWnd), hWnd, Msg, wParam, lParam,
                                    wide)
         if Msg == WM_SETTEXT:
@@ -322,6 +324,11 @@ class MessagesMixin:
             return self._click_button(control)
 
         # ----- Listbox messages -----
+        result = self._multi_select_message(control, Msg, wParam, lParam)
+        if result is None:
+            result = self._owner_draw_list_message(control, Msg, wParam, lParam)
+        if result is not None:
+            return result
         if Msg in (self.LB_ADDSTRING, self.LB_INSERTSTRING):
             # An owner-draw list without LBS_HASSTRINGS/CBS_HASSTRINGS keeps
             # lParam as the item's data: it is no string pointer
@@ -557,7 +564,7 @@ class MessagesMixin:
             return control.text_limit or (0x7FFFFFFE if control.style & self.ES_MULTILINE
                                           else 30000)
         if Msg == self.EM_REPLACESEL:
-            text = self._read_text(lParam, wide) if lParam else ''
+            text = self._read_long_text(lParam, wide) if lParam else ''
             control.replace_selection(text)
             return 0
         if Msg == self.EM_GETMODIFY:
@@ -601,10 +608,28 @@ class MessagesMixin:
             return 0
         if Msg == self.EM_GETPASSWORDCHAR:
             return ord(control.password_char) if control.password_char else 0
-        if Msg in (self.EM_SCROLLCARET, self.EM_EMPTYUNDOBUFFER):
-            return 1 if Msg == self.EM_SCROLLCARET else 0
-        if Msg in (self.EM_CANUNDO, self.EM_UNDO, self.EM_SETMARGINS, self.EM_GETMARGINS,
-                   self.EM_GETFIRSTVISIBLELINE):
+        if Msg == self.EM_SCROLLCARET:
+            control.edit_caret_shown = None  # The drawing scrolls the caret into view
+            return 1
+        if Msg == self.EM_EMPTYUNDOBUFFER:
+            control.undo_state = None
+            return 0
+        if Msg == self.EM_CANUNDO:
+            return 1 if control.undo_state is not None else 0
+        if Msg in (self.EM_UNDO, 0x0304):  # WM_UNDO
+            return 1 if not readonly and control.undo() else 0
+        if Msg in (0xB5, 0xB6) and control.style & self.ES_MULTILINE:
+            # EM_SCROLL (SB_LINEUP/DOWN, SB_PAGEUP/DOWN) and EM_LINESCROLL (lines
+            # in lParam): the view moves, the caret stays
+            lines = len(control.edit_lines())
+            page = max(1, control.edit_visible_lines)
+            delta = (signed(lParam) if Msg == 0xB6 else
+                     {0: -1, 1: 1, 2: -page, 3: page}.get(wParam, 0))
+            top = max(0, min(control.edit_top_line + delta, max(0, lines - page)))
+            moved, control.edit_top_line = top - control.edit_top_line, top
+            control.edit_caret_shown = (control.sel_caret, control.text)
+            return (0x10000 | (moved & 0xFFFF)) if Msg == 0xB5 else 1
+        if Msg in (self.EM_SETMARGINS, self.EM_GETMARGINS, self.EM_GETFIRSTVISIBLELINE):
             return control.edit_top_line if Msg == self.EM_GETFIRSTVISIBLELINE else 0
         if Msg in (self.WM_COPY, self.WM_CUT):
             start, end = control.selection()
@@ -1130,6 +1155,11 @@ class MessagesMixin:
             self.post_window_message(hWnd, self.WM_SYSCOMMAND, self.SC_CLOSE, 0)
         elif Msg == self.WM_SYSCOMMAND and wParam & 0xFFF0 == self.SC_CLOSE:
             self.post_window_message(hWnd, self.WM_CLOSE, 0, 0)
+        elif Msg == self.WM_SYSCHAR and self.gui and 0x20 < wParam < 0x10000:
+            # Alt+letter: the menu bar item with that mnemonic opens (SC_KEYMENU)
+            char = chr(wParam) if wide or wParam < 0x80 else \
+                bytes([wParam & 0xFF]).decode(config.ANSI_CODEPAGE, errors='replace')
+            self.gui.open_menu_by_mnemonic(hWnd, char)
 
         return 0
 

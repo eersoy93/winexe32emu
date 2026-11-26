@@ -2027,9 +2027,10 @@ class CPUEmulator(ProcessEnvironmentMixin):
         # Let the GUI route window messages to this process
         if self.gui:
             self.gui.register_process(self.api_handler)
-        # Like Windows, only console (CUI) programs start with a console
+        # Like Windows, only console (CUI) programs start with a console (the
+        # one of the parent that started them, unless it asked for a new one)
         if self.pe_loader.is_console_program():
-            self.api_handler.alloc_console()
+            self.api_handler.start_console()
 
         self.sched.acquire()
         self._tls.thread = self.main_thread
@@ -2075,6 +2076,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
             if self.api_handler:
                 self.api_handler.process_exited = True
                 self.api_handler.flush_std_streams()
+                self.api_handler.close_inherited_handles()
                 if self.gui:
                     self.gui.unregister_process(self.api_handler)
 
