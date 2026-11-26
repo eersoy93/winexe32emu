@@ -2,7 +2,7 @@
 
 The notable changes of winexe32emu, newest first. The version numbers follow the scheme in [README.md](README.md#versioning).
 
-## Unreleased
+## 0.4.0 - 2026-11-26
 
 ### Added
 

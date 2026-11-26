@@ -26,13 +26,13 @@ Written with GitHub Copilot and Claude AI.
 ## Features
 
 - 🖥️ **Fake Windows desktop** with a taskbar, a Start menu (Programs, Documents, Run...), windows, dialogs and sound
-- 🗑️ **Desktop folders**: the user's folder, an (always offline) Network folder and a Recycle Bin that deleted files can be restored from
+- 🗑️ **Desktop folders**: the user's folder, Network and a Recycle Bin
 - 📦 **Runs real programs**: setups and applications, several of them side by side
 - 💾 **Virtual drives**: A: (floppy disk), C: (hard disk) and D: (CD-ROM) are plain folders in `drives/`
 - 🔒 **Sandboxed**: programs can only reach the files inside their virtual drives
 - 🗂️ **A shared registry** that the emulated programs keep between runs
 - 🌐 **Offline by design**: programs see a PC without a network
-- 🧩 **Built-in apps**: Explorer (`explorer.exe`), Notepad (`notepad.exe`, with UTF-8, UTF-16, ANSI and other code pages, and Windows, Unix and Mac line endings), a Command Prompt (`cmd.exe`, with the basic commands and simple batch files) and a Windows Help stub (`winhlp32.exe`)
+- 🧩 **Built-in apps**: Explorer, Notepad, Command Prompt and a simple Windows Help
 - 🔍 **Missing API report**: see what a program needs that is not emulated yet
 
 ## Supported Programs
@@ -45,7 +45,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
-| Microsoft Office 95 Professional | Installer, Word, Excel, PowerPoint, Access, Schedule+, Binder, Office Shortcut Bar, Find Fast
+| Microsoft Office 95 Professional | Setup, Word, Excel, PowerPoint, Access, Schedule+, Binder, Office Shortcut Bar |
 | Ski32 | Program |
 
 ## Getting Started
@@ -58,16 +58,7 @@ cd winexe32emu
 pip install -r requirements.txt
 ```
 
-Pygame (`pygame-ce`) is optional: it is only needed for the fake desktop and sound.
-
-The built-in apps (like Explorer) and the test programs are compiled with the 32-bit MinGW-w64 toolchain:
-
-| System | Command |
-| --- | --- |
-| Debian / Ubuntu | `sudo apt install gcc-mingw-w64-i686` |
-| Fedora | `sudo dnf install mingw32-gcc` |
-| Arch Linux | `sudo pacman -S mingw-w64-gcc` |
-| macOS (Homebrew) | `brew install mingw-w64` |
+The built-in apps and the test programs also need the 32-bit MinGW-w64 compiler (e.g. `sudo apt install gcc-mingw-w64-i686` on Debian / Ubuntu). [CONTRIBUTING.md](CONTRIBUTING.md#sending-changes) lists the commands for other systems.
 
 ## Usage
 
@@ -98,22 +89,16 @@ Useful options:
 | `-h` | Shows all the options |
 | `--no-gui` | Runs a console program without the fake desktop |
 | `--codepage cp1254` | Uses another ANSI code page (e.g. Turkish) |
-| `--missing-apis [FILE]` | Collects the APIs a program needs but the emulator lacks |
+| `--missing-apis` | Lists what a program needs that is not emulated yet |
 | `--clean` | Deletes the virtual drives (asks first) |
 
 ## Running the Tests
 
 ```bash
-# Lint and unit tests (no MinGW-w64 needed)
-pip install ruff
-ruff check .
-SDL_VIDEODRIVER=dummy python3 -m unittest discover -s tests/python -v
-
-# Emulator tests: compiles the C programs in tests/ and runs each one
 python3 winexe32emu.py --tests
 ```
 
-A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-gui api_test.exe`. GitHub Actions runs all of these on every push.
+This compiles and runs the test programs. The unit tests and the linter are described in [CONTRIBUTING.md](CONTRIBUTING.md#sending-changes).
 
 ## Not Supported (Currently)
 
@@ -121,22 +106,16 @@ A single test program can be run on its own, e.g. `python3 winexe32emu.py --no-g
 - .NET programs
 - DirectX, OpenGL and other hardware graphics
 - A real network
-- OLE and DDE between two running programs (embedding a Word document in Binder, opening a template from the Office Shortcut Bar)
-- Drivers, services and other system components
-- APIs the emulator does not emulate yet (see `--missing-apis`)
+- Programs working together while running (e.g. editing a Word document inside Binder)
+- Drivers and services
 
 ## Versioning
 
-| Change | Version examples |
-| --- | --- |
-| Minor | 0.0.16, 0.0.17… |
-| Major | 0.0.5, 0.0.10, 0.0.15… |
-| Bigger | 0.1.0, 0.2.0… |
-| Stable release | 1.0.0, 2.0.0… |
+Small releases raise the last number (0.0.16, 0.0.17…), and every fifth one is a major release (0.0.5, 0.0.10…). Big milestones raise the middle number (0.3.0, 0.4.0…), and 1.0.0 will be the first stable release. The changes of each version are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
-Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions must be based only on legally obtained information, never on Windows source code. The changes of each version are in [CHANGELOG.md](CHANGELOG.md).
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions must be based only on legally obtained information, never on Windows source code.
 
 ## Disclaimer
 

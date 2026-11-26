@@ -38,9 +38,18 @@ Open an issue and include:
 
 1. Fork the repository and create a branch for your change.
 2. Set up the project as described in [README.md](README.md#getting-started).
+   The 32-bit MinGW-w64 compiler builds the built-in apps and the C test programs:
+
+   | System | Command |
+   | --- | --- |
+   | Debian / Ubuntu | `sudo apt install gcc-mingw-w64-i686` |
+   | Fedora | `sudo dnf install mingw32-gcc` |
+   | Arch Linux | `sudo pacman -S mingw-w64-gcc` |
+   | macOS (Homebrew) | `brew install mingw-w64` |
+
 3. Make your change. Keep it focused: one topic per pull request.
 4. Add or extend a test where it is possible: a unit test in `tests/python/`, or a check in one of the C test programs in `tests/`.
-5. Run the checks (see [Running the Tests](README.md#running-the-tests)):
+5. Run the checks (`pip install ruff` first; the unit tests need no MinGW-w64):
 
    ```bash
    ruff check .
