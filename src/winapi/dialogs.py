@@ -22,8 +22,9 @@ import ntpath
 
 from unicorn import UcError
 
-from .. import config, gui, winapi
+from .. import config, gui, recent_documents, winapi
 from ..logger import log
+from .owner_draw_list import is_owner_draw_list
 from ..sound import SoundPlayer
 
 
@@ -92,7 +93,12 @@ class DialogsMixin:
     @staticmethod
     def _dialog_units(template):
         """Pixels per horizontal / vertical dialog unit of a template's font"""
-        size = template['font'][1] if template['font'] else 8
+        if not template['font']:
+            # No DS_SETFONT: the system font's units (GetDialogBaseUnits, 8 x
+            # 16 pixels per 4 x 8 units). Access 95 sizes its message boxes
+            # for them: with the 8 pt units their text was cut off.
+            return 2.0, 2.0
+        size = template['font'][1]
         return 1.5 * size / 8, 1.625 * size / 8
 
     def _create_dialog(self, template, owner, proc=0, handler=None, parent=0, pos=(0, 0),
@@ -353,6 +359,8 @@ class DialogsMixin:
             return 5  # ODT_STATIC
         if control.class_name == 'BUTTON' and (control.style & 0xF) == 0xB:  # BS_OWNERDRAW
             return 4  # ODT_BUTTON
+        if is_owner_draw_list(control):
+            return 2  # ODT_LISTBOX
         return 0
 
     def _paint_control(self, hwnd):
@@ -361,6 +369,8 @@ class DialogsMixin:
         kind = self._owner_draw_type(control) if control else 0
         if not kind:
             return 0
+        if kind == 2:
+            return self._paint_owner_draw_list(control)
         if not self._drawitem_buf:
             self._drawitem_buf = self.emu.heap_alloc(48)
         hdc = self._create_dc(hwnd)
@@ -1045,6 +1055,10 @@ class DialogsMixin:
         self._mem_write(lpofn + 24, struct.pack('<I', index))
         if not flags & 0x8:  # OFN_NOCHANGEDIR
             self.current_directory = ntpath.dirname(full) if offset > 3 else full[:3]
+        if not flags & 0x02000000:  # OFN_DONTADDTORECENT
+            # Like the Windows dialog, the chosen file joins the recent documents
+            # (not a new file to save: it does not exist yet)
+            recent_documents.add_recent_document(full)
         return 1
 
     def GetOpenFileNameA(self, args):

@@ -20,12 +20,13 @@ from .. import winapi
 from ..config import EXPLORER_PATH, PYGAME_AVAILABLE
 from ..paths import resolve_drive_path
 from ..resources import read_exe_icon
+from .desktop_icons import DesktopIconsMixin
 
 if PYGAME_AVAILABLE:
     import pygame
 
 
-class DesktopMixin:
+class DesktopMixin(DesktopIconsMixin):
     """Desktop icons and the desktop context menu"""
 
     # ==================== DESKTOP ICONS ====================
@@ -38,12 +39,15 @@ class DesktopMixin:
 
     def _refresh_desktop_icons(self):
         """Read the desktop icons, (label, path or shortcut) pairs: My Computer
-        (Explorer, if compiled), then the shortcuts and programs of the
-        user's (C:\\Users\\User\\Desktop) and the public Desktop folders"""
+        (Explorer, if compiled) and the folders Explorer opens (the user's,
+        the network, the Recycle Bin: ('special', kind)), then the shortcuts
+        and programs of the user's (C:\\Users\\User\\Desktop) and the public
+        Desktop folders"""
         self.desktop_icons, self.desktop_icon_paths = [], {}
         if self._explorer_available():
             self.desktop_icons.append((self._program_label(EXPLORER_PATH), EXPLORER_PATH))
             self.desktop_icon_paths[EXPLORER_PATH] = resolve_drive_path(EXPLORER_PATH)
+            self.desktop_icons += self._special_desktop_entries()
         folders = [winapi.WinAPIHandler.SHELL_FOLDERS[0x10],   # CSIDL_DESKTOPDIRECTORY
                    winapi.WinAPIHandler.SHELL_FOLDERS[0x19]]   # CSIDL_COMMON_DESKTOPDIRECTORY
         for folder in folders:
@@ -117,6 +121,8 @@ class DesktopMixin:
         Computer's own icon for Explorer, else the program's EXE icon"""
         if isinstance(data, str) and data.lower() == EXPLORER_PATH.lower():
             return self._computer_icon(size)
+        if isinstance(data, tuple) and data[0] == 'special':
+            return self._special_desktop_icon(data[1], size)
         return self._exe_icon(host_path, size)
 
     def _exe_icon(self, host_path, size):
@@ -165,6 +171,7 @@ class DesktopMixin:
 
     def _draw_desktop_icons(self):
         """Draw the desktop icons with their labels under them"""
+        self._check_desktop_questions()
         for i, ((name, data), rect) in enumerate(zip(self.desktop_icons,
                                                      self._desktop_icon_rects(), strict=False)):
             selected = (i == self.selected_icon)
@@ -198,7 +205,9 @@ class DesktopMixin:
         if not 0 <= index < len(self.desktop_icons):
             return
         data = self.desktop_icons[index][1]
-        if isinstance(data, tuple):
+        if isinstance(data, tuple) and data[0] == 'special':
+            self._open_special_folder(data[1])
+        elif isinstance(data, tuple):
             self._open_shortcut(data)
         elif self.launcher:
             self.launcher(data)
@@ -212,7 +221,10 @@ class DesktopMixin:
                 self._launch_icon(index)
         elif button == 3:
             self.selected_icon = index
-            if index is not None:
+            data = self.desktop_icons[index][1] if index is not None else None
+            if isinstance(data, tuple) and data[0] == 'special':
+                items = self._special_menu_items(data[1])  # Empty Recycle Bin
+            elif index is not None:
                 items = [("Open", lambda: self._launch_icon(index))]
             else:
                 items = [("Refresh", self._refresh_desktop_icons), None,

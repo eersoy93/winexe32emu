@@ -160,7 +160,8 @@ class FilesMixin:
         (like GetFullPathName). A name without a drive letter is on the
         current directory's drive; "name" and the current drive's "X:name"
         are relative to the current directory, another drive's "Y:name" to
-        that drive's root.
+        that drive's current directory: the "=Y:" environment variable (set
+        by cmd), else its root.
         """
         if not filename:
             return None
@@ -174,7 +175,11 @@ class FilesMixin:
             drive = name[0].upper()
             name = name[2:]
         if not name.startswith('\\'):
-            base = current[2:] if drive == current[0].upper() else ''
+            if drive == current[0].upper():
+                base = current[2:]
+            else:
+                saved = getattr(self, 'environment', {}).get(f'={drive}:', '')
+                base = saved[2:] if saved[:2].upper() == f'{drive}:' else ''
             name = base + '\\' + name
         parts = []
         for part in name.split('\\'):

@@ -214,9 +214,11 @@ def main():
     # Started programs: [(CPUEmulator, emulation thread)]; they run side by side
     programs = []
 
-    def load_program(name, command_line=None, current_directory=None, program_args=None):
+    def load_program(name, command_line=None, current_directory=None, program_args=None,
+                     prepare=None):
         """Load an EXE from the emulated C drive and emulate it in a new thread.
-        Returns the CPUEmulator, or None on failure."""
+        prepare(emulator) runs before it starts (CreateProcess: what the child
+        inherits). Returns the CPUEmulator, or None on failure."""
         exe_path = find_program(name)
         if exe_path is None:
             log.error(f"File not found in emulation C drive: {name}")
@@ -236,6 +238,8 @@ def main():
             return None
         if current_directory:
             emulator.api_handler.current_directory = current_directory
+        if prepare is not None:
+            prepare(emulator)
         emulator.disassemble(loader.image_base + loader.entry_point, 20)
 
         def run_emulation():

@@ -324,6 +324,9 @@ class ControlsMixin:
             # to it): the edit types them, moves the caret, deletes...
             self.gui.edit_message(control, msg, wParam, wide)
             return 0
+        if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and \
+                control.class_name == 'LISTBOX':
+            return self._listbox_mouse_message(control, msg, wParam, lParam)
         if msg in (self.WM_KEYDOWN, self.WM_CHAR, self.WM_KEYUP, self.WM_LBUTTONDOWN,
                    self.WM_LBUTTONUP, self.WM_MOUSEMOVE, self.WM_SETFOCUS, self.WM_KILLFOCUS):
             return 0

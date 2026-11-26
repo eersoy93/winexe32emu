@@ -97,8 +97,8 @@ class CommonControlsMixin:
 
     def _draw_system_icon(self, index, x, y, size=16):
         """Draw one of the fake system image list icons"""
-        if index == 5:  # My Computer: the desktop icon's computer
-            self.screen.blit(self._computer_icon(size)[0], (x, y))
+        if index >= 5:  # My Computer and the other desktop icons (desktop_icons.py)
+            self.screen.blit(self._shell_icon_images(index, size)[0], (x, y))
             return
         fill, line = self.SYS_ICON_COLORS.get(index, self.SYS_ICON_COLORS[0])
         s = size / 16

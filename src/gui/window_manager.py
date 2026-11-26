@@ -135,6 +135,8 @@ class WindowManagerMixin:
             if box['cancel'] is not None:
                 self._messagebox_done(hwnd, box['cancel'])
             return
+        if self._host_dialog_close(hwnd):
+            return  # A dialog of the desktop (Run): closing it is Cancel
 
         console = self.consoles.get(hwnd)
         if console is not None:
@@ -289,6 +291,7 @@ class WindowManagerMixin:
             control.set_selection(0)
             control.edit_scroll = control.edit_top_line = 0
             control.modified = False
+            control.undo_state = None  # A new text cannot be undone
 
     def get_window_text(self, hwnd):
         """Get window/control text"""

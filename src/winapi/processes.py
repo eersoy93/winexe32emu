@@ -17,6 +17,8 @@
 import os
 import struct
 
+from unicorn import UcError
+
 from .. import winapi
 from ..logger import log
 from ..paths import find_program, windows_path_of_host
@@ -123,7 +125,8 @@ class ProcessesMixin:
             cmdline = f'"{path}"' if ' ' in path else path
         elif not app:
             cmdline = self._quote_program_name(cmdline)
-        child = starter(path, cmdline, current)
+        prepare = self._child_inheritance(args[4], args[5], args[6], args[8], wide)
+        child = starter(path, cmdline, current, prepare=prepare)
         if child is None:
             self._last_error = 193  # ERROR_BAD_EXE_FORMAT
             return 0
@@ -136,6 +139,105 @@ class ProcessesMixin:
             self._mem_write(lpProcessInformation,
                             struct.pack('<4I', hProcess, hThread, pid, tid))
         return 1
+
+    # CreateProcess flags: dwCreationFlags and STARTUPINFO.dwFlags
+    DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT = 0x8, 0x10, 0x400
+    STARTF_USESTDHANDLES = 0x100
+    STD_HANDLE_IDS = {'stdin': 0xFFFFFFF6, 'stdout': 0xFFFFFFF5, 'stderr': 0xFFFFFFF4}
+
+    def _read_environment_block(self, address, wide):
+        """{NAME: value} of an environment block ("NAME=value" strings, an empty
+        one at the end); the names upper-case like the process environments"""
+        environment = {}
+        unit = 2 if wide else 1
+        while len(environment) < 4096:
+            text = self._read_text(address, wide)
+            if not text:
+                break
+            name, sep, value = text[1:].partition('=')
+            if sep:
+                environment[(text[0] + name).upper()] = value
+            address += (len(text.encode('utf-16-le')) if wide else
+                        len(self.read_cstring(address))) + unit
+        return environment
+
+    def _inherited_handle(self, info):
+        """The child's copy of an inherited file handle: like on Windows it
+        shares the file position (a duplicated host descriptor)"""
+        copy = dict(info)
+        fp = info.get('fp')
+        try:
+            fd = fp.fileno()
+        except (AttributeError, OSError, ValueError):
+            return copy  # NUL and other devices: the same object will do
+        try:
+            fp.flush()
+            # Unbuffered: the parent reads the file as soon as the child ends
+            copy['fp'] = os.fdopen(os.dup(fd), fp.mode, buffering=0)
+            copy['inherited'] = True
+        except (OSError, ValueError) as e:
+            log.warning(f"Cannot inherit {info.get('name')!r}: {e}")
+        return copy
+
+    def close_inherited_handles(self):
+        """Close the host files of the inherited handles when the process ends
+        (the parent's own handles stay open)"""
+        for handle, info in list(self.handles.items()):
+            if info.get('inherited'):
+                try:
+                    info['fp'].close()
+                except OSError:
+                    pass
+                del self.handles[handle]
+
+    def _child_inheritance(self, inherit_handles, flags, lpEnvironment, lpStartupInfo, wide):
+        """What a child gets from CreateProcess, as a function applied to its
+        emulator before it starts: the environment (this process's, or
+        lpEnvironment), the console (a console program shares the parent's
+        unless CREATE_NEW_CONSOLE or DETACHED_PROCESS), the console title of
+        STARTUPINFO.lpTitle and its STARTF_USESTDHANDLES handles (cmd's
+        redirections) when bInheritHandles is TRUE"""
+        if lpEnvironment:
+            environment = self._read_environment_block(
+                lpEnvironment, wide or bool(flags & self.CREATE_UNICODE_ENVIRONMENT))
+        else:
+            environment = dict(self.environment)
+        title, std = None, {}
+        if lpStartupInfo:
+            try:
+                fields = struct.unpack('<17I', self.emu.uc.mem_read(lpStartupInfo, 68))
+            except UcError:
+                fields = (0,) * 17
+            if fields[3]:  # cb, lpReserved, lpDesktop, lpTitle...
+                title = self._read_text(fields[3], wide)
+            if fields[11] & self.STARTF_USESTDHANDLES and inherit_handles:
+                for kind, handle in zip(('stdin', 'stdout', 'stderr'), fields[14:17],
+                                        strict=True):
+                    info = self.handles.get(handle)
+                    if info and info.get('type') == 'file' and info.get('fp') is not None:
+                        std[self.STD_HANDLE_IDS[kind]] = info
+        share = self.has_console and not flags & (self.DETACHED_PROCESS |
+                                                  self.CREATE_NEW_CONSOLE)
+        parent = self
+
+        def prepare(emulator):
+            child = emulator.api_handler
+            child.environment = environment
+            child.console_title = title
+            child.console_parent = parent if share else None
+            child.console_detached = bool(flags & self.DETACHED_PROCESS)
+            for std_id, info in std.items():
+                handle = child.get_next_handle()
+                child.handles[handle] = parent._inherited_handle(info)
+                child.std_handles[std_id] = handle
+        return prepare
+
+    def redirected_std_file(self, kind):
+        """The file a standard stream ('stdin', 'stdout', 'stderr') goes to
+        when it is redirected (an inherited handle or SetStdHandle), else None"""
+        handle = self.std_handles.get(self.STD_HANDLE_IDS[kind])
+        info = self.handles.get(handle) if handle is not None else None
+        return info.get('fp') if info and info.get('type') == 'file' else None
 
     def WinExec(self, args):
         """WinExec(lpCmdLine, uCmdShow) - runs a program; a value above 31 on

@@ -18,6 +18,8 @@ progress bars) and 3D frames"""
 import re
 
 from ..config import PYGAME_AVAILABLE
+from ..winapi.listbox_multisel import item_selected
+from ..winapi.owner_draw_list import is_owner_draw_list, list_paint_state
 
 if PYGAME_AVAILABLE:
     import pygame
@@ -52,6 +54,17 @@ class ControlDrawingMixin:
                 self._draw_shape(shape, abs_x, abs_y)
             self.screen.set_clip(prev_clip)
 
+    def _request_owner_draw(self, control):
+        """Have the program draw an owner-draw list again if its items look
+        different from when they were drawn"""
+        if getattr(control, 'painted_state', None) == list_paint_state(control):
+            return
+        parent = self.windows.get(control.parent_hwnd)
+        owner = getattr(parent, 'owner', None)
+        if owner is not None and hasattr(owner, 'dirty_controls'):
+            control.painted_state = list_paint_state(control)
+            owner.dirty_controls[control.hwnd] = True
+
     @staticmethod
     def _is_owner_draw(control):
         """BS_OWNERDRAW button or SS_OWNERDRAW static"""
@@ -83,10 +96,12 @@ class ControlDrawingMixin:
         focused = control.hwnd == self.focused_control
         start, end = control.selection()
         caret = min(max(control.sel_caret, 0), len(shown))
-        lines = control.edit_lines()
         line_h = font.get_linesize()
         multiline = control.class_name == "EDIT" and control.style & 0x4
         inner_w = max(1, rect.width - 2 * padding)
+        if multiline and not control.style & 0x80:  # No ES_AUTOHSCROLL: word wrap
+            control.set_wrap(inner_w - 1, self._edit_measure(font))
+        lines = control.edit_lines()
         caret_line = control.line_of(caret)
         caret_px = font.size(shown[lines[caret_line][0]:caret])[0]
         if caret_px - control.edit_scroll > inner_w - 1:
@@ -95,10 +110,17 @@ class ControlDrawingMixin:
             control.edit_scroll = max(0, caret_px - inner_w // 3)
         if multiline:
             visible = max(1, (rect.height - 4) // line_h)
-            if caret_line < control.edit_top_line:
-                control.edit_top_line = caret_line
-            elif caret_line >= control.edit_top_line + visible:
-                control.edit_top_line = caret_line - visible + 1
+            control.edit_visible_lines = visible
+            # The view follows the caret when it moved or the text changed;
+            # otherwise it stays where the scroll bar or the wheel put it
+            seen = control.edit_caret_shown
+            if seen is None or seen[0] != caret or seen[1] is not control.text:
+                if caret_line < control.edit_top_line:
+                    control.edit_top_line = caret_line
+                elif caret_line >= control.edit_top_line + visible:
+                    control.edit_top_line = caret_line - visible + 1
+                control.edit_caret_shown = (caret, control.text)
+            control.edit_top_line = max(0, min(control.edit_top_line, len(lines) - 1))
             top, first_y = control.edit_top_line, rect.y + 2
         else:
             top, first_y = 0, rect.y + (rect.height - font.get_height()) // 2
@@ -336,7 +358,8 @@ class ControlDrawingMixin:
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled and not readonly
                              else self.COLOR_BUTTON, rect)
             inset = self._draw_window_edge(rect, control.style, control.ex_style)
-            self._draw_edit_text(control, rect, padding=inset + 2)
+            self._draw_edit_text(control, self._edit_text_rect(control, rect), padding=inset + 2)
+            self._draw_edit_scrollbar(control, abs_x, abs_y)
 
         elif control.class_name == "LISTBOX":
             rect = pygame.Rect(abs_x, abs_y, control.width, control.height)
@@ -346,8 +369,14 @@ class ControlDrawingMixin:
             # Items with the selected one highlighted, and the scroll bar
             geo = self._listbox_rects(control, (abs_x, abs_y))
             prev_clip = self.screen.get_clip()
+            if is_owner_draw_list(control):
+                # The parent draws the items (WM_DRAWITEM): again when they
+                # look different (a click, scrolling)
+                self._request_owner_draw(control)
+                self._draw_list_scrollbar(geo, control.hwnd)
+                return
             for i, item_rect in geo['items']:
-                selected = (i == control.sel_index)
+                selected = item_selected(control, i)
                 if selected:
                     pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, item_rect)
                 color = self.COLOR_TITLE_TEXT if selected else self.COLOR_TEXT

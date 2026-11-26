@@ -23,13 +23,15 @@ import uuid
 
 from unicorn import UcError
 
+from .. import recent_documents
 from ..config import USER_PROFILE_FOLDER
 from ..logger import log
 from ..paths import resolve_drive_path
 from ..windows import APPBARS, AppBar, work_area
+from .shell_namespace import ShellNamespaceMixin
 
 
-class ShellExtraMixin:
+class ShellExtraMixin(ShellNamespaceMixin):
     """shell32 extras, COM GUID helpers and rpcrt4 UUIDs"""
 
     # ---------- Command lines ----------
@@ -313,19 +315,28 @@ class ShellExtraMixin:
         return self.FindExecutableA(args, wide=True)
 
     def SHAddToRecentDocs(self, args):
+        """SHAddToRecentDocs(uFlags, pv): a shortcut to the file in the Recent
+        folder (the Start menu's Documents); pv NULL clears the list. uFlags:
+        SHARD_PIDL (1), SHARD_PATHA (2), SHARD_PATHW (3)"""
+        flags, pv = args[0], args[1]
+        if not pv:
+            recent_documents.clear_recent_documents()
+            return 0
+        try:
+            if flags == 1:
+                path = self._pidl_file_path(pv)
+            elif flags in (2, 3):
+                path = self._read_text(pv, flags == 3)
+            else:
+                return 0  # SHARD_APPIDINFO and later: not emulated
+        except UcError:
+            return 0
+        full = self.full_windows_path(path) if path else None
+        if full:
+            recent_documents.add_recent_document(full)
         return 0
 
-    def SHQueryRecycleBinA(self, args):
-        """SHQueryRecycleBinA/W(root, SHQUERYRBINFO) - an empty recycle bin"""
-        self._mem_write(args[1] + 4, b'\x00' * 16)
-        return 0
-
-    SHQueryRecycleBinW = SHQueryRecycleBinA
-
-    def SHEmptyRecycleBinA(self, args):
-        return 0
-
-    SHEmptyRecycleBinW = SHEmptyRecycleBinA
+    # (SHQueryRecycleBin and SHEmptyRecycleBin: ShellNamespaceMixin, shell_namespace.py)
 
     def SHFreeNameMappings(self, args):
         return 0

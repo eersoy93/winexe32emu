@@ -960,16 +960,30 @@ class Kernel32ExtraMixin:
     def SetConsoleCursorInfo(self, args):
         return 1 if self._console_output_handle(args[0]) else 0
 
-    def FillConsoleOutputCharacterA(self, args):
-        """FillConsoleOutputCharacterA/W, FillConsoleOutputAttribute(console,
-        value, count, COORD, &written)"""
+    def FillConsoleOutputAttribute(self, args):
+        """FillConsoleOutputAttribute(console, attribute, count, COORD,
+        &written) - the console shows one color: accepted"""
         if not self._console_output_handle(args[0]):
             return 0
         if args[4]:
             self._mem_write(args[4], struct.pack('<I', args[2]))
         return 1
 
-    FillConsoleOutputCharacterW = FillConsoleOutputAttribute = FillConsoleOutputCharacterA
+    def FillConsoleOutputCharacterA(self, args):
+        """FillConsoleOutputCharacterA/W(console, char, count, COORD, &written).
+        The console window keeps lines, not a character grid: blanks over the
+        whole screen from its top left corner (how CLS and the clrscr of C
+        programs clear it) clear the window"""
+        if not self.FillConsoleOutputAttribute(args):
+            return 0
+        char, count, coord = args[1] & 0xFFFF, args[2], args[3]
+        console = self.console
+        if (char in (0x20, 0) and coord == 0 and count >= 80 * 25 and
+                console is not None and self.gui):
+            self.gui.clear_console(console)
+        return 1
+
+    FillConsoleOutputCharacterW = FillConsoleOutputCharacterA
 
     def GetConsoleTitleA(self, args, wide=False):
         """GetConsoleTitleA/W(buffer, size) - the console window's title"""

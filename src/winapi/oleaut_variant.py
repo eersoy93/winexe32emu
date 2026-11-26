@@ -419,9 +419,13 @@ class OleAutVariantMixin:
         source, target = self._VAR_NAMES[from_name], self._VAR_NAMES[to_name]
         words = self._VAR_FROM_SIZES.get(source, 1)
         raw = struct.pack(f'<{words}I', *args[:words]).ljust(8, b'\x00')
-        rest = args[words:]
-        # (value, pOut) or (value, lcid, dwFlags, pOut)
-        flags = rest[1] if len(rest) >= 3 else 0
+        # (value, pOut), or (value, lcid, dwFlags, pOut) when a string is
+        # converted from or to. args holds the whole stack window, not just
+        # the arguments: the last slot is no pOut (Jet's VarR8FromStr wrote
+        # its double elsewhere and kept a stale value, shown as 2.785E-314).
+        text = 'Str' in (from_name, to_name) or 'Bstr' in (from_name, to_name)
+        rest = args[words:words + (3 if text else 1)]
+        flags = rest[1] if text else 0
         out = rest[-1]
         if from_name == 'Str':
             value = self.read_wide_string(args[0]) if args[0] else ''

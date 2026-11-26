@@ -164,7 +164,8 @@ class ShellFoldersMixin:
                 text = data[:-2].decode('utf-16-le')
             except UnicodeDecodeError:
                 return None
-            if text != self.MY_COMPUTER_PATH and not (len(text) >= 2 and text[1] == ':'):
+            if text != self.MY_COMPUTER_PATH and not self._is_virtual_folder(text) and \
+                    not (len(text) >= 2 and text[1] == ':'):
                 return None  # Not an item of ours
             last = text
             position += cb
@@ -187,7 +188,8 @@ class ShellFoldersMixin:
         """SHGetPathFromIDListA/W emulation (PIDLs of SHBrowseForFolder)"""
         pidl, pszPath = args[0], args[1]
         path = self._pidl_file_path(pidl)
-        if path is None or self._is_my_computer(path) or not pszPath:
+        if path is None or self._is_my_computer(path) or self._is_virtual_folder(path) or \
+                not pszPath:
             if pszPath:
                 self._write_units(pszPath, [], wide)
             return 0

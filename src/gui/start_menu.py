@@ -17,10 +17,10 @@
 import os
 import ntpath
 
-from .. import winapi
-from ..config import EXPLORER_PATH, PYGAME_AVAILABLE
+from .. import recent_documents, shell_open, winapi
+from ..config import COMMAND_PROMPT_PATH, EXPLORER_PATH, PYGAME_AVAILABLE, USER_PROFILE_FOLDER
 from ..paths import _program_subfolders, resolve_drive_path
-from ..resources import parse_shell_link
+from ..resources import parse_shell_link, read_exe_icon
 
 if PYGAME_AVAILABLE:
     import pygame
@@ -47,11 +47,13 @@ class StartMenuMixin:
         return bool(path) and os.path.isfile(path)
 
     def _fill_start_menu(self):
-        """Build the Start menu: Programs (the Start Menu folders of the user and
-        of all users with their shortcuts, then My Computer, if compiled, in
-        its own section) and Exit.
+        """Build the Start menu like Windows 95 orders it: Programs (the Start
+        Menu folders of the user and of all users with their shortcuts, then My
+        Computer, if compiled, in its own section), Documents (the recently
+        opened ones), Run... and Exit.
         Rows are ('program', label, path or shortcut), ('submenu', label, rows),
-        ('exit', label, None), ('separator', None, None) or ('empty', label, None)"""
+        ('document', label, Windows path), ('run', label, None), ('exit', label,
+        None), ('separator', None, None) or ('empty', label, None)"""
         self.start_icon_paths = {}
         folders = winapi.WinAPIHandler.SHELL_FOLDERS
         # CSIDL_PROGRAMS, CSIDL_COMMON_PROGRAMS
@@ -60,14 +62,47 @@ class StartMenuMixin:
         if self._explorer_available():
             rows = [('program', self._program_label(EXPLORER_PATH), EXPLORER_PATH)]
             self.start_icon_paths[EXPLORER_PATH] = resolve_drive_path(EXPLORER_PATH)
+        cmd_host = resolve_drive_path(COMMAND_PROMPT_PATH)
+        if cmd_host and os.path.isfile(cmd_host):  # Compiled from apps/cmd
+            cmd = ('shortcut', COMMAND_PROMPT_PATH, '', USER_PROFILE_FOLDER)
+            rows.append(('program', "Command Prompt", cmd))
+            self.start_icon_paths[cmd] = cmd_host
         if shortcut_rows:
             rows = shortcut_rows + ([('separator', None, None)] + rows if rows else [])
         self.start_menu_rows = [
             ('submenu', "Programs", rows or [('empty', "(no programs found)", None)]),
+            ('submenu', "Documents", self._document_rows()),
+            ('run', "Run...", None),
             ('separator', None, None),
             ('exit', "Exit", None),
         ]
         self.start_open_path = []
+
+    @staticmethod
+    def _document_rows():
+        """Documents submenu: the recent documents, the newest first (the ones
+        whose file is gone are left out), or "(Empty)" """
+        rows = [('document', label, path)
+                for label, path in recent_documents.recent_documents()]
+        return rows or [('empty', "(Empty)", None)]
+
+    def _open_document(self, path):
+        """Open a recent document with its associated program; it becomes the
+        newest one again, like Windows"""
+        program, command_line, directory = shell_open.open_command(path)
+        name = ntpath.basename(path.rstrip('\\')) or path
+        if program is None:
+            if command_line == 2:  # SE_ERR_FNF: deleted since the menu was filled
+                self._show_messagebox("Problem with Shortcut",
+                                      f"The item '{name}' that this shortcut refers to has "
+                                      "been changed or moved.", 0x10)
+            else:
+                self._show_messagebox(name, "This file does not have a program associated "
+                                      "with it for performing this action.", 0x10)
+            return
+        if self.launcher:
+            self.launcher(program, command_line, directory)
+            recent_documents.add_recent_document(path)
 
     def _shortcut_entries(self, folders, icon_paths):
         """Merged contents of folders (Windows paths), like Windows merges the
@@ -274,6 +309,83 @@ class StartMenuMixin:
             self.exe_icon_cache[('exit', 16)] = icon
         return icon
 
+    def _page_icon(self):
+        """16x16 plain document: a white page with a folded corner and lines of
+        text (cached); documents of a type without an icon get it"""
+        icon = self.exe_icon_cache.get(('page', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            outline = [(3, 1), (10, 1), (13, 4), (13, 15), (3, 15)]
+            pygame.draw.polygon(icon, (255, 255, 255), outline)
+            pygame.draw.polygon(icon, (0, 0, 0), outline, 1)
+            pygame.draw.lines(icon, (0, 0, 0), False, [(10, 1), (10, 4), (13, 4)])
+            for y in (6, 8, 10, 12):
+                pygame.draw.line(icon, (0, 0, 128), (5, y), (11 if y != 12 else 8, y))
+            self.exe_icon_cache[('page', 16)] = icon
+        return icon
+
+    def _documents_icon(self):
+        """16x16 Documents icon: an open folder with a page sticking out (cached)"""
+        icon = self.exe_icon_cache.get(('documents', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            yellow, olive = (255, 255, 128), (128, 128, 0)
+            back = pygame.Rect(0, 4, 13, 10)
+            pygame.draw.rect(icon, yellow, back)
+            pygame.draw.rect(icon, olive, back, 1)
+            page = pygame.Rect(4, 0, 9, 11)
+            pygame.draw.rect(icon, (255, 255, 255), page)
+            pygame.draw.rect(icon, (0, 0, 0), page, 1)
+            for y in (3, 5, 7):
+                pygame.draw.line(icon, (0, 0, 128), (6, y), (10, y))
+            # The folder's front flap, open towards the viewer
+            front = [(1, 8), (15, 8), (13, 15), (0, 15)]
+            pygame.draw.polygon(icon, (240, 224, 96), front)
+            pygame.draw.polygon(icon, olive, front, 1)
+            self.exe_icon_cache[('documents', 16)] = icon
+        return icon
+
+    def _run_icon(self):
+        """16x16 Run icon: a program window with a green arrow going into it
+        from the lower left (cached)"""
+        icon = self.exe_icon_cache.get(('run', 16))
+        if icon is None:
+            icon = pygame.Surface((16, 16), pygame.SRCALPHA)
+            window = pygame.Rect(4, 1, 12, 10)
+            pygame.draw.rect(icon, (255, 255, 255), window)
+            pygame.draw.rect(icon, (0, 0, 128), pygame.Rect(4, 1, 12, 3))
+            pygame.draw.rect(icon, (0, 0, 0), window, 1)
+            green, dark = (0, 192, 0), (0, 96, 0)
+            arrow = [(0, 13), (6, 7), (4, 5), (10, 5), (10, 11), (8, 9), (2, 15)]
+            pygame.draw.polygon(icon, green, arrow)
+            pygame.draw.polygon(icon, dark, arrow, 1)
+            self.exe_icon_cache[('run', 16)] = icon
+        return icon
+
+    def _document_icon(self, path, size):
+        """size x size icon of a recent document: its type's icon (DefaultIcon,
+        else the program that opens it), else the plain page (cached)"""
+        key = ('document', path.lower(), size)
+        icon = self.exe_icon_cache.get(key)
+        if icon is not None:
+            return icon
+        location = shell_open.document_icon_location(path)
+        image = None
+        if location:
+            file, index = location
+            host = resolve_drive_path(file) if file else None
+            if host and os.path.isfile(host) and file.lower().endswith(('.exe', '.dll')):
+                image = read_exe_icon(host, size, index)
+        if image is None:
+            icon = self._scaled_icon('page', self._page_icon(), size)
+        else:
+            width, height, rgba = image
+            icon = pygame.image.frombuffer(rgba, (width, height), 'RGBA').copy()
+            if (width, height) != (size, size):
+                icon = pygame.transform.smoothscale(icon, (size, size))
+        self.exe_icon_cache[key] = icon
+        return icon
+
     @staticmethod
     def _program_label(path):
         if path.lower() == EXPLORER_PATH.lower():
@@ -309,13 +421,22 @@ class StartMenuMixin:
                     text = self.font.render(label, True, (128, 128, 128))
                     self.screen.blit(text, (rect.x + 6, rect.y + 3))
                 elif kind == 'submenu':
-                    icon = self._scaled_icon('folder', self._folder_icon(), icon_size)
+                    if level == 0 and label == "Documents":
+                        icon = self._scaled_icon('documents', self._documents_icon(), icon_size)
+                    else:
+                        icon = self._scaled_icon('folder', self._folder_icon(), icon_size)
                     color = self._draw_menu_row(rect, label, i == open_index, icon=icon)
                     ax, ay = rect.right - 12, rect.centery
                     pygame.draw.polygon(self.screen, color,
                                         [(ax, ay - 4), (ax + 4, ay), (ax, ay + 4)])
                 elif kind == 'program':
                     icon = self._program_icon(data, self.start_icon_paths.get(data), icon_size)[0]
+                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
+                elif kind == 'document':
+                    icon = self._document_icon(data, icon_size)
+                    self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
+                elif kind == 'run':
+                    icon = self._scaled_icon('run', self._run_icon(), icon_size)
                     self._draw_menu_row(rect, label, rect.collidepoint(mouse_pos), icon=icon)
                 elif kind == 'exit':
                     icon = self._scaled_icon('exit', self._exit_icon(), icon_size)
@@ -352,6 +473,12 @@ class StartMenuMixin:
                 self._open_shortcut(data)
             elif self.launcher:
                 self.launcher(data)
+        elif kind == 'document':
+            self.start_menu_open = False
+            self._open_document(data)
+        elif kind == 'run':
+            self.start_menu_open = False
+            self._open_run_dialog()
         elif kind == 'exit':
             self.start_menu_open = False
             self.running = False  # Like closing the emulator's window

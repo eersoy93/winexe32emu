@@ -87,6 +87,8 @@ ENVIRONMENT_FILE_VARIABLES = {'COMSPEC'}
 # Explorer app (the desktop's My Computer) compiled from apps/explorer/ at every start
 # (compile_apps.sh)
 EXPLORER_PATH = 'C:\\Windows\\explorer.exe'
+# Command Prompt app compiled from apps/cmd/ (COMSPEC names it too)
+COMMAND_PROMPT_PATH = 'C:\\Windows\\System32\\cmd.exe'
 
 # Emulated folder holding the test programs compiled with --tests (drives/C/Windows/Tests/)
 TESTS_FOLDER = 'C:\\Windows\\Tests'

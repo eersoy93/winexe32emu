@@ -23,7 +23,7 @@ import time
 from unicorn import UcError
 from unicorn.x86_const import UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_EDI, UC_X86_REG_ESI
 
-from .. import config
+from .. import config, winapi
 from ..guest import ApiJump, QWordResult, X87Result
 from ..logger import log
 
@@ -804,13 +804,34 @@ class CrtMiscMixin:
         self.emu.stop_emulation = True
         return 0
 
-    def system(self, args):
-        """system emulation - there is no command processor"""
+    def system(self, args, wide=False):
+        """system/_wsystem emulation - runs "COMSPEC /c command" (the emulator's
+        cmd.exe) in this process's console and waits for it: its exit code.
+        system(NULL) tells whether there is a command interpreter."""
+        comspec = self.environment.get('COMSPEC', '')
+        path = self._image_path_of(comspec) if comspec else None
         if not args[0]:
-            return 0
-        log.warning(f"system(\"{self.read_string(args[0])}\") is not supported")
-        self._store_errno(self.ENOENT)
-        return 0xFFFFFFFF
+            return 1 if path else 0
+        command = self._read_text(args[0], wide)
+        starter = winapi.WinAPIHandler.process_starter
+        if path is None or starter is None:
+            log.warning(f"system(\"{command}\"): no command interpreter (COMSPEC)")
+            self._store_errno(self.ENOENT)
+            return 0xFFFFFFFF
+        self.flush_std_streams()
+        quoted = f'"{path}"' if ' ' in path else path
+        child = starter(path, f'{quoted} /c {command}', self.current_directory,
+                        prepare=self._child_inheritance(0, 0, 0, 0, False))
+        if child is None:
+            self._store_errno(self.ENOENT)
+            return 0xFFFFFFFF
+        self.emu.wait_until(lambda: not self._child_running(child))
+        if child.crashed:
+            return 0xC0000005
+        return (child.api_handler.exit_code or 0) if child.api_handler else 0
+
+    def _wsystem(self, args):
+        return self.system(args, wide=True)
 
     def abort(self, args):
         """abort emulation - raise(SIGABRT), then exit code 3"""

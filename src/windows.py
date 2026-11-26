@@ -14,6 +14,7 @@
 
 """Windows, controls and consoles of the pseudo Windows GUI"""
 
+import bisect
 import threading
 from functools import wraps
 
@@ -224,6 +225,22 @@ class FakeControl:
         # 'brush'} or None for the defaults
         self.ctl_colors = None
         self.modified = False  # EM_GETMODIFY
+        # EM_UNDO: (text, anchor, caret) before the last change (None: nothing
+        # to undo); a run of typed characters is one change
+        self.undo_state = None
+        self._typing_at = None  # Offset where the typed run ends
+        # edit_lines() cache: the text and wrap width it was made for, the
+        # lines and their start offsets
+        self._lines_key = None
+        self._lines = None
+        self._line_starts = None
+        # Word wrap (multiline EDIT without ES_AUTOHSCROLL): the text width in
+        # pixels and a function giving a character's width, set when drawn
+        self.wrap_width = 0
+        self.wrap_measure = None
+        self._wrap_cache = {}  # Line text -> its wrapped (start, end) pieces
+        self.edit_caret_shown = None  # (caret, text) the view was last scrolled to
+        self.edit_visible_lines = 1  # Lines the multiline edit shows (when drawn)
         # ES_PASSWORD shows this character instead of the text ('' : plain text)
         self.password_char = '*' if self.class_name == 'EDIT' and style & 0x20 else ''
 
@@ -252,31 +269,99 @@ class FakeControl:
             text = text[:max(0, self.text_limit - (len(self.text) - (end - start)))]
         if not text and start == end:
             return False
+        typed = start == end and len(text) == 1 and text not in '\r\n'
+        if not (typed and start == self._typing_at and self.undo_state is not None):
+            self.undo_state = (self.text, self.sel_anchor, self.sel_caret)
         self.text = self.text[:start] + text + self.text[end:]
         self.set_selection(start + len(text))
+        self._typing_at = start + 1 if typed else None
         self.modified = True
         return True
 
+    def undo(self):
+        """EM_UNDO: back to the text before the last change; undoing again
+        redoes it, like Windows' single-level edit undo. True if undone."""
+        if self.undo_state is None:
+            return False
+        text, anchor, caret = self.undo_state
+        self.undo_state = (self.text, self.sel_anchor, self.sel_caret)
+        self.text = text
+        self.set_selection(anchor, caret)
+        self._typing_at = None
+        self.modified = True
+        return True
+
+    def _wrap_pieces(self, line):
+        """(start, end) pieces of one line broken at self.wrap_width pixels,
+        after the last blank that fits (else inside the word)"""
+        measure, width = self.wrap_measure, self.wrap_width
+        pieces, piece_start, x, blank_end = [], 0, 0, None
+        for index, char in enumerate(line):
+            char_w = measure(char)
+            if x + char_w > width and index > piece_start and char not in ' \t':
+                cut = blank_end if blank_end is not None and blank_end > piece_start else index
+                pieces.append((piece_start, cut))
+                piece_start, blank_end = cut, None
+                x = sum(measure(c) for c in line[piece_start:index])
+            x += char_w
+            if char in ' \t':
+                blank_end = index + 1
+        pieces.append((piece_start, len(line)))
+        return pieces
+
+    def _wraps(self):
+        return (self.wrap_measure is not None and self.wrap_width > 0 and
+                self.class_name == 'EDIT' and self.style & 0x4 and not self.style & 0x80)
+
     def edit_lines(self):
-        """[(start, end)] character ranges of the lines (CR LF or LF breaks)"""
+        """[(start, end)] character ranges of the lines (CR LF or LF breaks; a
+        word-wrapped edit control breaks long lines too, with no character
+        between the pieces). Cached until the text or the wrap width changes:
+        the drawing and the caret keys ask for it all the time."""
+        text = self.text
+        wrap = self.wrap_width if self._wraps() else 0
+        key = self._lines_key
+        if key is not None and key[0] is text and key[1] == wrap:
+            return self._lines
         lines = []
         start = 0
-        text = self.text
+        if wrap and len(self._wrap_cache) > 20000:
+            self._wrap_cache.clear()
         while True:
             newline = text.find('\n', start)
             if newline < 0:
-                lines.append((start, len(text)))
-                return lines
-            end = newline - 1 if newline > start and text[newline - 1] == '\r' else newline
-            lines.append((start, end))
+                end = len(text)
+            else:
+                end = newline - 1 if newline > start and text[newline - 1] == '\r' else newline
+            if wrap and end - start > 1:
+                line = text[start:end]
+                pieces = self._wrap_cache.get(line)
+                if pieces is None:
+                    pieces = self._wrap_cache[line] = self._wrap_pieces(line)
+                lines.extend((start + a, start + b) for a, b in pieces)
+            else:
+                lines.append((start, end))
+            if newline < 0:
+                break
             start = newline + 1
+        self._lines_key = (text, wrap)
+        self._lines = lines
+        self._line_starts = [line_start for line_start, _ in lines]
+        return lines
+
+    def set_wrap(self, width, measure):
+        """Word wrap at width pixels with measure(char) widths (a new font or
+        width wraps the lines again)"""
+        if width != self.wrap_width or measure is not self.wrap_measure:
+            self._wrap_cache.clear()
+        self.wrap_width, self.wrap_measure = width, measure
 
     def line_of(self, offset):
-        """Index of the line that contains character offset"""
-        for index, (_start, end) in enumerate(self.edit_lines()):
-            if offset <= end:
-                return index
-        return len(self.edit_lines()) - 1
+        """Index of the line that contains character offset (at a word wrap
+        break: the line that starts there, where the caret shows)"""
+        lines = self.edit_lines()
+        index = bisect.bisect_right(self._line_starts, offset) - 1
+        return max(0, min(index, len(lines) - 1))
 
     def contains_point(self, px, py, parent_x=0, parent_y=0):
         """Is point inside control?"""
@@ -289,7 +374,8 @@ class FakeControl:
 class FakeConsole:
     """Console of one process: its output lines and a pending line read"""
 
-    MAX_LINES = 100
+    MAX_LINES = 300  # Like the 300 rows of GetConsoleScreenBufferInfo
+    MAX_HISTORY = 50
 
     def __init__(self, hwnd):
         self.hwnd = hwnd  # Console window
@@ -297,10 +383,14 @@ class FakeConsole:
         self.line_open = False  # Last line not ended by LF yet (output continues it)
         self.scroll = 0
         self.input = ""  # Line being typed
+        self.input_cursor = 0  # Insertion point in it (Left/Right/Home/End)
+        self.history = []  # Lines entered before (Up/Down recall them, like doskey)
+        self.history_pos = 0
         self.input_active = False  # A ReadConsole/stdin read is waiting
         self.input_result = None
         self.input_ready = threading.Event()
         self.cancelled = False  # Process ending or console closed: reads return None
+        self.attached = []  # Child processes sharing it (programs run by cmd)
 
 
 class _ProcessRouter:

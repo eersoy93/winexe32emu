@@ -162,6 +162,10 @@ class KeyboardMixin:
             return self.CONTROL_KEY_CHARS[vk]
         if event.unicode and len(event.unicode) == 1 and event.unicode.isprintable():
             return ord(event.unicode)
+        alt = self.key_states.get(0x12) and not self.key_states.get(0x11)
+        if alt and vk is not None and (0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39):
+            # Alt+letter may come without its text: the WM_SYSCHAR of a menu mnemonic
+            return vk | 0x20 if vk >= 0x41 else vk
         return None
 
     def _handle_key_press(self, event):
@@ -178,6 +182,8 @@ class KeyboardMixin:
             else:
                 self._handle_native_combo_click((-1, -1))
             return
+        if self._menu_key(event):  # An open menu bar dropdown has the keyboard
+            return
         # Alt+F4 goes to the active window even from a console or an edit control
         if event.key == pygame.K_F4 and self.alt_down and self._is_sys_key(0x73):
             if self.active_window in self.windows and not self._is_app_window(self.active_window):
@@ -187,6 +193,9 @@ class KeyboardMixin:
             return
         if self._messagebox_key(event):
             return
+        # Win+R, and the keys of the desktop's own dialogs (Run)
+        if self._host_dialog_key(event):
+            return
 
         # The active console window takes the line its program is waiting for
         console = self.consoles.get(self.active_window)
@@ -195,20 +204,15 @@ class KeyboardMixin:
                 # Enter - input completed; it stays on screen like in a real console
                 line = console.input
                 console.input = ""
+                console.input_cursor = 0
+                self.console_line_entered(console, line)
                 self.console_write(console, line + "\n", "stdin")
                 console.input_result = line
                 console.input_active = False
                 console.input_ready.set()  # Send signal to waiting thread
-            elif event.key == pygame.K_BACKSPACE:
-                # Backspace - delete last character
-                console.input = console.input[:-1]
-            elif event.key == pygame.K_ESCAPE:
-                # ESC - clear the line being typed
-                console.input = ""
             else:
-                # Printable character
-                if event.unicode and event.unicode.isprintable():
-                    console.input += event.unicode
+                # Typing, the cursor keys, Backspace/Delete, Esc, the history
+                self.console_edit_key(console, event.key, event.unicode)
             return
 
         # A focused EDIT control consumes keystrokes
@@ -260,6 +264,16 @@ class KeyboardMixin:
                 control.style & 0x1000 or not in_dialog):  # ES_WANTRETURN
             self._edit_insert(win, control, '\r\n')
             return True
+        if event.key == pygame.K_TAB and multiline and not in_dialog and not (
+                event.mod & (pygame.KMOD_CTRL | pygame.KMOD_ALT)):
+            self._edit_insert(win, control, '\t')  # Outside a dialog Tab is a character
+            return True
+        if win.owner is not None and not in_dialog and self._edit_passes_key(event):
+            # Keys the edit control has no use for go to the program's message
+            # loop, where TranslateAccelerator sees them like on Windows
+            # (Notepad's Ctrl+S, F3 and F5)
+            self._forward_key_to_window(event)
+            return True
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE, pygame.K_TAB):
             if in_dialog:
                 return False  # The dialog handles them (default button, Cancel, next edit)
@@ -274,6 +288,25 @@ class KeyboardMixin:
             return True
         self._edit_key(win, control, event)
         return True
+
+    # Ctrl+key combinations an edit control acts on itself (see _edit_key)
+    EDIT_CTRL_KEY_NAMES = frozenset(('a', 'c', 'v', 'x', 'z', 'insert', 'left', 'right', 'up',
+                                     'down', 'home', 'end', 'backspace', 'delete'))
+
+    def _edit_passes_key(self, event):
+        """Is this a keystroke an edit control does not handle: the function
+        keys, Alt+key and Ctrl+key other than its own (Ctrl+Alt is AltGr,
+        which types characters)?"""
+        if pygame.K_F1 <= event.key <= pygame.K_F12:
+            return True
+        ctrl, alt = event.mod & pygame.KMOD_CTRL, event.mod & pygame.KMOD_ALT
+        if ctrl and alt:
+            return False
+        if alt:
+            return event.key != pygame.K_BACKSPACE  # Alt+Backspace: undo
+        if ctrl:
+            return pygame.key.name(event.key) not in self.EDIT_CTRL_KEY_NAMES
+        return False
 
     @staticmethod
     def _edit_word_boundary(text, offset, direction):
@@ -367,6 +400,14 @@ class KeyboardMixin:
         caret = min(max(control.sel_caret, 0), len(text))
         lines = control.edit_lines()
 
+        def line_last(index):
+            # Where the caret ends on a line: before the break of a word-wrapped
+            # line (its end is where the next line starts and shows)
+            line_start, line_end = lines[index]
+            if index + 1 < len(lines) and lines[index + 1][0] == line_end > line_start:
+                return line_end - 1
+            return line_end
+
         def move(offset):
             # Never stop between the CR and LF of a line break
             if 0 < offset < len(text) and text[offset - 1] == '\r' and text[offset] == '\n':
@@ -395,18 +436,24 @@ class KeyboardMixin:
                     offset = caret + 2
             move(offset)
         elif key in (pygame.K_HOME, pygame.K_END):
-            line_start, line_end = lines[control.line_of(caret)]
+            line_start = lines[control.line_of(caret)][0]
             if ctrl:
                 offset = 0 if key == pygame.K_HOME else len(text)
             else:
-                offset = line_start if key == pygame.K_HOME else line_end
+                offset = line_start if key == pygame.K_HOME else line_last(control.line_of(caret))
             move(offset)
         elif key in (pygame.K_UP, pygame.K_DOWN) and len(lines) > 1:
             index = control.line_of(caret)
             target = index + (-1 if key == pygame.K_UP else 1)
             if 0 <= target < len(lines):
                 column = caret - lines[index][0]
-                move(min(lines[target][0] + column, lines[target][1]))
+                move(min(lines[target][0] + column, line_last(target)))
+        elif key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN) and control.style & 0x4:
+            move(self._edit_page(control, caret, key == pygame.K_PAGEDOWN))
+        elif (ctrl and key == pygame.K_z) or (event.mod & pygame.KMOD_ALT and
+                                              key == pygame.K_BACKSPACE):
+            if not readonly and control.undo():
+                self._edit_notify_change(win, control)
         elif key == pygame.K_BACKSPACE:
             if start != end:
                 delete(start, end)

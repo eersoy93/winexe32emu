@@ -18,7 +18,8 @@
 # (C:\Windows\explorer.exe). An app with an install_dir file goes to the
 # folder of C: that file names instead, where Windows keeps that program
 # (apps/msinfo32: Windows/System32); an EXE of the same name in another
-# letter case there is replaced.
+# letter case there is replaced. An app with a console file is a console
+# program (-mconsole, apps/cmd); the others are GUI programs (-mwindows).
 # An app whose EXE is newer than its files and this script is up to date and
 # not compiled again (--force compiles all).
 # Exit code: number of failed apps.
@@ -65,11 +66,13 @@ for dir in apps/*/; do
         i686-w64-mingw32-windres -I "$dir" -O coff -o "$obj" "$rc" || ok=0
     done
 
-    # GUI applications
+    # GUI applications, or console ones
+    subsystem=-mwindows
+    [ -f "${dir}console" ] && subsystem=-mconsole
     # shellcheck disable=SC2086
     if [ "$ok" -eq 1 ] && i686-w64-mingw32-gcc $CFLAGS -o "$exe" \
         "$dir"*.c $objects -lkernel32 -luser32 -lgdi32 -lcomctl32 -lshell32 -lole32 \
-        -mwindows; then
+        "$subsystem"; then
         echo "OK: $(basename "$exe")"
     else
         echo "ERROR: $(basename "$exe") compilation failed!"

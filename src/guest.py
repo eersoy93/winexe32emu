@@ -43,8 +43,25 @@ class ConsoleStream:
             self.flush()
         return len(data)
 
+    def _redirected(self):
+        """The file the stream goes to when the process got its standard
+        handles from cmd's redirection (> file, < file), else None"""
+        redirected = getattr(self.handler, 'redirected_std_file', None)
+        return redirected(self.kind) if redirected else None
+
     def flush(self):
         if not self._out:
+            return
+        target = self._redirected()
+        if target is not None:
+            # Text mode, like the C runtime writes a file: LF becomes CR LF
+            data = bytes(self._out).replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+            self._out.clear()
+            try:
+                target.write(data)
+                target.flush()
+            except (OSError, ValueError) as e:
+                log.warning(f"Writing the redirected {self.kind} failed: {e}")
             return
         text = self._out.decode(config.ANSI_CODEPAGE, errors='replace')
         self._out.clear()
@@ -61,6 +78,16 @@ class ConsoleStream:
             raise OSError("stream is not readable")
         # Make any pending prompt visible before blocking for input
         self.handler.flush_std_streams()
+        source = self._redirected()
+        if source is not None:
+            try:
+                line = source.readline()
+            except (OSError, ValueError):
+                line = b''
+            if not line:
+                return False
+            self._in += line.replace(b'\r\n', b'\n')  # Text mode
+            return True
         gui = self.handler.gui
         if gui:
             # No console (GUI program): stdin is at EOF

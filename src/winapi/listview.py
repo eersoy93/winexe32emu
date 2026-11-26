@@ -54,8 +54,11 @@ class ListViewMixin:
 
     def lv_icon_space(self, win):
         """Pixels before an item's label in the report, list and small icon
-        views: the small icon (none without a LVSIL_SMALL image list)"""
-        return (20 if win.nstate['imagelists'].get(1) else 0) + self.lv_state_image_width(win)
+        views: the small icon (none without a LVSIL_SMALL image list) and a
+        gap; Access 95's database window has 24 pixel wide small icons"""
+        small = self._imagelist(win.nstate['imagelists'].get(1))
+        icon = small['cx'] + 4 if small else 0
+        return icon + self.lv_state_image_width(win)
 
     def lv_state_image_width(self, win):
         """Room of the state images (LVSIL_STATE, e.g. check boxes) before the
