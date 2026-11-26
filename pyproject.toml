@@ -4,7 +4,7 @@
 
 [project]
 name = "winexe32emu"
-version = "0.4.0"  # Keep in step with WINEXE32EMU_VERSION (src/config.py)
+version = "0.4.1"  # Keep in step with WINEXE32EMU_VERSION (src/config.py)
 description = "32-bit Windows EXE emulator in Python"
 readme = "README.md"
 license = "Apache-2.0"

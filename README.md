@@ -112,7 +112,7 @@ This compiles and runs the test programs. The unit tests and the linter are desc
 
 ## Versioning
 
-Small releases raise the last number (0.0.16, 0.0.17…), and every fifth one is a major release (0.0.5, 0.0.10…). Big milestones raise the middle number (0.3.0, 0.4.0…), and 1.0.0 will be the first stable release. The changes of each version are in [CHANGELOG.md](CHANGELOG.md).
+Since 0.4.0, every release between the big milestones raises the last number by one (0.4.1, 0.4.2, 0.4.3…). Big milestones raise the middle number (0.3.0, 0.4.0…), and 1.0.0 will be the first stable release. Before 0.4.0, every fifth small release was a major release (0.0.5, 0.0.10…). The changes of each version are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
