@@ -21,12 +21,12 @@ Run from the repository root:
 """
 
 import os
-import shutil
 import struct
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 from src import config  # noqa: E402
@@ -143,8 +143,15 @@ class FileDescriptorTest(unittest.TestCase):
     """fopen, then the descriptor: what the MinGW C++ library's fstream does"""
 
     def setUp(self):
-        self.folder = tempfile.mkdtemp(dir=config.C_DRIVE_PATH)
-        self.name = 'C:\\' + os.path.basename(self.folder) + '\\dosbox.conf'
+        # Temporary drives: a fresh checkout (CI) has no drives/ folder
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        patcher = mock.patch.object(config, 'DRIVES_PATH', temp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.folder = os.path.join(temp.name, 'C', 'DOSBox')
+        os.makedirs(self.folder)
+        self.name = 'C:\\DOSBox\\dosbox.conf'
         handler = self.handler = WinAPIHandler.__new__(WinAPIHandler)
         handler.emu = FakeEmulator()
         handler.current_directory = 'C:\\'
@@ -157,9 +164,6 @@ class FileDescriptorTest(unittest.TestCase):
         handler.handles = {}
         self.uc = handler.emu.uc
         self.strings = handler.emu.heap_alloc(0x200)
-
-    def tearDown(self):
-        shutil.rmtree(self.folder, ignore_errors=True)
 
     def string(self, text, offset=0):
         address = self.strings + offset
