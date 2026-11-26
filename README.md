@@ -8,7 +8,7 @@
 
 Written with GitHub Copilot and Claude AI.
 
-![winexe32emu 0.3.0 Fake Desktop Image](doc/winexe32emu_0_3_0.png)
+![winexe32emu 0.4.0 Fake Desktop Image](doc/winexe32emu_0_4_0.png)
 
 ## Contents
 
