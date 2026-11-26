@@ -37,6 +37,8 @@ class CrtMixin:
     ENOENT = 2
     EEXIST = 17
     EACCES = 13
+    ENOMEM = 12
+    EBADF = 9
 
     _ERRNO_MESSAGES = {
         0: "No error", 1: "Operation not permitted", 2: "No such file or directory",

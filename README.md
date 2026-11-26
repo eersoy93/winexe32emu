@@ -45,6 +45,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
+| DOSBox 0.74-3 | Setup and program (DOS prompt, `mount`, `keyb`, keymapper) |
 | Microsoft Office 95 Professional | Setup, Word, Excel, PowerPoint, Access, Schedule+, Binder, Office Shortcut Bar |
 | Ski32 | Program |
 

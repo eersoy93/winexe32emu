@@ -20,6 +20,7 @@ from unicorn import UcError
 
 from .. import config, resources, winapi
 from ..logger import log
+from ..scan_codes import VK_SCAN_CODES
 
 
 class User32MiscMixin:
@@ -218,32 +219,43 @@ class User32MiscMixin:
         self._last_error = 0
         return len(self._window_text(args[0]).encode('utf-16-le', errors='surrogatepass')) // 2
 
+    _VSC_TO_VK_EX = {0x2A: 0xA0, 0x36: 0xA1, 0x1D: 0xA2, 0x38: 0xA4}
+    _VK_CHARS = {0xBA: ';', 0xBB: '=', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/',
+                 0xC0: '`', 0xDB: '[', 0xDC: '\\', 0xDD: ']', 0xDE: "'"}
+
     def MapVirtualKeyA(self, args):
-        """MapVirtualKeyA/W emulation: VK <-> scan code for the common keys"""
+        """MapVirtualKeyA/W emulation: VK <-> scan code of the US keyboard"""
         code, map_type = args[0], args[1]
-        table = {0x1B: 0x01, 0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x11: 0x1D, 0x10: 0x2A,
-                 0x12: 0x38, 0x20: 0x39, 0x14: 0x3A, 0x70: 0x3B, 0x71: 0x3C, 0x72: 0x3D,
-                 0x73: 0x3E, 0x74: 0x3F, 0x75: 0x40, 0x76: 0x41, 0x77: 0x42, 0x78: 0x43,
-                 0x79: 0x44, 0x24: 0x47, 0x26: 0x48, 0x21: 0x49, 0x25: 0x4B, 0x27: 0x4D,
-                 0x23: 0x4F, 0x28: 0x50, 0x22: 0x51, 0x2D: 0x52, 0x2E: 0x53, 0x6A: 0x37,
-                 0x6D: 0x4A, 0x6B: 0x4E}
-        row = '1234567890'
-        for i, ch in enumerate(row):
-            table[ord(ch)] = 0x02 + i
-        for scan, letters in ((0x10, 'QWERTYUIOP'), (0x1E, 'ASDFGHJKL'), (0x2C, 'ZXCVBNM')):
-            for i, ch in enumerate(letters):
-                table[ord(ch)] = scan + i
-        if map_type in (0, 2):  # MAPVK_VK_TO_VSC, MAPVK_VK_TO_CHAR
-            if map_type == 2:
-                return code if 0x30 <= code <= 0x5A or code == 0x20 else 0
-            return table.get(code, 0)
+        if map_type == 0:  # MAPVK_VK_TO_VSC (without the extended key flag)
+            return VK_SCAN_CODES.get(code, 0) & 0xFF
+        if map_type == 2:  # MAPVK_VK_TO_CHAR: the unshifted character
+            if 0x30 <= code <= 0x5A or code == 0x20:
+                return code
+            if 0x60 <= code <= 0x69:
+                return ord('0') + code - 0x60
+            return ord(self._VK_CHARS[code]) if code in self._VK_CHARS else 0
         if map_type in (1, 3):  # MAPVK_VSC_TO_VK(_EX)
-            for vk, scan in table.items():
-                if scan == code:
+            if code in self._VSC_TO_VK_EX:
+                # Only the _EX form tells the left and right keys apart
+                if map_type == 3:
+                    return self._VSC_TO_VK_EX[code]
+                return {0x2A: 0x10, 0x36: 0x10, 0x1D: 0x11, 0x38: 0x12}[code]
+            # A navigation key and the number pad key with its scan code:
+            # the former, which the table lists first
+            for vk, scan in VK_SCAN_CODES.items():
+                if scan & 0xFF == code:
                     return vk
         return 0
 
     def MapVirtualKeyW(self, args):
+        return self.MapVirtualKeyA(args)
+
+    def MapVirtualKeyExA(self, args):
+        """MapVirtualKeyExA/W(code, type, hkl): every keyboard layout is the
+        US one (GetKeyboardLayout)"""
+        return self.MapVirtualKeyA(args)
+
+    def MapVirtualKeyExW(self, args):
         return self.MapVirtualKeyA(args)
 
     def SendDlgItemMessageA(self, args, wide=False):

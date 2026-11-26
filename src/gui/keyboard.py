@@ -14,37 +14,37 @@
 
 """PseudoWindowsGUI mixin: Keyboard input: focus, virtual keys, edit controls"""
 
-
 from .. import winapi
 from ..config import PYGAME_AVAILABLE
+from ..scan_codes import VK_SCAN_CODES
 
 if PYGAME_AVAILABLE:
     import pygame
 
 
-def _vk_scan_codes():
-    """Virtual key -> scan code of a US keyboard (bit 8: an extended key)"""
-    table = {0x1B: 0x01, 0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x11: 0x1D, 0x10: 0x2A,
-             0x12: 0x38, 0x20: 0x39, 0x14: 0x3A, 0x70: 0x3B, 0x71: 0x3C, 0x72: 0x3D,
-             0x73: 0x3E, 0x74: 0x3F, 0x75: 0x40, 0x76: 0x41, 0x77: 0x42, 0x78: 0x43,
-             0x79: 0x44, 0x7A: 0x57, 0x7B: 0x58, 0x6A: 0x37, 0x6D: 0x4A, 0x6B: 0x4E,
-             0xBD: 0x0C, 0xBB: 0x0D, 0xDB: 0x1A, 0xDD: 0x1B, 0xBA: 0x27, 0xDE: 0x28,
-             0xC0: 0x29, 0xDC: 0x2B, 0xBC: 0x33, 0xBE: 0x34, 0xBF: 0x35,
-             # The keys between the main block and the numeric keypad are extended
-             0x24: 0x147, 0x26: 0x148, 0x21: 0x149, 0x25: 0x14B, 0x27: 0x14D,
-             0x23: 0x14F, 0x28: 0x150, 0x22: 0x151, 0x2D: 0x152, 0x2E: 0x153,
-             0x6F: 0x135}
-    for i, ch in enumerate('1234567890'):
-        table[ord(ch)] = 0x02 + i
-    for scan, letters in ((0x10, 'QWERTYUIOP'), (0x1E, 'ASDFGHJKL'), (0x2C, 'ZXCVBNM')):
-        for i, ch in enumerate(letters):
-            table[ord(ch)] = scan + i
-    for i in range(10):  # Numeric keypad 0-9
-        table[0x60 + i] = (0x52, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49)[i]
+def _physical_key_vks():
+    """Host scan code (a USB HID keyboard usage, layout-independent) ->
+    the virtual-key code of the key at that place on a US keyboard"""
+    table = {4 + i: 0x41 + i for i in range(26)}              # A-Z
+    table.update({30 + i: 0x31 + i for i in range(9)})        # 1-9
+    table.update({58 + i: 0x70 + i for i in range(12)})       # F1-F12
+    table.update({89 + i: 0x61 + i for i in range(9)})        # Keypad 1-9
+    table.update({
+        39: 0x30, 40: 0x0D, 41: 0x1B, 42: 0x08, 43: 0x09, 44: 0x20,
+        # - = [ ] \ (# of ISO keyboards) ; ' ` , . /
+        45: 0xBD, 46: 0xBB, 47: 0xDB, 48: 0xDD, 49: 0xDC, 50: 0xDC, 51: 0xBA,
+        52: 0xDE, 53: 0xC0, 54: 0xBC, 55: 0xBE, 56: 0xBF,
+        57: 0x14, 70: 0x2C, 71: 0x91, 72: 0x13, 73: 0x2D, 74: 0x24, 75: 0x21,
+        76: 0x2E, 77: 0x23, 78: 0x22, 79: 0x27, 80: 0x25, 81: 0x28, 82: 0x26,
+        83: 0x90, 84: 0x6F, 85: 0x6A, 86: 0x6D, 87: 0x6B, 88: 0x0D, 98: 0x60,
+        99: 0x6E,
+        100: 0xE2,  # The extra key of ISO keyboards (< > on Turkish Q)
+        224: 0x11, 225: 0x10, 226: 0x12, 228: 0x11, 229: 0x10, 230: 0x12,
+    })
     return table
 
 
-VK_SCAN_CODES = _vk_scan_codes()
+PHYSICAL_KEY_VKS = _physical_key_vks()
 
 
 def key_lparam(vk, flags=1):
@@ -67,12 +67,20 @@ class KeyboardMixin:
         return self.active_window
 
     def _pygame_key_to_vk(self, event):
-        """Map a Pygame key to a Windows virtual-key code, or None."""
+        """Map a Pygame key to a Windows virtual-key code, or None. Letters
+        and digits follow the host layout, like the virtual keys of Windows
+        (Ctrl+Z is Z on any keyboard); the other keys go by their place on
+        the keyboard: on a Turkish Q keyboard the keys of ş, ğ, ü, ö, ç and
+        ı give no ASCII key code, but a program that reads keys (DOSBox) must
+        still get them. Their characters (WM_CHAR) follow the host layout."""
         key = event.key
         if pygame.K_a <= key <= pygame.K_z:
             return key - 32            # 'a' (0x61) -> VK 'A' (0x41)
         if pygame.K_0 <= key <= pygame.K_9:
             return key                 # '0' (0x30) -> VK 0x30
+        physical = PHYSICAL_KEY_VKS.get(getattr(event, 'scancode', 0) or 0)
+        if physical is not None:
+            return physical
         if pygame.K_F1 <= key <= pygame.K_F12:
             return 0x70 + (key - pygame.K_F1)
         special = {
@@ -84,7 +92,22 @@ class KeyboardMixin:
             pygame.K_LSHIFT: 0x10, pygame.K_RSHIFT: 0x10,
             pygame.K_LCTRL: 0x11, pygame.K_RCTRL: 0x11,
             pygame.K_LALT: 0x12, pygame.K_RALT: 0x12,
+            pygame.K_INSERT: 0x2D, pygame.K_CAPSLOCK: 0x14, pygame.K_NUMLOCK: 0x90,
+            pygame.K_SCROLLOCK: 0x91, pygame.K_PAUSE: 0x13, pygame.K_PRINT: 0x2C,
+            # The punctuation keys of a US keyboard (VK_OEM_*): programs that
+            # read keys, not characters (SDL games, DOSBox), need them too
+            pygame.K_SEMICOLON: 0xBA, pygame.K_EQUALS: 0xBB, pygame.K_COMMA: 0xBC,
+            pygame.K_MINUS: 0xBD, pygame.K_PERIOD: 0xBE, pygame.K_SLASH: 0xBF,
+            pygame.K_BACKQUOTE: 0xC0, pygame.K_LEFTBRACKET: 0xDB,
+            pygame.K_BACKSLASH: 0xDC, pygame.K_RIGHTBRACKET: 0xDD, pygame.K_QUOTE: 0xDE,
+            # Numeric keypad
+            pygame.K_KP_PERIOD: 0x6E, pygame.K_KP_DIVIDE: 0x6F,
+            pygame.K_KP_MULTIPLY: 0x6A, pygame.K_KP_MINUS: 0x6D, pygame.K_KP_PLUS: 0x6B,
         }
+        keypad = (pygame.K_KP0, pygame.K_KP1, pygame.K_KP2, pygame.K_KP3, pygame.K_KP4,
+                  pygame.K_KP5, pygame.K_KP6, pygame.K_KP7, pygame.K_KP8, pygame.K_KP9)
+        if key in keypad:
+            return 0x60 + keypad.index(key)  # VK_NUMPAD0-9
         return special.get(key)
 
     def _alt_f4(self):
@@ -497,7 +520,7 @@ class KeyboardMixin:
         target = x - 4 + control.edit_scroll
         best, best_d = start, abs(target)
         for offset in range(start, end + 1):
-            d = abs(font.size(shown[start:offset])[0] - target)
+            d = abs(self._edit_text_width(font, shown[start:offset]) - target)
             if d < best_d:
                 best, best_d = offset, d
         return best

@@ -900,6 +900,53 @@ class GdiExtraMixin:
         self._refresh_dib_section(handle)
         return handle
 
+    def _dib_color_table(self, hdc):
+        """(bitmap handle, its DIB section, header size, entry count) of the
+        DIB section with a color table (1, 4, 8 bpp, DIB_RGB_COLORS) selected
+        into a memory DC, or None"""
+        state = self.dc_state.get(hdc)
+        hbm = state.get('bitmap') if state else None
+        bmp = self.gdi_objects.get(hbm) if hbm else None
+        dib = bmp.get('dib') if isinstance(bmp, dict) else None
+        if dib is None or dib['usage'] != 0:
+            return None
+        header = dib['header']
+        hdr_size = struct.unpack('<I', header[:4])[0]
+        if hdr_size == 12 or struct.unpack('<H', header[14:16])[0] > 8:
+            return None  # An OS/2 header (RGBTRIPLEs) or no color table
+        return hbm, dib, hdr_size, (len(header) - hdr_size) // 4
+
+    def SetDIBColorTable(self, args):
+        """SetDIBColorTable(hdc, iStart, cEntries, prgbq) - entries set in the
+        color table of the DIB section selected into hdc; its picture is
+        decoded again with them (SDL 1.2's 8-bit surfaces change colors so)"""
+        found = self._dib_color_table(args[0])
+        if found is None or args[1] >= found[3]:
+            return 0
+        hbm, dib, hdr_size, total = found
+        count = min(args[2], total - args[1])
+        try:
+            data = bytes(self.emu.uc.mem_read(args[3], count * 4)) if count else b''
+        except UcError:
+            return 0
+        start = hdr_size + args[1] * 4
+        header = dib['header']
+        dib['header'] = header[:start] + data + header[start + len(data):]
+        dib['snapshot'] = None  # The same bits now show other colors
+        self._refresh_dib_section(hbm)
+        return count
+
+    def GetDIBColorTable(self, args):
+        """GetDIBColorTable(hdc, iStart, cEntries, prgbq) - entries copied"""
+        found = self._dib_color_table(args[0])
+        if found is None or args[1] >= found[3]:
+            return 0
+        _, dib, hdr_size, total = found
+        count = min(args[2], total - args[1])
+        start = hdr_size + args[1] * 4
+        data = dib['header'][start:start + count * 4]
+        return count if self._mem_write(args[3], data) else 0
+
     def _refresh_dib_section(self, hbm):
         """A DIB section's picture from its memory, if the program changed it"""
         bmp = self.gdi_objects.get(hbm)
@@ -1059,6 +1106,26 @@ class GdiExtraMixin:
         chosen = entries[args[1]:args[1] + args[2]]
         data = b''.join(bytes(entry[:4]) for entry in chosen)
         return len(chosen) if self._mem_write(args[3], data) else 0
+
+    def SetPaletteEntries(self, args):
+        """SetPaletteEntries(hpal, iStart, cEntries, pPalEntries) - entries
+        set; a palette does not grow (ResizePalette does that)"""
+        palette = self._palette(args[0])
+        if palette is None or args[1] >= len(palette['entries']):
+            return 0
+        count = min(args[2], len(palette['entries']) - args[1])
+        try:
+            raw = bytes(self.emu.uc.mem_read(args[3], count * 4)) if count else b''
+        except UcError:
+            return 0
+        palette['entries'][args[1]:args[1] + count] = [
+            tuple(raw[i:i + 4]) for i in range(0, len(raw), 4)]
+        return count
+
+    def SetSystemPaletteUse(self, args):
+        """SetSystemPaletteUse(hdc, use) - SYSPAL_ERROR: the display has 32
+        bits per pixel, it has no system palette to share"""
+        return 0
 
     def GetNearestPaletteIndex(self, args):
         """GetNearestPaletteIndex(hpal, color)"""

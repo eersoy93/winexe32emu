@@ -214,6 +214,11 @@ class OleAutMixin:
         result = []
 
         def ready():
+            # Played wave buffers come back while a thread waits, as on
+            # Windows, where a system thread calls the waveOut callback: the
+            # SDL 1.2 audio thread waits for that callback, and DOSBox's main
+            # thread waits for the audio thread to end when it quits
+            self._audio_pump()
             if wait_all:
                 if all(self._object_signaled(info, False) for info in infos):
                     for info in infos:

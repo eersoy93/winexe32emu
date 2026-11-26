@@ -292,6 +292,10 @@ class MessagesMixin:
         if Msg == WM_GETFONT:
             return control.font_handle
 
+        if control.class_name == 'EDIT' and self.is_rich_edit(control):
+            result = self._rich_edit_message(control, Msg, wParam, lParam, wide)
+            if result is not None:
+                return result
         if control.class_name == 'EDIT' or (control.class_name == 'COMBOBOX' and
                                             Msg in (0x0140, 0x0141, 0x0142)):
             result = self._edit_message(control, Msg, wParam, lParam, wide)
@@ -661,6 +665,7 @@ class MessagesMixin:
         if Msg == self.WM_QUIT:
             self.quit_code = wParam
             self.quit_requested = True
+            self.quit_message_taken = False
         else:
             # Without a window it is a message for the calling thread
             self.post_window_message(hWnd, Msg, wParam, lParam,
@@ -678,6 +683,7 @@ class MessagesMixin:
         # carries the exit code in wParam
         self.quit_code = nExitCode
         self.quit_requested = True
+        self.quit_message_taken = False  # A new WM_QUIT is waiting
         return 0
 
     def SetTimer(self, args):
@@ -904,6 +910,7 @@ class MessagesMixin:
         while True:
             if self.quit_requested:
                 self._write_msg(lpMsg, 0, self.WM_QUIT, self.quit_code, 0)
+                self._take_quit_message()
                 return 0
 
             msg = self._next_message(True, hWnd, wMsgFilterMin, wMsgFilterMax)
@@ -917,16 +924,30 @@ class MessagesMixin:
             # GUI window closed -> end the message loop
             if self.gui and not self.gui.running:
                 self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
+                self.quit_message_taken = True
                 return 0
 
             # No GUI at all -> nothing can ever arrive, terminate
             if not self.gui:
                 self.quit_requested = True
+                self.quit_message_taken = True
                 self._write_msg(lpMsg, 0, self.WM_QUIT, 0, 0)
                 return 0
 
             # Idle: wait for the GUI thread to post input (does not burn instructions)
             self.emu.idle_wait(0.01)
+
+    def _take_quit_message(self):
+        """The program removed WM_QUIT from its queue. On Windows that ends
+        it: SDL 1.2 destroys its first window (WM_DESTROY posts WM_QUIT),
+        and the next window's message loop takes the WM_QUIT and goes on.
+        When the GUI is gone, or there is none, nothing else can come:
+        GetMessage keeps returning WM_QUIT, PeekMessage reports no message."""
+        if self.gui and self.gui.running and not self.emu.stop_emulation:
+            self.quit_requested = False
+            self.quit_message_taken = False
+        else:
+            self.quit_message_taken = True
 
     def GetMessageW(self, args):
         return self.GetMessageA(args, wide=True)
@@ -942,10 +963,16 @@ class MessagesMixin:
         remove = bool(wRemoveMsg & self.PM_REMOVE)
 
         # Quit pending or GUI gone: report WM_QUIT (PeekMessage returns TRUE)
-        if self.quit_requested or (self.gui and not self.gui.running) or not self.gui:
+        # until the program removes it (see _take_quit_message)
+        quitting = self.quit_requested or (self.gui and not self.gui.running) or not self.gui
+        if quitting and not self.quit_message_taken:
             code = self.quit_code if self.quit_requested else 0
             self._write_msg(lpMsg, 0, self.WM_QUIT, code, 0)
+            if remove:
+                self._take_quit_message()
             return 1
+        if quitting and not self.gui:
+            return 0  # Nothing else can arrive without the GUI
 
         msg = self._next_message(remove, hWnd, wMsgFilterMin, wMsgFilterMax)
         if msg is None:

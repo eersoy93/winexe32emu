@@ -20,6 +20,8 @@ import struct
 from unicorn import UcError
 
 from .. import config
+from ..guest import ConsoleStream
+from ..paths import drive_letter_of_host
 
 
 class CrtStdioMixin:
@@ -386,6 +388,191 @@ class CrtStdioMixin:
 
     def fileno(self, args):
         return self._fileno(args)
+
+    # ---- Low-level I/O on CRT file descriptors ----
+    # A descriptor is the _file of a stream: 0-2 are stdin, stdout and
+    # stderr, the others come from fopen or _fdopen. The MinGW C++ library
+    # (fstream) opens files with fopen and then reads and writes the
+    # descriptor of the FILE.
+
+    def _fd_entry(self, fd):
+        """file_streams entry of a descriptor (None if it is not open)"""
+        if 0 <= fd <= 2:
+            self._ensure_iob()
+            return self.file_streams.get(self._iob_addr + fd * self._FILE_SIZE)
+        for info in self.file_streams.values():
+            if info.get('fd') == fd:
+                return info
+        return None
+
+    def _fd_file(self, fd):
+        """Python file object of a descriptor, or None with errno EBADF"""
+        info = self._fd_entry(fd)
+        if info is None:
+            self._store_errno(self.EBADF)
+            return None
+        return info['fp']
+
+    def _read(self, args):
+        """_read(fd, buffer, count) - bytes read (0 at the end of the file),
+        or -1 with errno"""
+        fp = self._fd_file(args[0])
+        if fp is None:
+            return 0xFFFFFFFF
+        if isinstance(fp, ConsoleStream):
+            self.flush_std_streams()
+        try:
+            data = fp.read(args[2])
+        except (OSError, ValueError):
+            self._store_errno(self.EBADF)
+            return 0xFFFFFFFF
+        if data and not self._mem_write(args[1], data):
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        return len(data or b'')
+
+    def _write(self, args):
+        """_write(fd, buffer, count) - bytes written, or -1 with errno"""
+        fp = self._fd_file(args[0])
+        if fp is None:
+            return 0xFFFFFFFF
+        try:
+            data = bytes(self.emu.uc.mem_read(args[1], args[2])) if args[2] else b''
+        except UcError:
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        try:
+            written = fp.write(data)
+        except (OSError, ValueError):
+            self._store_errno(self.EBADF)
+            return 0xFFFFFFFF
+        return len(data) if written is None else written
+
+    def _lseek(self, args):
+        """_lseek(fd, offset, origin) - the new position, or -1 with errno
+        (EINVAL for a negative position, ESPIPE-like EBADF for the console)"""
+        fp = self._fd_file(args[0])
+        if fp is None:
+            return 0xFFFFFFFF
+        offset = self._signed32(args[1])
+        if args[2] not in (0, 1, 2):
+            self._store_errno(self.EINVAL)
+            return 0xFFFFFFFF
+        try:
+            if args[2] == 0 and offset < 0:
+                raise ValueError
+            return fp.seek(offset, args[2]) & 0xFFFFFFFF
+        except ValueError:
+            self._store_errno(self.EINVAL)
+        except (OSError, AttributeError):
+            self._store_errno(self.EBADF)
+        return 0xFFFFFFFF
+
+    def _chsize(self, args):
+        """_chsize(fd, size) - 0, or -1 with errno (the read-only D: gives EACCES)"""
+        info = self._fd_entry(args[0])
+        if info is None:
+            self._store_errno(self.EBADF)
+            return 0xFFFFFFFF
+        if info.get('path') and self._write_protected(info['path']):
+            self._store_errno(self.EACCES)
+            return 0xFFFFFFFF
+        try:
+            position = info['fp'].tell()
+            info['fp'].truncate(self._signed32(args[1]))
+            info['fp'].seek(position)
+        except (OSError, ValueError, AttributeError):
+            self._store_errno(self.EACCES)
+            return 0xFFFFFFFF
+        return 0
+
+    def _fdopen(self, args):
+        """_fdopen(fd, mode) - a new FILE* for an open descriptor; it shares
+        the descriptor's file and position, as on Windows"""
+        info = self._fd_entry(args[0])
+        if info is None:
+            self._store_errno(self.EBADF)
+            return 0
+        ptr = self.emu.heap_alloc(self._FILE_SIZE)
+        if not ptr:
+            self._store_errno(self.ENOMEM)
+            return 0
+        self.file_streams[ptr] = {'fp': info['fp'], 'path': info.get('path'),
+                                  'fd': args[0], 'shared': True}
+        self._write_file_struct(ptr, args[0], info['fp'])
+        return ptr
+
+    # struct _stat of msvcrt.dll (32-bit sizes and times)
+    _S_IFDIR, _S_IFCHR, _S_IFREG = 0x4000, 0x2000, 0x8000
+    _S_IREAD, _S_IWRITE, _S_IEXEC = 0x100, 0x80, 0x40
+    _EXECUTABLE_EXTENSIONS = ('.exe', '.com', '.bat', '.cmd')
+
+    def _write_stat(self, address, host_path, windows_name=None):
+        """Fill a struct _stat for a host file or folder; False on failure"""
+        try:
+            info = os.stat(host_path)
+        except OSError as e:
+            self._store_errno(self._oserror_errno(e))
+            return False
+        is_dir = os.path.isdir(host_path)
+        mode = self._S_IREAD
+        if not self._host_read_only(host_path):
+            mode |= self._S_IWRITE
+        name = (windows_name or host_path).lower()
+        if is_dir or name.endswith(self._EXECUTABLE_EXTENSIONS):
+            mode |= self._S_IEXEC
+        # The user permission bits repeat for group and others
+        mode |= (mode >> 3) | (mode >> 6)
+        mode |= self._S_IFDIR if is_dir else self._S_IFREG
+        letter = drive_letter_of_host(host_path) or 'C'
+        drive = ord(letter.upper()) - ord('A')
+        size = 0 if is_dir else min(info.st_size, 0x7FFFFFFF)
+
+        def stamp(value):
+            return max(0, min(int(value), 0x7FFFFFFF))
+        data = struct.pack('<IHHhhhHIiiii', drive, 0, mode, 1, 0, 0, 0, drive, size,
+                           stamp(info.st_atime), stamp(info.st_mtime), stamp(info.st_ctime))
+        if not self._mem_write(address, data):
+            self._store_errno(self.EINVAL)
+            return False
+        return True
+
+    def _stat(self, args):
+        """_stat(path, buffer) - 0, or -1 with errno ENOENT"""
+        name = self.read_string(args[0]) if args[0] else ''
+        # A trailing backslash is only valid on a root folder ("C:\")
+        path = None
+        if name and not (name.endswith(('\\', '/')) and len(name.rstrip('\\/')) > 2):
+            path = self.resolve_drive_path(name)
+        if path is None or not os.path.exists(path):
+            self._store_errno(self.ENOENT)
+            return 0xFFFFFFFF
+        return 0 if self._write_stat(args[1], path, name) else 0xFFFFFFFF
+
+    def stat(self, args):
+        return self._stat(args)
+
+    def _fstat(self, args):
+        """_fstat(fd, buffer) - 0, or -1 with errno EBADF; the console and
+        devices are character devices"""
+        info = self._fd_entry(args[0])
+        if info is None:
+            self._store_errno(self.EBADF)
+            return 0xFFFFFFFF
+        path = info.get('path')
+        if path and os.path.exists(path):
+            if not self._write_stat(args[1], path):
+                return 0xFFFFFFFF
+            try:
+                info['fp'].flush()
+                size = os.fstat(info['fp'].fileno()).st_size
+                self._mem_write(args[1] + 20, struct.pack('<i', min(size, 0x7FFFFFFF)))
+            except (OSError, ValueError, AttributeError):
+                pass
+            return 0
+        mode = self._S_IFCHR | 0x1B6  # read/write for everyone
+        data = struct.pack('<IHHhhhHIiiii', args[0], 0, mode, 1, 0, 0, 0, args[0], 0, 0, 0, 0)
+        return 0 if self._mem_write(args[1], data) else 0xFFFFFFFF
 
     def setvbuf(self, args):
         """setvbuf emulation - buffering is handled by the host"""

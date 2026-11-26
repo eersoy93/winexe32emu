@@ -427,6 +427,29 @@ class DeviceContextMixin:
         return 1
 
     # GDI32.DLL APIs
+    # The display's gamma ramp: 3 x 256 WORDs (red, green, blue), linear
+    # (identity) until a program sets one
+    _IDENTITY_GAMMA_RAMP = struct.pack('<768H', *([i * 257 for i in range(256)] * 3))
+
+    def GetDeviceGammaRamp(self, args):
+        """GetDeviceGammaRamp emulation - the ramp SetDeviceGammaRamp last set
+        (SDL 1.2 saves it at startup to restore it at exit)"""
+        if args[0] not in self.dc_map or not args[1]:
+            return 0
+        ramp = getattr(self, '_gamma_ramp', self._IDENTITY_GAMMA_RAMP)
+        return 1 if self._mem_write(args[1], ramp) else 0
+
+    def SetDeviceGammaRamp(self, args):
+        """SetDeviceGammaRamp emulation - kept for GetDeviceGammaRamp; the
+        fake desktop itself is always drawn with the identity ramp"""
+        if args[0] not in self.dc_map or not args[1]:
+            return 0
+        try:
+            self._gamma_ramp = bytes(self.emu.uc.mem_read(args[1], 1536))
+        except UcError:
+            return 0
+        return 1
+
     def GetDeviceCaps(self, args):
         """GetDeviceCaps emulation"""
         hdc = args[0]

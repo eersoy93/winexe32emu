@@ -748,11 +748,25 @@ class MsvcrtMixin:
     # File functions
     def _alloc_file_ptr(self, fp, path):
         """Register a Python file object and hand back a fake FILE* pointer."""
-        ptr = self.next_file_ptr
-        self.next_file_ptr += 0x20
+        ptr = self.emu.heap_alloc(self._FILE_SIZE)
+        if not ptr:
+            fp.close()
+            self._store_errno(self.ENOMEM)
+            return 0
         self.file_streams[ptr] = {'fp': fp, 'path': path, 'fd': self.next_fd}
+        self._write_file_struct(ptr, self.next_fd, fp)
         self.next_fd += 1
         return ptr
+
+    def _write_file_struct(self, ptr, fd, fp):
+        """Fill the guest FILE struct of a stream: programs read its _file
+        (fileno inlined by the MinGW C++ library) and _flag themselves. The
+        buffer fields stay empty, so every access goes through the CRT."""
+        mode = getattr(fp, 'mode', 'r')
+        flag = self._IOREAD if ('r' in mode or '+' in mode) else 0
+        if any(c in mode for c in 'wa+'):
+            flag |= self._IOWRT
+        self._mem_write(ptr, struct.pack('<IIIIIIII', 0, 0, 0, flag, fd, 0, 0, 0))
 
     def fopen(self, args):
         """fopen emulation - opens a real file inside the drives/ sandbox"""
@@ -783,6 +797,53 @@ class MsvcrtMixin:
 
         return self._alloc_file_ptr(fp, path)
 
+    def freopen(self, args):
+        """freopen emulation - closes a stream and opens a file on the same
+        FILE* (SDL 1.2 programs send stdout and stderr to text files this
+        way); returns the stream, or NULL with errno after closing it"""
+        mode = self.read_string(args[1])
+        stream = args[2]
+        filename = self.read_string(args[0]) if args[0] else None
+        log.debug(f"freopen(\"{filename}\", \"{mode}\", 0x{stream:x})")
+        info = self.file_streams.get(stream)
+        if filename is None:
+            # A NULL name only changes the mode of the open file: keep it as is
+            return stream if info else 0
+        if info is not None:
+            if not isinstance(info['fp'], ConsoleStream):
+                try:
+                    info['fp'].close()
+                except OSError:
+                    pass
+            del self.file_streams[stream]
+
+        fp = self.open_device_stream(filename, mode)
+        if fp is False:
+            self._store_errno(self.ENOENT)
+            return 0
+        path = None
+        if fp is None:
+            path = self.resolve_drive_path(filename)
+            if path is None or (self._crt_mode_writes(mode) and self._write_protected(path)):
+                self._store_errno(self.EACCES)
+                return 0
+            try:
+                fp = open(path, self._c_mode_to_python(mode))
+            except OSError as e:
+                self._store_errno(self._oserror_errno(e))
+                return 0
+        # The stream keeps its descriptor: stdout stays 1
+        if self._iob_addr <= stream < self._iob_addr + 3 * self._FILE_SIZE:
+            fd = (stream - self._iob_addr) // self._FILE_SIZE
+        else:
+            fd = info.get('fd') if info else None
+        if fd is None:
+            fd = self.next_fd
+            self.next_fd += 1
+        self.file_streams[stream] = {'fp': fp, 'path': path, 'fd': fd}
+        self._write_file_struct(stream, fd, fp)
+        return stream
+
     def _p_stream(self, ptr):
         """Look up the Python file object for a FILE* pointer (or None)."""
         info = self.file_streams.get(ptr)
@@ -794,6 +855,9 @@ class MsvcrtMixin:
         log.debug(f"fclose(0x{stream:x})")
         info = self.file_streams.pop(stream, None)
         if info:
+            is_std = self._iob_addr <= stream < self._iob_addr + 3 * self._FILE_SIZE
+            if not is_std:
+                self.emu.heap_free(stream)
             try:
                 info['fp'].close()
             except OSError:

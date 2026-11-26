@@ -21,6 +21,7 @@ from unicorn import UcError
 
 from .. import config, windows
 from ..logger import log
+from .richedit import RICHEDIT_CLASSES
 
 
 class User32WindowsMixin:
@@ -290,10 +291,13 @@ class User32WindowsMixin:
             if base_class.upper() == "MSCTLS_STATUSBAR32" and hWndParent in self.gui.windows:
                 hwnd = self._create_status_bar(hWndParent, window_name, dwStyle, hMenu)
             elif base_class.upper() in ["BUTTON", "EDIT", "STATIC", "LISTBOX", "COMBOBOX",
-                                        "SCROLLBAR", "MSCTLS_PROGRESS32"]:
+                                        "SCROLLBAR", "MSCTLS_PROGRESS32", *RICHEDIT_CLASSES]:
                 # BUTTON with a checkbox or radio button style is drawn and
                 # clicked as a checkbox
                 control_class = base_class
+                rich_edit = base_class.upper() in RICHEDIT_CLASSES
+                if rich_edit:
+                    control_class = "EDIT"  # A plain text edit control (richedit.py)
                 if (base_class.upper() == "BUTTON" and
                         (dwStyle & 0xF) in self.CHECK_BUTTON_STYLES):
                     control_class = "CHECKBOX"
@@ -307,6 +311,10 @@ class User32WindowsMixin:
                 if not dwStyle & self.WS_VISIBLE and hwnd in self.gui.controls:
                     # Hidden until ShowWindow (Office's file dialogs keep spare edits)
                     self.gui.controls[hwnd].visible = False
+                if rich_edit and hwnd in self.gui.controls:
+                    # GetClassName gives "RichEdit20A", not "Edit"
+                    self.gui.controls[hwnd].rich_edit = True
+                    self.gui.controls[hwnd].superclass_name = base_class
                 if superclass and hwnd in self.gui.controls:
                     # GetClassName gives the superclass; its procedure gets the messages
                     self.gui.controls[hwnd].superclass_name = class_name

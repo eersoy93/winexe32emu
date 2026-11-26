@@ -4,6 +4,22 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 Every change must be made with clean room techniques: it is based only on public documentation and the behavior observed from running programs, never on Windows source code or disassembled code (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## Unreleased
+
+### Added
+
+- DOSBox 0.74-3: the NSIS setup and DOSBox run; the DOS prompt, `mount`, `keyb` and the keymapper (Ctrl+F1) work, and the close button ends it
+- Rich edit controls (`RichEdit20A` and others) as plain text edit controls, with RTF text streamed in
+- The CRT's file descriptor I/O (`_read`, `_write`, `_lseek`, `_fstat`, `_stat`, `_fdopen`, `_chsize`) and `freopen`
+- `MapVirtualKeyEx`, the gamma ramp, palette and DIB color table APIs, and "no device" answers of the joystick and MIDI APIs
+
+### Fixed
+
+- Keys of non-US host keyboards (e.g. ş, ğ, ü, ö, ç of Turkish Q) and the punctuation, Insert, lock and keypad keys reach programs as key messages
+- Edit controls draw tabs as gaps up to the tab stops
+- A WM_QUIT the program took from its queue no longer stays: SDL 1.2 programs went on to quit
+- Played wave buffers come back while a thread waits, so SDL 1.2 programs no longer hang when they quit
+
 ## 0.4.0 - 2026-11-26
 
 ### Added

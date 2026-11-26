@@ -39,10 +39,44 @@ class EditControlMixin:
             def measure(char):
                 width = widths.get(char)
                 if width is None:
-                    width = widths[char] = font.size(char)[0]
+                    # Wrapping takes a tab as a whole tab stop wide
+                    width = widths[char] = (self._edit_tab_stop(font) if char == '\t'
+                                            else font.size(char)[0])
                 return width
             measures[font] = measure
         return measure
+
+    @staticmethod
+    def _edit_tab_stop(font):
+        """Distance of the tab stops of an edit control: 32 dialog units,
+        8 average character widths (the EM_SETTABSTOPS default)"""
+        return max(1, font.size('x')[0] * 8)
+
+    def _edit_text_width(self, font, text):
+        """Width of the text of a line from the line's start: a tab goes on
+        to the next tab stop (font.size would draw it as a box)"""
+        if '\t' not in text:
+            return font.size(text)[0]
+        stop = self._edit_tab_stop(font)
+        x = 0
+        for index, part in enumerate(text.split('\t')):
+            if index:
+                x = (x // stop + 1) * stop
+            if part:
+                x += font.size(part)[0]
+        return x
+
+    def _edit_blit_line_part(self, font, line, start, end, x0, y, color):
+        """Draw line[start:end] at its place in a line drawn from x0 (tabs
+        are gaps up to their tab stops)"""
+        offset = start
+        for index, part in enumerate(line[start:end].split('\t')):
+            if index:
+                offset += 1  # The tab
+            if part:
+                x = x0 + self._edit_text_width(font, line[:offset])
+                self.screen.blit(font.render(part, True, color), (x, y))
+            offset += len(part)
 
     @classmethod
     def _edit_has_vscroll(cls, control):

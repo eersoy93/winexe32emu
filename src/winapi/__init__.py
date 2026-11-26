@@ -83,6 +83,7 @@ from .window_bits import WindowBitsMixin
 from .listbox_multisel import ListBoxMultiSelMixin
 from .owner_draw_list import OwnerDrawListMixin
 from .typecomp import TypeCompMixin
+from .richedit import RichEditMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -105,5 +106,5 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     TypeInfoMixin, SafeArrayMixin, OleAutVariantMixin,
                     OleLockBytesMixin, CodePagesMixin, FindReplaceMixin,
                     WindowBitsMixin, ListBoxMultiSelMixin, OwnerDrawListMixin,
-                    TypeCompMixin):
+                    TypeCompMixin, RichEditMixin):
     """Windows API emulation"""

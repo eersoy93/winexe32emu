@@ -103,7 +103,7 @@ class ControlDrawingMixin:
             control.set_wrap(inner_w - 1, self._edit_measure(font))
         lines = control.edit_lines()
         caret_line = control.line_of(caret)
-        caret_px = font.size(shown[lines[caret_line][0]:caret])[0]
+        caret_px = self._edit_text_width(font, shown[lines[caret_line][0]:caret])
         if caret_px - control.edit_scroll > inner_w - 1:
             control.edit_scroll = caret_px - inner_w + 1
         elif caret_px < control.edit_scroll:
@@ -136,21 +136,22 @@ class ControlDrawingMixin:
             if y > rect.bottom:
                 break
             first, last = max(start, line_start), min(end, line_end)
+            line = shown[line_start:line_end]
             if show_selection and first < last:
-                x = x0
-                for piece, selected in ((shown[line_start:first], False),
-                                        (shown[first:last], True),
-                                        (shown[last:line_end], False)):
-                    if not piece:
+                for a, b, selected in ((line_start, first, False), (first, last, True),
+                                       (last, line_end, False)):
+                    if a >= b:
                         continue
-                    width = font.size(piece)[0]
+                    a, b = a - line_start, b - line_start
                     if selected:
-                        pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR, (x, y, width, line_h))
-                    self.screen.blit(font.render(piece, True, self.COLOR_TITLE_TEXT if selected
-                                                 else color), (x, y))
-                    x += width
-            elif line_end > line_start:
-                self.screen.blit(font.render(shown[line_start:line_end], True, color), (x0, y))
+                        left = self._edit_text_width(font, line[:a])
+                        width = self._edit_text_width(font, line[:b]) - left
+                        pygame.draw.rect(self.screen, self.COLOR_TITLE_BAR,
+                                         (x0 + left, y, width, line_h))
+                    self._edit_blit_line_part(font, line, a, b, x0, y,
+                                              self.COLOR_TITLE_TEXT if selected else color)
+            elif line:
+                self._edit_blit_line_part(font, line, 0, len(line), x0, y, color)
         if focused and (pygame.time.get_ticks() // 500) % 2 == 0:
             caret_x = x0 + caret_px
             if multiline:

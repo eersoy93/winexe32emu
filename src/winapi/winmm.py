@@ -634,6 +634,34 @@ class WinmmMixin:
         self._acm_header_status(pash, 0x10000)  # ACMSTREAMHEADER_STATUSF_DONE
         return 0
 
+    # ---------- MIDI output ----------
+    # No MIDI device: programs fall back to their own music (DOSBox plays
+    # through its emulated sound cards without a MIDI device)
+
+    def midiOutGetNumDevs(self, args):
+        """midiOutGetNumDevs emulation - no MIDI output devices"""
+        return 0
+
+    def midiOutGetDevCapsA(self, args):
+        """midiOutGetDevCapsA emulation - every device ID is invalid"""
+        return 2  # MMSYSERR_BADDEVICEID
+
+    def midiOutGetDevCapsW(self, args):
+        return self.midiOutGetDevCapsA(args)
+
+    def midiOutOpen(self, args):
+        """midiOutOpen emulation - even the MIDI mapper has no device to use"""
+        if args[0]:
+            self._mem_write(args[0], b'\x00' * 4)
+        return 68  # MIDIERR_NODEVICE
+
+    def _midi_no_handle(self, args):
+        """MIDI calls on a handle: none can be open"""
+        return 5  # MMSYSERR_INVALHANDLE
+
+    midiOutClose = midiOutShortMsg = midiOutLongMsg = _midi_no_handle
+    midiOutPrepareHeader = midiOutUnprepareHeader = midiOutReset = _midi_no_handle
+
     # ---------- Joystick ----------
 
     def joyGetPos(self, args):
@@ -643,6 +671,19 @@ class WinmmMixin:
     def joyGetDevCapsA(self, args):
         """joyGetDevCapsA emulation - no joystick driver"""
         return 165  # JOYERR_PARMS
+
+    def joyGetDevCapsW(self, args):
+        """joyGetDevCapsW emulation - no joystick driver"""
+        return 165  # JOYERR_PARMS
+
+    def joyGetPosEx(self, args):
+        """joyGetPosEx emulation - no joystick is connected"""
+        return 167  # JOYERR_UNPLUGGED
+
+    def joyGetNumDevs(self, args):
+        """joyGetNumDevs emulation - 0: no joystick driver is installed, so
+        programs (SDL 1.2) open no joysticks"""
+        return 0
 
     # ---------- Multimedia file I/O (mmio) ----------
     # An HMMIO is the address of its MMIOINFO block in guest memory, which an

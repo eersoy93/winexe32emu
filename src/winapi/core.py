@@ -87,7 +87,9 @@ class CoreMixin:
         'DeleteDC': 1, 'DeleteObject': 1, 'Ellipse': 5, 'EnumFontFamiliesA': 4, 'EnumFontsA': 4,
         'GetBkColor': 1, 'GetCharABCWidthsA': 4, 'GetCharABCWidthsW': 4,
         'GetCharWidth32A': 4, 'GetCharWidth32W': 4, 'GetCharWidthA': 4, 'GetCharWidthW': 4,
-        'GetDeviceCaps': 2, 'GetDIBits': 7, 'GetNearestColor': 2,
+        'GetDIBColorTable': 4, 'SetDIBColorTable': 4, 'SetPaletteEntries': 4,
+        'SetSystemPaletteUse': 2, 'GetDeviceCaps': 2, 'GetDeviceGammaRamp': 2,
+        'SetDeviceGammaRamp': 2, 'GetDIBits': 7, 'GetNearestColor': 2,
         'GetObjectA': 3, 'GetPixel': 3, 'RestoreDC': 2, 'SaveDC': 1,
         'GetStockObject': 1, 'GetTextColor': 1, 'GetTextExtentPoint32A': 4,
         'GetTextExtentPoint32W': 4, 'GetTextExtentPointA': 4, 'GetTextExtentPointW': 4,
@@ -323,7 +325,8 @@ class CoreMixin:
         'InsertMenuItemW': 4, 'InsertMenuW': 5, 'IsClipboardFormatAvailable': 1,
         'LoadAcceleratorsA': 2, 'LoadAcceleratorsW': 2, 'LoadBitmapW': 2, 'LoadMenuA': 2,
         'LoadMenuW': 2, 'LoadStringW': 4, 'MapDialogRect': 2, 'MapVirtualKeyA': 2,
-        'MapVirtualKeyW': 2, 'ModifyMenuW': 5, 'MonitorFromPoint': 3, 'MonitorFromRect': 2,
+        'MapVirtualKeyExA': 3, 'MapVirtualKeyExW': 3, 'MapVirtualKeyW': 2,
+        'ModifyMenuW': 5, 'MonitorFromPoint': 3, 'MonitorFromRect': 2,
         'MonitorFromWindow': 2, 'NativeWndProc': 4, 'NativeEditProc': 4, 'NativeButtonProc': 4,
         'NativeStaticProc': 4, 'NativeListBoxProc': 4, 'NativeComboBoxProc': 4, 'OpenClipboard': 1,
         'RegisterClipboardFormatA': 1, 'RegisterClipboardFormatW': 1, 'RemoveMenu': 3,
@@ -387,8 +390,12 @@ class CoreMixin:
         'GetFileVersionInfoSizeW': 2, 'GetFileVersionInfoW': 4, 'VerQueryValueA': 4,
         'VerQueryValueW': 4,
         # winmm
-        'joyGetDevCapsA': 3, 'joyGetPos': 2, 'mciGetDeviceIDA': 1, 'mciGetErrorStringA': 3,
-        'mciSendCommandA': 4, 'mciSendStringA': 4, 'mmioClose': 2, 'mmioInstallIOProcA': 3,
+        'joyGetDevCapsA': 3, 'joyGetDevCapsW': 3, 'joyGetNumDevs': 0, 'joyGetPos': 2,
+        'joyGetPosEx': 2, 'mciGetDeviceIDA': 1, 'mciGetErrorStringA': 3,
+        'mciSendCommandA': 4, 'mciSendStringA': 4, 'midiOutClose': 1,
+        'midiOutGetDevCapsA': 3, 'midiOutGetDevCapsW': 3, 'midiOutGetNumDevs': 0,
+        'midiOutLongMsg': 3, 'midiOutOpen': 5, 'midiOutPrepareHeader': 3, 'midiOutReset': 1,
+        'midiOutShortMsg': 2, 'midiOutUnprepareHeader': 3, 'mmioClose': 2, 'mmioInstallIOProcA': 3,
         'mmioInstallIOProcW': 3,
         'mmioOpenA': 3, 'mmioRead': 3, 'mmioSeek': 3, 'mmioStringToFOURCCA': 2, 'mmioWrite': 3,
         'waveOutGetNumDevs': 0, 'PlaySoundA': 3, 'PlaySound': 3,
@@ -897,9 +904,8 @@ class CoreMixin:
         # the GUI console window (FakeConsole) when the GUI is running
         self.has_console = False
         self.console = None
-        # msvcrt FILE* streams: fake FILE pointer -> {'fp': python file, 'path': str}
+        # msvcrt FILE* streams: FILE pointer -> {'fp': python file, 'path': str}
         self.file_streams = {}
-        self.next_file_ptr = 0x0F000000  # dedicated range for fake FILE* pointers
         self.registered_classes = {}  # Registered window classes
         self.module_classes = {}  # (lower-case name, hInstance) -> registered_classes entry
         self.system_class_data = {}  # System class name -> fields changed by SetClassLong
@@ -940,6 +946,7 @@ class CoreMixin:
         self._drawitem_buf = 0
         self.quit_requested = False
         self.quit_code = 0  # wParam of WM_QUIT (PostQuitMessage)
+        self.quit_message_taken = False  # The program removed the WM_QUIT
         # True once the emulated process is gone (ExitProcess or emulation end).
         # After that no window can consume messages, so the GUI must stop
         # treating windows as live app windows (e.g. X click posts WM_CLOSE).
