@@ -2,6 +2,8 @@
 
 The notable changes of winexe32emu, newest first. The version numbers follow the scheme in [README.md](README.md#versioning).
 
+Every change must be made with clean room techniques: it is based only on public documentation and the behavior observed from running programs, never on Windows source code or disassembled code (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
 ## 0.4.0 - 2026-11-26
 
 ### Added
