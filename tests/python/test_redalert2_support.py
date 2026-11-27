@@ -892,6 +892,27 @@ class TimerPeekTest(unittest.TestCase):
         self.assertAlmostEqual(period(1000), 1.0)
 
 
+@unittest.skipUnless(config.PYGAME_AVAILABLE, "needs pygame")
+class SubclassedDialogListTest(unittest.TestCase):
+    """The movie list (Movies & Credits > Play Movies) is a list box in a
+    dialog that the game subclassed; it keeps the selection itself"""
+
+    def test_click_goes_to_the_subclass(self):
+        from src.gui import PseudoWindowsGUI
+        gui = PseudoWindowsGUI(640, 480)
+        posted = []
+        owner = types.SimpleNamespace(
+            dialogs={0x100: {}}, WM_LBUTTONDOWN=0x0201, WM_LBUTTONDBLCLK=0x0203,
+            MK_LBUTTON=0x1, _control_subclass=lambda hwnd: 0x5EE4F0,
+            post_window_message=lambda *args: posted.append(args))
+        parent = types.SimpleNamespace(owner=owner)
+        control = types.SimpleNamespace(hwnd=0x110, parent_hwnd=0x100)
+        with mock.patch('pygame.key.get_mods', return_value=0):
+            self.assertTrue(gui._subclassed_list_click(parent, control, 0, 33, 9))
+        self.assertEqual(posted, [(0x110, 0x0201, 0x1, (9 << 16) | 33)])
+        self.assertEqual(gui.list_mouse_down, (owner, 0x110))
+
+
 class ValidateRectTest(unittest.TestCase):
     """ValidateRect with a rectangle takes only that rectangle out of the
     update region: the area a closed drop-down list uncovered is still

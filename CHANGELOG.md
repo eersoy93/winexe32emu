@@ -4,6 +4,12 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 Every change must be made with clean room techniques: it is based only on public documentation and the behavior observed from running programs, never on Windows source code or disassembled code (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## Unreleased
+
+### Fixed
+
+- A click on a subclassed list box in a dialog goes to the program's procedure too: Red Alert 2's movie list (Movies & Credits > Play Movies) selected nothing, so Play Movie did not play
+
 ## 0.5.0 - 2026-11-27
 
 ### Added

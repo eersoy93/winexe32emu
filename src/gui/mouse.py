@@ -336,10 +336,11 @@ class MouseMixin:
         WM_LBUTTONDOWN (WM_LBUTTONDBLCLK the second time, the class has
         CS_DBLCLKS) and passes it on to the list box procedure, which selects
         the item. The release goes to the list too (it tracks the mouse while
-        the button is down). True if the click was handed over."""
+        the button is down). A list box in a dialog too: Red Alert 2's movie
+        list keeps its selection in its own procedure. True if the click was
+        handed over."""
         owner = getattr(parent, 'owner', None)
-        if owner is None or not owner._control_subclass(control.hwnd) or \
-                control.parent_hwnd in owner.dialogs:
+        if owner is None or not owner._control_subclass(control.hwnd):
             return False
         double = self._double_click(('listbox', control.hwnd, index))
         message = owner.WM_LBUTTONDBLCLK if double else owner.WM_LBUTTONDOWN
