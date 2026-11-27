@@ -322,7 +322,7 @@ class NetworkMixin:
             self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
             return self.SOCKET_ERROR
         data, text_at = b'', args[1] + 32 * len(rows)
-        for row, name in zip(rows, names):
+        for row, name in zip(rows, names, strict=True):
             data += struct.pack('<IiiiiiII', row[0], self.AF_INET, 16, 16, row[1], row[2],
                                 row[3], text_at)
             text_at += len(name)

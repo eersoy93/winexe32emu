@@ -890,7 +890,7 @@ class DirectDrawMixin:
             for index in range(len(chain) - 1):
                 for name in self.DD_PICTURE_KEYS:
                     chain[index][name] = chain[index + 1][name]
-            for name, value in zip(self.DD_PICTURE_KEYS, first):
+            for name, value in zip(self.DD_PICTURE_KEYS, first, strict=True):
                 chain[-1][name] = value
         self._dd_pull(surface)  # The new front buffer is shown
         self._dd_present(surface, now=True)
