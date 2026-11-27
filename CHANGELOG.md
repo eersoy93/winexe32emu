@@ -4,72 +4,47 @@ The notable changes of winexe32emu, newest first. The version numbers follow the
 
 Every change must be made with clean room techniques: it is based only on public documentation and the behavior observed from running programs, never on Windows source code or disassembled code (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-## Unreleased
-
-### Fixed
-
-- A click on a subclassed list box in a dialog goes to the program's procedure too: Red Alert 2's movie list (Movies & Credits > Play Movies) selected nothing, so Play Movie did not play
-- `__dllonexit` adds the exit handler to the calling DLL's own table, which the DLL runs when it is unloaded, instead of to the process's `exit()` list: 7-Zip 9.20's `7z.exe` crashed at the end of every run, calling into `7z.dll` after `FreeLibrary`
-
 ## 0.5.0 - 2026-11-27
 
 ### Added
 
-- Command & Conquer: Red Alert 2: the CD's Setup (`Setup.exe`) runs to the end, its Autorun menu (`AUTORUN.EXE`) works and the 1.006 patch (`RA21006EN.EXE`) updates the installed game
-- DirectDraw in software (`DirectDrawCreate`, surfaces, palettes, clippers, color keys, flipping, full-screen display modes); the primary surface is shown in the program's window
-- DirectSound through the mixer (`DirectSoundCreate`, static and streaming sound buffers)
-- Volume labels of the drives: the first line of `drives/D.label` is the label of D: (setup programs recognize their CD by it); `SetVolumeLabel` is kept there
-- Placeholder files with a version resource for the emulated system DLLs in `C:\Windows\System32` (setup programs look for them and read their version)
-- `PlaySound` plays `WAVE` resources; `timeGetDevCaps` and the IMM queries of a PC without an input method editor
-- Command & Conquer: Red Alert 2: the installed game (`Ra2.exe`, which starts `GAME.EXE`) plays its intro videos and shows its main, single player and campaign menus
-- `EnumProtocols` lists the installed network transports (TCP/IP and UDP/IP)
-- The trackbar control (`msctls_trackbar32`) keeps its range, position and step sizes (`TBM_*` messages); it is not drawn or moved with the mouse yet
+- Command & Conquer: Red Alert 2:
+  - The CD's Setup and Autorun menu work, and the 1.006 patch updates the installed game
+  - The game plays its intro videos and shows its menus; skirmish games can be played
+- DirectDraw and DirectSound, so games show graphics and play music and sounds
+- Volume labels of the drives (setup programs recognize their CD by it)
+- Placeholder system DLLs that setup programs look for
+- More multimedia, network and control APIs
+
+### Changed
+
+- DirectDraw and thread switching are faster: Red Alert 2 runs noticeably faster
 
 ### Fixed
 
-- File mappings are the mapped file itself: what a program writes to a writable view is in the file, a mapping larger than its file makes the file grow, and files up to 1 GB can be mapped (they were copied, and limited to 256 MB)
-- A mapping is taken out of the address space when its handle is closed and its views are unmapped; two mappings can no longer be mistaken for each other
-- A repaint between `BeginPaint` and `EndPaint` appears on the screen when it is complete: windows that repaint themselves often no longer flicker
-- `StretchBlt` on a window draws nothing outside the update region of a partial `WM_PAINT`
-- An `InvalidateRect` made while the background is erased no longer repaints the window forever
-- A program's dialog gets the mouse messages of its client area (dialogs that paint their own buttons)
-- A subclassed control gets `WM_PAINT` in the program's window procedure: a control the program paints itself is no longer drawn over by the emulator, and an owner-draw control that is invalidated while it is drawn no longer repaints forever
-- What an exclusive full-screen DirectDraw program writes on the primary surface covers its child windows too (menus made of dialogs whose controls the program paints)
-- `CoRegisterClassObject` holds a reference to the class object until `CoRevokeClassObject`: a program's own class factory is no longer destroyed by the first `CoCreateInstance`
-- `WriteFile` on a handle opened without write access fails with `ERROR_ACCESS_DENIED` and no longer logs an error for every call
-- `PeekMessage` with `PM_NOREMOVE` sees a due timer (`WM_TIMER`): the animations of Red Alert 2's main menu run (its message loop only fetches a message after peeking one); `GetQueueStatus` reports it as `QS_TIMER`
-- A drop-down combo box's window is only its selection field (`GetWindowRect`, `GetClientRect`), and `CB_SETITEMHEIGHT`/`CB_GETITEMHEIGHT` set and tell the height of the field and the items (an owner-draw combo box asks its parent with `WM_MEASUREITEM`): the texts of Red Alert 2's skirmish settings are inside their boxes
-- A click on a subclassed combo box goes to the program's window procedure first; the list opens only if it passes the click on (Red Alert 2 shows lists of its own)
-- `UpdateWindow` paints a subclassed or owner-draw control at once, and hiding, moving or destroying a control repaints what was under it (also in a subclassed dialog): the frames Red Alert 2 draws around its controls and the area under its closed lists appear
-- `DestroyWindow` of a subclassed control sends `WM_DESTROY` and `WM_NCDESTROY` to its window procedure: Red Alert 2's skirmish screen no longer freezes after a list closes
-- DirectDraw copies a surface's pixels between the program and the emulator only when the other side needs them (`Lock` after a Blt or GDI drawing; Blt, GDI or the screen after `Unlock`), and shows the primary surface from one thread instead of a timer thread per picture: Red Alert 2 locks its surfaces hundreds of times a second
-- The Interlocked APIs and `IDirectDrawSurface::IsLost` run as guest code, without a call into the emulator
-- A guest thread gives its turn away only when another thread wants to run, and gets it back as soon as that one blocks again: Red Alert 2 runs about 17% faster in a skirmish game
-- A click on a subclassed button or check box goes to the program's window procedure; the button procedure it passes the click on checks the box with `BM_SETCHECK` sent to it and notifies the parent: Red Alert 2's skirmish options (Short Game, Crates Appear...) can be changed
-- `PostThreadMessage` reaches a thread of another emulated process, and `CreateProcess` with `bInheritHandles` gives the child the inheritable handles (`SECURITY_ATTRIBUTES.bInheritHandle`, `DuplicateHandle`, `SetHandleInformation`) with the same values: Red Alert 2's launcher hands `GAME.EXE` a shared memory block this way, and without it a skirmish ended in defeat after about half a minute
-- A looping DirectSound buffer plays as a looping copy in the mixer that what the program writes (`Unlock`) goes into, like a sound card playing the ring: the music and sounds of Red Alert 2 no longer stutter while it computes a frame
-- A looping DirectSound buffer played at a rate that does not divide the mixer's (Red Alert 2 varies the rate of its sound effects) is played as a ring too: the effects were cut
-- A DirectSound buffer whose sound ended no longer stops or changes the volume of the sound that took its mixer channel next; the mixer has 32 channels instead of 8
-- `CB_GETDROPPEDCONTROLRECT` gives the combo box's dropped-down rectangle, and a drop-down combo box sized with only its field's height keeps the height of its list: Red Alert 2's keyboard options froze when their category list was opened
-- `ValidateRect` with a rectangle takes only that rectangle out of the update region (it validated the whole window): a closed drop-down list no longer stays on the screen
-- A parent window without `WS_CLIPCHILDREN` paints again where a child window was shown: the drop-down lists of Red Alert 2's combo boxes have their frame
-- A window's timer keeps the id the program gives it, 0 too, so `KillTimer` with that id stops it; a destroyed window's timers are gone, like on Windows, and a `SetTimer` period is rounded up to the system clock tick (15.625 ms): the animations of Red Alert 2's menus ran too fast
+- Mapped files are written back to disk, and larger files can be mapped
+- Windows that repaint often no longer flicker, and some no longer repaint forever
+- Many bugs in dialogs, buttons, check boxes and combo boxes that a program draws itself
+- Menu animations ran too fast, and timers could not always be stopped
+- Music and sound effects no longer stutter or get cut
+- Starting a program from another one passes the shared handles it needs
+- COM objects a program registers itself are no longer destroyed too early
+- Red Alert 2 plays the movies chosen in its movie list
+- 7-Zip 9.20's command line program no longer crashes at the end of every run
 
 ## 0.4.1 - 2026-11-26
 
 ### Added
 
-- DOSBox 0.74-3: the NSIS setup and DOSBox run; the DOS prompt, `mount`, `keyb` and the keymapper (Ctrl+F1) work, and the close button ends it
-- Rich edit controls (`RichEdit20A` and others) as plain text edit controls, with RTF text streamed in
-- The CRT's file descriptor I/O (`_read`, `_write`, `_lseek`, `_fstat`, `_stat`, `_fdopen`, `_chsize`) and `freopen`
-- `MapVirtualKeyEx`, the gamma ramp, palette and DIB color table APIs, and "no device" answers of the joystick and MIDI APIs
+- DOSBox 0.74-3: its setup and DOSBox itself run, with the DOS prompt and the keymapper
+- Rich edit controls, as plain text edit controls
+- More C runtime file functions and more keyboard, graphics, joystick and MIDI APIs
 
 ### Fixed
 
-- Keys of non-US host keyboards (e.g. ş, ğ, ü, ö, ç of Turkish Q) and the punctuation, Insert, lock and keypad keys reach programs as key messages
-- Edit controls draw tabs as gaps up to the tab stops
-- A WM_QUIT the program took from its queue no longer stays: SDL 1.2 programs went on to quit
-- Played wave buffers come back while a thread waits, so SDL 1.2 programs no longer hang when they quit
+- Keys of non-US keyboards (e.g. Turkish Q) and more special keys reach programs
+- Edit controls draw tabs
+- Programs made with SDL 1.2 no longer quit too early or hang when they quit
 
 ## 0.4.0 - 2026-11-26
 
