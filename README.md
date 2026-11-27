@@ -45,7 +45,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
-| Command & Conquer: Red Alert 2 | Setup, Autorun menu, the 1.006 patch and the game (menus, campaign, skirmish) |
+| Command & Conquer: Red Alert 2 1.006 | Setup, Autorun menu, programs, game (menus, campaign, skirmish) |
 | DOSBox 0.74-3 | NSIS setup and program |
 | Microsoft Office 95 Professional | Setup, Word, Excel, PowerPoint, Access, Schedule+, Binder, Office Shortcut Bar |
 | Ski32 | Program |
