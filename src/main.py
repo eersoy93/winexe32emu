@@ -33,6 +33,7 @@ from .paths import (COMPILE_APPS_SCRIPT, CREATE_DRIVES_SCRIPT, create_drive_fold
                     run_setup_script, RUN_TESTS_SCRIPT)
 from .pe_loader import PELoader
 from .sound import SoundPlayer
+from .system_files import create_system_files
 from .winapi import WinAPIHandler
 
 
@@ -175,6 +176,7 @@ def main():
         run_setup_script(COMPILE_APPS_SCRIPT, "Compiling Apps")
     create_environment_folders()
     WinAPIHandler.create_known_folders()
+    create_system_files(WinAPIHandler.EMULATED_DLLS | WinAPIHandler.SYSTEM_DLLS)
 
     if args.exe is None and not (use_gui and PYGAME_AVAILABLE):
         log.error("An EXE name is required when the GUI is not available")
@@ -251,6 +253,8 @@ def main():
             finally:
                 # Sounds do not outlive their process
                 SoundPlayer.stop_owned_by(emulator.api_handler)
+                if emulator.api_handler:
+                    emulator.api_handler.stop_direct_sound()
                 log.success("Emulation completed!")
 
         # Separate thread so the GUI stays responsive

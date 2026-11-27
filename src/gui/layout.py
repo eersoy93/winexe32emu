@@ -384,7 +384,7 @@ class LayoutMixin:
             self.screen.set_clip(content.clip(parent_clip))
             if child.native:
                 self._draw_native(child, cx, cy, cw, ch)
-            for shape in child.drawn_shapes:
+            for shape in child.shown_shapes():
                 self._draw_shape(shape, cx, cy)
             self._draw_caret(hwnd, cx, cy)
             for control in child.controls:

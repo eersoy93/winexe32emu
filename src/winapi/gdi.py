@@ -714,7 +714,7 @@ class GdiMixin:
             return (0, 0) + tuple(self.gui.client_size(self.gui.windows[hwnd]))
         if self.gui and hwnd in self.gui.controls:
             control = self.gui.controls[hwnd]
-            return (0, 0, control.width, control.height)
+            return (0, 0, control.width, control.window_height)
         return (0, 0) + tuple(self._screen_size())
 
     def _dc_clip(self, hdc):

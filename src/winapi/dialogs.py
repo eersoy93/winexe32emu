@@ -363,6 +363,35 @@ class DialogsMixin:
             return 2  # ODT_LISTBOX
         return 0
 
+    def _send_control_paint(self, hwnd):
+        """WM_PAINT of a control goes to its window procedure. A program's
+        subclassing procedure may paint the control itself and never pass the
+        message on to the control's own procedure: then the GUI doesn't draw
+        the control's face (programs that draw their whole user interface)."""
+        subclass = self._control_subclass(hwnd)
+        control = self.gui.controls.get(hwnd)
+        if not subclass or control is None:
+            return self._paint_control(hwnd)
+        control.program_painted = True  # Until the control's own procedure gets it
+        self.paint_pending.add(hwnd)
+        try:
+            return self.emu.call_wndproc(subclass, hwnd, self.WM_PAINT, 0, 0)
+        finally:
+            if hwnd in self.paint_pending:  # No BeginPaint: validated all the same
+                self.paint_pending.discard(hwnd)
+                self.update_rects.pop(hwnd, None)
+
+    def _default_control_paint(self, hwnd):
+        """WM_PAINT in a control's own procedure: an owner-draw control asks
+        its parent to draw it, the GUI draws the others in their parent's
+        WM_CTLCOLOR* colors"""
+        control = self.gui.controls[hwnd]
+        control.program_painted = False
+        if self._owner_draw_type(control):
+            return self._paint_control(hwnd)
+        self._update_ctl_colors(control)
+        return 0
+
     def _paint_control(self, hwnd):
         """WM_PAINT of an owner-draw control: send WM_DRAWITEM to its parent"""
         control = self.gui.controls.get(hwnd)
@@ -478,7 +507,7 @@ class DialogsMixin:
     def _dispatch(self, hwnd, message, wParam, lParam):
         """DispatchMessage for a message already read from the queue"""
         if message == self.WM_PAINT and hwnd in self.gui.controls:
-            return self._paint_control(hwnd)
+            return self._send_control_paint(hwnd)
         if message == self.WM_PAINT and hwnd in self.dialogs:
             # The dialog's background: WM_CTLCOLORDLG to its own procedure
             colors = self._ask_ctl_colors(hwnd, self.WM_CTLCOLORDLG, hwnd)

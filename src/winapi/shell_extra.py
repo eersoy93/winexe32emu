@@ -658,10 +658,16 @@ class ShellExtraMixin(ShellNamespaceMixin):
         if args[1]:
             classes = self.__dict__.setdefault('_class_objects', {})
             classes[cookie] = (self._read_guid(args[0]), args[1])
+            # The registration holds a reference until CoRevokeClassObject: a
+            # factory that starts without one must survive the Release of
+            # those who create objects with it
+            self._guest_method(args[1], 1, [])  # AddRef
         return 0
 
     def CoRevokeClassObject(self, args):
-        self.__dict__.get('_class_objects', {}).pop(args[0], None)
+        entry = self.__dict__.get('_class_objects', {}).pop(args[0], None)
+        if entry is not None and not self.process_exited:
+            self._guest_method(entry[1], 2, [])  # Release
         return 0
 
     def _inproc_server(self, clsid):

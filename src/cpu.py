@@ -134,6 +134,9 @@ class GuestThread:
         self.stop = False  # ExitThread: stop this thread's emulation
         self.python_thread = None
         self.pending_fault = None  # access violation the memory hook saw
+        # When the thread wants the scheduler lock back (idle_wait), or None
+        # while it runs or waits to get it
+        self.wake_at = None
         self.dispatch_depth = 0  # exceptions being dispatched (nested ones)
         self.tls_array = 0  # TEB->ThreadLocalStoragePointer (static TLS blocks)
         self.protection_index = 0  # Entries of CPUEmulator.protection_log applied
@@ -174,6 +177,23 @@ class CPUEmulator(ProcessEnvironmentMixin):
     NATIVE_ROUTINE_DLLS = ('msvcrt.dll', 'ntdll.dll', 'ucrtbase.dll',
                            'api-ms-win-crt-string-l1-1-0.dll', 'vcruntime140.dll',
                            'api-ms-win-crt-heap-l1-1-0.dll')
+    # Small APIs a game calls thousands of times a second, as guest code
+    # (Red Alert 2: two Interlocked calls and an IsLost per sprite it draws).
+    # A bad pointer faults in the program, like on Windows.
+    NATIVE_STUBS = {
+        ('kernel32.dll', 'InterlockedIncrement'): bytes.fromhex(
+            '8b4c2404' 'b801000000' 'f00fc101' '40' 'c20400'),
+        ('kernel32.dll', 'InterlockedDecrement'): bytes.fromhex(
+            '8b4c2404' 'b8ffffffff' 'f00fc101' '48' 'c20400'),
+        ('kernel32.dll', 'InterlockedExchange'): bytes.fromhex(
+            '8b4c2404' '8b442408' '8701' 'c20800'),
+        ('kernel32.dll', 'InterlockedExchangeAdd'): bytes.fromhex(
+            '8b4c2404' '8b442408' 'f00fc101' 'c20800'),
+        ('kernel32.dll', 'InterlockedCompareExchange'): bytes.fromhex(
+            '8b4c2404' '8b542408' '8b44240c' 'f00fb111' 'c20c00'),
+        # A software surface is never lost: DD_OK
+        ('ole32.dll', 'IDirectDrawSurface7::IsLost'): bytes.fromhex('33c0' 'c20400'),
+    }
     # malloc and free of small blocks run as guest code too: freed blocks of
     # up to SMALL_BLOCK_MAX bytes wait in per-size free lists (heads at
     # NATIVE_DATA_ADDR) for the next malloc of their size; other calls go to
@@ -213,7 +233,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
         self.process_id = self.allocate_id()
         self.main_thread = GuestThread(self.allocate_id())
         self.threads = {self.main_thread.tid: self.main_thread}
-        self.sched = threading.Condition(threading.RLock())
+        sched_lock = threading.RLock()
+        self.sched = threading.Condition(sched_lock)
+        # A thread that gave its turn away (maybe_yield) waits here; the next
+        # thread to block hands the turn back at once
+        self._yield_cond = threading.Condition(sched_lock)
         self._slice_start = time.monotonic()
         self._running_thread = None  # The guest thread holding the scheduler lock
         self._watchdog = None  # Preemption thread, started with the second thread
@@ -313,6 +337,7 @@ class CPUEmulator(ProcessEnvironmentMixin):
     def wake_threads(self):
         """Let blocked threads re-check what they wait for (call with the
         scheduler lock, e.g. from API handlers)"""
+        self._threads_woken = True
         try:
             self.sched.notify_all()
         except RuntimeError:
@@ -321,10 +346,16 @@ class CPUEmulator(ProcessEnvironmentMixin):
 
     def idle_wait(self, seconds):
         """Block the calling guest thread for a while and let other threads run"""
+        thread = self.current_thread
+        if thread is not None:
+            thread.wake_at = time.monotonic() + seconds
         try:
+            self._yield_cond.notify()
             self.sched.wait(seconds)
         except RuntimeError:
             time.sleep(seconds)
+        if thread is not None:
+            thread.wake_at = None
         self._start_slice()
 
     def _start_slice(self):
@@ -377,7 +408,29 @@ class CPUEmulator(ProcessEnvironmentMixin):
         """Time slicing at API calls: a thread that runs long without
         blocking gives the other runnable threads a turn"""
         if len(self.threads) > 1 and time.monotonic() - self._slice_start > self.THREAD_TIME_SLICE:
-            self.idle_wait(0.0005)
+            if self._others_runnable():
+                try:
+                    self._yield_cond.notify()  # Another thread that gave its turn away
+                    self._yield_cond.wait(0.002)
+                except RuntimeError:
+                    pass
+            self._start_slice()
+
+    def _others_runnable(self):
+        """Does another thread wait for the scheduler lock? The others mostly
+        sleep (Red Alert 2's sound and timer threads): a turn given to none of
+        them cost its main thread 7% of the time"""
+        if getattr(self, '_threads_woken', True):
+            self._threads_woken = False
+            return True  # Notified threads (an event was set) may run
+        now = time.monotonic()
+        current = self.current_thread
+        for thread in list(self.threads.values()):
+            if thread is current or thread.exited:
+                continue
+            if thread.wake_at is None or thread.wake_at <= now:
+                return True
+        return False
 
     def map_shared(self, base, size, perms=UC_PROT_ALL):
         """Map new process memory, visible to every thread's Unicorn instance"""
@@ -703,6 +756,8 @@ class CPUEmulator(ProcessEnvironmentMixin):
                     # Its Unicorn instance too: the handle can outlive the
                     # thread (GetExitCodeThread), the CPU state is not needed
                     thread.uc = None
+                    self._threads_woken = True
+                    self._yield_cond.notify_all()
                     self.sched.notify_all()
                     log.debug(f"Thread {tid} exited ({thread.exit_code})")
 
@@ -1134,6 +1189,9 @@ class CPUEmulator(ProcessEnvironmentMixin):
         native = getattr(self, 'native_routines', {}).get(func_name)
         if native and dll_name.lower() in self.NATIVE_ROUTINE_DLLS:
             return native
+        native = getattr(self, 'native_stubs', {}).get((dll_name.lower(), func_name))
+        if native:
+            return native
         prologue = self.api_handler.native_prologue(func_name)
         entry = self.next_hook_addr
         hook_addr = entry + len(prologue)
@@ -1300,6 +1358,11 @@ class CPUEmulator(ProcessEnvironmentMixin):
                     placed[code] = address
                     address = (address + len(code) + 15) & ~15
                 self.native_routines[name] = placed[code]
+            self.native_stubs = {}
+            for key, code in self.NATIVE_STUBS.items():
+                self.uc.mem_write(address, code)
+                self.native_stubs[key] = address
+                address = (address + len(code) + 15) & ~15
             if self.heap_class_map is not None:
                 self._place_small_block_cache(address)
         except UcError as e:

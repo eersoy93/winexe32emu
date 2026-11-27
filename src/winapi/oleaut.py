@@ -337,8 +337,8 @@ class OleAutMixin:
     def CreateEventA(self, args, wide=False):
         """CreateEventA/W emulation"""
         manual, initial, lpName = args[1], args[2], args[3]
-        handle = self._named_object(lpName, 'event', wide, lambda: {
-            'manual': bool(manual), 'signaled': bool(initial)})
+        handle = self._mark_inheritable(args[0], self._named_object(
+            lpName, 'event', wide, lambda: {'manual': bool(manual), 'signaled': bool(initial)}))
         log.debug(f"CreateEvent(manual={manual}, initial={initial}) -> 0x{handle:x}")
         return handle
 
@@ -391,8 +391,8 @@ class OleAutMixin:
         if maximum <= 0 or maximum >= 0x80000000 or initial > maximum:
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
-        return self._named_object(lpName, 'semaphore', wide, lambda: {
-            'count': initial, 'max': maximum})
+        return self._mark_inheritable(args[0], self._named_object(
+            lpName, 'semaphore', wide, lambda: {'count': initial, 'max': maximum}))
 
     def CreateSemaphoreW(self, args):
         return self.CreateSemaphoreA(args, wide=True)
@@ -417,8 +417,9 @@ class OleAutMixin:
         """CreateMutexA/W emulation"""
         initial_owner, lpName = args[1], args[2]
         tid = self.emu.current_thread.tid
-        return self._named_object(lpName, 'mutex', wide, lambda: {
-            'owner': tid if initial_owner else 0, 'count': 1 if initial_owner else 0})
+        return self._mark_inheritable(args[0], self._named_object(
+            lpName, 'mutex', wide, lambda: {'owner': tid if initial_owner else 0,
+                                            'count': 1 if initial_owner else 0}))
 
     def CreateMutexW(self, args):
         return self.CreateMutexA(args, wide=True)

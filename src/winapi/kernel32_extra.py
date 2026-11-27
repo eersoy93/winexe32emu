@@ -549,6 +549,8 @@ class Kernel32ExtraMixin:
                 info['shared'] = info.get('shared', 0) + 1
         new = self.get_next_handle()
         self.handles[new] = info
+        if args[5]:  # bInheritHandle
+            self.inheritable_handles.add(new)
         if target_addr:
             self._mem_write(target_addr, struct.pack('<I', new))
         if options & 1 and handle in self.handles:  # DUPLICATE_CLOSE_SOURCE
@@ -560,7 +562,8 @@ class Kernel32ExtraMixin:
         if args[0] not in self.handles and args[0] not in (0x10, 0x11, 0x12):
             self._last_error = 6
             return 0
-        flags = self.handles.get(args[0], {}).get('handle_flags', 0)
+        flags = self.handles.get(args[0], {}).get('handle_flags', 0) & ~1 | \
+            (1 if args[0] in self.inheritable_handles else 0)  # HANDLE_FLAG_INHERIT
         return 1 if self._mem_write(args[1], struct.pack('<I', flags)) else 0
 
     def SetHandleInformation(self, args):
@@ -572,6 +575,11 @@ class Kernel32ExtraMixin:
             self._last_error = 6
             return 0
         info['handle_flags'] = (info.get('handle_flags', 0) & ~args[1]) | (args[2] & args[1])
+        if args[1] & 1:  # HANDLE_FLAG_INHERIT belongs to the handle, not the object
+            if args[2] & 1:
+                self.inheritable_handles.add(args[0])
+            else:
+                self.inheritable_handles.discard(args[0])
         return 1
 
     def GetProcessId(self, args):
@@ -1042,10 +1050,6 @@ class Kernel32ExtraMixin:
         not emulated"""
         self._last_error = 50  # ERROR_NOT_SUPPORTED
         return 0
-
-    def FlushViewOfFile(self, args):
-        """FlushViewOfFile(base, size) - the views are written when unmapped"""
-        return 1
 
     def SetConsoleScreenBufferSize(self, args):
         return 1 if self._console_output_handle(args[0]) else 0

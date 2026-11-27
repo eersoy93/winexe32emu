@@ -219,6 +219,10 @@ class ProcessesMixin:
         share = self.has_console and not flags & (self.DETACHED_PROCESS |
                                                   self.CREATE_NEW_CONSOLE)
         parent = self
+        # Inheritable handles go to the child with the same values (the Red
+        # Alert 2 launcher posts the game the handle of a shared memory block)
+        inherited = {handle: self.handles[handle] for handle in sorted(self.inheritable_handles)
+                     if handle in self.handles} if inherit_handles else {}
 
         def prepare(emulator):
             child = emulator.api_handler
@@ -226,11 +230,39 @@ class ProcessesMixin:
             child.console_title = title
             child.console_parent = parent if share else None
             child.console_detached = bool(flags & self.DETACHED_PROCESS)
+            for handle, info in inherited.items():
+                child.handles[handle] = parent._inherited_object(info)
+                child.inheritable_handles.add(handle)
             for std_id, info in std.items():
-                handle = child.get_next_handle()
-                child.handles[handle] = parent._inherited_handle(info)
+                handle = next((h for h, i in inherited.items() if i is info), None)
+                if handle is None:
+                    handle = child.get_next_handle()
+                    child.handles[handle] = parent._inherited_handle(info)
                 child.std_handles[std_id] = handle
         return prepare
+
+    def _inherited_object(self, info):
+        """The child's handle to an object it inherits: a file gets its own
+        host descriptor, a kernel object one more reference"""
+        if info.get('type') == 'file' and info.get('fp') is not None:
+            return self._inherited_handle(info)
+        if 'refs' in info:
+            info['refs'] += 1
+        else:
+            info['shared'] = info.get('shared', 0) + 1
+        return info
+
+    def _mark_inheritable(self, lpAttributes, handle):
+        """A new handle is inheritable if its SECURITY_ATTRIBUTES say so
+        (bInheritHandle); returns the handle"""
+        if handle and handle != 0xFFFFFFFF and lpAttributes:
+            try:
+                inherit = struct.unpack('<I', self.emu.uc.mem_read(lpAttributes + 8, 4))[0]
+            except UcError:
+                inherit = 0
+            if inherit:
+                self.inheritable_handles.add(handle)
+        return handle
 
     def redirected_std_file(self, kind):
         """The file a standard stream ('stdin', 'stdout', 'stderr') goes to

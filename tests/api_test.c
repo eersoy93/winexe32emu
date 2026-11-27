@@ -448,10 +448,18 @@ static void test_shell(void)
                      strcmp(paths[0], "A:\\") == 0 && strcmp(paths[1], "C:\\") == 0 &&
                      strcmp(paths[2], "D:\\") == 0;
             check(ok, "IShellFolder::EnumObjects (My Computer holds A:, C:, D:)");
-            check(ok && computer->lpVtbl->GetDisplayNameOf(computer, item[2], SHGDN_NORMAL,
-                                                           &name) == S_OK &&
-                  name.uType == STRRET_WSTR && wcscmp(name.pOleStr, L"CD Drive (D:)") == 0,
-                  "IShellFolder::GetDisplayNameOf (CD Drive (D:))");
+            {
+                /* A CD without a volume label is a "CD Drive"; one with a
+                   label (drives/D.label) is shown with it */
+                char label[64] = "";
+                WCHAR expected[96];
+                GetVolumeInformationA("D:\\", label, sizeof(label), NULL, NULL, NULL, NULL, 0);
+                wsprintfW(expected, L"%S (D:)", label[0] ? label : "CD Drive");
+                check(ok && computer->lpVtbl->GetDisplayNameOf(computer, item[2], SHGDN_NORMAL,
+                                                               &name) == S_OK &&
+                      name.uType == STRRET_WSTR && wcscmp(name.pOleStr, expected) == 0,
+                      "IShellFolder::GetDisplayNameOf (the CD's label or CD Drive, (D:))");
+            }
             for (i = 0; i < 4; i++)
                 if (item[i])
                     CoTaskMemFree(item[i]);

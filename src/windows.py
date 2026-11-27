@@ -14,6 +14,7 @@
 
 """Windows, controls and consoles of the pseudo Windows GUI"""
 
+import time
 import bisect
 import threading
 from functools import wraps
@@ -94,11 +95,17 @@ class FakeWindow:
         # A child window whose class has no background brush is not erased:
         # its parent's drawing shows through where it does not paint
         self.transparent = False
+        # The window of an exclusive full-screen DirectDraw program after it
+        # wrote on the screen: its drawing covers its child windows too
+        self.shapes_over_children = False
         self.wndclass = None  # Registered class (of its module) of a program's window
 
         # Retained drawing list (GDI display list, redrawn every frame):
         # Rectangle/Ellipse/LineTo/SetPixel/Polygon/TextOut... items
         self.drawn_shapes = []
+        # While the program paints (BeginPaint..EndPaint): (start time, the
+        # display list shown until the paint is complete), else None
+        self.paint_snapshot = None
 
         # Menu bar: list of {'text', 'id', 'items': [...]} or None
         self.menu = None
@@ -121,6 +128,27 @@ class FakeWindow:
         self.restore_y = y
         self.restore_width = width
         self.restore_height = height
+
+    # A paint that takes longer than this is shown while it is drawn (a
+    # program may open a dialog or run a message loop inside WM_PAINT)
+    PAINT_SNAPSHOT_SECONDS = 0.5
+
+    def begin_paint(self):
+        """The program starts to repaint the window: until end_paint the
+        screen keeps the drawing it had (a repaint appears at once on a real
+        PC; here its steps would show as flicker)"""
+        self.paint_snapshot = (time.monotonic(), self.drawn_shapes)
+
+    def end_paint(self):
+        self.paint_snapshot = None
+
+    def shown_shapes(self):
+        """The display list to draw on the screen"""
+        snapshot = self.paint_snapshot
+        if snapshot is not None and \
+                time.monotonic() - snapshot[0] < self.PAINT_SNAPSHOT_SECONDS:
+            return snapshot[1]
+        return self.drawn_shapes
 
     def contains_point(self, px, py):
         """Is point inside window?"""
@@ -173,6 +201,8 @@ class FakeWindow:
 class FakeControl:
     """Fake Windows control (Button, Edit, Static, etc.)"""
 
+    COMBO_FIELD_HEIGHT = 24
+
     def __init__(self, hwnd, class_name, text, x, y, width, height, style=0, ex_style=0):
         self.hwnd = hwnd
         self.class_name = class_name.upper()
@@ -185,6 +215,8 @@ class FakeControl:
         self.ex_style = ex_style
         self.visible = True
         self.enabled = True
+        # Height of a drop-down combo box's selection field (CB_SETITEMHEIGHT -1)
+        self.combo_field_height = self.COMBO_FIELD_HEIGHT
         self.parent_hwnd = 0
         self.control_id = 0  # Control ID (hMenu in CreateWindowEx) for WM_COMMAND
         self.checked = False  # For Checkbox/Radio
@@ -243,6 +275,16 @@ class FakeControl:
         self.edit_visible_lines = 1  # Lines the multiline edit shows (when drawn)
         # ES_PASSWORD shows this character instead of the text ('' : plain text)
         self.password_char = '*' if self.class_name == 'EDIT' and style & 0x20 else ''
+
+    @property
+    def window_height(self):
+        """Height of the window as Windows has it: a drop-down combo box is only
+        its selection field (the height it was created with includes the list,
+        which is a separate pop-up window). Red Alert 2 centers the text of its
+        own combo boxes in GetClientRect, which drew it below the box."""
+        if self.class_name == 'COMBOBOX' and self.style & 0x3 != 0x1:  # Not CBS_SIMPLE
+            return min(self.height, self.combo_field_height)
+        return self.height
 
     # ---------- EDIT selection ----------
 

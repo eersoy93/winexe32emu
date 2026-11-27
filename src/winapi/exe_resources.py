@@ -15,6 +15,7 @@
 """WinAPIHandler mixin: Resources of the loaded EXE, standard handles, code page conversion,
 errors, virtual memory and heaps"""
 
+import io
 import re
 import struct
 
@@ -262,6 +263,14 @@ class ExeResourcesMixin:
 
             log.debug(f"WriteFile(0x{hFile:x}, {nNumberOfBytesToWrite} bytes)")
             return 1  # Success
+        except io.UnsupportedOperation:
+            # The handle was opened without GENERIC_WRITE
+            if lpNumberOfBytesWritten != 0:
+                self._mem_write(lpNumberOfBytesWritten, struct.pack('<I', 0))
+            log.debug(f"WriteFile(0x{hFile:x}): handle is read-only "
+                      f"({self.handles.get(hFile, {}).get('name')})")
+            self._last_error = 5  # ERROR_ACCESS_DENIED
+            return 0
         except Exception as e:
             log.error(f"WriteFile error: {e}")
             return 0

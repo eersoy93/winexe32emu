@@ -141,9 +141,13 @@ class ConsoleMixin:
         return resolver() if resolver else None
 
     def get_next_handle(self):
-        """Create new handle"""
+        """Create new handle (not one a parent process passed on: inherited
+        handles keep their values)"""
         handle = self.next_handle
         self.next_handle += 4
+        handles = getattr(self, 'handles', ())
+        while handle in handles:
+            handle, self.next_handle = self.next_handle, self.next_handle + 4
         return handle
 
     def _read_until_null(self, address, max_bytes, unit):

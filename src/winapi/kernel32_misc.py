@@ -424,6 +424,7 @@ class Kernel32MiscMixin:
                 # DuplicateHandle: other handles still use the object
                 info['shared'] -= 1
                 del self.handles[hObject]
+                self.inheritable_handles.discard(hObject)
                 return 1
             if 'refs' in info:
                 # The last handle of a named object destroys its name
@@ -432,6 +433,8 @@ class Kernel32MiscMixin:
                 if info['refs'] <= 0 and name and \
                         winapi.WinAPIHandler.named_kernel_objects.get(name) is info:
                     del winapi.WinAPIHandler.named_kernel_objects[name]
+            if info.get('type') == 'mapping':
+                self._release_mapping(info)
             fp = info.get('fp')
             if fp:
                 try:
@@ -439,6 +442,7 @@ class Kernel32MiscMixin:
                 except OSError as e:
                     log.error(f"CloseHandle close error: {e}")
             del self.handles[hObject]
+        self.inheritable_handles.discard(hObject)
         return 1
 
     def Sleep(self, args):
@@ -536,8 +540,8 @@ class Kernel32MiscMixin:
         dwCreationDisposition = args[4]
         log.debug(f"CreateFileA(\"{filename}\", access=0x{dwDesiredAccess:x}, "
                   f"share={args[2]}, disp={dwCreationDisposition})")
-        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition,
-                                        args[2])
+        return self._mark_inheritable(args[3], self._create_file_common(
+            filename, dwDesiredAccess, dwCreationDisposition, args[2]))
 
     def CreateFileW(self, args):
         """CreateFileW emulation - wide-char CreateFile"""
@@ -546,8 +550,8 @@ class Kernel32MiscMixin:
         dwCreationDisposition = args[4]
         log.debug(f"CreateFileW(\"{filename}\", access=0x{dwDesiredAccess:x}, "
                   f"share={args[2]}, disp={dwCreationDisposition})")
-        return self._create_file_common(filename, dwDesiredAccess, dwCreationDisposition,
-                                        args[2])
+        return self._mark_inheritable(args[3], self._create_file_common(
+            filename, dwDesiredAccess, dwCreationDisposition, args[2]))
 
     # Access rights that count as reading, writing or deleting for the share
     # modes (bits like FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE)

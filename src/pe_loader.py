@@ -30,7 +30,8 @@ class PELoader:
     # Imports by ordinal that the emulator implements by name: (dll, ordinal) -> name
     # (pefile's ordlookup knows oleaut32, ws2_32 and wsock32)
     KNOWN_ORDINALS = {('comctl32.dll', 17): 'InitCommonControls',
-                      ('comctl32.dll', 6): 'CreateStatusWindowA'}
+                      ('comctl32.dll', 6): 'CreateStatusWindowA',
+                      ('dsound.dll', 1): 'DirectSoundCreate'}
 
     @classmethod
     def ordinal_name(cls, dll_name, ordinal):

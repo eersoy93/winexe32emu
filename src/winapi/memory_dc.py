@@ -1017,6 +1017,11 @@ class MemoryDCMixin:
             return 1
 
         hwnd = self._dc_hwnd(hdcDest)
+        # Like BitBlt: nothing is drawn outside the DC's clipping (the update
+        # region of a WM_PAINT for a part of the window)
+        clipped = self._draw_clip(hdcDest) is not None
+        if clipped:
+            shapes = [part for shape in shapes for part in self._clip_shape(hdcDest, shape)]
         if self.gui and hwnd in self.gui.controls:
             # An owner-draw control's DC (WM_DRAWITEM)
             for shape in shapes:
@@ -1027,9 +1032,13 @@ class MemoryDCMixin:
 
         window = self.gui.windows[hwnd]
         client_w, client_h = self.gui.client_size(window)
-        if xd <= 0 and yd <= 0 and xd + wd >= client_w and yd + hd >= client_h:
+        if (not clipped and xd <= 0 and yd <= 0 and xd + wd >= client_w
+                and yd + hd >= client_h):
             # Full-area blit: swap in a fresh list (GUI thread iterates snapshots)
             window.drawn_shapes = shapes
+        elif clipped:
+            for shape in shapes:
+                self.gui.add_shape(hwnd, shape)
         else:
             window.drawn_shapes = window.drawn_shapes + shapes
         return 1

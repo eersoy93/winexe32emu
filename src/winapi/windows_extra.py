@@ -442,10 +442,16 @@ class WindowsExtraMixin:
 
     def PostThreadMessageA(self, args):
         """PostThreadMessageA/W(idThread, Msg, wParam, lParam) - a message
-        without a window for a thread of the program"""
-        if args[0] not in self.emu.threads:
+        without a window for a thread of any program (thread ids are unique
+        in the system: the Red Alert 2 launcher posts 0xBEEF to the game's
+        main thread)"""
+        target = self._thread_process(args[0])
+        if target is None:
             self._last_error = 1444  # ERROR_INVALID_THREAD_ID
             return 0
+        if target is not self:
+            target.post_window_message(0, args[1], args[2], args[3], thread=args[0])
+            return 1
         if args[1] == self.WM_QUIT and args[0] == self.emu.current_thread.tid:
             self.quit_code = args[2]
             self.quit_requested = True
@@ -456,6 +462,16 @@ class WindowsExtraMixin:
         return 1
 
     PostThreadMessageW = PostThreadMessageA
+
+    def _thread_process(self, tid):
+        """The emulated process that has the thread tid, or None"""
+        if tid in self.emu.threads:
+            return self
+        for process in list(self.gui.processes) if self.gui else ():
+            emu = getattr(process, 'emu', None)
+            if emu is not None and tid in getattr(emu, 'threads', {}):
+                return process
+        return None
 
     def WindowFromDC(self, args):
         """WindowFromDC(hdc) - the window of a window's DC (0 for others)"""

@@ -570,6 +570,9 @@ class User32WindowsMixin:
             self.gui.show_window(hWnd, False)
             if win is not None and was_visible:
                 self._uncovered(win, (win.x, win.y, win.width, win.height), True)
+            elif target is not None and was_visible:
+                self._control_uncovered(target, (target.x, target.y, target.width,
+                                                 target.height), True)
             return was_visible
         if win is None or win.parent is not None:  # A control or child window
             self.gui.show_window(hWnd, True)
@@ -602,6 +605,8 @@ class User32WindowsMixin:
         """UpdateWindow emulation"""
         hWnd = args[0]
         log.debug(f"UpdateWindow(0x{hWnd:x})")
+        if self.gui and hWnd in self.gui.controls:
+            return self._update_control(hWnd)
         win = self.gui.windows.get(hWnd) if self.gui else None
         if (win is None or win.owner is not self or hWnd in self.painted_windows or
                 hWnd in self.updating_windows or hWnd in self.dialogs or
@@ -621,6 +626,26 @@ class User32WindowsMixin:
             if hWnd in self.paint_pending:
                 self.paint_pending.discard(hWnd)
                 self.update_rects.pop(hWnd, None)
+        return 1
+
+    def _update_control(self, hwnd):
+        """UpdateWindow of a control waiting for WM_PAINT that its program
+        paints (subclassed or owner-draw): WM_PAINT is sent at once. Red Alert
+        2 updates every control while its dialog paints, then copies the
+        dialog's area with the frames the controls drew around them."""
+        control = self.gui.controls[hwnd]
+        parent = self.gui.windows.get(control.parent_hwnd)
+        if (hwnd not in self.dirty_controls or hwnd in self.updating_windows or
+                not control.visible or parent is None or parent.owner is not self or
+                not self._shown_with_parents(parent) or
+                not (self._control_subclass(hwnd) or self._owner_draw_type(control))):
+            return 1
+        del self.dirty_controls[hwnd]
+        self.updating_windows.add(hwnd)
+        try:
+            self._send_control_paint(hwnd)
+        finally:
+            self.updating_windows.discard(hwnd)
         return 1
 
     def _shown_with_parents(self, win):
@@ -643,7 +668,7 @@ class User32WindowsMixin:
                 self.cbt_destroy_window(hWnd)):
             return 0  # A WH_CBT hook prevented it
         if self.gui and hWnd in self.gui.controls:
-            self.gui.destroy_control(hWnd)
+            self._destroy_control(hWnd)
         elif self.gui and hWnd in self.dialogs:
             dialog = self.dialogs[hWnd]
             if not dialog.get('destroying'):
@@ -692,6 +717,32 @@ class User32WindowsMixin:
             return 0
 
         return 1
+
+    WM_NCDESTROY = 0x0082
+
+    def _destroy_control(self, hwnd):
+        """DestroyWindow of a control: a procedure the program subclassed it
+        with gets WM_DESTROY and WM_NCDESTROY while it still exists (Red
+        Alert 2 unregisters its list's scroll bar there; without it its
+        dialog stopped animating after a drop-down list closed), then what
+        was under it is painted again"""
+        control = self.gui.controls[hwnd]
+        subclass = self._control_subclass(hwnd)
+        if subclass:
+            self.emu.call_wndproc(subclass, hwnd, self.WM_DESTROY, 0, 0)
+            if hwnd in self.gui.controls:
+                self.emu.call_wndproc(subclass, hwnd, self.WM_NCDESTROY, 0, 0)
+            if hwnd not in self.gui.controls:
+                return  # Its procedure destroyed it already
+        was_visible = control.visible
+        control.visible = False
+        self._control_uncovered(control, (control.x, control.y, control.width,
+                                          control.window_height), was_visible)
+        self.gui.destroy_control(hwnd)
+        self.dirty_controls.pop(hwnd, None)
+        self.window_longs.pop(hwnd, None)
+        with self.message_lock:
+            self.message_queue[:] = [m for m in self.message_queue if m['hwnd'] != hwnd]
 
     def _window_and_children(self, hwnd):
         """A window's handle and those of its child windows and controls"""
@@ -774,7 +825,7 @@ class User32WindowsMixin:
             control = self.gui.controls[hWnd]
             if control.class_name == 'STATUSBAR':
                 self.gui.layout_statusbar(control)
-            right, bottom = control.width, control.height
+            right, bottom = control.width, control.window_height
 
         if lpRect:
             rect_data = struct.pack("<iiii", left, top, right, bottom)
@@ -827,7 +878,7 @@ class User32WindowsMixin:
                 self.gui.layout_statusbar(control)
             ox, oy = self.gui.client_origin(parent) if parent else (0, 0)
             left, top = ox + control.x, oy + control.y
-            right, bottom = left + control.width, top + control.height
+            right, bottom = left + control.width, top + control.window_height
 
         if lpRect:
             rect_data = struct.pack("<iiii", left, top, right, bottom)

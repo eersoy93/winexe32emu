@@ -250,6 +250,8 @@ class DeviceContextMixin:
         win = self.gui.windows.get(hWnd) if self.gui else None
         if win is None:
             update = None
+        else:
+            win.begin_paint()
         self.dc_state[hdc].pop('vis', None)
 
         if update is None:
@@ -270,7 +272,13 @@ class DeviceContextMixin:
         # drawings were cleared), so it is erased every time.
         erase = 0
         if self.gui and hWnd in self.gui.windows and hWnd not in self.gui.consoles:
+            painted = hWnd in self.painted_windows
             erase = 0 if self.SendMessageA([hWnd, self.WM_ERASEBKGND, hdc, 0]) else 1
+            if painted:
+                # The update region is validated when the background has been
+                # erased: an InvalidateRect made while erasing it (Red Alert
+                # 2's Autorun) does not ask for another WM_PAINT
+                self.ValidateRect([hWnd, 0])
 
         # Fill PAINTSTRUCT structure
         if lpPaint:
@@ -292,6 +300,9 @@ class DeviceContextMixin:
         hWnd = args[0]
         lpPaint = args[1]
         log.debug(f"EndPaint(0x{hWnd:x})")
+        win = self.gui.windows.get(hWnd) if self.gui else None
+        if win is not None:
+            win.end_paint()
         # Free the DC allocated by BeginPaint
         if lpPaint:
             try:
@@ -348,7 +359,10 @@ class DeviceContextMixin:
         rect = self._rect_and(rect, (0, 0) + tuple(self.gui.client_size(win)))
         if rect is None:
             return
-        if win.owner is self and hwnd not in self.dialogs:
+        # A dialog is painted again only when its program subclassed it (and
+        # may paint it itself): Red Alert 2 draws its dialogs on the screen,
+        # and its own drop-down list leaves its picture there when it closes
+        if win.owner is self and (hwnd not in self.dialogs or self._dialog_subclass(hwnd)):
             self._invalidate(hwnd, rect)
         for child in list(win.children):
             child_win = self.gui.windows.get(child)

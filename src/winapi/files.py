@@ -281,6 +281,7 @@ class FilesMixin:
                    'psapi.dll', 'mpr.dll', 'winspool.drv', 'imm32.dll', 'kernelbase.dll',
                    'ws2_32.dll', 'wsock32.dll', 'rpcrt4.dll', 'secur32.dll', 'crypt32.dll',
                    'dbghelp.dll', 'setupapi.dll', 'userenv.dll', 'dwmapi.dll',
+                   'ddraw.dll', 'dsound.dll',
                    # The emulated C runtime (programs often ship copies of these)
                    'vcruntime140.dll', 'ucrtbase.dll'}
 

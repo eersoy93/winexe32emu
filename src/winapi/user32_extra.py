@@ -380,9 +380,12 @@ class User32ExtraMixin:
         return self._next_message(remove=False) is not None
 
     def GetQueueStatus(self, args):
-        """GetQueueStatus(flags) - QS_POSTMESSAGE if a message is waiting"""
-        if self.gui and self._next_message(remove=False) is not None:
-            bits = 0x8 & args[0]  # QS_POSTMESSAGE
+        """GetQueueStatus(flags) - QS_TIMER for a due timer, else
+        QS_POSTMESSAGE if a message is waiting"""
+        msg = self._next_message(remove=False) if self.gui else None
+        if msg is not None:
+            kind = 0x10 if msg[1] == self.WM_TIMER else 0x8  # QS_TIMER, QS_POSTMESSAGE
+            bits = kind & args[0]
             return (bits << 16) | bits
         return 0
 
@@ -974,6 +977,35 @@ class User32ExtraMixin:
     def ChangeDisplaySettingsExW(self, args):
         return self.ChangeDisplaySettingsW([args[1], args[3]])
 
+    # ---------- Input method editors (imm32): none is installed ----------
+
+    def ImmGetDefaultIMEWnd(self, args):
+        """ImmGetDefaultIMEWnd(hwnd) - no IME window (NULL)"""
+        return 0
+
+    def ImmGetContext(self, args):
+        """ImmGetContext(hwnd) - windows have no input context without an IME"""
+        return 0
+
+    def ImmReleaseContext(self, args):
+        return 1
+
+    def ImmAssociateContext(self, args):
+        """ImmAssociateContext(hwnd, himc) - the previous context: none"""
+        return 0
+
+    def ImmIsIME(self, args):
+        return 0
+
+    def ImmDisableIME(self, args):
+        return 1
+
+    def ImmGetOpenStatus(self, args):
+        return 0
+
+    def ImmSetOpenStatus(self, args):
+        return 0
+
     # ---------- Window stations and desktops ----------
 
     WINSTA_HANDLE = 0x00000040
@@ -1556,8 +1588,9 @@ class User32ExtraMixin:
         control = self.gui.controls.get(args[0]) if self.gui else None
         if control is None or 'COMBOBOX' not in control.class_name:
             return 0
-        data = struct.pack('<I8iI3I', 52, 0, 0, control.width, control.height,
-                           max(0, control.width - 18), 0, control.width, control.height,
+        height = control.window_height
+        data = struct.pack('<I8iI3I', 52, 0, 0, control.width, height,
+                           max(0, control.width - 18), 0, control.width, height,
                            0, args[0], self._combo_edit(args[0]), 0)
         return 1 if self._mem_write(args[1], data) else 0
 

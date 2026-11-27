@@ -280,6 +280,7 @@ class ControlsMixin:
                    'REBAR': self._rebar_message, 'COMBOBOXEX': self._comboboxex_message,
                    'HEADER': self._header_message,
                    'TOOLTIPS': self._tooltip_message,
+                   'TRACKBAR': self._trackbar_message,
                    'TAB': self._tab_message}.get(win.native)
         result = handler(win, msg, wParam, lParam) if handler else None
         if result is not None:
@@ -306,6 +307,8 @@ class ControlsMixin:
         if msg == 0x000E:  # WM_GETTEXTLENGTH
             text = self._window_text(hwnd)
             return len(text if wide else text.encode(config.ANSI_CODEPAGE, errors='replace'))
+        if msg == self.WM_PAINT:
+            return self._default_control_paint(hwnd)
         parent = self.gui.windows.get(control.parent_hwnd)
         if (control.class_name == 'EDIT' and parent is not None and parent.native == 'LISTVIEW'
                 and msg == self.WM_KEYDOWN and wParam in (0x0D, 0x1B)):
@@ -327,11 +330,56 @@ class ControlsMixin:
         if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and \
                 control.class_name == 'LISTBOX':
             return self._listbox_mouse_message(control, msg, wParam, lParam)
+        if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK) and \
+                control.class_name == 'COMBOBOX' and control.style & 0x3 != 0x1:
+            # A click a subclassing procedure passed on opens or closes the list
+            self.gui.open_combo = None if self.gui.open_combo == hwnd else hwnd
+            return 0
+        if msg in (self.WM_LBUTTONDOWN, self.WM_LBUTTONDBLCLK, self.WM_LBUTTONUP) and \
+                control.class_name in ('BUTTON', 'CHECKBOX'):
+            return self._button_mouse_message(control, msg, lParam)
         if msg in (self.WM_KEYDOWN, self.WM_CHAR, self.WM_KEYUP, self.WM_LBUTTONDOWN,
                    self.WM_LBUTTONUP, self.WM_MOUSEMOVE, self.WM_SETFOCUS, self.WM_KILLFOCUS):
             return 0
         # CallWindowProcA of an ANSI subclass passes ANSI text (LB_ADDSTRING...)
         return self._control_message(control, msg, wParam, lParam, wide)
+
+    def _button_mouse_message(self, control, msg, lParam):
+        """The button procedure's mouse clicks: a release over the button it
+        was pressed on clicks it. An automatic check box or radio button gets
+        BM_SETCHECK through its window procedure, so a subclassing procedure
+        sees the new state, then the parent gets BN_CLICKED."""
+        if msg != self.WM_LBUTTONUP:
+            control.button_pressed = True
+            return 0
+        pressed, control.button_pressed = getattr(control, 'button_pressed', False), False
+        x, y = lParam & 0xFFFF, (lParam >> 16) & 0xFFFF
+        if not pressed or x >= control.width or y >= control.height:
+            return 0
+        style = control.style & 0xF
+        if control.class_name == 'CHECKBOX' and style in (0x3, 0x6):  # BS_AUTOCHECKBOX/3STATE
+            # The emulated state is a bool, so BS_AUTO3STATE skips "indeterminate"
+            self.SendMessageA([control.hwnd, self.BM_SETCHECK, 0 if control.checked else 1, 0])
+        elif control.class_name == 'CHECKBOX' and style == 0x9:  # BS_AUTORADIOBUTTON
+            parent = self.gui.windows.get(control.parent_hwnd)
+            for other in parent.controls if parent is not None else ():
+                if other is not control and other.checked and \
+                        other.class_name == 'CHECKBOX' and (other.style & 0xF) == 0x9 and \
+                        self._same_radio_group(parent, control, other):
+                    self.SendMessageA([other.hwnd, self.BM_SETCHECK, 0, 0])
+            self.SendMessageA([control.hwnd, self.BM_SETCHECK, 1, 0])
+        if control.parent_hwnd:
+            wParam = ((self.BN_CLICKED & 0xFFFF) << 16) | (control.control_id & 0xFFFF)
+            self.SendMessageA([control.parent_hwnd, self.WM_COMMAND, wParam, control.hwnd])
+        return 0
+
+    @staticmethod
+    def _same_radio_group(parent, a, b):
+        """True if two controls of a window are in one group (a WS_GROUP
+        control starts a group)"""
+        controls = parent.controls
+        i, j = sorted((controls.index(a), controls.index(b)))
+        return not any(c.style & 0x00020000 for c in controls[i + 1:j + 1])
 
     def _read_struct(self, address, fmt):
         return struct.unpack(fmt, self.emu.uc.mem_read(address, struct.calcsize(fmt)))

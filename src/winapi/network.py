@@ -292,6 +292,49 @@ class NetworkMixin:
         self._last_error = self.WSANO_DATA
         return 0
 
+    # PROTOCOL_INFO rows of the installed transports: service flags, socket
+    # type, protocol, largest message and name. Only TCP/IP is installed, so
+    # a program that looks for IPX/SPX learns that it is missing.
+    TRANSPORTS = (
+        (0x0066, 1, 6, 0, 'TCP/IP'),        # delivery, order, graceful close, expedited
+        (0x0609, 2, 17, 65467, 'UDP/IP'),   # connectionless, messages, broad/multicast
+    )
+
+    def EnumProtocolsA(self, args, wide=False):
+        """EnumProtocols(protocols, buffer, length) - PROTOCOL_INFO array of the
+        transports; the names are stored behind the array in the same buffer"""
+        wanted = None
+        if args[0]:
+            wanted = set()
+            while (number := self._read_u32(args[0] + 4 * len(wanted))) != 0:
+                wanted.add(number)
+                if len(wanted) > 64:
+                    break
+        rows = [row for row in self.TRANSPORTS if wanted is None or row[2] in wanted]
+        names = [(row[4] + '\0').encode('utf-16-le' if wide else 'ascii') for row in rows]
+        needed = 32 * len(rows) + sum(len(name) for name in names)
+        if not args[2]:
+            self._last_error = 87  # ERROR_INVALID_PARAMETER
+            return self.SOCKET_ERROR
+        available = self._read_u32(args[2])
+        self._mem_write(args[2], struct.pack('<I', needed))
+        if available < needed or (needed and not args[1]):
+            self._last_error = 122  # ERROR_INSUFFICIENT_BUFFER
+            return self.SOCKET_ERROR
+        data, text_at = b'', args[1] + 32 * len(rows)
+        for row, name in zip(rows, names):
+            data += struct.pack('<IiiiiiII', row[0], self.AF_INET, 16, 16, row[1], row[2],
+                                row[3], text_at)
+            text_at += len(name)
+        data += b''.join(names)
+        if data and not self._mem_write(args[1], data):
+            self._last_error = 87
+            return self.SOCKET_ERROR
+        return len(rows)
+
+    def EnumProtocolsW(self, args):
+        return self.EnumProtocolsA(args, wide=True)
+
     def getaddrinfo(self, args, wide=False):
         """getaddrinfo/GetAddrInfoW(node, service, hints, &result) - IPv4
         addresses of this computer (numeric ports and the known services)"""

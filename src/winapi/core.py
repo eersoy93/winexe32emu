@@ -400,6 +400,7 @@ class CoreMixin:
         'mmioOpenA': 3, 'mmioRead': 3, 'mmioSeek': 3, 'mmioStringToFOURCCA': 2, 'mmioWrite': 3,
         'waveOutGetNumDevs': 0, 'PlaySoundA': 3, 'PlaySound': 3,
         'PlaySoundW': 3, 'sndPlaySoundA': 2, 'sndPlaySoundW': 2, 'timeBeginPeriod': 1,
+        'timeGetDevCaps': 2,
         'timeEndPeriod': 1, 'timeGetTime': 0, 'timeSetEvent': 5, 'timeKillEvent': 1,
         'MmTimerThreadProc': 1, 'waveOutClose': 1, 'waveOutGetPosition': 3,
         'waveOutOpen': 6, 'waveOutPause': 1, 'waveOutPrepareHeader': 3, 'waveOutReset': 1,
@@ -678,6 +679,10 @@ class CoreMixin:
         'StrStrIW': 2, 'StrStrW': 2, 'StrToInt64ExA': 3, 'StrToInt64ExW': 3, 'StrToIntA': 1,
         'StrToIntExA': 3, 'StrToIntExW': 3, 'StrToIntW': 1, 'StrTrimA': 2, 'StrTrimW': 2,
         'wvnsprintfA': 4, 'wvnsprintfW': 4,
+        # imm32
+        'ImmGetDefaultIMEWnd': 1, 'ImmGetContext': 1, 'ImmReleaseContext': 2,
+        'ImmAssociateContext': 2, 'ImmIsIME': 1, 'ImmDisableIME': 1,
+        'ImmGetOpenStatus': 1, 'ImmSetOpenStatus': 2,
         # user32
         'ActivateKeyboardLayout': 2, 'AdjustWindowRectExForDpi': 5, 'AnimateWindow': 3,
         'AreDpiAwarenessContextsEqual': 2, 'AttachThreadInput': 3, 'BlockInput': 1,
@@ -759,6 +764,7 @@ class CoreMixin:
         'GetFileVersionInfoExA': 5, 'GetFileVersionInfoExW': 5, 'GetFileVersionInfoSizeExA': 3,
         'GetFileVersionInfoSizeExW': 3, 'VerLanguageNameA': 3, 'VerLanguageNameW': 3,
         # ws2_32/wsock32
+        'EnumProtocolsA': 3, 'EnumProtocolsW': 3,
         'FreeAddrInfoW': 1, 'GetAddrInfoW': 4, 'GetHostNameW': 2, 'InetNtopW': 4,
         'InetPtonW': 3, 'WSAAccept': 5, 'WSAAddressToStringA': 5, 'WSAAddressToStringW': 5,
         'WSAAsyncSelect': 4, 'WSACleanup': 0, 'WSACloseEvent': 1, 'WSAConnect': 7,
@@ -899,6 +905,8 @@ class CoreMixin:
         # committed pages (only those count as used "physical" memory)
         self.virtual_commits = {}
         self.next_handle = 0x1000
+        # Handles a child of CreateProcess(bInheritHandles=TRUE) gets
+        self.inheritable_handles = set()
         self.console_output = []
         # Own console: has_console follows AllocConsole/FreeConsole, console is
         # the GUI console window (FakeConsole) when the GUI is running
@@ -1042,7 +1050,7 @@ class CoreMixin:
         self.clipboard_open = False
         self.clipboard_window = 0  # OpenClipboard's window
         self._metafile_tables = {}  # EnumMetaFile handle table -> object handles
-        self.mapping_views = {}  # id(file mapping info) -> its address here
+        self.mapping_views = {}  # id(file mapping info) -> [its address here, info, views]
 
         # Registry: predefined HKEY -> key node (shared by the emulated
         # programs and saved to REGISTRY_FILE), open HKEY -> key node
@@ -1152,7 +1160,7 @@ class CoreMixin:
     # runtime DLLs)
     OTHER_SYSTEM_DLLS = {
         'msimg32.dll', 'gdiplus.dll', 'wininet.dll', 'urlmon.dll', 'netapi32.dll',
-        'msvfw32.dll', 'avifil32.dll', 'ddraw.dll', 'dsound.dll', 'dinput.dll',
+        'msvfw32.dll', 'avifil32.dll', 'dinput.dll',
         'dinput8.dll', 'd3d8.dll', 'd3d9.dll', 'opengl32.dll', 'glu32.dll', 'lz32.dll',
         'olepro32.dll', 'oledlg.dll', 'riched20.dll', 'riched32.dll', 'msftedit.dll',
         'iphlpapi.dll', 'wintrust.dll', 'cabinet.dll', 'powrprof.dll', 'wtsapi32.dll',

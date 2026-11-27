@@ -22,6 +22,7 @@ from unicorn import UcError
 
 from .. import config, winapi
 from ..logger import log
+from .owner_draw_list import is_owner_draw_combo
 
 
 class MessagesMixin:
@@ -461,6 +462,25 @@ class MessagesMixin:
                 return 1
             if Msg == 0x0157:  # CB_GETDROPPEDSTATE
                 return 1 if self.gui and self.gui.open_combo == control.hwnd else 0
+            if Msg in (0x0153, 0x0154) and wParam == 0xFFFFFFFF:
+                # CB_SETITEMHEIGHT / CB_GETITEMHEIGHT of the selection field
+                # (-1): its text height, without the 3-pixel edges
+                if Msg == 0x0153:
+                    if not 0 < lParam < 256:
+                        return self.CB_ERR
+                    control.combo_field_height = lParam + 6
+                    return 0
+                return control.combo_field_height - 6
+            if Msg == 0x0153:  # CB_SETITEMHEIGHT of the list's items
+                if not 0 < lParam < 256:
+                    return self.CB_ERR
+                control.item_height = lParam
+                return 0
+            if Msg == 0x0154:  # CB_GETITEMHEIGHT
+                if is_owner_draw_combo(control):
+                    return self._list_item_height(control)
+                return getattr(control, 'item_height', None) or (
+                    self.gui.LISTBOX_ITEM_H if self.gui else 16)
             if Msg in (0x0140, 0x0141, 0x0142, 0x0153, 0x0154, 0x0160):
                 # CB_GETEDITSEL, CB_LIMITTEXT, CB_SETEDITSEL, CB_SETITEMHEIGHT,
                 # CB_GETITEMHEIGHT, CB_SETDROPPEDWIDTH
@@ -716,14 +736,17 @@ class MessagesMixin:
         log.debug(f"KillTimer(0x{hWnd:x}, id={nIDEvent})")
         return 1 if self.timers.pop((hWnd, nIDEvent), None) else 0
 
-    def _pop_due_timer(self, matches=lambda hwnd, message: True):
-        """Return (hwnd, id, callback) of a due timer and schedule its next fire"""
+    def _pop_due_timer(self, matches=lambda hwnd, message: True, remove=True):
+        """Return (hwnd, id, callback) of a due timer and, when its WM_TIMER is
+        removed from the queue, schedule its next fire"""
         now = time.time()
         thread = self.emu.current_thread.tid
         for (hwnd, timer_id), timer in self.timers.items():
             if not hwnd and timer.get('thread', thread) != thread:
                 continue
             if now >= timer['next_fire'] and matches(hwnd, self.WM_TIMER):
+                if not remove:
+                    return (hwnd, timer_id, timer['callback'])
                 # Keep the period on its grid so polling delays don't slow the timer
                 timer['next_fire'] += timer['elapse']
                 if timer['next_fire'] <= now:
@@ -868,16 +891,17 @@ class MessagesMixin:
             parent = self.gui.windows.get(control.parent_hwnd)
             ready = (parent is not None and parent.visible and control.visible
                      and control.parent_hwnd in self.painted_windows)
-            if not self._owner_draw_type(control):
+            if not self._owner_draw_type(control) and not self._control_subclass(hwnd):
                 # Drawn by the GUI: while painting it the system asks the
-                # parent for its colors (WM_CTLCOLOR*)
+                # parent for its colors (WM_CTLCOLOR*). A subclassed control
+                # gets WM_PAINT like the owner-draw ones below: its procedure
+                # may paint it
                 if ready and remove and matches(hwnd, self.WM_PAINT):
                     del self.dirty_controls[hwnd]
                     self._update_ctl_colors(control)
                     # Its own WM_PAINT paints over what the program drew on
-                    # it through GetDC (a progress bar in a status bar); a
-                    # subclassed control would draw it again: it stays
-                    if control.drawn_shapes and not self._control_subclass(hwnd):
+                    # it through GetDC (a progress bar in a status bar)
+                    if control.drawn_shapes:
                         self.gui.clear_drawings(hwnd)
                 elif parent is None:
                     self.dirty_controls.pop(hwnd, None)
@@ -887,12 +911,14 @@ class MessagesMixin:
                     del self.dirty_controls[hwnd]
                 return (hwnd, self.WM_PAINT, 0, 0)
 
-        # Fire due timers (lowest priority, like real WM_TIMER)
-        if remove:
-            due = self._pop_due_timer(matches)
-            if due is not None:
-                timer_hwnd, timer_id, callback = due
-                return (timer_hwnd, self.WM_TIMER, timer_id, callback)
+        # Fire due timers (lowest priority, like real WM_TIMER). PM_NOREMOVE
+        # sees a due timer too: Red Alert 2's menu loop peeks without removing
+        # and fetches a message only when one is there, so its animation timers
+        # never ran
+        due = self._pop_due_timer(matches, remove)
+        if due is not None:
+            timer_hwnd, timer_id, callback = due
+            return (timer_hwnd, self.WM_TIMER, timer_id, callback)
 
         return None
 
@@ -1046,7 +1072,7 @@ class MessagesMixin:
             log.debug(f"DispatchMessageA: hwnd=0x{hwnd:x}, msg=0x{message:x}")
 
             if message == self.WM_PAINT and self.gui and hwnd in self.gui.controls:
-                return self._paint_control(hwnd)
+                return self._send_control_paint(hwnd)
 
             # Controls: their (possibly subclassed) window procedure
             if self.gui and hwnd in self.gui.controls and not self._dialog_of(hwnd):

@@ -48,6 +48,13 @@ class WinmmMixin:
         """timeBeginPeriod emulation - TIMERR_NOERROR"""
         return 0
 
+    def timeGetDevCaps(self, args):
+        """timeGetDevCaps(ptc, cbtc) - TIMECAPS: periods from 1 ms to 1000 s"""
+        if not args[0] or args[1] < 8:
+            return 97  # TIMERR_NOCANDO
+        self._mem_write(args[0], struct.pack('<II', 1, 1000000))
+        return 0
+
     def timeEndPeriod(self, args):
         """timeEndPeriod emulation - TIMERR_NOERROR"""
         return 0
@@ -320,6 +327,7 @@ class WinmmMixin:
                     entry = dev['queue'].pop(0)
                     dev['done_bytes'] += entry['length']
                     self._wave_done(hwo, dev, entry['hdr'])
+            self._dsound_pump()
             for device_id, device in list(self.mci_devices.items()):
                 if device['mode'] == 526 and self._mci_finished(device):
                     device['mode'] = 525
@@ -1299,7 +1307,7 @@ class WinmmMixin:
         except UcError:
             return None
 
-    def _play_sound_common(self, pszSound, flags, wide):
+    def _play_sound_common(self, pszSound, flags, wide, module=0):
         """Shared PlaySound/sndPlaySound logic; returns TRUE/FALSE"""
         if not pszSound or (flags & self.SND_PURGE):
             log.debug("PlaySound(NULL) - stop")
@@ -1311,7 +1319,13 @@ class WinmmMixin:
 
         length = None
         if (flags & self.SND_RESOURCE) == self.SND_RESOURCE:
-            log.debug("PlaySound(SND_RESOURCE) - resources are not supported")
+            # A "WAVE" resource of the module (the EXE for NULL)
+            name = self._resource_key(pszSound, wide)
+            found = self._find_resource('WAVE', name, module)
+            log.debug(f"PlaySound(resource {name!r}, 0x{flags:x})")
+            data = self._read_wav_memory(found[0]) if found else None
+            if data is not None:
+                length = SoundPlayer.play(io.BytesIO(data), loop, owner=self)
         elif flags & self.SND_MEMORY:
             data = self._read_wav_memory(pszSound)
             log.debug(f"PlaySound(memory 0x{pszSound:08x}, 0x{flags:x})")
@@ -1346,7 +1360,7 @@ class WinmmMixin:
     def PlaySoundA(self, args, wide=False):
         """PlaySoundA/W emulation (winmm) - WAV files on the drives (drives/), memory
         images and system sound aliases"""
-        return self._play_sound_common(args[0], args[2], wide)
+        return self._play_sound_common(args[0], args[2], wide, args[1])
 
     def PlaySoundW(self, args):
         return self.PlaySoundA(args, wide=True)

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """WinAPIHandler mixin: owner-draw list boxes (LBS_OWNERDRAWFIXED,
-LBS_OWNERDRAWVARIABLE)
+LBS_OWNERDRAWVARIABLE) and the item height of owner-draw combo boxes
 
 The GUI draws the list's frame, background and scroll bar; the parent draws
 every visible item (WM_DRAWITEM) after telling the item height
@@ -28,7 +28,8 @@ from .listbox_multisel import item_selected
 LBS_OWNERDRAWFIXED, LBS_OWNERDRAWVARIABLE, LBS_HASSTRINGS = 0x0010, 0x0020, 0x0040
 LB_SETTOPINDEX, LB_SETITEMHEIGHT, LB_GETITEMHEIGHT = 0x0197, 0x01A0, 0x01A1
 WM_MEASUREITEM = 0x002C
-ODT_LISTBOX, ODA_DRAWENTIRE, ODS_SELECTED = 2, 0x0001, 0x0001
+ODT_LISTBOX, ODT_COMBOBOX, ODA_DRAWENTIRE, ODS_SELECTED = 2, 3, 0x0001, 0x0001
+CBS_OWNERDRAWFIXED, CBS_OWNERDRAWVARIABLE = 0x0010, 0x0020
 # Messages after which the items look different
 LIST_CHANGES = (0x0180, 0x0181, 0x0182, 0x0184, 0x0185, 0x0186, 0x019B, 0x0183,
                 LB_SETTOPINDEX, 0x019A)  # ..., LB_SETITEMDATA
@@ -38,6 +39,12 @@ def is_owner_draw_list(control):
     """Is control an owner-draw LISTBOX?"""
     return control.class_name == 'LISTBOX' and bool(
         control.style & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE))
+
+
+def is_owner_draw_combo(control):
+    """Is control an owner-draw COMBOBOX?"""
+    return control.class_name == 'COMBOBOX' and bool(
+        control.style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE))
 
 
 def list_paint_state(control):
@@ -62,9 +69,9 @@ class OwnerDrawListMixin:
         return 0
 
     def _list_item_height(self, control):
-        """Height of the items of an owner-draw list: the parent tells it
-        (WM_MEASUREITEM) the first time it is needed, unless LB_SETITEMHEIGHT
-        set it"""
+        """Height of the items of an owner-draw list or combo box: the parent
+        tells it (WM_MEASUREITEM) the first time it is needed, unless
+        LB_SETITEMHEIGHT / CB_SETITEMHEIGHT set it"""
         height = getattr(control, 'item_height', None)
         if height:
             return height
@@ -76,7 +83,8 @@ class OwnerDrawListMixin:
         try:
             # CtlType, CtlID, itemID, itemWidth, itemHeight, itemData
             self.emu.uc.mem_write(buffer, struct.pack(
-                '<6I', ODT_LISTBOX, control.control_id & 0xFFFFFFFF, 0,
+                '<6I', ODT_COMBOBOX if control.class_name == 'COMBOBOX' else ODT_LISTBOX,
+                control.control_id & 0xFFFFFFFF, 0,
                 max(control.width - 2, 0), default, 0))
             self._send_to_parent(control, WM_MEASUREITEM, control.control_id, buffer)
             height = struct.unpack('<I', self.emu.uc.mem_read(buffer + 16, 4))[0]
@@ -148,3 +156,4 @@ class OwnerDrawListMixin:
             self._delete_dc(hdc)
             self.emu.heap_free(buffer)
         return 0
+

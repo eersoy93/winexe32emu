@@ -47,8 +47,25 @@ class DrivesTimeMixin:
     # Bytes per sector and sectors per cluster of the drive types
     DRIVE_GEOMETRY = {DRIVE_REMOVABLE: (512, 1), DRIVE_FIXED: (512, 8), DRIVE_CDROM: (2048, 1)}
 
+    @staticmethod
+    def _volume_label_file(letter):
+        """Host file holding the label of a drive: drives/D.label for D:,
+        next to the drive's folder (a folder has no volume label of its own)"""
+        return os.path.join(config.DRIVES_PATH, letter.upper() + '.label')
+
     def _volume_label(self, letter):
-        return winapi.WinAPIHandler.volume_labels.get(letter, '')
+        """Volume label of a drive: the one set in this session, else the
+        first line of its label file (setup programs recognize their CD by
+        its label)"""
+        label = winapi.WinAPIHandler.volume_labels.get(letter)
+        if label is None:
+            label = ''
+            try:
+                with open(self._volume_label_file(letter), encoding='utf-8') as f:
+                    label = f.readline().strip()[:32]
+            except (OSError, UnicodeDecodeError):
+                pass
+        return label
 
     def _drive_letter(self, address, wide=False):
         """Drive of a root path argument ("C:\\", NULL: the current drive), or
@@ -187,7 +204,7 @@ class DrivesTimeMixin:
         return mask
 
     def SetVolumeLabelA(self, args, wide=False):
-        """SetVolumeLabelA/W emulation - kept for this session (not on a CD)"""
+        """SetVolumeLabelA/W emulation - kept in the drive's label file (not on a CD)"""
         letter = self._drive_letter(args[0], wide)
         if letter is None:
             self._last_error = 3
@@ -196,7 +213,14 @@ class DrivesTimeMixin:
             self._last_error = self.ERROR_WRITE_PROTECT
             return 0
         label = self._read_text(args[1], wide) if args[1] else ''
-        winapi.WinAPIHandler.volume_labels[letter] = label[:11].upper()
+        label = label[:11].upper()
+        winapi.WinAPIHandler.volume_labels[letter] = label
+        try:
+            # Kept for the next start too, like a label written to the disk
+            with open(self._volume_label_file(letter), 'w', encoding='utf-8') as f:
+                f.write(label + '\n')
+        except OSError as e:
+            log.warning(f"Cannot save the volume label of {letter}: {e}")
         return 1
 
     def SetVolumeLabelW(self, args):
@@ -458,39 +482,85 @@ class DrivesTimeMixin:
     def Module32NextW(self, args):
         return self._toolhelp_next(args, 'module', False, True)
 
+    PAGE_READWRITE = 0x04  # (PAGE_EXECUTE_READWRITE: Kernel32VistaMixin)
+    # Largest section: pagefile-backed ones are host memory, a file's is the
+    # file itself (it must still fit into the program's 2 GB with its views)
+    MAX_SHARED_MEMORY, MAX_FILE_MAPPING = 0x10000000, 0x40000000
+
+    @staticmethod
+    def _map_host_file(path, size, writable):
+        """The host's own mapping of a file: what the program writes to a
+        writable one is in the file, a read-only one is a private copy that
+        is only read when it is touched. None if the host cannot map it."""
+        try:
+            with open(path, 'r+b' if writable else 'rb') as f:
+                return mmap.mmap(f.fileno(), size, access=mmap.ACCESS_WRITE if writable
+                                 else mmap.ACCESS_COPY)
+        except (OSError, ValueError):
+            return None
+
     def CreateFileMappingA(self, args, wide=False):
-        """CreateFileMappingA/W emulation - host memory that every process (and
-        thread) mapping it shares; a file's contents are copied in"""
-        hFile, size_high, size_low, lpName = args[0], args[3], args[4], args[5]
+        """CreateFileMappingA/W emulation - memory that every process (and
+        thread) mapping it shares: host memory for a pagefile-backed section,
+        the host's mapping of the file for a file's (so large files are not
+        copied and a writable view changes the file)"""
+        hFile, protect, size_high, size_low, lpName = args[0], args[2], args[3], args[4], args[5]
         size = (size_high << 32) | size_low
         file_info = self.handles.get(hFile) if hFile != 0xFFFFFFFF else None
-        if file_info is not None and file_info.get('fp') and size == 0:
-            fp = file_info['fp']
+        fp = file_info.get('fp') if file_info is not None else None
+        path = file_info.get('path') if fp else None
+        file_size = 0
+        if fp:
             current = fp.tell()
-            size = fp.seek(0, os.SEEK_END)
+            file_size = fp.seek(0, os.SEEK_END)
             fp.seek(current, os.SEEK_SET)
-        if size == 0 or size > 0x10000000:
+            size = size or file_size
+        if size == 0 or size > (self.MAX_FILE_MAPPING if path else self.MAX_SHARED_MEMORY):
             self._last_error = 87  # ERROR_INVALID_PARAMETER
             return 0
+        writable = bool(path and getattr(fp, 'writable', bool)() and
+                        protect & (self.PAGE_READWRITE | self.PAGE_EXECUTE_READWRITE))
+        if writable and size > file_size:
+            # A mapping larger than its file makes the file that large
+            try:
+                fp.flush()
+                os.truncate(path, size)
+                file_size = size
+            except OSError:
+                self._last_error = 112  # ERROR_DISK_FULL
+                return 0
 
         def create():
-            span = self.emu._align_size(size, 0x10000)
-            buf = mmap.mmap(-1, span)
-            if file_info is not None and file_info.get('fp'):
-                fp = file_info['fp']
-                current = fp.tell()
-                fp.seek(0)
-                buf[:size] = fp.read(size).ljust(size, b'\x00')
-                fp.seek(current, os.SEEK_SET)
+            buf = None
+            if path and size <= file_size:
+                fp.flush()
+                buf = self._map_host_file(path, size, writable)
+                span = self.emu._align_size(size, 0x1000)  # Its last page ends the file
+            if buf is None:
+                if size > self.MAX_SHARED_MEMORY:
+                    raise MemoryError(size)
+                span = self.emu._align_size(size, 0x10000)
+                buf = mmap.mmap(-1, span)
+                if fp:
+                    position = fp.tell()
+                    fp.seek(0)
+                    buf[:size] = fp.read(size).ljust(size, b'\x00')
+                    fp.seek(position, os.SEEK_SET)
             return {'size': size, 'span': span, 'buf': buf,
                     'ptr': ctypes.addressof(ctypes.c_char.from_buffer(buf))}
-        return self._named_object(lpName, 'mapping', wide, create)
+        try:
+            return self._mark_inheritable(args[1], self._named_object(lpName, 'mapping',
+                                                                      wide, create))
+        except MemoryError:
+            self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
+            return 0
 
     def CreateFileMappingW(self, args):
         return self.CreateFileMappingA(args, wide=True)
 
     def MapViewOfFile(self, args):
-        """MapViewOfFile emulation - the mapping's memory, mapped once per process"""
+        """MapViewOfFile emulation - the mapping's memory, mapped once per
+        process; its views are parts of it"""
         info = self.handles.get(args[0])
         if not info or info.get('type') != 'mapping':
             self._last_error = 6  # ERROR_INVALID_HANDLE
@@ -499,20 +569,44 @@ class DrivesTimeMixin:
         if offset >= info['size']:
             self._last_error = 87
             return 0
-        base = self.mapping_views.get(id(info))
-        if base is None:
+        # (the entry keeps the mapping alive: the id of a freed one is reused)
+        entry = self.mapping_views.get(id(info))
+        if entry is None:
             base = self.emu._free_image_base(0, info['span'])
             if base is None:
                 self._last_error = 8  # ERROR_NOT_ENOUGH_MEMORY
                 return 0
             self.emu.map_foreign(base, info['span'], info['buf'], info['ptr'])
-            self.mapping_views[id(info)] = base
-        return base + offset
+            entry = self.mapping_views[id(info)] = [base, info, 0]
+        entry[2] += 1
+        return entry[0] + offset
 
     def MapViewOfFileEx(self, args):
         return self.MapViewOfFile(args[:5])
 
+    def _release_mapping(self, info):
+        """Take a mapping out of the address space when its last handle is
+        closed and none of its views is mapped (programs that work through a
+        large file map it again and again)"""
+        entry = self.mapping_views.get(id(info))
+        if entry is None or entry[2] > 0 or info.get('refs', 0) > 0:
+            return
+        del self.mapping_views[id(info)]
+        self.emu.unmap_shared(entry[0], info['span'])
+
     def UnmapViewOfFile(self, args):
+        """UnmapViewOfFile(base) - one view less of its mapping"""
+        for entry in list(self.mapping_views.values()):
+            base, info, count = entry
+            if base <= args[0] < base + info['span'] and count > 0:
+                entry[2] -= 1
+                self._release_mapping(info)
+                return 1
+        self._last_error = 487  # ERROR_INVALID_ADDRESS
+        return 0
+
+    def FlushViewOfFile(self, args):
+        """FlushViewOfFile(base, size) - a file's view is the file already"""
         return 1
 
     def GlobalSize(self, args):

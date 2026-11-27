@@ -176,8 +176,11 @@ class User32Mixin:
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
+            before = (control.x, control.y, control.width, control.height)
             (control.x, control.y, control.width,
              control.height) = self._read_signed_args(args, 1, 4)
+            if bRepaint:
+                self._control_uncovered(control, before, control.visible)
 
         return 1
 
@@ -192,6 +195,21 @@ class User32Mixin:
         x, y, width, height = before
         self._invalidate_area(win.parent, (x, y, x + width, y + height),
                               skip=win.hwnd if win.visible else 0)
+
+    def _control_uncovered(self, control, before, was_visible):
+        """A control that was hidden or moved from before (x, y, width,
+        height): its parent paints that area again. Red Alert 2 swaps an edit
+        control for a list box one pixel smaller and draws the frame around
+        it when its dialog paints the uncovered edge."""
+        if not was_visible or not control.parent_hwnd or \
+                (control.visible and (control.x, control.y, control.width,
+                                      control.height) == before):
+            return
+        parent = self.gui.windows.get(control.parent_hwnd)
+        if parent is None or not parent.visible or parent.owner is not self:
+            return
+        x, y, width, height = before
+        self._invalidate(control.parent_hwnd, (x, y, x + width, y + height))
 
     WM_WINDOWPOSCHANGED = 0x0047
     SWP_NOSIZE, SWP_NOMOVE, SWP_NOREDRAW = 0x0001, 0x0002, 0x0008
@@ -300,6 +318,8 @@ class User32Mixin:
             self._send_size(hWnd)
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
+            before = (control.x, control.y, control.width, control.height)
+            was_visible = control.visible
             X, Y, cx, cy = self._read_signed_args(args, 2, 4)
             if not (uFlags & 0x0002):  # SWP_NOMOVE
                 control.x, control.y = X, Y
@@ -309,6 +329,8 @@ class User32Mixin:
                 control.visible = True
             elif uFlags & 0x0080:  # SWP_HIDEWINDOW
                 control.visible = False
+            if not uFlags & self.SWP_NOREDRAW:
+                self._control_uncovered(control, before, was_visible)
 
         return 1
 
@@ -838,7 +860,7 @@ class User32Mixin:
 
     def _combo_edit_rect(self, control):
         """Window rect of a combo box's edit field, in its client coordinates"""
-        return (3, 3, max(3, control.width - 20), max(3, min(control.height, 22) - 3))
+        return (3, 3, max(3, control.width - 20), max(3, min(control.window_height, 22) - 3))
 
     def IsWindowVisible(self, args):
         """IsWindowVisible emulation - WS_VISIBLE (a minimized window is

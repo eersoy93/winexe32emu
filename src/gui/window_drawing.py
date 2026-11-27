@@ -67,8 +67,9 @@ class WindowDrawingMixin:
         self.screen.set_clip(content_rect)
 
         # Render GDI shapes and texts (Rectangle, Ellipse, TextOut, ...)
-        for shape in window.drawn_shapes:
-            self._draw_shape(shape, client_x, client_y)
+        if not window.shapes_over_children:
+            for shape in window.shown_shapes():
+                self._draw_shape(shape, client_x, client_y)
         self._draw_caret(window.hwnd, client_x, client_y)
 
         if getattr(window, 'messagebox_icon', 0):
@@ -79,6 +80,12 @@ class WindowDrawingMixin:
             self._draw_control(control, client_x, client_y)
 
         self._draw_child_windows(window)
+
+        if window.shapes_over_children:
+            # The screen an exclusive full-screen program wrote itself
+            self.screen.set_clip(content_rect)
+            for shape in window.shown_shapes():
+                self._draw_shape(shape, client_x, client_y)
 
         self.screen.set_clip(None)
 
@@ -509,11 +516,16 @@ class WindowDrawingMixin:
 
     COMBO_DEFAULT_ROWS = 8  # Rows shown when the template height leaves no room for a list
 
+    def _combo_item_height(self, control):
+        """Height of the rows of a combo box's list (CB_SETITEMHEIGHT, or what
+        the parent of an owner-draw one said)"""
+        return getattr(control, 'item_height', None) or self.LISTBOX_ITEM_H
+
     def _combo_visible_rows(self, control):
         """Rows the open dropdown list shows (from the control's height, which includes it)"""
         count = max(1, len(control.items))
-        box_h = min(control.height, 24)
-        rows = (control.height - box_h - 2) // self.LISTBOX_ITEM_H
+        box_h = control.window_height
+        rows = (control.height - box_h - 2) // self._combo_item_height(control)
         if rows < 1:
             rows = self.COMBO_DEFAULT_ROWS
         return max(1, min(rows, count))
@@ -529,8 +541,8 @@ class WindowDrawingMixin:
         if not win or not win.visible or win.minimized:
             return None
         ox, oy = self.client_origin(win)
-        box_h = min(control.height, 24)
-        item_h = self.LISTBOX_ITEM_H
+        box_h = control.window_height
+        item_h = self._combo_item_height(control)
         count = len(control.items)
         top_y = oy + control.y + box_h
         rows = self._combo_visible_rows(control)
@@ -540,7 +552,7 @@ class WindowDrawingMixin:
         top = max(0, min(control.top_index, count - rows))
         control.top_index = top
         drop = pygame.Rect(ox + control.x, top_y, control.width, rows * item_h + 2)
-        geo = self._list_geometry(drop, count, rows, top)
+        geo = self._list_geometry(drop, count, rows, top, item_h)
         geo['drop'] = drop
         return geo
 
@@ -646,3 +658,4 @@ class WindowDrawingMixin:
             self.screen.set_clip(prev_clip)
 
         self._draw_list_scrollbar(geo, control.hwnd)
+

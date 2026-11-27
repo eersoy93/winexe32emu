@@ -350,6 +350,33 @@ class MouseMixin:
         self.list_mouse_down = (owner, control.hwnd)
         return True
 
+    def _subclassed_combo_click(self, parent, control, cx, cy):
+        """A left click on a combo box a program subclassed: its procedure gets
+        WM_LBUTTONDOWN, and the list opens only if it passes the message on to
+        the combo box procedure. Red Alert 2 keeps it and shows a list box of
+        its own instead. True if the click was handed over."""
+        owner = getattr(parent, 'owner', None)
+        if owner is None or not owner._control_subclass(control.hwnd):
+            return False
+        owner.post_window_message(control.hwnd, owner.WM_LBUTTONDOWN, owner.MK_LBUTTON,
+                                  self._make_lparam(cx, cy))
+        self.list_mouse_down = (owner, control.hwnd)
+        return True
+
+    def _subclassed_button_click(self, parent, control, cx, cy):
+        """A left click on a button or check box a program subclassed: its
+        procedure gets WM_LBUTTONDOWN and the release, and the button procedure
+        it passes them on to checks the box and notifies the parent. Red Alert
+        2 keeps the state of its check boxes in its own procedure. True if the
+        click was handed over."""
+        owner = getattr(parent, 'owner', None)
+        if owner is None or not owner._control_subclass(control.hwnd):
+            return False
+        owner.post_window_message(control.hwnd, owner.WM_LBUTTONDOWN, owner.MK_LBUTTON,
+                                  self._make_lparam(cx, cy))
+        self.list_mouse_down = (owner, control.hwnd)
+        return True
+
     def _subclassed_list_release(self, pos):
         """WM_LBUTTONUP to the subclassed list box the button went down on;
         True if there was one"""
@@ -359,8 +386,9 @@ class MouseMixin:
         abs_pos = self._scrollbar_abs_pos(control) if control is not None else None
         if owner is None or abs_pos is None:
             return False
+        border = 1 if control.class_name == 'LISTBOX' else 0
         owner.post_window_message(hwnd, owner.WM_LBUTTONUP, 0, self._make_lparam(
-            pos[0] - abs_pos[0] - 1, pos[1] - abs_pos[1] - 1))
+            pos[0] - abs_pos[0] - border, pos[1] - abs_pos[1] - border))
         return True
 
     def _capture_target(self):
@@ -392,7 +420,7 @@ class MouseMixin:
             for hwnd in reversed(self.z_order):
                 w = self.windows.get(hwnd)
                 if w and w.visible and not w.minimized and w.contains_point(x, y):
-                    if w.is_dialog or not self._is_app_window(hwnd):
+                    if not self._is_app_window(hwnd):
                         return
                     if y < self.client_origin(w)[1]:
                         return  # title bar / menu bar / chrome
@@ -447,7 +475,7 @@ class MouseMixin:
         for hwnd in reversed(self.z_order):
             win = self.windows.get(hwnd)
             if win and win.visible and not win.minimized and win.contains_point(x, y):
-                if win.is_dialog or not self._is_app_window(hwnd):
+                if not self._is_app_window(hwnd):
                     return
                 if y < self.client_origin(win)[1]:
                     return  # title bar / menu bar / chrome, not client area
@@ -629,9 +657,7 @@ class MouseMixin:
                         ctrl_y = content_y + control.y
                         # A combobox only occupies its closed box; the
                         # CreateWindow height includes the dropdown area
-                        ctrl_h = control.height
-                        if control.class_name == "COMBOBOX":
-                            ctrl_h = min(control.height, 24)
+                        ctrl_h = control.window_height
                         if not (ctrl_x <= x <= ctrl_x + control.width and
                                 ctrl_y <= y <= ctrl_y + ctrl_h):
                             continue
@@ -668,6 +694,9 @@ class MouseMixin:
                             if win.is_dialog and not self._is_app_window(hwnd):
                                 self._close_window(hwnd)
                                 return
+                            if button == 1 and self._subclassed_button_click(
+                                    target, control, x - ctrl_x, y - ctrl_y):
+                                return
                             # Normal window - notify WndProc with WM_COMMAND
                             if button == 1 and self.winapi:
                                 self._post_button_command(win, control)
@@ -691,6 +720,9 @@ class MouseMixin:
                         elif control.class_name == "CHECKBOX":
                             if button == 1:
                                 self.focused_control = None
+                                if self._subclassed_button_click(target, control,
+                                                                 x - ctrl_x, y - ctrl_y):
+                                    return
                                 # BS_AUTOCHECKBOX (0x3) toggles by itself
                                 if (control.style & 0xF) == 0x3:
                                     control.checked = not control.checked
@@ -744,6 +776,9 @@ class MouseMixin:
                                 return
                             if button == 1:
                                 self.focused_control = None
+                                if self._subclassed_combo_click(target, control,
+                                                                x - ctrl_x, y - ctrl_y):
+                                    return
                                 # Toggle the dropdown list
                                 if self.open_combo == control.hwnd:
                                     self.open_combo = None
@@ -769,8 +804,9 @@ class MouseMixin:
                         break
 
                     # No control hit -> forward raw mouse click to the WndProc
-                    if (not win.is_dialog and y >= content_y and
-                            self._is_app_window(hwnd)):
+                    # (a program's dialog too: Red Alert 2's Autorun paints
+                    # its buttons itself and follows the mouse)
+                    if y >= content_y and self._is_app_window(hwnd):
                         cx, cy = self._client_point(win, x, y)
                         lparam = self._make_lparam(cx, cy)
                         if button == 1:

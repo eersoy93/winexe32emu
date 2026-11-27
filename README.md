@@ -45,6 +45,7 @@ These are playable, but may not be supported 100%:
 | 7-Zip 9.20 (x86) | NSIS setup and programs |
 | 7-Zip 26.06 (x86) | Setup and programs |
 | Ants | Setup and program |
+| Command & Conquer: Red Alert 2 | Setup, Autorun menu, the 1.006 patch and the game (menus, campaign, skirmish) |
 | DOSBox 0.74-3 | NSIS setup and program |
 | Microsoft Office 95 Professional | Setup, Word, Excel, PowerPoint, Access, Schedule+, Binder, Office Shortcut Bar |
 | Ski32 | Program |
@@ -70,6 +71,8 @@ The built-in apps and the test programs also need the 32-bit MinGW-w64 compiler 
    | `drives/A` | A: (floppy disk) |
    | `drives/C` | C: (hard disk) |
    | `drives/D` | D: (CD-ROM, read-only for the programs) |
+
+   A CD-ROM's volume label goes in the text file `drives/D.label` (e.g. `RA1`): setup programs often recognize their CD by it.
 
 2. Start the fake desktop and run your programs from the Start menu:
 
@@ -105,7 +108,7 @@ This compiles and runs the test programs. The unit tests and the linter are desc
 
 - 64-bit (x64) programs, and 16-bit DOS and Windows 3.x programs
 - .NET programs
-- DirectX, OpenGL and other hardware graphics
+- Direct3D, OpenGL and other hardware graphics (DirectDraw and DirectSound are emulated in software)
 - A real network
 - Programs working together while running (e.g. editing a Word document inside Binder)
 - Drivers and services

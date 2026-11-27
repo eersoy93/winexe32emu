@@ -581,7 +581,7 @@ class User32MiscMixin:
         for control in win.controls:
             if (control.visible or not args[3] & 0x1) and \
                     control.x <= x < control.x + control.width and \
-                    control.y <= y < control.y + control.height:
+                    control.y <= y < control.y + control.window_height:
                 return control.hwnd
         cw, ch = self.gui.client_size(win)
         return hwnd if 0 <= x < cw and 0 <= y < ch else 0

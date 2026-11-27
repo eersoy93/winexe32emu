@@ -41,7 +41,10 @@ class ControlDrawingMixin:
         try:
             # An owner-draw button or static shows only what its parent draws
             # (WM_DRAWITEM): its own face and text are not drawn
-            if not self._is_owner_draw(control):
+            # ...and so does a control whose WM_PAINT the program's subclassing
+            # procedure handles without the control's own procedure
+            if not self._is_owner_draw(control) and not getattr(
+                    control, 'program_painted', False):
                 self._draw_control_body(control, parent_x + control.x, parent_y + control.y)
         finally:
             self.font = gui_font
@@ -388,7 +391,7 @@ class ControlDrawingMixin:
             self._draw_list_scrollbar(geo, control.hwnd)
 
         elif control.class_name == "COMBOBOX":
-            box_h = min(control.height, 24)
+            box_h = control.window_height
             rect = pygame.Rect(abs_x, abs_y, control.width, box_h)
             pygame.draw.rect(self.screen, self.COLOR_EDIT_BG if control.enabled
                              else self.COLOR_BUTTON, rect)

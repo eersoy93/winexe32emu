@@ -76,6 +76,7 @@ from .safearray import SafeArrayMixin
 from .oleaut_variant import OleAutVariantMixin
 from .ole_lockbytes import OleLockBytesMixin
 from .tooltips import TooltipsMixin
+from .trackbar import TrackbarMixin
 from .tabcontrol import TabControlMixin
 from .codepages import CodePagesMixin
 from .find_replace import FindReplaceMixin
@@ -84,6 +85,8 @@ from .listbox_multisel import ListBoxMultiSelMixin
 from .owner_draw_list import OwnerDrawListMixin
 from .typecomp import TypeCompMixin
 from .richedit import RichEditMixin
+from .directdraw import DirectDrawMixin
+from .directsound import DirectSoundMixin
 
 
 class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
@@ -102,9 +105,11 @@ class WinAPIHandler(CoreMixin, ConsoleMixin, FilesMixin,
                     ShlwapiMixin, SecurityMixin, Kernel32ExtraMixin, User32ExtraMixin,
                     ShellExtraMixin, SystemExtraMixin, NetworkMixin, DdeMixin,
                     Lz32Mixin, WindowsExtraMixin, GdiExtraMixin,
-                    OleStorageMixin, OleMiscMixin, MdiMixin, TooltipsMixin, TabControlMixin,
+                    OleStorageMixin, OleMiscMixin, MdiMixin, TooltipsMixin, TrackbarMixin,
+                    TabControlMixin,
                     TypeInfoMixin, SafeArrayMixin, OleAutVariantMixin,
                     OleLockBytesMixin, CodePagesMixin, FindReplaceMixin,
                     WindowBitsMixin, ListBoxMultiSelMixin, OwnerDrawListMixin,
-                    TypeCompMixin, RichEditMixin):
+                    TypeCompMixin, RichEditMixin, DirectDrawMixin,
+                    DirectSoundMixin):
     """Windows API emulation"""
