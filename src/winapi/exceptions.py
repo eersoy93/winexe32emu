@@ -634,11 +634,34 @@ class ExceptionsMixin:
         return 0
 
     def api__dllonexit(self, args):
-        """__dllonexit emulation"""
-        func = args[0]
-        log.debug(f"__dllonexit(0x{func:08x})")
-        if func:
-            self.exit_handlers.append(func)
+        """__dllonexit(func, pbegin, pend): append func to the calling DLL's
+        own table *pbegin..*pend (a malloc block). The DLL's startup code runs
+        that table itself at DLL_PROCESS_DETACH, so the handlers must not go
+        into the process's exit() list: after FreeLibrary they would call
+        into an unloaded DLL (7-Zip 9.20's 7z.exe crashed at exit so).
+        Returns func, or NULL if the table cannot grow."""
+        func, pbegin, pend = args[0], args[1], args[2]
+        log.debug(f"__dllonexit(0x{func:08x}, 0x{pbegin:08x}, 0x{pend:08x})")
+        if not (pbegin and pend):
+            return 0
+        begin, end = self._read_u32(pbegin), self._read_u32(pend)
+        used = end - begin if begin and begin <= end else 0
+        capacity = self.emu.heap_block_size(begin) if begin else 0
+        if capacity is None or used + 4 > capacity:
+            # Grow (or create) the table; the DLL frees it with free()
+            new_capacity = max(32 * 4, 2 * (used + 4))
+            table = self.emu.heap_alloc(new_capacity)
+            if not table:
+                return 0
+            if used and not self._mem_write(table, self.emu.uc.mem_read(begin, used)):
+                self.emu.heap_free(table)
+                return 0
+            if begin and capacity is not None:
+                self.emu.heap_free(begin)
+            begin = table
+        self._mem_write(begin + used, struct.pack('<I', func))
+        self._mem_write(pbegin, struct.pack('<I', begin))
+        self._mem_write(pend, struct.pack('<I', begin + used + 4))
         return func
 
     def _invoke_watson(self, args):

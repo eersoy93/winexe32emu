@@ -38,6 +38,7 @@ __declspec(dllimport) void loader_set_marker(const char *path);
 
 #define EXIT_MARKER "C:\\Windows\\Temp\\loader_test_exit.tmp"
 #define FREE_MARKER "C:\\Windows\\Temp\\loader_test_free.tmp"
+#define DLLONEXIT_MARKER "C:\\Windows\\Temp\\loader_test_dllonexit.tmp"
 #define DLL_COPY "C:\\Windows\\Temp\\loader_copy.dll"
 
 static int failures = 0;
@@ -170,12 +171,13 @@ static void test_free_library(void)
     char path[MAX_PATH], text[8];
     HMODULE copy, again;
     LONG (*copy_count)(int);
-    void (*copy_set_marker)(const char *);
+    void (*copy_set_marker)(const char *), (*copy_set_exit_marker)(const char *);
     BOOL (*copy_disable)(HMODULE);
     LONG static_attach;
 
     GetModuleFileNameA(GetModuleHandleA("loader_test_dll.dll"), path, sizeof(path));
     DeleteFileA(FREE_MARKER);
+    DeleteFileA(DLLONEXIT_MARKER);
     check(CopyFileA(path, DLL_COPY, FALSE), "Copy the DLL");
     copy = LoadLibraryA(DLL_COPY);
     again = LoadLibraryA("loader_copy.dll");
@@ -184,9 +186,12 @@ static void test_free_library(void)
         return;
     copy_count = (LONG (*)(int))(void *)GetProcAddress(copy, "loader_count");
     copy_set_marker = (void (*)(const char *))(void *)GetProcAddress(copy, "loader_set_marker");
+    copy_set_exit_marker = (void (*)(const char *))(void *)GetProcAddress(
+        copy, "loader_set_exit_marker");
     copy_disable = (BOOL (*)(HMODULE))(void *)GetProcAddress(copy, "loader_disable_thread_calls");
     check(copy_count && copy_count(0) == 1, "The copy has its own DllMain and data");
     copy_set_marker(FREE_MARKER);
+    copy_set_exit_marker(DLLONEXIT_MARKER);
 
     static_attach = loader_count(1);
     check(copy_disable(copy), "DisableThreadLibraryCalls");
@@ -201,11 +206,15 @@ static void test_free_library(void)
           "FreeLibrary of the last reference unloads the DLL");
     check(read_marker(FREE_MARKER, text) && strcmp(text, "free") == 0,
           "DllMain(DLL_PROCESS_DETACH) of FreeLibrary");
+    /* Run at exit() instead, the handler would call into the unloaded DLL */
+    check(read_marker(DLLONEXIT_MARKER, text) && strcmp(text, "dlox") == 0,
+          "__dllonexit fills the DLL's own table, run at FreeLibrary");
     check(!in_loader_list(L"loader_copy.dll"), "The unloaded DLL left PEB->Ldr");
     SetLastError(0);
     check(!FreeLibrary((HMODULE)0x12340000) && GetLastError() == ERROR_MOD_NOT_FOUND,
           "FreeLibrary of no module fails");
     DeleteFileA(FREE_MARKER);
+    DeleteFileA(DLLONEXIT_MARKER);
     DeleteFileA(DLL_COPY);
 }
 

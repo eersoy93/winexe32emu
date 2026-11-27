@@ -9,6 +9,7 @@ Every change must be made with clean room techniques: it is based only on public
 ### Fixed
 
 - A click on a subclassed list box in a dialog goes to the program's procedure too: Red Alert 2's movie list (Movies & Credits > Play Movies) selected nothing, so Play Movie did not play
+- `__dllonexit` adds the exit handler to the calling DLL's own table, which the DLL runs when it is unloaded, instead of to the process's `exit()` list: 7-Zip 9.20's `7z.exe` crashed at the end of every run, calling into `7z.dll` after `FreeLibrary`
 
 ## 0.5.0 - 2026-11-27
 
