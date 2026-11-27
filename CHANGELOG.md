@@ -9,27 +9,29 @@ Every change must be made with clean room techniques: it is based only on public
 ### Added
 
 - Command & Conquer: Red Alert 2:
-  - The CD's Setup and Autorun menu work, and the 1.006 patch updates the installed game
-  - The game plays its intro videos and shows its menus; skirmish games can be played
-- DirectDraw and DirectSound, so games show graphics and play music and sounds
-- Volume labels of the drives (setup programs recognize their CD by it)
-- Placeholder system DLLs that setup programs look for
-- More multimedia, network and control APIs
-
-### Changed
-
-- DirectDraw and thread switching are faster: Red Alert 2 runs noticeably faster
+  - Setup installs the game from the CD, the Autorun menu works and the 1.006 patch updates it
+  - The game plays its intro videos and shows its menus
+  - Skirmish games can be set up and played
+  - The movie list plays the chosen movies
+- DirectDraw and DirectSound in software: games draw in full screen and play music and sounds
+- Volume labels of the drives, so setup programs recognize their CD
+- Placeholder system DLLs with a version, which setup programs look for
+- Sounds stored in programs, the list of network transports, and a first trackbar control (it
+  is not drawn yet)
 
 ### Fixed
 
-- Mapped files are written back to disk, and larger files can be mapped
-- Windows that repaint often no longer flicker, and some no longer repaint forever
-- Many bugs in dialogs, buttons, check boxes and combo boxes that a program draws itself
-- Menu animations ran too fast, and timers could not always be stopped
-- Music and sound effects no longer stutter or get cut
-- Starting a program from another one passes the shared handles it needs
-- COM objects a program registers itself are no longer destroyed too early
-- Red Alert 2 plays the movies chosen in its movie list
+- Mapped files: what a program writes goes into the file, the file can grow, and files up to
+  1 GB can be mapped
+- Painting: windows no longer flicker or repaint forever, controls a program draws itself are
+  not drawn over, and the area under a closed list or a hidden control is painted again
+- Buttons, check boxes, list boxes and combo boxes that a program changes or draws itself get
+  their clicks and sizes right
+- Timers: menu animations run at the right speed, and a timer can always be stopped
+- More sounds can play at once
+- A program started by another one gets the handles and messages that program gives it
+- COM objects a program registers itself are no longer destroyed too early, and writing to a
+  file opened only for reading fails like on Windows
 - 7-Zip 9.20's command line program no longer crashes at the end of every run
 
 ## 0.4.1 - 2026-11-26
