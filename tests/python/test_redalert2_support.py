@@ -492,6 +492,98 @@ class DirectSoundTest(unittest.TestCase):
         self.assertIsNone(state['ring'])
         call('Release')
 
+    @unittest.skipUnless(config.PYGAME_AVAILABLE, "needs pygame")
+    def test_ring_at_any_rate(self):
+        """Red Alert 2 plays its effect streams at varied rates (21168 Hz):
+        the ring is resampled to whole mixer frames and stays a ring"""
+        mixer = SoundPlayer._mixer()
+        if not mixer or mixer[1] != -16:
+            self.skipTest("needs a 16-bit mixer")
+        handler = self.handler
+        self.assertEqual(handler.DirectSoundCreate([0, self.mem, 0]), 0)
+        sound = self.dword(self.mem)
+        wave_format = self.mem + 0x100
+        self.uc.mem_write(wave_format, struct.pack('<HHIIHHH', 1, 1, 22050, 44100, 2, 16, 0))
+        desc = self.mem + 0x200
+        self.uc.mem_write(desc, struct.pack('<5I', 20, 0, 4410, 0, wave_format))
+        handler._com_dsound('CreateSoundBuffer', False, [sound, desc, self.mem, 0])
+        buffer = self.dword(self.mem)
+        state = handler.com_objects[buffer]
+        frames = 4410 // 2
+        self.uc.mem_write(state['mem'], struct.pack(f'<{frames}h', *range(frames)))
+
+        def call(method, *args):
+            return handler._com_dsbuffer(method, False, [buffer, *args])
+
+        call('SetFrequency', 21168)
+        self.assertEqual(call('Play', 0, 0, handler.DSBPLAY_LOOPING), 0)
+        self.assertIsNotNone(state['ring'])
+        mixer_frames = round(frames * mixer[0] / 21168)
+        self.assertEqual(state['ring_frames'], mixer_frames)
+        samples = struct.unpack(f'<{len(state["ring_view"]) // 2}h', bytes(state['ring_view']))
+        left = samples[::mixer[2]]
+        self.assertEqual(len(left), mixer_frames)
+        # In order, the first and last buffer frames at the ends
+        self.assertEqual((left[0], left[-1]), (0, frames - 1))
+        self.assertEqual(list(left), sorted(left))
+        # A write in the middle lands at its time in the ring
+        out = self.mem + 0x300
+        call('Lock', 2000, 2, out, out + 4, 0, 0, 0)
+        self.uc.mem_write(state['mem'] + 2000, struct.pack('<h', -5))
+        call('Unlock', self.dword(out), 2, 0, 0)
+        samples = struct.unpack(f'<{len(state["ring_view"]) // 2}h', bytes(state['ring_view']))
+        at = [i for i, v in enumerate(samples[::mixer[2]]) if v == -5]
+        self.assertTrue(at)
+        self.assertAlmostEqual(at[0] / mixer[0], 1000 / 21168, places=4)
+        call('Stop')
+        call('Release')
+
+    @unittest.skipUnless(config.PYGAME_AVAILABLE, "needs pygame")
+    def test_finished_sound_leaves_its_channel(self):
+        """A short sound that ended does not own its channel any more: the
+        mixer gave it to another sound, which playing the short one again
+        or changing its volume must not cut"""
+        import pygame
+        if not SoundPlayer.available():
+            self.skipTest("needs a mixer")
+        handler = self.handler
+        self.assertEqual(pygame.mixer.get_num_channels(), SoundPlayer.MIXER_CHANNELS)
+        self.assertEqual(handler.DirectSoundCreate([0, self.mem, 0]), 0)
+        sound = self.dword(self.mem)
+        wave_format = self.mem + 0x100
+        self.uc.mem_write(wave_format, struct.pack('<HHIIHHH', 1, 1, 22050, 44100, 2, 16, 0))
+        desc = self.mem + 0x200
+        self.uc.mem_write(desc, struct.pack('<5I', 20, 0, 4410, 0, wave_format))
+        handler._com_dsound('CreateSoundBuffer', False, [sound, desc, self.mem, 0])
+        buffer = self.dword(self.mem)
+        state = handler.com_objects[buffer]
+
+        def call(method, *args):
+            return handler._com_dsbuffer(method, False, [buffer, *args])
+
+        call('Play', 0, 0, 0)
+        channel = state['channel']
+        self.assertIsNotNone(channel)
+        self.assertTrue(handler._ds_owns_channel(state))
+        channel.stop()  # The short sound (0.1 s) ended ...
+        other = pygame.mixer.Sound(buffer=bytes(44100 * 4))
+        later = time.monotonic() + 1
+        try:
+            channel.play(other, loops=-1)  # ... and its channel plays another one
+            with mock.patch('src.winapi.directsound.time.monotonic', return_value=later):
+                self.assertFalse(handler._ds_owns_channel(state))
+                call('SetVolume', 0xFFFFFC18)  # -1000
+                self.assertEqual(channel.get_volume(), 1.0)
+                call('Play', 0, 0, 0)
+                self.assertTrue(channel.get_busy())
+                self.assertNotEqual(state['channel'].id, channel.id)
+                self.assertTrue(handler._ds_owns_channel(state))
+                call('Stop')
+                self.assertTrue(channel.get_busy())
+        finally:
+            channel.stop()
+        call('Release')
+
 
 class FileMappingTest(unittest.TestCase):
     """The 1.006 patch of Red Alert 2 writes the new files through mapped
@@ -763,6 +855,100 @@ class TimerPeekTest(unittest.TestCase):
         self.assertGreater(handler.timers[(0x20, 1)]['next_fire'], 0.0)
         self.assertIsNone(handler._pop_due_timer(remove=False))
 
+    def test_destroyed_window_has_no_timers(self):
+        """The game leaves its main menu without KillTimer: the timers of
+        the destroyed windows must not keep firing on the next screen"""
+        handler = self.handler
+        handler.gui = types.SimpleNamespace(windows={}, controls={0x24: None})
+        handler.combo_edits = {}
+        handler.timers[(0x24, 2)] = {'elapse': 0.03, 'callback': 0, 'next_fire': 0.0,
+                                     'thread': 1}
+        self.assertEqual(handler._pop_due_timer(), (0x24, 2, 0))
+        self.assertNotIn((0x20, 1), handler.timers)
+
+    def test_window_timer_id_zero(self):
+        """The menus set a fast timer with id 0, kill it with id 0 and set
+        a slow one: only the slow one is left"""
+        handler = self.handler
+        handler.timers, handler.next_timer_id = {}, 1
+        self.assertNotEqual(handler.SetTimer([0x30, 0, 1, 0]), 0)
+        self.assertEqual(handler.KillTimer([0x30, 0]), 1)
+        handler.SetTimer([0x30, 0, 91, 0])
+        self.assertEqual(list(handler.timers), [(0x30, 0)])
+        self.assertAlmostEqual(handler.timers[(0x30, 0)]['elapse'], 0.09375)
+        # A window-less timer gets an id; setting that id again replaces it
+        timer_id = handler.SetTimer([0, 0, 50, 0])
+        self.assertEqual(handler.SetTimer([0, timer_id, 100, 0]), timer_id)
+        self.assertEqual(len(handler.timers), 2)
+
+    def test_period_follows_the_system_tick(self):
+        """Windows fires a timer on a clock tick (64 a second): a 10 ms
+        timer, the options screen's animation, comes about every 15.6 ms"""
+        period = WinAPIHandler._timer_period
+        self.assertAlmostEqual(period(0), 0.015625)
+        self.assertAlmostEqual(period(10), 0.015625)
+        self.assertAlmostEqual(period(16), 0.03125)
+        self.assertAlmostEqual(period(30), 0.03125)
+        self.assertAlmostEqual(period(1000), 1.0)
+
+
+class ValidateRectTest(unittest.TestCase):
+    """ValidateRect with a rectangle takes only that rectangle out of the
+    update region: the area a closed drop-down list uncovered is still
+    painted after the game validates the list box next to it"""
+
+    def setUp(self):
+        handler = self.handler = com_handler()
+        handler.gui = types.SimpleNamespace(windows={0x30: object()},
+                                            client_size=lambda win: (640, 480))
+        handler.painted_windows, handler.paint_pending = set(), set()
+        handler.update_rects = {0x30: (12, 107, 220, 245)}
+        self.rect = handler.emu.heap_alloc(16)
+
+    def validate(self, rect):
+        self.handler.emu.uc.mem_write(self.rect, struct.pack('<4i', *rect))
+        return self.handler.ValidateRect([0x30, self.rect])
+
+    def test_other_area_stays_invalid(self):
+        handler = self.handler
+        self.assertEqual(self.validate((231, 80, 431, 261)), 1)  # The list box beside it
+        self.assertEqual(handler.update_rects[0x30], (12, 107, 220, 245))
+        self.assertNotIn(0x30, handler.painted_windows)
+        self.validate((0, 0, 640, 150))  # Across its top
+        self.assertEqual(handler.update_rects[0x30], (12, 150, 220, 245))
+        self.validate((0, 0, 640, 480))  # All of it
+        self.assertIn(0x30, handler.painted_windows)
+        self.assertNotIn(0x30, handler.update_rects)
+
+    def test_without_rect_all_is_valid(self):
+        handler = self.handler
+        self.assertEqual(handler.ValidateRect([0x30, 0]), 1)
+        self.assertIn(0x30, handler.painted_windows)
+        self.assertNotIn(0x30, handler.update_rects)
+
+
+class ChildShownTest(unittest.TestCase):
+    """The dialog draws the frame of the drop-down list it opens when it
+    paints the list's area: a parent without WS_CLIPCHILDREN paints there
+    again when a child window is shown"""
+
+    def test_parent_paints_under_a_shown_child(self):
+        handler = com_handler()
+        handler.painted_windows, handler.paint_pending = {0x30}, set()
+        handler.update_rects, handler.dirty_controls = {}, {}
+        dialog = types.SimpleNamespace(visible=True, owner=handler, style=0x40000040)
+        child = types.SimpleNamespace(parent=0x30, x=12, y=107, width=208, height=138)
+        handler.gui = types.SimpleNamespace(windows={0x30: dialog}, controls={},
+                                            client_size=lambda win: (640, 480))
+        handler._child_shown(child)
+        self.assertNotIn(0x30, handler.painted_windows)
+        self.assertEqual(handler.update_rects[0x30], (12, 107, 220, 245))
+        # A parent that clips its children has nothing to paint there
+        handler.painted_windows, handler.update_rects = {0x30}, {}
+        dialog.style |= handler.WS_CLIPCHILDREN
+        handler._child_shown(child)
+        self.assertIn(0x30, handler.painted_windows)
+
 
 class ComboBoxSizeTest(unittest.TestCase):
     """A drop-down combo box's window is its selection field; the height it
@@ -775,6 +961,29 @@ class ComboBoxSizeTest(unittest.TestCase):
         self.assertEqual(simple.window_height, 200)
         listbox = FakeControl(0x28, 'LISTBOX', '', 10, 10, 120, 200)
         self.assertEqual(listbox.window_height, 200)
+
+    def test_field_height_keeps_the_list(self):
+        """Sized with its list and then with its field's height, a drop-down
+        combo box keeps the list's height"""
+        combo = FakeControl(0x20, 'COMBOBOX', '', 12, 81, 208, 200, style=0x50000313)
+        WinAPIHandler._resize_control(combo, 208, 239)
+        WinAPIHandler._resize_control(combo, 208, 25)
+        self.assertEqual((combo.width, combo.height), (208, 239))
+        listbox = FakeControl(0x24, 'LISTBOX', '', 10, 10, 120, 200)
+        WinAPIHandler._resize_control(listbox, 120, 25)
+        self.assertEqual(listbox.height, 25)
+
+    def test_dropped_control_rect(self):
+        """The keyboard options place their own list by the combo box's
+        dropped-down rectangle"""
+        handler = com_handler()
+        handler.gui = None
+        out = handler.emu.heap_alloc(16)
+        combo = FakeControl(0x20, 'COMBOBOX', '', 12, 81, 208, 200, style=0x50000313)
+        self.assertEqual(handler._control_message(combo, 0x0152, 0, out), 1)
+        self.assertEqual(struct.unpack('<4i', handler.emu.uc.mem_read(out, 16)),
+                         (12, 81, 220, 281))
+        self.assertEqual(handler._control_message(combo, 0x0152, 0, 0), 0)
 
     def test_selection_field_height(self):
         handler = WinAPIHandler.__new__(WinAPIHandler)

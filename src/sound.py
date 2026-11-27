@@ -32,6 +32,7 @@ class SoundPlayer:
     """
 
     _lock = threading.Lock()
+    MIXER_CHANNELS = 32   # Sounds that can play at the same time
     _format = None        # None: not tried yet, False: no audio, else mixer format
     _play_sound = None    # Sound started by PlaySound (only one at a time)
     _play_owner = None    # Process (WinAPIHandler) that started _play_sound
@@ -52,6 +53,11 @@ class SoundPlayer:
                         if not pygame.mixer.get_init():
                             pygame.mixer.init(frequency=44100, size=-16, channels=1)
                         cls._format = pygame.mixer.get_init() or False
+                        if cls._format:
+                            # Red Alert 2 keeps five looping DirectSound
+                            # streams playing besides its short sounds and
+                            # videos: the mixer's default of 8 ran out
+                            pygame.mixer.set_num_channels(cls.MIXER_CHANNELS)
                     except pygame.error as e:
                         log.warning(f"No audio device, sounds are silent: {e}")
             return cls._format

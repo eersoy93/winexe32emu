@@ -267,6 +267,21 @@ class MessagesMixin:
                 return index
         return self.LB_ERR
 
+    def _combo_dropped_rect(self, control, lParam):
+        """CB_GETDROPPEDCONTROLRECT: the screen rectangle of the combo box
+        with its list dropped down (the height it was created with). Red
+        Alert 2 places the list it draws itself by it; without the answer it
+        read whatever was in its RECT and its keyboard options froze."""
+        if not lParam:
+            return 0
+        parent = self.gui.windows.get(control.parent_hwnd) if self.gui else None
+        ox, oy = self.gui.client_origin(parent) if parent else (0, 0)
+        left, top = ox + control.x, oy + control.y
+        width = max(control.width, getattr(control, 'dropped_width', 0))
+        if not self._write_rect(lParam, left, top, left + width, top + control.height):
+            return 0
+        return 1
+
     def _control_message(self, control, Msg, wParam, lParam, wide=False):
         """Handle a message sent to a child control (emulation thread).
 
@@ -462,6 +477,8 @@ class MessagesMixin:
                 return 1
             if Msg == 0x0157:  # CB_GETDROPPEDSTATE
                 return 1 if self.gui and self.gui.open_combo == control.hwnd else 0
+            if Msg == 0x0152:  # CB_GETDROPPEDCONTROLRECT
+                return self._combo_dropped_rect(control, lParam)
             if Msg in (0x0153, 0x0154) and wParam == 0xFFFFFFFF:
                 # CB_SETITEMHEIGHT / CB_GETITEMHEIGHT of the selection field
                 # (-1): its text height, without the 3-pixel edges
@@ -706,6 +723,20 @@ class MessagesMixin:
         self.quit_message_taken = False  # A new WM_QUIT is waiting
         return 0
 
+    USER_TIMER_MINIMUM = 10  # ms
+    SYSTEM_TICK = 1 / 64     # s: the default system timer interval (15.625 ms)
+
+    @classmethod
+    def _timer_period(cls, milliseconds):
+        """Seconds between the WM_TIMER messages of a SetTimer period: at
+        least USER_TIMER_MINIMUM, and a timer fires only on a system clock
+        tick, so a 10 ms timer comes about 64 times a second as on Windows.
+        Red Alert 2's options screen animates on a 10 ms timer and ran half
+        again too fast at 100 a second."""
+        period = max(milliseconds, cls.USER_TIMER_MINIMUM) / 1000.0
+        ticks = -(-period // cls.SYSTEM_TICK)  # Rounded up
+        return ticks * cls.SYSTEM_TICK
+
     def SetTimer(self, args):
         """SetTimer emulation"""
         hWnd = args[0]
@@ -713,12 +744,17 @@ class MessagesMixin:
         uElapse = args[2]
         lpTimerFunc = args[3]
 
-        # Window-less timers get a fresh id (like real Windows)
-        if hWnd == 0 or nIDEvent == 0:
+        # A window's timer is the nIDEvent given, 0 too (Red Alert 2 sets
+        # and kills its menu timers with id 0; when they got another id, its
+        # KillTimer failed and the fast first timer of its animation kept
+        # running). A window-less timer replaces the one of that id, or
+        # gets a new id.
+        if hWnd == 0 and (nIDEvent == 0 or (0, nIDEvent) not in self.timers):
             nIDEvent = self.next_timer_id
             self.next_timer_id += 1
 
-        elapse = max(uElapse, 10) / 1000.0  # USER_TIMER_MINIMUM ~ 10ms
+        elapse = self._timer_period(uElapse)
+
         self.timers[(hWnd, nIDEvent)] = {
             'elapse': elapse,
             'callback': lpTimerFunc,
@@ -726,8 +762,10 @@ class MessagesMixin:
             'thread': self.emu.current_thread.tid,  # Gets the WM_TIMER of hWnd NULL
         }
 
-        log.debug(f"SetTimer(0x{hWnd:x}, id={nIDEvent}, {uElapse}ms) -> {nIDEvent}")
-        return nIDEvent
+        # With a window: a nonzero value (the documented return value)
+        result = nIDEvent or 1
+        log.debug(f"SetTimer(0x{hWnd:x}, id={nIDEvent}, {uElapse}ms) -> {result}")
+        return result
 
     def KillTimer(self, args):
         """KillTimer emulation"""
@@ -736,11 +774,22 @@ class MessagesMixin:
         log.debug(f"KillTimer(0x{hWnd:x}, id={nIDEvent})")
         return 1 if self.timers.pop((hWnd, nIDEvent), None) else 0
 
+    def _drop_dead_timers(self):
+        """Like Windows, a destroyed window's timers are gone: Red Alert 2
+        leaves a screen without KillTimer, and the timers of its old windows
+        made the animation of the next screen run twice as fast"""
+        if not getattr(self, 'gui', None):
+            return
+        gone = [key for key in self.timers if key[0] and not self.IsWindow([key[0]])]
+        for key in gone:
+            self.timers.pop(key, None)
+
     def _pop_due_timer(self, matches=lambda hwnd, message: True, remove=True):
         """Return (hwnd, id, callback) of a due timer and, when its WM_TIMER is
         removed from the queue, schedule its next fire"""
         now = time.time()
         thread = self.emu.current_thread.tid
+        self._drop_dead_timers()
         for (hwnd, timer_id), timer in self.timers.items():
             if not hwnd and timer.get('thread', thread) != thread:
                 continue

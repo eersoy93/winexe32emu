@@ -1426,9 +1426,40 @@ class MemoryDCMixin:
     # (an ENUMLOGFONT starts with the LOGFONT)
     EnumFontsA = EnumFontFamiliesA
 
+    @staticmethod
+    def _rect_minus(rect, cut):
+        """The smallest rectangle holding what is left of rect when cut is
+        taken out of it (None: nothing is left)"""
+        left, top, right, bottom = rect
+        if cut[0] >= right or cut[2] <= left or cut[1] >= bottom or cut[3] <= top:
+            return rect
+        if cut[0] <= left and cut[2] >= right:  # Cut across: top or bottom goes
+            if cut[1] <= top:
+                top = cut[3]
+            elif cut[3] >= bottom:
+                bottom = cut[1]
+        elif cut[1] <= top and cut[3] >= bottom:  # Cut down: left or right goes
+            if cut[0] <= left:
+                left = cut[2]
+            elif cut[2] >= right:
+                right = cut[0]
+        return (left, top, right, bottom) if left < right and top < bottom else None
+
     def ValidateRect(self, args):
-        """ValidateRect emulation - mark the window as painted"""
-        hWnd = args[0]
+        """ValidateRect(hWnd, lpRect): lpRect (client coordinates) leaves the
+        window's update region, all of it without lpRect. Red Alert 2
+        validates the list box it has just drawn while the area its closed
+        drop-down list uncovered still waits to be painted; all of it was
+        dropped and the list stayed on the screen."""
+        hWnd, lpRect = args[0], args[1]
+        win = self.gui.windows.get(hWnd) if self.gui else None
+        cut = self._read_rect(lpRect) if lpRect else None
+        if cut is not None and win is not None and hWnd not in self.painted_windows:
+            rect = self.update_rects.get(hWnd) or (0, 0) + tuple(self.gui.client_size(win))
+            rest = self._rect_minus(rect, cut)
+            if rest is not None:
+                self.update_rects[hWnd] = rest
+                return 1
         self.painted_windows.add(hWnd)
         self.paint_pending.discard(hWnd)
         self.update_rects.pop(hWnd, None)

@@ -20,14 +20,17 @@ played as a whole. A looping buffer is a ring the program may keep writing
 to ahead of the play cursor (a stream): the cursor follows the clock, and
 the mixer plays a copy of the ring in a loop, like a sound card, and what
 the program writes (Unlock) is copied into it, so the sound goes on while
-the program is busy. A ring whose rate does not divide the mixer's is
-handed to the mixer piece by piece a little ahead of the cursor instead.
+the program is busy (resampled to the mixer's rate). Without a 16-bit
+mixer, a ring is handed to the mixer piece by piece a little ahead of the
+cursor instead.
 
 Interfaces, structures and constants follow the public DirectX header
 (dsound.h of MinGW-w64) and the DirectSound documentation.
 """
 
+import array
 import struct
+import sys
 import time
 
 from unicorn import UcError
@@ -127,7 +130,7 @@ class DirectSoundMixin:
     def _ds_new_buffer(self, fmt, size, primary, mem=0):
         state = {'kind': 'dsbuffer', 'format': fmt, 'size': size, 'primary': primary,
                  'mem': mem, 'shared': bool(mem), 'playing': False, 'looping': False,
-                 'started': 0.0, 'offset': 0, 'fed': 0, 'channel': None,
+                 'started': 0.0, 'offset': 0, 'fed': 0, 'channel': None, 'channel_until': 0.0,
                  'volume': 0, 'pan': 0, 'frequency': fmt['rate']}
         if not primary and not mem:
             state['mem'] = self.emu.heap_alloc(size)
@@ -245,8 +248,40 @@ class DirectSoundMixin:
         """Mixer volume (0..1) of a buffer's attenuation in hundredths of a dB"""
         return 10 ** (max(-10000, min(0, state['volume'])) / 2000)
 
+    # A sound is taken as ended this long before its time: the mixer may
+    # give the channel away a little before the clock says it ended
+    DS_CHANNEL_MARGIN = 0.05
+
+    @staticmethod
+    def _ds_owns_channel(state):
+        """True while the buffer's channel still plays a sound of the buffer.
+        A channel whose sound ended is free: the mixer gives it to the next
+        sound, and stopping it or changing its volume then would cut that
+        one (Red Alert 2's effects went silent when a short sound that had
+        used their channel was played again). Told by the time its sounds
+        end: Channel.get_sound() crashed (segmentation fault) when the
+        mixer's thread ended the sound at the same time."""
+        return (state['channel'] is not None and
+                time.monotonic() < state['channel_until'])
+
+    def _ds_play(self, state, channel, sound, loops=0, queue=False):
+        """Play (or queue) a sound of the buffer on its channel"""
+        try:
+            length = sound.get_length() if loops == 0 else float('inf')
+            now = time.monotonic()
+            if queue:
+                channel.queue(sound)
+                state['channel_until'] = max(state['channel_until'], now) + length
+            else:
+                channel.play(sound, loops=loops)
+                state['channel_until'] = now + length - self.DS_CHANNEL_MARGIN
+        except pygame.error:
+            state['channel'] = None
+
     def _ds_channel(self, state):
         """Mixer channel of a buffer (None without a free one)"""
+        if state['channel'] is not None and not self._ds_owns_channel(state):
+            state['channel'] = None
         if state['channel'] is None:
             try:
                 state['channel'] = pygame.mixer.find_channel()
@@ -273,10 +308,7 @@ class DirectSoundMixin:
         sound = self._ds_sound(state, data[state['offset']:])
         channel = self._ds_channel(state) if sound is not None else None
         if channel is not None:
-            try:
-                channel.play(sound)
-            except pygame.error:
-                state['channel'] = None
+            self._ds_play(state, channel, sound)
 
     # A looping buffer is handed to the mixer this far ahead of its play
     # cursor (seconds): programs that stream write further ahead than this
@@ -310,10 +342,7 @@ class DirectSoundMixin:
             state['fed'] += count
             if sound is None:
                 return
-            if busy:
-                channel.queue(sound)
-            else:
-                channel.play(sound)
+            self._ds_play(state, channel, sound, queue=busy)
         except (pygame.error, UcError):
             pass
 
@@ -321,26 +350,27 @@ class DirectSoundMixin:
         """Play a looping buffer as a sound card does: a mixer sound as long
         as the ring loops, and the program's writes are copied into it
         (_ds_ring_copy). Pieces handed over in time ran dry while Red Alert 2
-        computed a frame, the music stuttered. False if the buffer's rate does
-        not divide the mixer's (its copy would drift from the cursor)."""
+        computed a frame, the music stuttered. The sound has the ring's
+        frames at the mixer's rate, rounded to whole frames: it loops in
+        step with the cursor at any rate (Red Alert 2 plays its effects at
+        varied rates such as 21168 Hz, and they were cut)."""
         mixer = SoundPlayer._mixer()
         rate, size, align = state['frequency'], state['size'], state['format']['align']
-        if not mixer or mixer[1] != -16 or rate <= 0 or mixer[0] % rate or size < align:
+        if not mixer or mixer[1] != -16 or rate <= 0 or size < align:
             return False
-        frame_bytes = mixer[0] // rate * mixer[2] * 2  # Mixer bytes per buffer frame
+        frames = size // align
+        mixer_frames = max(1, round(frames * mixer[0] / rate))
         try:
-            ring = pygame.mixer.Sound(buffer=bytes(size // align * frame_bytes))
+            ring = pygame.mixer.Sound(buffer=bytes(mixer_frames * mixer[2] * 2))
         except pygame.error:
             return False
         state['ring'], state['ring_view'] = ring, memoryview(ring).cast('B')
+        state['ring_frames'] = mixer_frames
         state['ring_origin'] = state['offset']  # The buffer byte the sound starts with
         self._ds_ring_copy(state, 0, size)
         channel = self._ds_channel(state)
         if channel is not None:
-            try:
-                channel.play(ring, loops=-1)
-            except pygame.error:
-                state['channel'] = None
+            self._ds_play(state, channel, ring, loops=-1)
         return True
 
     def _ds_ring_copy(self, state, start, count):
@@ -349,8 +379,9 @@ class DirectSoundMixin:
         fmt, size, view = state['format'], state['size'], state.get('ring_view')
         if view is None or not mixer:
             return
-        align, rate = fmt['align'], state['frequency']
-        frame_bytes = mixer[0] // rate * mixer[2] * 2
+        align = fmt['align']
+        frames, mixer_frames = size // align, state['ring_frames']
+        frame_bytes = mixer[2] * 2  # Bytes per mixer frame (16-bit samples)
         start -= start % align
         count = min(size, count + align - 1)
         count -= count % align
@@ -361,17 +392,41 @@ class DirectSoundMixin:
             to_origin = (origin - start) % size or size
             n = min(count, to_end, to_origin)
             data = bytes(self.emu.uc.mem_read(state['mem'] + start, n))
-            pcm = self._convert_samples(self._pcm_samples(data, fmt['bits']), fmt['channels'],
-                                        rate, mixer[2], mixer[0], 16)
-            at = (start - origin) % size // align * frame_bytes
-            pcm = pcm[:len(view) - at]
-            view[at:at + len(pcm)] = pcm
+            # The piece's frames in the mixer's channel layout, then picked
+            # for the mixer frames that fall on them
+            samples = self._pcm_samples(data, fmt['bits'])
+            if fmt['channels'] == 1 and mixer[2] == 2:
+                stereo = array.array('h', bytes(4 * len(samples)))
+                stereo[0::2] = stereo[1::2] = samples
+                samples = stereo
+            elif fmt['channels'] == 2 and mixer[2] == 1:
+                samples = array.array('h', ((a + b) >> 1 for a, b in
+                                            zip(samples[0::2], samples[1::2], strict=False)))
+            first = (start - origin) % size // align
+            last = first + n // align
+            # Mixer frames whose time falls in the piece: from the first at
+            # or after its start to the last before its end
+            at = -(-first * mixer_frames // frames)
+            until = -(-last * mixer_frames // frames)
+            if until > at:
+                if until - at != last - first:
+                    picked = [j * frames // mixer_frames - first for j in range(at, until)]
+                    channels = mixer[2]
+                    resampled = array.array('h', bytes(2 * channels * len(picked)))
+                    for c in range(channels):
+                        source = samples[c::channels]
+                        resampled[c::channels] = array.array('h', (source[k] for k in picked))
+                    samples = resampled
+                if sys.byteorder != 'little':
+                    samples.byteswap()
+                view[at * frame_bytes:until * frame_bytes] = samples.tobytes()
             start, count = (start + n) % size, count - n
 
     def _ds_stop_channel(self, state):
         state['ring'] = state['ring_view'] = None
-        channel, state['channel'] = state['channel'], None
-        if channel is not None:
+        owned = self._ds_owns_channel(state)
+        channel, state['channel'], state['channel_until'] = state['channel'], None, 0.0
+        if owned:
             try:
                 channel.stop()
             except pygame.error:
@@ -444,7 +499,7 @@ class DirectSoundMixin:
             if not -10000 <= value <= (0 if method == 'SetVolume' else 10000):
                 return self.DSERR_INVALIDPARAM
             state[method[3:].lower()] = value
-            if method == 'SetVolume' and state['channel'] is not None:
+            if method == 'SetVolume' and self._ds_owns_channel(state):
                 try:
                     state['channel'].set_volume(self._ds_gain(state))
                 except pygame.error:

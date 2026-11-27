@@ -177,12 +177,27 @@ class User32Mixin:
         elif self.gui and hWnd in self.gui.controls:
             control = self.gui.controls[hWnd]
             before = (control.x, control.y, control.width, control.height)
-            (control.x, control.y, control.width,
-             control.height) = self._read_signed_args(args, 1, 4)
+            control.x, control.y, cx, cy = self._read_signed_args(args, 1, 4)
+            self._resize_control(control, cx, cy)
             if bRepaint:
                 self._control_uncovered(control, before, control.visible)
 
         return 1
+
+    @staticmethod
+    def _resize_control(control, width, height):
+        """New size of a control. The height of a drop-down combo box is
+        that of its dropped-down list too (CB_GETDROPPEDCONTROLRECT); a
+        height with no room for a list item below the selection field
+        leaves the list as it was. Red Alert 2 sizes its combo boxes with
+        the list, then once more with the field's height, and its keyboard
+        options list showed one item."""
+        item_height = getattr(control, 'item_height', None) or 16
+        if (control.class_name == 'COMBOBOX' and control.style & 0x3 != 0x1 and
+                height < control.combo_field_height + item_height):
+            control.width = width
+            return
+        control.width, control.height = width, height
 
     def _uncovered(self, win, before, was_visible):
         """A child window that was hidden or moved from before (x, y, width,
@@ -195,6 +210,19 @@ class User32Mixin:
         x, y, width, height = before
         self._invalidate_area(win.parent, (x, y, x + width, y + height),
                               skip=win.hwnd if win.visible else 0)
+
+    WS_CLIPCHILDREN = 0x02000000
+
+    def _child_shown(self, win):
+        """A child window was shown. A parent without WS_CLIPCHILDREN paints
+        the area of its children too (RedrawWindow's documentation), so
+        that area is painted again in it: Red Alert 2's dialogs draw the
+        frame of the drop-down lists they open there, the lists had none."""
+        parent = self.gui.windows.get(win.parent) if self.gui else None
+        if (parent is None or not parent.visible or parent.owner is not self or
+                getattr(parent, 'style', 0) & self.WS_CLIPCHILDREN):
+            return
+        self._invalidate(win.parent, (win.x, win.y, win.x + win.width, win.y + win.height))
 
     def _control_uncovered(self, control, before, was_visible):
         """A control that was hidden or moved from before (x, y, width,
@@ -306,6 +334,8 @@ class User32Mixin:
                         self.gui.z_order.insert(0, hWnd)
                 if uFlags & 0x0040:  # SWP_SHOWWINDOW
                     self.gui.show_window(hWnd, True)
+                    if not was_visible and win.parent:
+                        self._child_shown(win)
                 elif uFlags & 0x0080:  # SWP_HIDEWINDOW
                     self.gui.show_window(hWnd, False)
                 if (not uFlags & 0x0010 and win.parent is None  # SWP_NOACTIVATE
@@ -324,7 +354,7 @@ class User32Mixin:
             if not (uFlags & 0x0002):  # SWP_NOMOVE
                 control.x, control.y = X, Y
             if not (uFlags & 0x0001):  # SWP_NOSIZE
-                control.width, control.height = cx, cy
+                self._resize_control(control, cx, cy)
             if uFlags & 0x0040:  # SWP_SHOWWINDOW
                 control.visible = True
             elif uFlags & 0x0080:  # SWP_HIDEWINDOW

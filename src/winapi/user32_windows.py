@@ -576,6 +576,8 @@ class User32WindowsMixin:
             return was_visible
         if win is None or win.parent is not None:  # A control or child window
             self.gui.show_window(hWnd, True)
+            if win is not None and not was_visible:
+                self._child_shown(win)
             if win is not None and win.size_state is None:
                 self._send_size(hWnd)
             return was_visible

@@ -41,6 +41,12 @@ Every change must be made with clean room techniques: it is based only on public
 - A click on a subclassed button or check box goes to the program's window procedure; the button procedure it passes the click on checks the box with `BM_SETCHECK` sent to it and notifies the parent: Red Alert 2's skirmish options (Short Game, Crates Appear...) can be changed
 - `PostThreadMessage` reaches a thread of another emulated process, and `CreateProcess` with `bInheritHandles` gives the child the inheritable handles (`SECURITY_ATTRIBUTES.bInheritHandle`, `DuplicateHandle`, `SetHandleInformation`) with the same values: Red Alert 2's launcher hands `GAME.EXE` a shared memory block this way, and without it a skirmish ended in defeat after about half a minute
 - A looping DirectSound buffer plays as a looping copy in the mixer that what the program writes (`Unlock`) goes into, like a sound card playing the ring: the music and sounds of Red Alert 2 no longer stutter while it computes a frame
+- A looping DirectSound buffer played at a rate that does not divide the mixer's (Red Alert 2 varies the rate of its sound effects) is played as a ring too: the effects were cut
+- A DirectSound buffer whose sound ended no longer stops or changes the volume of the sound that took its mixer channel next; the mixer has 32 channels instead of 8
+- `CB_GETDROPPEDCONTROLRECT` gives the combo box's dropped-down rectangle, and a drop-down combo box sized with only its field's height keeps the height of its list: Red Alert 2's keyboard options froze when their category list was opened
+- `ValidateRect` with a rectangle takes only that rectangle out of the update region (it validated the whole window): a closed drop-down list no longer stays on the screen
+- A parent window without `WS_CLIPCHILDREN` paints again where a child window was shown: the drop-down lists of Red Alert 2's combo boxes have their frame
+- A window's timer keeps the id the program gives it, 0 too, so `KillTimer` with that id stops it; a destroyed window's timers are gone, like on Windows, and a `SetTimer` period is rounded up to the system clock tick (15.625 ms): the animations of Red Alert 2's menus ran too fast
 
 ## 0.4.1 - 2026-11-26
 
